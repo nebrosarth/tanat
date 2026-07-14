@@ -1,0 +1,83 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<tanat_config>
+	<logs>
+		<LogOutputFile>
+			<level value="1" />
+			<thread_info value="true" />
+			<files_count value="2" />
+			<file_size value="512" />
+			<output value="{APP_DATA}TanatOnline/logs/tanat.log" />
+		</LogOutputFile>
+	</logs>
+
+	<data_dir value="./data/" />
+	<saves_dir value="{APP_DATA}TanatOnline/saves/" />
+
+	<locale_path value="configs/locale" />
+	<lang value="rus" />
+
+	<afk>
+		<kick_time value="600.0" />
+		<warning_time value="60.0" />
+	</afk>
+
+	<ai>
+		<update_rate value="0.5" />
+		<view_radius value="10.0" />
+	</ai>
+
+	<microReconnect>
+		<reconnect_time value="1000" />
+		<reconnect_attempts value="30" />
+		<web_reconnect_attempts value="3" />
+	</microReconnect>
+
+	<win_cursors value="true" />
+	<single_app_instance value="false" />
+	<use_control_server value="local_test" />
+
+	<control_server name="local_test">
+		<host value="127.0.0.1" />
+		<port value="8080" />
+		<ping_time value="60" />
+		<disconnect_time value="15" />
+		<item_proto value="http://127.0.0.1:8080/xml/items.amf" />
+		<quests value="http://127.0.0.1:8080/xml/quests.amf" />
+		<tasks value="http://127.0.0.1:8080/xml/tasks.amf" />
+		<avatars value="http://127.0.0.1:8080/xml/avatars.amf" />
+		<session value="{EMAIL}_session" />
+	</control_server>
+
+	<autoupdate>
+		<address value="http://127.0.0.1:8080/" />
+		<ignores>
+			<file value="output_log.txt" />
+			<file value="Uninstall.exe" />
+			<file value="Uninstall.ini" />
+		</ignores>
+	</autoupdate>
+
+	<avatars>
+		<avatar value="Avtr_DPS_BlackDragon" />
+		<avatar value="Avtr_DPS_Cerber" />
+		<avatar value="Avtr_DPS_Sharli" />
+		<avatar value="Avtr_Dsb_Elgorm" />
+		<avatar value="Avtr_Dsb_Hekata" />
+		<avatar value="Avtr_Dsb_PlusMinus" />
+		<avatar value="Avtr_HK_Astarot" />
+		<avatar value="Avtr_HK_Dutnik" />
+		<avatar value="Avtr_HK_Mihalych" />
+		<avatar value="Avtr_HK_ShinDalar" />
+		<avatar value="Avtr_HK_Tangren" />
+		<avatar value="Avtr_HK_Teridin" />
+		<avatar value="Avtr_Psh_Anhel" />
+		<avatar value="Avtr_Sp_Arianna" />
+		<avatar value="Avtr_Sp_Inshari" />
+		<avatar value="Avtr_Sp_Kiona" />
+		<avatar value="Avtr_Sp_Neirofim" />
+		<avatar value="Avtr_Tank_Sigilion" />
+		<avatar value="Avtr_Tank_Veritas" />
+		<avatar value="Avtr_Tank_Zamaran" />
+		<avatar value="Avtr_Tank_Velial" />
+	</avatars>
+</tanat_config>
