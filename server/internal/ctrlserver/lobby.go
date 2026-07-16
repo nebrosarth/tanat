@@ -26,27 +26,112 @@ func (s *Server) handleUserMoney(req ctrlproto.Request, resp *ctrlproto.Response
 }
 
 // handleUserBag answers user|bag -> {user_money, bag:[...]} (UserBagArgParser).
-// The bag (consumable inventory) is empty for now.
+// Each bag entry is {id, artikul_id, cnt, used} -- the same shape as a
+// permanently-dressed hero-set item (DressedItem), minus the equip slot. The
+// per-entry "id" is synthesized here (1, 2, 3...) since only the article id +
+// count are persisted (session.BagItem); it only needs to be unique within one
+// response, not stable across requests.
 func (s *Server) handleUserBag(req ctrlproto.Request, resp *ctrlproto.Response) {
 	money := int32(0)
+	bag := amf.NewArray()
 	if h := s.heroFromSession(req); h != nil {
 		money = h.Money
+		for i, bi := range h.Bag {
+			bag.Add(amf.NewArray().
+				Set("id", int32(i+1)).
+				Set("artikul_id", bi.ArticleID).
+				Set("cnt", bi.Count).
+				Set("used", int32(0)))
+		}
 	}
 	resp.Add("user", "bag", amf.NewArray().
 		Set("user_money", money).
-		Set("bag", amf.NewArray()))
+		Set("bag", bag))
 }
 
 // handleUserGameInfo answers user|game_info; ParseGameInfo reads the fields
-// straight off the packet arguments.
+// straight off the packet arguments. The client fires this both for its own hero
+// (no user_id / user_id == self) and, in the shared central square, for every OTHER
+// occupant's hero id (BindPlayerAvatar auto-requests it when a "Hero"-prefab avatar
+// is bound). Honor the requested user_id so another player's level/rating resolve;
+// fall back to the session hero (self path, unchanged) when it is absent/unknown.
 func (s *Server) handleUserGameInfo(req ctrlproto.Request, resp *ctrlproto.Response) {
-	resp.Add("user", "game_info", s.gameInfoFields(s.heroFromSession(req)))
+	h := s.heroFromSession(req)
+	if id, ok := req.Params.GetInt("user_id"); ok {
+		if u, ok := s.Store.ByID(id); ok && u.Hero != nil {
+			h = u.Hero
+		}
+	}
+	resp.Add("user", "game_info", s.gameInfoFields(h))
 }
 
-// handleHeroGetDataList answers hero|get_data_list -> {data:{"<id>":{...}}}.
+// handleHeroGetDataList answers hero|get_data_list -> {data:{"<id>":{...}}}. The
+// client sends an "id" array; in the central square that array holds OTHER
+// occupants' hero ids (auto-requested on avatar bind, since the "Hero" prefab drives
+// SetHeroView from this response). Answer for every requested id looked up in the
+// store, so other players render as real customized heroes rather than bodiless
+// movers; fall back to the session hero (self path, unchanged) when no id resolves.
 func (s *Server) handleHeroGetDataList(req ctrlproto.Request, resp *ctrlproto.Response) {
-	resp.Add("hero", "get_data_list", amf.NewArray().
-		Set("data", heroDataMapOf(s.heroFromSession(req))))
+	data := amf.NewArray()
+	for _, h := range s.requestedHeroes(req) {
+		addHeroData(data, h)
+	}
+	if len(data.Assoc) == 0 {
+		addHeroData(data, s.heroFromSession(req))
+	}
+	resp.Add("hero", "get_data_list", amf.NewArray().Set("data", data))
+}
+
+// requestedHeroes resolves the heroes named by the request's "id" array (the ids the
+// client asked hero|get_data_list for) against the store. Unknown ids are skipped.
+func (s *Server) requestedHeroes(req ctrlproto.Request) []*session.Hero {
+	if req.Params == nil {
+		return nil
+	}
+	ids, ok := req.Params.GetArray("id")
+	if !ok {
+		return nil
+	}
+	var out []*session.Hero
+	for _, v := range ids.Dense {
+		var id int32
+		switch n := v.(type) {
+		case int32:
+			id = n
+		case float64:
+			id = int32(n)
+		default:
+			continue
+		}
+		if u, ok := s.Store.ByID(id); ok && u.Hero != nil {
+			out = append(out, u.Hero)
+		}
+	}
+	return out
+}
+
+// handleHeroGetData answers hero|get_data -> {load:{id, race, gender, ...}} for a
+// SINGLE hero. This is the request the client auto-fires (HeroSender.DataRequest)
+// when it binds a "Hero"-prefab avatar that appears AFTER the initial world load --
+// exactly another player walking into the square (Battle.BindPlayerAvatar ->
+// UpdateHeroData). Without it the other player shows a nickname but no body, since
+// SetHeroView only runs once this response's mView arrives. HeroDataArgParser wants
+// the view under a "load" key (its presence sets mPersExists=true) with the hero id
+// inside it; an unknown id gets {create:{id}} (mPersExists=false -> client skips).
+func (s *Server) handleHeroGetData(req ctrlproto.Request, resp *ctrlproto.Response) {
+	h := s.heroFromSession(req)
+	if id, ok := req.Params.GetInt("id"); ok {
+		if u, ok := s.Store.ByID(id); ok && u.Hero != nil {
+			h = u.Hero
+		}
+	}
+	if h == nil {
+		resp.Add("hero", "get_data", amf.NewArray().
+			Set("create", amf.NewArray().Set("id", int32(-1))))
+		return
+	}
+	load := heroViewArray(h).Set("id", h.ID)
+	resp.Add("hero", "get_data", amf.NewArray().Set("load", load))
 }
 
 // handleFullHeroInfo answers user|full_hero_info -> {visual_data, hero_data,
@@ -94,8 +179,16 @@ func (s *Server) gameInfoFields(h *session.Hero) *amf.MixedArray {
 // user_info}} map the client parses in HeroDataListArgParser.ParseData.
 func heroDataMapOf(h *session.Hero) *amf.MixedArray {
 	m := amf.NewArray()
+	addHeroData(m, h)
+	return m
+}
+
+// addHeroData adds h's {load, dressed_items, clan_info, user_info} entry to m, keyed
+// by the hero id (a no-op for a nil hero). Shared by hero|get_data_list (which may
+// carry several occupants) and user|full_hero_info (a single hero).
+func addHeroData(m *amf.MixedArray, h *session.Hero) {
 	if h == nil {
-		return m
+		return
 	}
 	entry := amf.NewArray().
 		Set("load", heroViewArray(h)).
@@ -107,7 +200,6 @@ func heroDataMapOf(h *session.Hero) *amf.MixedArray {
 			Set("next_exp", h.NextExp).
 			Set("rating", int32(0)))
 	m.Set(strconv.Itoa(int(h.ID)), entry)
-	return m
 }
 
 // heroViewArray is the hero appearance sub-array ("load").
@@ -147,11 +239,63 @@ func (s *Server) handleCastleList(req ctrlproto.Request, resp *ctrlproto.Respons
 	resp.Add("castle", "list", amf.NewArray().Set("castles", amf.NewArray()))
 }
 
-// handleGroupList answers user|group_list -> {users:[], leader:-1} (solo).
+// handleGroupList answers user|group_list -> {users:[...], leader}. It returns the
+// party of the requester (or of the user_id queried), each member row carrying the
+// fields GroupWindow reads {id, nick, online, level, race, gender, clan_info}.
+//
+// leader is 0 when the requester leads (or is solo), the leader's id when someone else
+// leads, and -1 only when inspecting ANOTHER user who is solo. Reporting a solo
+// requester as leader=0 is deliberate: the client sets mLeaderId=SelfHeroId on
+// leader==0 (Group.OnGroupList), which makes Group.IsLeader true -- and the central-
+// square popup only offers "invite to group" (GROUP_INVITE) to a leader. Returning -1
+// there (mLeaderId=-1, IsLeader=false) leaves a lone player with only "ask to join",
+// so the invite flow is never reachable and no group can ever be started by inviting.
 func (s *Server) handleGroupList(req ctrlproto.Request, resp *ctrlproto.Response) {
-	resp.Add("user", "group_list", amf.NewArray().
-		Set("users", amf.NewArray()).
-		Set("leader", int32(-1)))
+	u := s.userFromSession(req)
+	users := amf.NewArray()
+	leader := int32(-1)
+	if u != nil {
+		target := u.ID
+		if id, ok := req.Params.GetInt("user_id"); ok && id > 0 {
+			target = id
+		}
+		if g := s.Store.GroupOf(target); g != nil {
+			leader = g.Leader
+			if g.Leader == u.ID {
+				leader = 0
+			}
+			for _, mid := range g.Members {
+				users.Add(s.groupMemberRow(mid))
+			}
+		} else if target == u.ID {
+			// Solo requester: their own (trivial) leader, so GROUP_INVITE shows. members
+			// stays empty (IsEmpty true), so "ask to join" stays available too.
+			leader = 0
+		}
+	}
+	resp.Add("user", "group_list", amf.NewArray().Set("users", users).Set("leader", leader))
+}
+
+// groupMemberRow builds one party-list row for a member id.
+func (s *Server) groupMemberRow(uid int32) *amf.MixedArray {
+	nick := ""
+	var level, race int32
+	gender := false
+	online := s.MPD != nil && s.MPD.Online(uid)
+	if mu, ok := s.Store.ByID(uid); ok {
+		nick = mu.Username
+		if mu.Hero != nil {
+			level, race, gender = mu.Hero.Level, mu.Hero.Race, mu.Hero.Gender
+		}
+	}
+	return amf.NewArray().
+		Set("id", uid).
+		Set("nick", nick).
+		Set("online", online).
+		Set("level", level).
+		Set("race", race).
+		Set("gender", gender).
+		Set("clan_info", amf.NewArray().Set("id", int32(-1)).Set("tag", ""))
 }
 
 // handleCanReconnect answers common|can_reconnect with {answer:false} so the

@@ -491,7 +491,8 @@ type huntState struct {
 	passiveBuffCount [4]int32
 
 	hasProjectile bool
-	procs         []procState
+	procs         []procState // rolled when the avatar HITS (basic attack)
+	defenseProcs  []procState // rolled when the avatar is STRUCK (Titanid «Каменная кожа»)
 
 	// reviveSlot / ccImmuneSlot are the 1-based slots of a learned PASSIVE carrying an
 	// OpRevive / OpImmune op (0 = none). Set at world-build. reviveReadyAt /
@@ -539,11 +540,50 @@ type huntState struct {
 	anchorEnds   []anchorEnd
 	nextAnchorID int32 // solo/bare-conn fallback id space (instance uses inst.nextAnchorID)
 
+	// drops (loot chests): solo/bare-conn fallback id space + set (instance uses
+	// inst.drops/nextDropID/nextDropItemID).
+	drops          map[int32]*dropState
+	nextDropID     int32
+	nextDropItemID int32
+
+	// Consumable bag: this session's mirror of the hero's persistent Bag
+	// (session.Store), loaded once at world-build (sendInitialBagLocked) and kept
+	// in sync as potions are drunk/looted.
+	bag            map[int32]int32 // articleID -> count
+	bagItemID      map[int32]int32 // articleID -> wire inventory "id" (ADD_TO_INVENTORY)
+	bagArticleByID map[int32]int32 // reverse of bagItemID
+	nextBagID      int32
+	sentItemProtos map[int32]bool // article ids already PROTOTYPE_INFO'd this session
+	sentBuffProtos map[int32]bool // itemBuffProtoID ids already PROTOTYPE_INFO'd this session
+	// itemCooldownUntil gates re-use of EACH specific article id independently
+	// -- real per-item cooldowns (gamedata.Item.Cooldown) range 30-40s for
+	// Health/Mana potions (tapering by level bracket) up to a flat 150s for
+	// every buff-type potion, replacing an earlier simplification that shared
+	// one flat 15s cooldown across every potion kind.
+	itemCooldownUntil map[int32]float64
+
+	// invisibleUntil / invisFxUID: an active Invisibility potion. While live, mobs
+	// ignore this avatar as a target candidate (mobTargetLocked) -- it suppresses
+	// NEW aggro, but doesn't retroactively break a mob already mid-chase (a
+	// deliberately simple v1 rule, not a full "vanish").
+	invisibleUntil float64
+	invisFxUID     int32
+	invisBuffEffID int32
+
+	// revealInvisibleUntil / revealBuffEffID: an active Revelation potion.
+	// Currently a no-op beyond its own buff icon/timer -- Hunt is a co-op PvE
+	// mode with no enemy avatars to reveal, and mobs carry no invisibility of
+	// their own. Forward-compatible state for whenever PvP or invisible mobs
+	// exist. (AntiPhysArmor's phys_armor_pen, by contrast, is now LIVE: mobs
+	// carry real physical armor and hitMobFlagsLocked penetrates it. AntiMagicArmor's
+	// magic_armor_pen stays inert until mobs get magic armor.)
+	revealInvisibleUntil float64
+	revealBuffEffID      int32
+
 	// self dash + death/respawn
 	dashUntil, dashSpeed float64
 	deadUntil, diedAt    float64
 	corpseHidden         bool
-	nextRegen            float64
 
 	// Active respawn checkpoint (m.Reborn). Death returns here; walking near a
 	// different Reborn_point moves it. rebornIdx = index of the active checkpoint
@@ -614,6 +654,33 @@ type mobState struct {
 	skillTargetObj int32 // objID a single-target boss skill was aimed at
 
 	pf pathState // routed chase waypoints when the straight line is wall-blocked
+
+	// «Штурм» (DOTA) fields. team is the object's in-battle team: 1 = the player's
+	// side (allies), -1 = enemies (Hunt's convention; teamVal falls back to -1 so a
+	// plain Hunt mob keeps hostile-to-player behaviour). structure marks a static
+	// building rendered from a Fn_* building prefab (dotaPrefab) instead of a mob
+	// model; altar marks the win object; dotaRole classifies it. Creeps are ordinary
+	// mobs with a team + a lane to march (lane waypoints, laneIdx = next waypoint,
+	// laneFwd = walk direction). dtarget is the object the creep/cannon is currently
+	// engaging.
+	team      int32
+	structure bool
+	altar     bool
+	dotaRole  gamedata.DotaRole
+	dotaPrefab string
+	lane      []gamedata.Vec2
+	laneIdx   int
+	laneFwd   bool
+	dtarget   int32
+}
+
+// teamVal is the object's sync TEAM value: the explicit DOTA team, or -1 (enemy of
+// the player) for a Hunt mob that never set one. Never returns 0 (client NEUTRAL).
+func (m *mobState) teamVal() int32 {
+	if m.team != 0 {
+		return m.team
+	}
+	return -1
 }
 
 // maxHealth / rollDamage / xpReward / coinReward return the mob's effective
@@ -650,6 +717,16 @@ func (m *mobState) coinReward() int32 {
 		return m.coins
 	}
 	return m.mob.Coins
+}
+
+// physArmor is the mob's effective physical armor at `now`: its authored flat base
+// (Mob.PhysArmor -- NOT level-scaled, since mitigation is already a percentage curve)
+// plus any active phys_armor status mods, times the armor_pct multiplier. Velial's
+// ult «Трибунал» appends a NEGATIVE phys_armor mod here, so a debuffed mob's armor
+// drops (and can go below 0 = armor broken, which armorMitigation turns into a damage
+// amplifier). Consumed on the incoming-damage path (hitMobFlagsLocked).
+func (m *mobState) physArmor(now float64) float64 {
+	return (m.mob.PhysArmor + m.st.modSum(now, "phys_armor")) * m.st.modMul(now, "armor_pct")
 }
 
 func (hs *huntState) newEffID() int32                  { hs.nextEffID++; return hs.nextEffID }
@@ -690,7 +767,6 @@ func (s *Server) sendHuntWorldState(c *conn, name string) {
 	}
 	hs.points = 1
 	now := float64(s.battleTime())
-	hs.nextRegen = now + 2
 
 	// Debug testing aid: optionally spawn at a higher level so the level-gated
 	// ranks (e.g. the ult at level 5) are reachable immediately. Set hs.level
@@ -765,6 +841,18 @@ func (s *Server) sendHuntWorldState(c *conn, name string) {
 	// Invisible trap-fx anchor prototype: a stationary object a SELF-mode ground fx
 	// parents to so it holds the cast point (see trap_anchor.go). One fixed proto.
 	pkts = append(pkts, protoInfoPkt(trapAnchorProtoID, trapAnchorProtoDesc()))
+	// Ground-loot chest prototype (see drops.go). One fixed proto, spawned wherever
+	// a mob happens to drop loot.
+	pkts = append(pkts, protoInfoPkt(dropChestProtoID, dropChestProtoDesc()))
+	// Potion buff-bar icons are no longer eagerly registered here: each item
+	// now gets its OWN dedicated buff prototype, lazily PROTOTYPE_INFO'd the
+	// first time it's actually drunk (ensureItemBuffProtoLocked in
+	// consumables.go) -- see itemBuffProtoID's doc for why (per-tier icon,
+	// not one shared placeholder per Kind).
+	// Shared consumable-use action prototype every item's <PTool> references
+	// (see itemProtoDesc's doc) -- without it, clicking any bag item is a
+	// total client-side no-op: no DO_ACTION packet is ever sent.
+	pkts = append(pkts, protoInfoPkt(itemUseActionProtoID, itemUseActionProtoDesc()))
 
 	// 2. Self player + avatar object. SET_AVATAR level is 0-based on the wire.
 	c.lock()
@@ -847,7 +935,15 @@ func (s *Server) sendHuntWorldState(c *conn, name string) {
 		for _, op := range sk.Ops {
 			switch op.Kind {
 			case gamedata.OpProc:
-				hs.procs = append(hs.procs, procState{slot: i + 1, chance: op.Chance, ops: op.Ops})
+				pr := procState{slot: i + 1, chance: op.Chance, ops: op.Ops}
+				// Most procs fire when the avatar HITS (runProcsLocked, basic-attack path).
+				// A defensive proc like Titanid's «Каменная кожа» instead hardens when the
+				// avatar is STRUCK, so it is rolled from the incoming-damage path.
+				if procOnDamaged(hs.av.Prefab, i+1) {
+					hs.defenseProcs = append(hs.defenseProcs, pr)
+				} else {
+					hs.procs = append(hs.procs, pr)
+				}
 			case gamedata.OpRevive:
 				hs.reviveSlot = i + 1
 			case gamedata.OpImmune:
@@ -914,12 +1010,24 @@ func (s *Server) sendHuntWorldState(c *conn, name string) {
 		c.RemoteAddr(), self, objID, a.Prefab, pb.MapID, len(m.Spawns), hs.hasProjectile)
 	s.sendSeq(c, pkts)
 
+	// Consumable bag: register this hero's persisted potions as Battle-channel
+	// inventory so a hunt session starts with the same bag the lobby shows.
+	c.lock()
+	s.sendInitialBagLocked(c)
+	c.unlock()
+
 	// Cross-player rendering: show the existing members to this newcomer and this
 	// newcomer to them, so a shared world actually looks shared. The instance
 	// ticker (started at instance creation) drives the shared simulation -- no
 	// per-connection combat goroutine any more.
 	c.lock()
 	s.introduceMemberLocked(c, float64(s.battleTime()))
+	// «Штурм»: register the structure/creep prototypes and render every base structure
+	// (altars, cannons, towers, generators) on this member's client. Must run before
+	// worldReady so the first DOTA tick's creep syncs don't race the scene build.
+	if c.inst != nil && c.inst.dota != nil {
+		s.dotaWorldSetupLocked(c, float64(s.battleTime()))
+	}
 	// The world is fully built: join the shared tick + broadcast set now, so no
 	// mob/teammate packet could have raced ahead of this member's scene load.
 	hs.worldReady = true
@@ -1129,6 +1237,7 @@ func (s *Server) handleDoAction(c *conn, p battleproto.Packet) {
 		s.ack(c, p)
 		return
 	}
+	itemID := p.Args.IntOr("id", -1)
 	action := p.Args.IntOr("action", -1)
 	target := p.Args.IntOr("target", -1)
 	var px, py float32
@@ -1146,9 +1255,19 @@ func (s *Server) handleDoAction(c *conn, p battleproto.Packet) {
 	a := hs.av
 
 	switch {
+	case action == -1:
+		// SelfPlayer.UseItem sends {id: itemObjId, action: -1, target: avatarObjId}:
+		// this is a consumable use, not an attack/skill (those carry a real action
+		// proto id). itemID indexes hs.bagArticleByID, not any object/proto space.
+		s.useItemLocked(c, itemID, float64(s.battleTime()))
 	case action == attackProtoID(a):
 		ms := hs.mobs[target]
 		if ms == nil || ms.dead {
+			return
+		}
+		// «Штурм» friendly fire: never attack an ally (own-team creep/structure). Hunt
+		// mobs are team -1 (teamVal), so this never blocks a PvE target.
+		if ms.teamVal() == 1 {
 			return
 		}
 		// A client-issued attack means its DEFENCE loop is live and will re-pick the
@@ -1309,7 +1428,12 @@ func (s *Server) scheduleProjectileLocked(c *conn, seq int, targetID int32, rele
 			Set("source", c.objID).
 			Set("target", ms.id).
 			Set("hit_at", float64(now)+flight))
-		s.scheduleHitLocked(c, seq, ms.id, time.Duration(flight*float64(time.Second)))
+		// The bolt is now in flight (SET_PROJECTILE sent, client animates it landing on
+		// the mob). Its hit is COMMITTED: it must land on arrival even if the player
+		// cancels or retargets the attack mid-flight (which bumps attackSeq). Gating the
+		// arrival hit on seq -- as a melee swing is -- would make a visibly-connecting
+		// arrow deal no damage.
+		s.scheduleProjectileHitLocked(c, ms.id, time.Duration(flight*float64(time.Second)))
 	}
 	if release <= 0 {
 		launch() // inline: caller holds the lock (snap shot, byte-identical to before)
@@ -1347,12 +1471,29 @@ func (s *Server) scheduleSwingDone(c *conn, seq int, interval time.Duration) {
 	})
 }
 
+// scheduleHitLocked lands a basic-attack hit after windup, gated on the attack still
+// being live (attackSeq unchanged) -- a melee swing interrupted before it connects
+// deals no damage.
 func (s *Server) scheduleHitLocked(c *conn, seq int, targetID int32, windup time.Duration) {
+	s.scheduleHitAfterLocked(c, seq, targetID, windup, false)
+}
+
+// scheduleProjectileHitLocked lands the hit for a bolt already in flight: it is
+// COMMITTED (seq is not checked), so a projectile that visibly reaches the mob still
+// deals its damage even if the player cancels or retargets during the flight.
+func (s *Server) scheduleProjectileHitLocked(c *conn, targetID int32, windup time.Duration) {
+	s.scheduleHitAfterLocked(c, 0, targetID, windup, true)
+}
+
+func (s *Server) scheduleHitAfterLocked(c *conn, seq int, targetID int32, windup time.Duration, committed bool) {
 	time.AfterFunc(windup, func() {
 		c.lock()
 		defer c.unlock()
 		hs := c.huntState
-		if hs == nil || hs.closed || hs.attackSeq != seq {
+		if hs == nil || hs.closed {
+			return
+		}
+		if !committed && hs.attackSeq != seq {
 			return
 		}
 		av := hs.av
@@ -1400,6 +1541,37 @@ func (s *Server) runProcsLocked(c *conn, ms *mobState, now float64) {
 	}
 }
 
+// runDefenseProcsLocked rolls each ON-DAMAGED passive after the avatar takes a hit --
+// Titanid's «Каменная кожа» hardens (stacks +phys_armor) when he is STRUCK, not when
+// he strikes. attacker is the mob that hit; the ops (a self armor buff) ignore it, but
+// it feeds the ctx like a struck-target would for runProcsLocked.
+func (s *Server) runDefenseProcsLocked(c *conn, attacker *mobState, now float64) {
+	hs := c.huntState
+	if len(hs.defenseProcs) == 0 {
+		return
+	}
+	px, py := c.posAtLocked(float32(now))
+	for _, pr := range hs.defenseProcs {
+		level := int(hs.skillLevel[pr.slot-1])
+		if level < 1 {
+			continue
+		}
+		if rand.Float64() >= pr.chance.At(level) {
+			continue
+		}
+		ctx := opCtx{slot: pr.slot, level: level, target: attacker, px: px, py: py, hasPos: true}
+		s.applyOpsLocked(c, pr.ops, ctx, now)
+	}
+}
+
+// procOnDamaged reports whether a passive's OpProc fires on taking damage (rather than
+// on hitting). Hand-maintained by prefab+slot -- the trigger mode is a semantic of the
+// skill, not present in the data. Titanid's «Каменная кожа» (slot 3) is the one such
+// passive: it stacks armor as he is struck.
+func procOnDamaged(prefab string, slot int) bool {
+	return prefab == "Avtr_Tank_Titanid" && slot == 3
+}
+
 func (s *Server) stopAttackLocked(c *conn, silent bool) {
 	hs := c.huntState
 	if hs.attackTarget == 0 {
@@ -1437,6 +1609,19 @@ func (s *Server) creditConnLocked(c *conn, damager int32) *conn {
 	return c
 }
 
+// attackerArmorPenLocked returns the physical armor penetration of whoever owns the
+// damager object -- a player who quaffed an AntiPhysArmor potion (phys_armor_pen), or
+// the owner of the summon that landed the hit. It resolves the owner through
+// creditConnLocked (players + their summons). 0 when there is no live owning avatar
+// (e.g. environmental damage), leaving the mob's armor untouched.
+func (s *Server) attackerArmorPenLocked(c *conn, damager int32, now float64) float64 {
+	owner := s.creditConnLocked(c, damager)
+	if owner == nil || owner.huntState == nil {
+		return 0
+	}
+	return owner.huntState.st.modSum(now, "phys_armor_pen")
+}
+
 // hitMobLocked applies damage: RECEIVE_HIT + HEALTH sync (to every viewer), then
 // the death sequence (ON_KILL -> HEALTH 0 -> XP/level -> delayed DELETE_OBJECT).
 // damager is the RECEIVE_HIT source (the client resolves the impact VFX from it):
@@ -1453,8 +1638,25 @@ func (s *Server) hitMobFlagsLocked(c *conn, ms *mobState, dmg float64, damager i
 	if ms.dead {
 		return
 	}
-	// Simple armor mitigation using the mob's implicit toughness is skipped
-	// (mobs have no armor stat); damage applies directly.
+	// «Штурм»: the altar (Fortress Crystal) shrugs off all damage until its side's
+	// cannons are destroyed -- the core push rule. No effect on Hunt (ms.altar false).
+	if ms.altar && c.inst != nil && c.inst.dota != nil && !c.inst.dota.altarVulnerableLocked(ms) {
+		return
+	}
+	// Armor mitigation. The mob's physical armor softens the blow via the shared
+	// armor/(armor+50) curve; the attacker's armor penetration (an AntiPhysArmor potion's
+	// phys_armor_pen) chips POSITIVE armor toward 0 first. Velial's ult «Трибунал» applies
+	// a negative phys_armor mod, so a stripped mob's armor can fall below 0 and it then
+	// takes AMPLIFIED damage (armorMitigation > 1). Zero-armor mobs (most trash) get a 1.0
+	// multiplier -- damage lands in full, exactly as before armor existed.
+	now := float64(s.battleTime())
+	armor := ms.physArmor(now)
+	if armor > 0 {
+		if pen := s.attackerArmorPenLocked(c, damager, now); pen > 0 {
+			armor = math.Max(0, armor-pen)
+		}
+	}
+	dmg *= armorMitigation(armor)
 	ms.aggro = true
 	ms.hp -= dmg
 	s.broadcastObjLocked(c, ms.id, battleproto.CmdReceiveHit, amf.NewArray().
@@ -1495,6 +1697,11 @@ func (s *Server) hitMobFlagsLocked(c *conn, ms *mobState, dmg float64, damager i
 	// On-kill heal (Cerber's «Кровавый пир»): the killer restores a fraction of the
 	// slain enemy's max HP, capped.
 	s.applyHealOnKillLocked(killer, ms, float64(s.battleTime()))
+	// Loot: a ground chest with a single random consumable, shared party-wide
+	// loot rights. Bosses always drop; trash rolls a flat 1-in-N chance.
+	if s.rollDropLocked(ms) {
+		s.spawnDropLocked(c, ms.x, ms.y, float64(s.battleTime()))
+	}
 
 	// Schedule the revive: every creature -- trash and boss alike -- respawns
 	// mobRespawnDelay (5 min) after death, so the location can be farmed. The
@@ -1580,6 +1787,14 @@ func (s *Server) awardCoinsLocked(c *conn, fromObj, coins int32) {
 		Set("delta", amf.NewArray().Set("v", coins).Set("r", int32(0))))
 }
 
+// heroExpShare is the fraction of in-hunt XP that also feeds the account's
+// PERSISTENT character level (session.Hero.Level/Exp), independent of the
+// ephemeral hunt-instance level below. By design the hunt-instance level/XP
+// itself is never persisted (it's a per-session battle-power scaler, reset
+// every hunt); this is the one deliberate exception -- a slice of the XP
+// earned still grows the permanent character across sessions.
+const heroExpShare = 0.10
+
 // grantXPLocked adds experience and processes level-ups. Each level gained grows
 // the avatar's power via LevelPowerMul/LevelHealthMul (see gamedata): the max
 // HP/mana pools rise and the hero is topped up by exactly the gained amount, then
@@ -1588,6 +1803,9 @@ func (s *Server) grantXPLocked(c *conn, xp float64) {
 	hs := c.huntState
 	hs.xp += xp
 	s.syncSelfLocked(c, syncExperience)
+	if charXP := int32(xp * heroExpShare); charXP > 0 {
+		s.Store.AddHeroExp(c.selfPlayerID, charXP)
+	}
 	levels := gamedata.AvatarXPLevels
 	now := float64(s.battleTime())
 	leveled := false
@@ -1741,5 +1959,9 @@ func (c *conn) closeHunt() {
 	}
 	if c.inst != nil {
 		c.inst.leaveInstanceLocked(c)
+	}
+	// A central-square occupant: drop its avatar from every remaining occupant.
+	if c.linst != nil {
+		c.linst.leaveLobbyInstanceLocked(c)
 	}
 }

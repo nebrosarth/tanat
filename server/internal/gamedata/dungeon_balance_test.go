@@ -300,8 +300,11 @@ func TestDungeonPlacement(t *testing.T) {
 		if !isDemonMob(sp.Mob) || !sp.Abs {
 			continue
 		}
-		// Velial's lair chamber (X 455..510, Z 285..330).
-		if sp.DX >= 455 && sp.DX <= 510 && sp.DY >= 285 && sp.DY <= 330 {
+		// Velial's lair chamber. The boss now keeps a wide (26m) mob-free ring like a
+		// respawn point, so demons form a RING around the lair rather than hugging the
+		// boss -- the box spans the whole chamber (X 455..520, Z 275..345), not the
+		// centre. Velial sits at ~(486,306); nothing spawns within 26m of him.
+		if sp.DX >= 455 && sp.DX <= 520 && sp.DY >= 275 && sp.DY <= 345 {
 			velialDemons++
 		}
 		// Cerber->Hekata connector (the mid-left walkable region).

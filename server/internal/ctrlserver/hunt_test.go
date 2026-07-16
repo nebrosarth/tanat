@@ -33,15 +33,18 @@ func TestHuntMatchmakingFlow(t *testing.T) {
 			Set("sess_uid", userID).Set("sess_key", sessKey).Set("counter", counter)
 	}
 
-	// arena|get_maps_info must list every hunt map with type_id 4.
+	// arena|get_maps_info must list every hunt map (type_id 4) AND every «Штурм»
+	// (DOTA, type_id 1) map -- FightHelper.FindMapById needs both so JoinBattle can
+	// route by mType.
 	mi, _ := postEnvelope(t, url, mkReq("arena", "get_maps_info", amf.NewArray(), 2)).
 		GetArray(ctrlproto.CmdKey("arena", "get_maps_info"))
 	if mi == nil {
 		t.Fatal("no arena|get_maps_info response")
 	}
 	maps, ok := mi.GetArray("maps_info")
-	if !ok || len(maps.Dense) != len(gamedata.HuntMaps()) {
-		t.Fatalf("maps_info: want %d dense entries, got %#v", len(gamedata.HuntMaps()), mi.Assoc)
+	wantMaps := len(gamedata.HuntMaps()) + len(gamedata.DotaMaps())
+	if !ok || len(maps.Dense) != wantMaps {
+		t.Fatalf("maps_info: want %d dense entries, got %#v", wantMaps, mi.Assoc)
 	}
 	first, ok := maps.Dense[0].(*amf.MixedArray)
 	if !ok {
@@ -108,6 +111,26 @@ func TestHuntMatchmakingFlow(t *testing.T) {
 	if pb.MapID != huntMap.ID || pb.AvatarID != avatar.ID || pb.Passwd != passwd || pb.Scene != huntMap.Scene {
 		t.Errorf("pending battle = %+v, want map=%d avatar=%d passwd=%s scene=%s",
 			pb, huntMap.ID, avatar.ID, passwd, huntMap.Scene)
+	}
+
+	// The select-window "random" button sends avatar_id -1; the server must resolve
+	// it to a real roster avatar and launch (not reject it).
+	rnd, _ := postEnvelope(t, url,
+		mkReq("hunt", "ready", amf.NewArray().
+			Set("map_id", huntMap.ID).Set("avatar_id", int32(-1)), 6)).
+		GetArray(ctrlproto.CmdKey("hunt", "ready"))
+	if status, _ := rnd.GetInt("status"); status != ctrlproto.StatusOK {
+		t.Fatalf("hunt|ready with random avatar (-1) failed: status %d", status)
+	}
+	if _, ok := rnd.GetArray("params"); !ok {
+		t.Fatal("hunt|ready random: missing launch params")
+	}
+	rpb, ok := srv.Store.TakePendingBattle(userID)
+	if !ok {
+		t.Fatal("hunt|ready random: no pending battle recorded")
+	}
+	if _, ok := gamedata.AvatarByID(rpb.AvatarID); !ok || rpb.AvatarID == -1 {
+		t.Errorf("random avatar not resolved: pending avatar id = %d", rpb.AvatarID)
 	}
 
 	// Unknown map must fail, not launch.
@@ -186,6 +209,65 @@ func TestAvatarsAmfAndList(t *testing.T) {
 		}
 		if av, _ := entry.GetBool("available"); !av {
 			t.Errorf("avatar %d not available", a.ID)
+		}
+	}
+}
+
+// TestItemsAmfCarriesCtrlPrototypeFields guards the "item never appears in
+// any bag" bug: CachedCtrlPrototypeProvider only resolves a non-null
+// CtrlPrototype.Article/Desc for an article id if PropertyHolder.
+// RetrieveProperties found ALL of PCtrlDesc's five required keys
+// (id/title/short/long/icon) for that entry -- a missing one drops the whole
+// entry (PArticle included), silently: the lobby bag then skips the item
+// (SelfHero.CreateThing's Article==null guard) and the in-battle bag
+// NullReferenceExceptions instead, aborting its refresh. Serving this empty
+// (the old handleEmptyProto stub) was the actual root cause, not anything in
+// the Battle-channel PROTOTYPE_INFO XML.
+func TestItemsAmfCarriesCtrlPrototypeFields(t *testing.T) {
+	srv := New()
+	ts := httptest.NewServer(srv.Handler())
+	defer ts.Close()
+
+	resp, err := http.Get(ts.URL + "/xml/items.amf")
+	if err != nil {
+		t.Fatalf("get items.amf: %v", err)
+	}
+	defer resp.Body.Close()
+	dec := amf.NewDecoder(resp.Body)
+	v, err := dec.DecodeMessage()
+	if err != nil {
+		t.Fatalf("decode items.amf: %v", err)
+	}
+	root, ok := v.(*amf.MixedArray)
+	if !ok {
+		t.Fatalf("items.amf root is %T", v)
+	}
+	if len(root.Dense) != len(gamedata.Items()) {
+		t.Fatalf("items.amf: %d entries, want %d", len(root.Dense), len(gamedata.Items()))
+	}
+	for i, want := range gamedata.Items() {
+		entry, ok := root.Dense[i].(*amf.MixedArray)
+		if !ok {
+			t.Fatalf("items.amf[%d] is %T", i, root.Dense[i])
+		}
+		if id, _ := entry.GetInt("id"); id != want.ArticleID {
+			t.Errorf("items.amf[%d].id = %d, want %d", i, id, want.ArticleID)
+		}
+		// PCtrlDesc's five keys are ALL required -- assert every one is present.
+		for _, key := range []string{"title", "short", "long", "icon"} {
+			if _, ok := entry.GetString(key); !ok {
+				t.Errorf("items.amf[%d] (article %d) missing required PCtrlDesc key %q", i, want.ArticleID, key)
+			}
+		}
+		if icon, _ := entry.GetString("icon"); icon != want.Icon {
+			t.Errorf("items.amf[%d].icon = %q, want %q", i, icon, want.Icon)
+		}
+		// kind_id must NOT default to 0 (ShopGUI.ItemType.QUEST_ITEM): the
+		// live client rendered every potion's tooltip with the generic
+		// "Предмет, требующийся для задания" quest-item description because
+		// this field was missing entirely.
+		if kind, ok := entry.GetInt("kind_id"); !ok || kind == 0 {
+			t.Errorf("items.amf[%d] (article %d) kind_id = %d, ok=%v -- must not be 0 (QUEST_ITEM)", i, want.ArticleID, kind, ok)
 		}
 	}
 }

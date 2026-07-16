@@ -99,3 +99,91 @@ func TestNavGrid42OutsideBlocked(t *testing.T) {
 		t.Fatal("a point far outside map_4_2 is walkable")
 	}
 }
+
+// map_4_1 («Логово вторжения») nav grid is RECONSTRUCTED from the client minimap (no
+// authored polygon exists for this map). The transform is fit to the 5 canonical
+// Reborn_point checkpoints — the real respawn floor, NOT mob positions (which were random
+// offsets and are not a walkability signal). Those checkpoints must be walkable and
+// mutually reachable from spawn (one connected component).
+func TestNavGrid41RebornsWalkableAndReachable(t *testing.T) {
+	sx, sy := navGrid41.Spawn()
+	if !navGrid41.Walkable(sx, sy) {
+		t.Fatalf("map_4_1 spawn (%.1f,%.1f) is not walkable", sx, sy)
+	}
+	if math.Abs(sx-(-140.5)) > 1 || math.Abs(sy-3.1) > 1 {
+		t.Errorf("map_4_1 spawn drifted from the start Reborn: got (%.1f,%.1f)", sx, sy)
+	}
+	// The 5 canonical Reborn_point checkpoints from the map_4_1 scene bundle (world X,Z).
+	reborns := [][2]float64{
+		{-140.5, 3.1}, {150.0, 104.5}, {69.0, -227.2}, {-208.4, -107.4}, {-50.6, -64.2},
+	}
+	for i, r := range reborns {
+		if !navGrid41.Walkable(r[0], r[1]) {
+			t.Errorf("map_4_1 Reborn %d (%.1f,%.1f) is not walkable", i, r[0], r[1])
+		}
+		if p := navGrid41.Path(sx, sy, r[0], r[1]); len(p) == 0 {
+			t.Errorf("map_4_1 Reborn %d (%.1f,%.1f) is not reachable from spawn", i, r[0], r[1])
+		}
+	}
+}
+
+func TestNavGrid41OutsideBlocked(t *testing.T) {
+	if navGrid41.Walkable(10000, 10000) {
+		t.Fatal("a point far outside map_4_1 is walkable")
+	}
+	// Far south of the reconstructed region (void) must be blocked.
+	if navGrid41.Walkable(-140.5, -1000) {
+		t.Fatal("a point in the map_4_1 void is walkable")
+	}
+}
+
+// map_4_1 «Логово вторжения» is BOSSES + ELITE-ONLY demon/undead packs (user spec:
+// "боссов и только элитных мобов, демонов и нежить"). Assert all four bosses are pinned
+// (Abs) and reachable from spawn, every non-boss spawn is an elite tier (no common
+// trash), and every spawn sits on walkable floor of the reconstructed grid.
+func TestInvasionPack41BossesAndElitesOnly(t *testing.T) {
+	sx, sy := navGrid41.Spawn()
+	elite := map[int]bool{ // elite undead + elite demons only
+		mobGhoulPossessed: true, mobSkeletonWarrior: true, mobSkeletonBerserk: true,
+		mobSkeletonSniper: true, mobZombieBigElite: true, mobZombieSoldierElite: true,
+		mobDemonMeleeElite: true, mobDemonRangeElite: true,
+	}
+	wantBoss := []int{mobBossElgorm, mobBossVelial, mobBossCerber, mobBossHekata}
+	isBoss := map[int]bool{}
+	for _, b := range wantBoss {
+		isBoss[b] = true
+	}
+	seenBoss := map[int]bool{}
+	nElite := 0
+	for i, sp := range invasionPack41 {
+		mx, my := sx+sp.DX, sy+sp.DY
+		if sp.Abs {
+			mx, my = sp.DX, sp.DY
+		}
+		if !navGrid41.Walkable(mx, my) {
+			t.Errorf("spawn %d (mob %d) at (%.1f,%.1f) is not on walkable floor", i, sp.Mob, mx, my)
+		}
+		switch {
+		case isBoss[sp.Mob]:
+			seenBoss[sp.Mob] = true
+			if !sp.Abs {
+				t.Errorf("boss mob %d must be Abs-placed", sp.Mob)
+			}
+			if p := navGrid41.Path(sx, sy, mx, my); len(p) == 0 {
+				t.Errorf("boss mob %d at (%.1f,%.1f) is not reachable from spawn", sp.Mob, mx, my)
+			}
+		case elite[sp.Mob]:
+			nElite++
+		default:
+			t.Errorf("spawn %d uses non-elite/non-boss mob index %d — map_4_1 is elite-only", i, sp.Mob)
+		}
+	}
+	for _, b := range wantBoss {
+		if !seenBoss[b] {
+			t.Errorf("boss mob %d is missing from invasionPack41", b)
+		}
+	}
+	if nElite < 20 {
+		t.Errorf("only %d elite mobs on map_4_1 — expected a populated dungeon", nElite)
+	}
+}

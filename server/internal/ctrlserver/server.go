@@ -15,9 +15,12 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"sync"
 
 	"tanatserver/internal/amf"
 	"tanatserver/internal/ctrlproto"
+	"tanatserver/internal/gamedata"
+	"tanatserver/internal/mpd"
 	"tanatserver/internal/session"
 )
 
@@ -29,14 +32,60 @@ type Server struct {
 	// cmd/ctrlserver after starting the battle listener.
 	BattleHost  string
 	BattlePorts []int32
+
+	// MPD is the push-channel hub (chat lines, party invites, online status). Set by
+	// cmd/ctrlserver after starting the MPD listener; nil in tests that don't push.
+	// MPDHost/MPDPorts are advertised to the client in the chat|conf packet so it
+	// opens the MPD socket.
+	MPD      *mpd.Hub
+	MPDHost  string
+	MPDPorts []int32
+
+	// DotaMatchSize is how many players a «Штурм» (DOTA) match waits for before it
+	// starts (configurable 1-10 via --dota-players; clamped by SetDotaMatchSize). 1 =
+	// the solo instant-match. Read under fightMu.
+	DotaMatchSize int32
+
+	// fightMu guards the «Штурм» (DOTA) matchmaking state: fightSel is the in-flight
+	// selection per user (chosen map + avatar + room), held between fight|select_avatar
+	// and the arg-less fight|ready; dotaQueue is the per-map waiting list the matcher
+	// fills until DotaMatchSize players are ready to form a match; nextDotaRoom hands
+	// each formed match a unique shared-world room id so concurrent matches don't merge.
+	// See dota.go.
+	fightMu      sync.Mutex
+	fightSel     map[int32]fightSelection
+	dotaQueue    map[int32][]int32
+	nextDotaRoom int32
 }
 
 func New() *Server {
 	return &Server{
-		Store:       session.NewStore(),
-		BattleHost:  "127.0.0.1",
-		BattlePorts: []int32{9339},
+		Store:         session.NewStore(),
+		BattleHost:    "127.0.0.1",
+		BattlePorts:   []int32{9339},
+		DotaMatchSize: 1, // solo instant-match until configured otherwise
 	}
+}
+
+// DotaMatchMin/Max bound the configurable «Штурм» match size.
+const (
+	DotaMatchMin int32 = 1
+	DotaMatchMax int32 = 10
+)
+
+// SetDotaMatchSize sets how many players a «Штурм» match waits for, clamped to
+// [DotaMatchMin, DotaMatchMax]. Returns the value actually applied.
+func (s *Server) SetDotaMatchSize(n int32) int32 {
+	if n < DotaMatchMin {
+		n = DotaMatchMin
+	}
+	if n > DotaMatchMax {
+		n = DotaMatchMax
+	}
+	s.fightMu.Lock()
+	s.DotaMatchSize = n
+	s.fightMu.Unlock()
+	return n
 }
 
 func (s *Server) Handler() http.Handler {
@@ -48,7 +97,7 @@ func (s *Server) Handler() http.Handler {
 	// prototypes (see PropertyHolder/CtrlAvatarStore/QuestStore.Retrieve). We
 	// serve an empty one so those loads succeed instead of 404-ing and retrying
 	// forever. Real content can be filled in later.
-	mux.HandleFunc("/xml/items.amf", s.handleEmptyProto)
+	mux.HandleFunc("/xml/items.amf", s.handleItemsAmf)
 	mux.HandleFunc("/xml/avatars.amf", s.handleAvatarsAmf)
 	mux.HandleFunc("/xml/quests.amf", s.handleEmptyProto)
 	mux.HandleFunc("/xml/tasks.amf", s.handleEmptyProto)
@@ -65,6 +114,64 @@ func (s *Server) handleEmptyProto(w http.ResponseWriter, r *http.Request) {
 // the client's CtrlAvatarStore parses at connect (see hunt.go).
 func (s *Server) handleAvatarsAmf(w http.ResponseWriter, r *http.Request) {
 	writeAMF(w, s.handleAvatarsProto(), "avatars.amf ")
+}
+
+// handleItemsAmf serves /xml/items.amf: the Ctrl-side item catalog
+// PropertyHolder.RetrieveProperties(Stream) parses at connect
+// (CtrlServerConnection.DownloadItemPrototypes), keyed by article id and
+// consumed by CachedCtrlPrototypeProvider whenever anything (the lobby bag,
+// the in-battle bag) resolves a CtrlPrototype.Article. This is a completely
+// separate, AMF-native mechanism from the Battle channel's XML-in-AMF
+// PROTOTYPE_INFO (internal/battleserver/consumables.go's itemProtoDesc) --
+// serving it empty (the old handleEmptyProto stub) left every synthetic
+// potion article id's CtrlPrototype.Article permanently null: the lobby bag
+// silently drops such items (SelfHero.CreateThing's ctrlPrototype.Article ==
+// null guard) and the in-battle bag NullReferenceExceptions instead
+// (BattleScreen.UpdateInventory/InventoryMenu.SetItems dereference
+// CtrlProto.Article.X unconditionally), aborting that UI's entire refresh.
+func (s *Server) handleItemsAmf(w http.ResponseWriter, r *http.Request) {
+	writeAMF(w, s.handleItemsProto(), "items.amf ")
+}
+
+// ctrlItemKindPotion is ShopGUI.ItemType.POTION (=19 in the decompiled enum).
+// CtrlPrototype.PArticle.mKindId defaults to 0 (ItemType.QUEST_ITEM) when the
+// "kind_id" field is absent, and FormatedTipMgr's tooltip renders that as the
+// generic "QUEST_ITEM_TEXT" locale line ("Предмет, требующийся для задания")
+// -- reported live as every potion showing a bogus "quest item" description.
+const ctrlItemKindPotion int32 = 19
+
+// handleItemsProto builds one PropertyHolder entry per consumable: "id" plus
+// PCtrlDesc's five keys (id/title/short/long/icon -- ALL required, since
+// PropertyHolder.RetrieveProperty<T> loads PCtrlDesc/PArticle/PPrefab for an
+// entry inside one shared try/catch and a KeyNotFoundException from a missing
+// required field drops the whole entry, not just that property) and a handful
+// of PArticle fields (all read via the non-throwing TryGet, so optional).
+// tree_id/tree_slot are deliberately omitted: CtrlPrototype.IsConsumable()
+// actually means "is a skill-tree upgrade item" (gates BattleScreen's
+// tree-panel vs. normal-bag routing), NOT "is a drinkable potion" -- setting
+// it would misroute every potion out of the normal bag.
+func (s *Server) handleItemsProto() *amf.MixedArray {
+	root := amf.NewArray()
+	for _, it := range gamedata.Items() {
+		root.Add(amf.NewArray().
+			Set("id", it.ArticleID).
+			Set("title", it.NameKey).
+			Set("short", "").
+			Set("long", it.DescKey).
+			Set("icon", it.Icon).
+			Set("price", int32(0)).
+			Set("sell_price", int32(0)).
+			Set("type_id", int32(1)).
+			Set("kind_id", ctrlItemKindPotion).
+			Set("min_hero_level", int32(1)).
+			Set("min_ava_level", int32(0)).
+			Set("cnt", int32(1)).
+			Set("price_type", int32(1)).
+			Set("cooldown", it.Cooldown).
+			Set("sort", int32(0)).
+			Set("flags", int32(0)))
+	}
+	return root
 }
 
 // clientVersion must match TanatApp.mVersion (the Launcher component's
@@ -142,6 +249,10 @@ func (s *Server) dispatch(req ctrlproto.Request, resp *ctrlproto.Response) {
 		s.handleFullHeroInfo(req, resp)
 	case ctrlproto.CmdKey("hero", "get_data_list"):
 		s.handleHeroGetDataList(req, resp)
+	case ctrlproto.CmdKey("hero", "get_data"):
+		s.handleHeroGetData(req, resp)
+	case ctrlproto.CmdKey("chat", "add"):
+		s.handleChatAdd(req, resp)
 	case ctrlproto.CmdKey("avatar", "list"):
 		s.handleAvatarListReal(req, resp)
 	case ctrlproto.CmdKey("store", "list"):
@@ -150,6 +261,30 @@ func (s *Server) dispatch(req ctrlproto.Request, resp *ctrlproto.Response) {
 		s.handleCastleList(req, resp)
 	case ctrlproto.CmdKey("user", "group_list"):
 		s.handleGroupList(req, resp)
+	case ctrlproto.CmdKey("user", "join_from_group_request"):
+		s.handleGroupInvite(req, resp)
+	case ctrlproto.CmdKey("user", "join_from_group_answer"):
+		s.handleGroupInviteAnswer(req, resp)
+	case ctrlproto.CmdKey("user", "join_to_group_request"):
+		s.handleGroupJoinRequest(req, resp)
+	case ctrlproto.CmdKey("user", "join_to_group_answer"):
+		s.handleGroupJoinAnswer(req, resp)
+	case ctrlproto.CmdKey("user", "leave_group"):
+		s.handleGroupLeave(req, resp)
+	case ctrlproto.CmdKey("user", "remove_from_group"):
+		s.handleGroupKick(req, resp)
+	case ctrlproto.CmdKey("user", "change_leader"):
+		s.handleGroupChangeLeader(req, resp)
+	case ctrlproto.CmdKey("user", "get_bw_list"):
+		s.handleGetBwList(req, resp)
+	case ctrlproto.CmdKey("user", "add_to_list"):
+		s.handleAddToList(req, resp)
+	case ctrlproto.CmdKey("user", "remove_from_list"):
+		s.handleRemoveFromList(req, resp)
+	case ctrlproto.CmdKey("user", "friend_answer"):
+		s.handleFriendAnswer(req, resp)
+	case ctrlproto.CmdKey("user", "find"):
+		s.handleUserFind(req, resp)
 	case ctrlproto.CmdKey("common", "can_reconnect"):
 		s.handleCanReconnect(req, resp)
 	case ctrlproto.CmdKey("arena", "get_maps_info"):
@@ -165,6 +300,16 @@ func (s *Server) dispatch(req ctrlproto.Request, resp *ctrlproto.Response) {
 	case ctrlproto.CmdKey("hunt", "accept"):
 		// Validation-only on the client (group-invite confirmation).
 		resp.Ack("hunt", "accept")
+	case ctrlproto.CmdKey("fight", "join"):
+		s.handleFightJoin(req, resp)
+	case ctrlproto.CmdKey("fight", "in_request"):
+		s.handleFightInRequest(req, resp)
+	case ctrlproto.CmdKey("fight", "select_avatar"):
+		s.handleFightSelectAvatar(req, resp)
+	case ctrlproto.CmdKey("fight", "ready"):
+		s.handleFightReady(req, resp)
+	case ctrlproto.CmdKey("fight", "desert"):
+		s.handleFightDesert(req, resp)
 	case ctrlproto.CmdKey("user", "leave_info"):
 		// BattleScreen asks for the desertion/karma penalty shown on the exit
 		// button. UserLeaveInfoArgParser requires current_karma/new_karma/labels/
@@ -232,7 +377,30 @@ func (s *Server) handleLogin(req ctrlproto.Request, resp *ctrlproto.Response) {
 	if u.HasHero {
 		resp.Add("common", "area_conf", s.areaConfFields(u, defaultAreaID(u)))
 		log.Printf("ctrl: bundling area_conf into login (returning hero) for user %d", u.ID)
+		// Volunteer the MPD credentials alongside area_conf so a returning player opens
+		// the push socket on entry. A new account gets it in hero|create instead (once
+		// it actually enters the world), so the client only ever connects once.
+		s.addChatConf(resp, u.ID, sessKey)
 	}
+}
+
+// addChatConf bundles the chat|conf packet (MPD host/port + this user's id and
+// session key as the MPD credentials) so the client opens the push socket. The
+// client never requests chat|conf -- it subscribes and connects on receipt, so we
+// volunteer it alongside area_conf. No-op when the MPD server isn't configured.
+func (s *Server) addChatConf(resp *ctrlproto.Response, uid int32, sid string) {
+	if s.MPD == nil || s.MPDHost == "" {
+		return
+	}
+	ports := amf.NewArray()
+	for _, p := range s.MPDPorts {
+		ports.Add(p)
+	}
+	resp.Add("chat", "conf", amf.NewArray().
+		Set("chat_server_host", s.MPDHost).
+		Set("chat_server_port", ports).
+		Set("chat_server_uid", uid).
+		Set("chat_server_sid", sid))
 }
 
 func (s *Server) handleHeroCreate(req ctrlproto.Request, resp *ctrlproto.Response) {
@@ -260,6 +428,7 @@ func (s *Server) handleHeroCreate(req ctrlproto.Request, resp *ctrlproto.Respons
 	// BattleServerConnection.Connect kicks off the Battle TCP handshake.
 	resp.Add("common", "area_conf", s.areaConfFields(u, defaultAreaID(u)))
 	log.Printf("ctrl: bundling area_conf into hero|create for user %d (race=%d)", u.ID, race)
+	s.addChatConf(resp, u.ID, req.SessKey)
 }
 
 // heroRaceElf mirrors TanatKernel.HeroRace.ELF (HUMAN=1, ELF=2).

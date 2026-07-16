@@ -17,12 +17,12 @@ import (
 // the world lock.
 func (c *conn) mobViewersLocked(objID int32, fn func(mem *conn, idx, count int)) {
 	for _, mem := range c.members() {
-		hs := mem.huntState
-		if hs == nil {
+		tr := mem.renderTr()
+		if tr == nil {
 			continue
 		}
-		if idx := hs.tr.index(objID); idx >= 0 {
-			fn(mem, idx, hs.tr.count())
+		if idx := tr.index(objID); idx >= 0 {
+			fn(mem, idx, tr.count())
 		}
 	}
 }
@@ -70,13 +70,13 @@ func (s *Server) addAttackEffectorLocked(mem *conn, objID, attackProto int32, no
 // if the member wasn't tracking it. Shared by the avatar/mob/summon hide helpers so
 // the removal-index/count math lives in exactly one place.
 func (s *Server) untrackObjForMemberLocked(mem *conn, objID int32, now float32) {
-	hs := mem.huntState
-	if hs == nil {
+	tr := mem.renderTr()
+	if tr == nil {
 		return
 	}
-	if idx := hs.tr.remove(objID); idx >= 0 {
+	if idx := tr.remove(objID); idx >= 0 {
 		s.push(mem, battleproto.CmdSync, amf.NewArray().Set("data",
-			newSyncBlob(now).removeIndex(idx).build(hs.tr.count())))
+			newSyncBlob(now).removeIndex(idx).build(tr.count())))
 		s.push(mem, battleproto.CmdDeleteObject, amf.NewArray().Set("id", objID))
 	}
 }

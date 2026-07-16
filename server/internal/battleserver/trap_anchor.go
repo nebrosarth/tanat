@@ -38,6 +38,14 @@ func trapUsesAnchor(prefab string, slot int) bool {
 	return prefab == "Avtr_Dsb_Elgorm" && slot == 3
 }
 
+// payloadFxUsesAnchor reports whether a skill's POINT payload fx is SELF-mode (parents
+// to its owner) and so must be pinned to a stationary anchor to hold the cast point,
+// rather than trailing the caster. Like trapUsesAnchor the fx mode is baked in the
+// client, hand-maintained by prefab+slot: Titanid's «Землетрясение» (slot 1) quake fx.
+func payloadFxUsesAnchor(prefab string, slot int) bool {
+	return prefab == "Avtr_Tank_Titanid" && slot == 1
+}
+
 // allocAnchorID hands out a party-wide anchor object id (instance space) or a per-conn
 // one for a solo/bare-conn, both based clear of every other id space.
 func (c *conn) allocAnchorID() int32 {

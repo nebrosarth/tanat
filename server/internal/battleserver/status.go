@@ -134,6 +134,30 @@ func (st *unitStatus) modMul(now float64, stat string) float64 {
 	return f
 }
 
+// armorConst is the K in the armor curve armor/(armor+K): armor == K halves the
+// damage (50% mitigation). Shared by the player and mob damage paths so both read
+// the same tuning.
+const armorConst = 50.0
+
+// armorMitigation maps an armor value to an incoming-damage MULTIPLIER on the classic
+// armor/(armor+K) curve (K = armorConst):
+//
+//	positive armor -> K/(armor+K), i.e. 1 - armor/(armor+K): reduce, in (0,1]
+//	zero armor      -> 1.0 (no change; matches the pre-armor behaviour exactly)
+//	negative armor  -> 1 + (-armor)/(-armor+K): AMPLIFY, bounded strictly below 2x
+//
+// Negative armor is "armor broken past 0" -- e.g. Velial's ult «Трибунал» appends a
+// negative phys_armor status mod, so a stripped target takes amplified damage. The
+// symmetric negative branch keeps the multiplier finite and continuous at 0 (a naive
+// 1 - armor/(armor+K) blows up as armor -> -K); it never divides by zero and caps the
+// amplification just under 2x no matter how deep the break stacks.
+func armorMitigation(armor float64) float64 {
+	if armor >= 0 {
+		return armorConst / (armor + armorConst)
+	}
+	return 1 + (-armor)/(-armor+armorConst)
+}
+
 // absorb applies the shield pool to incoming damage, returning what remains.
 func (st *unitStatus) absorb(now float64, dmg float64) float64 {
 	if now >= st.shieldUntil || st.shield <= 0 {

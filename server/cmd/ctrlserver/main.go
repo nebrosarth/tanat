@@ -22,6 +22,7 @@ import (
 
 	"tanatserver/internal/battleserver"
 	"tanatserver/internal/ctrlserver"
+	"tanatserver/internal/mpd"
 	"tanatserver/internal/session"
 )
 
@@ -29,8 +30,10 @@ func main() {
 	addr := flag.String("addr", ":8080", "listen address for the Ctrl HTTP server")
 	battleAddr := flag.String("battle-addr", ":9339", "listen address for the Battle TCP server")
 	battleHost := flag.String("battle-host", "127.0.0.1", "host advertised to the client for the Battle server (in area_conf)")
+	mpdAddr := flag.String("mpd-addr", ":9340", "listen address for the MPD push server (chat/party/presence)")
 	logPath := flag.String("log", defaultLogPath(), "also write logs to this file (blank = stdout only)")
 	accountsPath := flag.String("accounts", defaultAccountsPath(), "JSON file to persist accounts/heroes (blank = in-memory only)")
+	dotaPlayers := flag.Int("dota-players", 1, "«Штурм» (DOTA) match size: players a match waits for before it starts (1-10; 1 = solo instant-match)")
 	flag.Parse()
 
 	if *logPath != "" {
@@ -47,6 +50,9 @@ func main() {
 	if *accountsPath != "" {
 		srv.Store = session.NewPersistentStore(*accountsPath)
 	}
+	if applied := srv.SetDotaMatchSize(int32(*dotaPlayers)); applied != int32(*dotaPlayers) {
+		log.Printf("«Штурм» match size %d out of range, clamped to %d", *dotaPlayers, applied)
+	}
 
 	// The Battle server shares the Ctrl server's session store (CONNECT arrives
 	// with the user's id; later the self-player/avatar chain will need the hero).
@@ -58,14 +64,36 @@ func main() {
 		}
 	}
 
+	// The MPD push hub (chat, party, presence) shares the same store. It is
+	// advertised to the client in chat|conf under the same host as the Battle server
+	// (same machine); the Battle server mirrors square occupancy into it for area
+	// chat.
+	hub := mpd.NewHub(srv.Store)
+	srv.MPD = hub
+	battle.MPD = hub
+	// Party co-members get online/offline pushes as a user's MPD socket comes and goes.
+	hub.OnConnect = srv.NotifyOnline
+	hub.OnDisconnect = srv.NotifyOffline
+	if _, portStr, err := splitHostPort(*mpdAddr); err == nil {
+		if port, err := strconv.Atoi(portStr); err == nil {
+			srv.MPDHost = *battleHost
+			srv.MPDPorts = []int32{int32(port)}
+		}
+	}
+
 	go func() {
 		if err := battle.ListenAndServe(*battleAddr); err != nil {
 			log.Fatalf("battle server: %v", err)
 		}
 	}()
+	go func() {
+		if err := hub.ListenAndServe(*mpdAddr); err != nil {
+			log.Fatalf("mpd server: %v", err)
+		}
+	}()
 
-	log.Printf("ctrlserver listening on %s (POST /entry_point.php); battle on %s advertised as %s:%v",
-		*addr, *battleAddr, srv.BattleHost, srv.BattlePorts)
+	log.Printf("ctrlserver listening on %s (POST /entry_point.php); battle on %s advertised as %s:%v; mpd on %s; «Штурм» match size %d",
+		*addr, *battleAddr, srv.BattleHost, srv.BattlePorts, *mpdAddr, srv.DotaMatchSize)
 	if err := http.ListenAndServe(*addr, srv.Handler()); err != nil {
 		log.Fatal(err)
 	}

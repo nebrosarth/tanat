@@ -66,10 +66,11 @@ type Avatar struct {
 	AttackSpeed float64
 	AttackRange float64
 	// AttackWindup is the fraction of a basic-attack swing (0..1) the caster spends
-	// winding up before the projectile is released. 0 = a snap shot that leaves at
-	// the start of the swing (the default for every ranged hero). A caster like
-	// Elgorm, whose bolt leaves only at the END of a deliberate throw animation,
-	// uses a high fraction so the projectile (and its hit) land late in the swing.
+	// winding up before the projectile is released. 0 = a snap shot that leaves at the
+	// start of the swing (melee heroes, who never fire one). Every ranged hero looses
+	// at the END of the draw/throw so it flies and lands late; this is set uniformly
+	// by rangedAttackWindup in registerSkills for AttackProjectile avatars (0.65, or
+	// 0.5 for Plus-Minus, the one mid-animation exception) -- not hand-set here.
 	AttackWindup float64
 	DmgMin       int32
 	DmgMax       int32
@@ -261,11 +262,14 @@ func buildAvatars() []Avatar {
 	// data/resources.xml and the embedded locale.
 	for i := range list {
 		switch list[i].Prefab {
-		case "Avtr_Dsb_Elgorm":
-			// His basic attack is a deliberate throw whose bolt leaves only at the END
-			// of the animation (not a snap shot). Release the projectile ~65% into the
-			// swing so it flies and lands late, matching the cast-attack motion.
-			list[i].AttackWindup = 0.65
+		case "Avtr_DPS_Einzenhaim":
+			// Requested ranged: attack from range instead of the Killer template's 2.5
+			// melee reach. His client model has NO basic-attack projectile pool
+			// (VisualEffectOptions.mProjectiles is empty), so there is no arrow visual --
+			// the swing plays and the hit lands instantly at range (a hitscan, like a
+			// caster). A real flying projectile would require repacking his bundle. He
+			// stays AttackProjectile:false, so no SET_PROJECTILE is emitted.
+			list[i].AttackRange = rangedBasicAttackRange
 		case "Avtr_HK_Astarot":
 			// GUI skill icons shipped under the Psh_ class prefix.
 			list[i].skillIconBase = "Avtr_Psh_Astarot"
@@ -385,6 +389,18 @@ type Mob struct {
 	XP          float64 // experience granted to the killer (at level 1; scales with MobSpawn.Level)
 	Coins       int32   // bronze-coin bounty granted to the killer (at level 1; scales too)
 
+	// PhysArmor is the mob's flat physical armor: incoming physical damage is scaled
+	// by armorMitigation(armor) = 50/(armor+50), so e.g. 50 armor halves it. It is a
+	// PERCENTAGE curve, so armor is NOT level-scaled (a value is one fixed % of
+	// mitigation at every placement level). 0 = no armor, damage lands in full (the
+	// default for fragile trash -- unchanged behaviour). Deliberately non-zero on
+	// bosses and heavy/armored creatures (golems, big undead, armored demons), which
+	// is exactly what an armor-break debuff (Velial's ult «Трибунал», which appends a
+	// negative phys_armor status mod) is meant to strip -- breaking it past 0 flips
+	// the curve to AMPLIFY damage. Attacker armor penetration (AntiPhysArmor potions,
+	// phys_armor_pen) chips positive armor toward 0. Mobs have no magic armor yet.
+	PhysArmor float64
+
 	// Stationary mobs never chase or reposition -- they hold their spawn point and
 	// only attack when the target enters range (turret/plant behaviour). Speed is
 	// unused for them.
@@ -454,7 +470,7 @@ var mobs = []Mob{
 	// the Cerber->Hekata connector). Base = LEVEL 1; always placed deep (level
 	// 10-18), so MobHPMul lifts it to elite-tier HP there (~470 at L10, ~710 at L18).
 	{NameKey: "IDS_Mob_Demon_Melee_Name", Prefab: "Mob_Demon_Melee01", Icon: "Gui/Mobs/Icons/Mob_Demon",
-		Health: 200, Mana: 0, DmgMin: 22, DmgMax: 32, AttackSpeed: 0.85, Speed: 4.3, XP: 18, Coins: 8, CollisionRadius: 0.95},
+		Health: 200, Mana: 0, DmgMin: 22, DmgMax: 32, AttackSpeed: 0.85, Speed: 4.3, XP: 18, Coins: 8, PhysArmor: 8, CollisionRadius: 0.95}, // armored guardian
 	// 4-7 -- map_4_0 dungeon BOSSES, tuned as a difficulty LADDER the player climbs
 	// as they level: Elgorm (beatable ~L5) < Velial (~L10) < Cerber (~L15) <
 	// Hekata (~L20, the final boss). HP scales toward the original Titanid-boss
@@ -469,16 +485,16 @@ var mobs = []Mob{
 	// Hekata (linear at his level-15 slot: 214 + (374-214)/2).
 	{NameKey: "IDS_Boss_Elgorm_Name", Prefab: "Boss_Elgorm", Icon: "Gui/Mobs/Icons/Boss_Elgorm",
 		Health: 6000, DmgMin: 26, DmgMax: 40, AttackSpeed: 0.8, Speed: 4.0, XP: 600, Coins: 96, AttackRange: 7.0,
-		CollisionRadius: 1.8, Skills: elgormSkills},
+		CollisionRadius: 1.8, PhysArmor: 12, Skills: elgormSkills},
 	{NameKey: "IDS_Boss_Velial_Name", Prefab: "Boss_Velial", Icon: "Gui/Mobs/Icons/Boss_Velial",
 		Health: 8000, DmgMin: 42, DmgMax: 60, AttackSpeed: 0.9, Speed: 4.3, XP: 1500, Coins: 214,
-		CollisionRadius: 2.2, Skills: velialSkills},
+		CollisionRadius: 2.2, PhysArmor: 18, Skills: velialSkills},
 	{NameKey: "IDS_Boss_Cerber_Name", Prefab: "Boss_Cerber", Icon: "Gui/Mobs/Icons/Boss_Cerber",
 		Health: 10000, DmgMin: 48, DmgMax: 66, AttackSpeed: 1.2, Speed: 4.9, XP: 3000, Coins: 294,
-		CollisionRadius: 2.0, Skills: cerberSkills},
+		CollisionRadius: 2.0, PhysArmor: 22, Skills: cerberSkills},
 	{NameKey: "IDS_Boss_Hekata_Name", Prefab: "Boss_Hekata", Icon: "Gui/Mobs/Icons/Boss_Hekata",
 		Health: 12000, DmgMin: 40, DmgMax: 60, AttackSpeed: 0.9, Speed: 4.0, XP: 5000, Coins: 374, AttackRange: 7.0,
-		CollisionRadius: 1.9, Skills: hekataSkills},
+		CollisionRadius: 1.9, PhysArmor: 20, Skills: hekataSkills},
 	// 8-11 -- extra crypt creatures (undead + demons) for map_4_0. Stats below are
 	// LEVEL 1; placement level (MobSpawn.Level) scales them. The Ghoul is the
 	// trivial starter at the dungeon mouth: it reuses Elgorm's summon model
@@ -493,12 +509,12 @@ var mobs = []Mob{
 	// Zombie brute: slow but tanky, a speed bump in the corridors. Real shipped name
 	// for Mob_ZombieBig_01 is "Зомби крушитель" -- no locale patch needed either.
 	{NameKey: "IDS_Mob_ZombieBig_Name", Prefab: "Mob_ZombieBig_01", Icon: "Gui/Mobs/Icons/Mob_Zombie",
-		Health: 150, Mana: 0, DmgMin: 16, DmgMax: 24, AttackSpeed: 0.6, Speed: 3.4, XP: 14, Coins: 8, CollisionRadius: 1.0},
+		Health: 150, Mana: 0, DmgMin: 16, DmgMax: 24, AttackSpeed: 0.6, Speed: 3.4, XP: 14, Coins: 8, PhysArmor: 8, CollisionRadius: 1.0}, // heavy brute
 	// Ranged demon: the elite ranged guardian, paired with the melee demons. Real
 	// shipped name for Mob_Demon_Range is "Демон воитель" (was wrongly reusing the
 	// melee demon's key -- fixed).
 	{NameKey: "IDS_Mob_Demon_Range_Name", Prefab: "Mob_Demon_Range", Icon: "Gui/Mobs/Icons/Mob_Demon",
-		Health: 170, Mana: 0, DmgMin: 26, DmgMax: 36, AttackSpeed: 0.8, Speed: 4.2, XP: 20, Coins: 9, AttackRange: 10.0, CollisionRadius: 0.95},
+		Health: 170, Mana: 0, DmgMin: 26, DmgMax: 36, AttackSpeed: 0.8, Speed: 4.2, XP: 20, Coins: 9, AttackRange: 10.0, PhysArmor: 5, CollisionRadius: 0.95},
 	// 12-22 -- the rest of each family the client actually ships a name+model for
 	// (verified in the real baked locale), so the crypt uses every skeleton/
 	// ghoul/zombie/demon variant instead of just one representative per family.
@@ -509,11 +525,11 @@ var mobs = []Mob{
 	// (лучник/снайпер), plus the one-off "Горящий скелет". No locale key ships
 	// for the 2H_Melee model family, so it stays unused rather than mislabeled.
 	{NameKey: "IDS_Mob_Skeleton1HSh_Melee_Name", Prefab: "Mob_Skeleton_1HSh_Melee_01", Icon: "Gui/Mobs/Icons/mob_skeleton",
-		Health: 210, Mana: 0, DmgMin: 12, DmgMax: 18, AttackSpeed: 0.8, Speed: 4.2, XP: 9, Coins: 6, CollisionRadius: 0.6},
+		Health: 210, Mana: 0, DmgMin: 12, DmgMax: 18, AttackSpeed: 0.8, Speed: 4.2, XP: 9, Coins: 6, PhysArmor: 5, CollisionRadius: 0.6}, // shield-bearer
 	{NameKey: "IDS_Mob_Skeleton1H_Melee_g_Name", Prefab: "Mob_Skeleton_1H_Melee_02", Icon: "Gui/Mobs/Icons/mob_skeleton",
 		Health: 260, Mana: 0, DmgMin: 22, DmgMax: 30, AttackSpeed: 0.9, Speed: 4.5, XP: 14, Coins: 7, CollisionRadius: 0.65},
 	{NameKey: "IDS_Mob_Skeleton1HSh_Melee_g_Name", Prefab: "Mob_Skeleton_1HSh_Melee_02", Icon: "Gui/Mobs/Icons/mob_skeleton",
-		Health: 280, Mana: 0, DmgMin: 24, DmgMax: 34, AttackSpeed: 1.0, Speed: 4.6, XP: 15, Coins: 7, CollisionRadius: 0.65},
+		Health: 280, Mana: 0, DmgMin: 24, DmgMax: 34, AttackSpeed: 1.0, Speed: 4.6, XP: 15, Coins: 7, PhysArmor: 7, CollisionRadius: 0.65}, // elite shield-bearer
 	{NameKey: "IDS_Mob_Skeleton_Range_g_Name", Prefab: "Mob_Skeleton_Range_02", Icon: "Gui/Mobs/Icons/mob_skeleton",
 		Health: 60, Mana: 200, DmgMin: 20, DmgMax: 28, AttackSpeed: 0.8, Speed: 4.2, XP: 16, Coins: 7, AttackRange: 11.0, CollisionRadius: 0.6},
 	{NameKey: "IDS_Mob_Skeleton_1H_Melee_05_Name", Prefab: "Mob_Skeleton_1H_Melee_05", Icon: "Gui/Mobs/Icons/mob_skeleton",
@@ -523,7 +539,7 @@ var mobs = []Mob{
 	{NameKey: "IDS_Mob_ZombieCrawl_g_Name", Prefab: "Mob_ZombieCrawl_01", Icon: "Gui/Mobs/Icons/Mob_Zombie",
 		Health: 140, Mana: 0, DmgMin: 14, DmgMax: 14, AttackSpeed: 1.1, Speed: 4.5, XP: 18, Coins: 8, CollisionRadius: 0.5},
 	{NameKey: "IDS_Mob_ZombieBig_g_Name", Prefab: "Mob_ZombieBig_02", Icon: "Gui/Mobs/Icons/Mob_Zombie",
-		Health: 240, Mana: 0, DmgMin: 26, DmgMax: 38, AttackSpeed: 0.6, Speed: 3.4, XP: 22, Coins: 9, CollisionRadius: 1.0},
+		Health: 240, Mana: 0, DmgMin: 26, DmgMax: 38, AttackSpeed: 0.6, Speed: 3.4, XP: 22, Coins: 9, PhysArmor: 10, CollisionRadius: 1.0}, // elite heavy brute
 	// "Зомби солдат": a fast-hitting mid-weight brute. Per stats.txt: 150 HP with a
 	// HIGH attack rate (0.7s between attacks) and heavy damage. AttackSpeed is
 	// attacks-per-second (interval = 1/rate), so 0.7s interval => 1.43 (NOT 0.7,
@@ -535,9 +551,84 @@ var mobs = []Mob{
 	// Elite melee demon (a distinct second Demon_Melee model ships); elite ranged
 	// demon reuses the one Demon_Range model, same as the ghoul case above.
 	{NameKey: "IDS_Mob_Demon_Melee_g_Name", Prefab: "Mob_Demon_Melee02", Icon: "Gui/Mobs/Icons/Mob_Demon",
-		Health: 320, Mana: 0, DmgMin: 34, DmgMax: 48, AttackSpeed: 0.9, Speed: 4.4, XP: 28, Coins: 11, CollisionRadius: 1.0},
+		Health: 320, Mana: 0, DmgMin: 34, DmgMax: 48, AttackSpeed: 0.9, Speed: 4.4, XP: 28, Coins: 11, PhysArmor: 10, CollisionRadius: 1.0}, // elite armored demon
 	{NameKey: "IDS_Mob_Demon_Range_g_Name", Prefab: "Mob_Demon_Range", Icon: "Gui/Mobs/Icons/Mob_Demon",
-		Health: 270, Mana: 0, DmgMin: 38, DmgMax: 52, AttackSpeed: 0.85, Speed: 4.3, XP: 30, Coins: 12, AttackRange: 11.0, CollisionRadius: 0.95},
+		Health: 270, Mana: 0, DmgMin: 38, DmgMax: 52, AttackSpeed: 0.85, Speed: 4.3, XP: 30, Coins: 12, AttackRange: 11.0, PhysArmor: 6, CollisionRadius: 0.95},
+	// 23-26 -- map_4_2 («Заповедные джунгли») BOSS LADDER. Placed at fixed arenas
+	// (MobSpawn.Abs, absolute world X,Z measured in-game) as a rising difficulty
+	// ladder the party clears in order: Grimlok < Fairy < Titanid < Anhel (final).
+	// (Roster order below is by id; the ladder RUNGS -- HP/dmg/XP/coins -- are assigned
+	// per that power order, so Fairy sits between Grimlok and Titanid.)
+	// v1 = BASIC ATTACK only (no Skills) -> hand-tuned via authored stats, placed at
+	// Level 1 so ScaledStats is the identity (bosses stay unscaled). Names resolve
+	// from the STOCK baked locale (verified in Tanat_Data/resources.assets): the
+	// three hero-model bosses use their avatar name keys, Fairy the real boss key.
+	// Grimlok/Titanid/Anhel REUSE playable AVATAR prefabs as boss models -- valid in
+	// data/Characters/Avatars, and the client already instantiates avatar prefabs as
+	// world objects (the lobby renders other players this way), so they render + play
+	// their attack animation; confirm in-game. Fairy is a genuine Boss_* prefab.
+	// Fairy/Anhel are ranged (AttackRange set): the client model's own attack spawns
+	// its shipped projectile (Boss_Fairy_pojectile / Anhel VFX), same as ranged mobs.
+	{NameKey: "IDS_Avtr_HK_Grimlok_Name", Prefab: "Avtr_HK_Grimlok", Icon: "Gui/Mobs/Icons/Avtr_HK_Grimlok",
+		Health: 5000, DmgMin: 24, DmgMax: 38, AttackSpeed: 0.9, Speed: 4.2, XP: 500, Coins: 90, PhysArmor: 12, CollisionRadius: 1.8},
+	{NameKey: "IDS_Avtr_Tank_Titanid_Name", Prefab: "Avtr_Tank_Titanid", Icon: "Gui/Mobs/Icons/Avtr_Tank_Titanid",
+		Health: 9000, DmgMin: 40, DmgMax: 56, AttackSpeed: 0.85, Speed: 4.0, XP: 2000, Coins: 240, PhysArmor: 25, CollisionRadius: 2.0}, // stone tank
+	{NameKey: "IDS_Boss_Fairy_Name", Prefab: "Boss_Fairy", Icon: "Gui/Mobs/Icons/Boss_Fairy",
+		Health: 7000, DmgMin: 34, DmgMax: 50, AttackSpeed: 0.9, Speed: 4.3, XP: 1000, Coins: 150, AttackRange: 8.0, PhysArmor: 10, CollisionRadius: 1.6},
+	{NameKey: "IDS_Avtr_Psh_Anhel_Name", Prefab: "Avtr_Psh_Anhel", Icon: "Gui/Mobs/Icons/Avtr_Psh_Anhel",
+		Health: 12000, DmgMin: 44, DmgMax: 62, AttackSpeed: 0.9, Speed: 4.0, XP: 4000, Coins: 360, AttackRange: 7.0, PhysArmor: 22, CollisionRadius: 1.9},
+	// 27-39 -- map_4_2 («Заповедные джунгли») TRASH ROSTER for the procedural pack
+	// generator (buildJunglePack42). Jungle theme: spiders, tribesmen (natives),
+	// dinosaurs, gorillas, and GOLEMS. Base = LEVEL 1; placement level (MobSpawn.Level)
+	// scales HP/dmg/XP/coins along the route. Prefabs verified in data/Characters/Mobs
+	// (valid_prefabs.txt); NameKeys verified in the stock baked locale (resources.assets).
+	// Icons are best-effort (the GUI icon atlas isn't in resources.assets, same as the
+	// crypt mobs) -- a missing one renders a blank enemy card, never a crash.
+	// Spiders: small, fast, fragile swarmers at the mouth.
+	{NameKey: "IDS_Mob_Spider_01_Name", Prefab: "Mob_Spider_01", Icon: "Gui/Mobs/Icons/mob_spider",
+		Health: 90, DmgMin: 8, DmgMax: 12, AttackSpeed: 1.1, Speed: 4.8, XP: 12, Coins: 6, CollisionRadius: 0.6},
+	{NameKey: "IDS_Mob_Spider_02_Name", Prefab: "Mob_Spider_02", Icon: "Gui/Mobs/Icons/mob_spider",
+		Health: 130, DmgMin: 12, DmgMax: 16, AttackSpeed: 1.0, Speed: 4.7, XP: 16, Coins: 7, CollisionRadius: 0.7},
+	// Tribesmen: native humanoids -- melee spearmen, ranged blowgunners, undead.
+	{NameKey: "IDS_Mob_Tribesman_Melee_01_Name", Prefab: "Mob_Tribesman_Melee_01", Icon: "Gui/Mobs/Icons/mob_tribesman",
+		Health: 150, DmgMin: 14, DmgMax: 20, AttackSpeed: 0.9, Speed: 4.4, XP: 14, Coins: 7, CollisionRadius: 0.7},
+	{NameKey: "IDS_Mob_Tribesman_Range_01_Name", Prefab: "Mob_Tribesman_Range_01", Icon: "Gui/Mobs/Icons/mob_tribesman",
+		Health: 90, DmgMin: 14, DmgMax: 20, AttackSpeed: 0.8, Speed: 4.3, XP: 14, Coins: 7, AttackRange: 9.0, CollisionRadius: 0.6},
+	{NameKey: "IDS_Mob_Tribesman_Zombie_02_Name", Prefab: "Mob_Tribesman_Zombie_02", Icon: "Gui/Mobs/Icons/mob_tribesman",
+		Health: 180, DmgMin: 16, DmgMax: 22, AttackSpeed: 0.8, Speed: 3.9, XP: 15, Coins: 7, CollisionRadius: 0.7},
+	{NameKey: "IDS_Mob_TribesmanBig_Melee_01_Name", Prefab: "Mob_TribesmanBig_Melee_01", Icon: "Gui/Mobs/Icons/mob_tribesman",
+		Health: 300, DmgMin: 26, DmgMax: 36, AttackSpeed: 0.7, Speed: 3.9, XP: 24, Coins: 10, PhysArmor: 8, CollisionRadius: 0.9}, // heavy native
+	// Dinosaurs: fast melee raptors + a ranged spitter.
+	{NameKey: "IDS_Mob_Dinosaur_Melee_01_Name", Prefab: "Mob_Dinosaur_Melee_01", Icon: "Gui/Mobs/Icons/mob_dino",
+		Health: 220, DmgMin: 20, DmgMax: 28, AttackSpeed: 0.9, Speed: 4.6, XP: 20, Coins: 8, CollisionRadius: 0.9},
+	{NameKey: "IDS_Mob_Dinosaur_Melee_02_Name", Prefab: "Mob_Dinosaur_Melee_02", Icon: "Gui/Mobs/Icons/mob_dino",
+		Health: 300, DmgMin: 28, DmgMax: 38, AttackSpeed: 0.9, Speed: 4.7, XP: 26, Coins: 10, CollisionRadius: 1.0},
+	{NameKey: "IDS_Mob_Dinosaur_Range_01_Name", Prefab: "Mob_Dinosaur_Range_01", Icon: "Gui/Mobs/Icons/mob_dino",
+		Health: 160, DmgMin: 22, DmgMax: 30, AttackSpeed: 0.8, Speed: 4.4, XP: 22, Coins: 9, AttackRange: 10.0, CollisionRadius: 0.9},
+	// Gorillas: heavy bruisers; the GorillaBoss model is reused as an ELITE mob here.
+	{NameKey: "IDS_Mob_Gorilla_Melee_01_Name", Prefab: "Mob_Gorilla_Melee_01", Icon: "Gui/Mobs/Icons/mob_gorilla",
+		Health: 260, DmgMin: 24, DmgMax: 34, AttackSpeed: 0.85, Speed: 4.5, XP: 24, Coins: 10, CollisionRadius: 1.0},
+	{NameKey: "IDS_Mob_GorillaBoss_Melee_01_Name", Prefab: "Mob_GorillaBoss_Melee_01", Icon: "Gui/Mobs/Icons/mob_gorilla",
+		Health: 420, DmgMin: 34, DmgMax: 46, AttackSpeed: 0.8, Speed: 4.4, XP: 34, Coins: 13, PhysArmor: 10, CollisionRadius: 1.2}, // elite bruiser
+	// Golems: tanky, slow stone guardians -- GATED to the Titanid trail (golemAllowed).
+	{NameKey: "IDS_Mob_Golem_Melee_01_Name", Prefab: "Mob_Golem_Melee_01", Icon: "Gui/Mobs/Icons/mob_golem",
+		Health: 500, DmgMin: 30, DmgMax: 44, AttackSpeed: 0.6, Speed: 3.4, XP: 40, Coins: 14, PhysArmor: 14, CollisionRadius: 1.3}, // stone golem
+	{NameKey: "IDS_Mob_Golem_Melee_02_Name", Prefab: "Mob_Golem_Melee_02", Icon: "Gui/Mobs/Icons/mob_golem",
+		Health: 650, DmgMin: 38, DmgMax: 52, AttackSpeed: 0.6, Speed: 3.3, XP: 48, Coins: 16, PhysArmor: 16, CollisionRadius: 1.4}, // greater stone golem
+	// «Штурм» racial troops (mobHumanCreepMelee..mobElfCreepRange). Prefabs verified in
+	// data/Characters/Creeps (H_Creep*/Elf_Creep* bundles expose Mnst_Human_Creep1..3 /
+	// Mnst_Elf_Creep1..3). Creep1 = melee footman, Creep2 = ranged (ships a projectile).
+	// Modest HP so a hero clears a wave but a lone hero can't solo a whole lane of
+	// cannons+creeps instantly. XP/coins low (lane farm, not boss bounty). Team is set
+	// per battle by the DOTA instance, not here.
+	{NameKey: "IDS_Mnst_Sobor_Creep1_Name", Prefab: "Mnst_Human_Creep1_prop01", Icon: "Gui/Mobs/Icons/Mnst_Sobor_Creep1",
+		Health: 200, DmgMin: 14, DmgMax: 20, AttackSpeed: 0.9, Speed: 4.0, XP: 12, Coins: 4, CollisionRadius: 0.6},
+	{NameKey: "IDS_Mnst_Sobor_Creep2_Name", Prefab: "Mnst_Human_Creep2_prop01", Icon: "Gui/Mobs/Icons/Mnst_Sobor_Creep2",
+		Health: 130, DmgMin: 16, DmgMax: 22, AttackSpeed: 0.8, Speed: 4.0, XP: 14, Coins: 5, AttackRange: 9.0, CollisionRadius: 0.55},
+	{NameKey: "IDS_Mnst_Apostate_Creep1_Name", Prefab: "Mnst_Elf_Creep1_prop01", Icon: "Gui/Mobs/Icons/Mnst_Apostate_Creep1",
+		Health: 200, DmgMin: 14, DmgMax: 20, AttackSpeed: 0.9, Speed: 4.0, XP: 12, Coins: 4, CollisionRadius: 0.6},
+	{NameKey: "IDS_Mnst_Apostate_Creep2_Name", Prefab: "Mnst_Elf_Creep2_prop01", Icon: "Gui/Mobs/Icons/Mnst_Apostate_Creep2",
+		Health: 130, DmgMin: 16, DmgMax: 22, AttackSpeed: 0.8, Speed: 4.0, XP: 14, Coins: 5, AttackRange: 9.0, CollisionRadius: 0.55},
 }
 
 // Boss ability kits, one entry per distinctive VFX prefab in each boss bundle
@@ -606,6 +697,32 @@ const (
 	mobZombieSoldierElite
 	mobDemonMeleeElite
 	mobDemonRangeElite
+	// map_4_2 jungle boss ladder (appended; several tests key mobs 0-2 by number).
+	mobBossGrimlok
+	mobBossTitanid
+	mobBossFairy
+	mobBossAnhel
+	// map_4_2 jungle trash roster (procedural packs, buildJunglePack42).
+	mobSpider
+	mobSpiderElite
+	mobTribesman
+	mobTribesmanRange
+	mobTribesmanZombie
+	mobTribesmanBig
+	mobDino
+	mobDinoElite
+	mobDinoRange
+	mobGorilla
+	mobGorillaElite
+	mobGolem
+	mobGolemElite
+	// «Штурм» (DOTA, map_1_0) racial troops ("crips"): melee + ranged per race.
+	// Rendered from the Mnst_Human_Creep* / Mnst_Elf_Creep* prefabs (data/Characters/
+	// Creeps). They march a lane and fight; team is assigned per-battle, not here.
+	mobHumanCreepMelee
+	mobHumanCreepRange
+	mobElfCreepMelee
+	mobElfCreepRange
 )
 
 // demonFamily lists every demon-type mob index (used to test demon coverage in
@@ -650,6 +767,12 @@ type HuntMap struct {
 	SpawnX float64
 	SpawnY float64
 
+	// SpawnAt, when non-nil, is the battle-start point and OVERRIDES both Nav.Spawn()
+	// and SpawnX/SpawnY. Used when the nav grid's seed marker is not the intended
+	// player start: the real start is confirmed in-game (walk to the spot, read the
+	// CLICK target coords) and pinned here, while Nav still drives walkability/clipping.
+	SpawnAt *Vec2
+
 	// Nav is the walkability oracle for this scene (nil = unrestricted movement).
 	// When set it drives both the spawn point and movement clipping.
 	Nav Nav
@@ -666,6 +789,9 @@ type HuntMap struct {
 // Spawn returns the avatar's start position in scene world coordinates: the
 // nav-mesh interior point when walkability data exists, else the fallback.
 func (m HuntMap) Spawn() (float64, float64) {
+	if m.SpawnAt != nil {
+		return m.SpawnAt.X, m.SpawnAt.Y
+	}
 	if m.Nav != nil {
 		return m.Nav.Spawn()
 	}
@@ -674,17 +800,6 @@ func (m HuntMap) Spawn() (float64, float64) {
 
 // MapTypeHunt mirrors TanatKernel.MapType.HUNT.
 const MapTypeHunt int32 = 4
-
-// forestPack is the default mob layout: a loose ring of panthers with a pair
-// of tree-catchers, all within sight of the player spawn.
-var forestPack = []MobSpawn{
-	{Mob: 0, DX: 14, DY: 6},
-	{Mob: 0, DX: 18, DY: -4},
-	{Mob: 0, DX: -12, DY: 10},
-	{Mob: 0, DX: -16, DY: -8},
-	{Mob: 1, DX: 24, DY: 12},
-	{Mob: 1, DX: -22, DY: -14},
-}
 
 // dungeonPack40 is the map_4_0 (crypt) mob layout, laid out along the route the
 // player takes as they level: Голодные гули at the mouth, undead trash through
@@ -759,13 +874,22 @@ const (
 
 	dungeonSpawnClear  = 26.0 // mob-free ring around the player's start tile (safe zone)
 	dungeonRebornClear = 26.0 // and around every respawn checkpoint (no mobs on a res)
-	dungeonBossClear   = 7.0  // don't bury a boss under trash
+	// Bosses get an even wider mob-free ring than a player respawn point (was 7m, then
+	// 26m = respawn clearance, now +50%): you engage a boss in a clean arena, with no
+	// trash pack pulled in alongside it. Applies to every map that pins bosses (crypt
+	// dungeonPack40 + jungle buildJunglePack42).
+	dungeonBossClear = 39.0
 )
 
-var dungeonBosses = []struct {
+// bossPlacement pins one boss to a fixed world arena (spawned Abs). Shared by every
+// map that places bosses -- the crypt (dungeonBosses) and the invasion lair
+// (invasionBosses41).
+type bossPlacement struct {
 	mob  int
 	x, y float64
-}{
+}
+
+var dungeonBosses = []bossPlacement{
 	{mobBossElgorm, 303.8, 121.3},
 	{mobBossVelial, 486.3, 306.1},
 	{mobBossCerber, 239.1, 434.6},
@@ -874,15 +998,24 @@ func navClearance(ng *NavGrid) []int {
 var dungeonPack40 = buildDungeonPack40()
 
 func buildDungeonPack40() []MobSpawn {
-	ng := navGrid40
-	sx, sy := ng.Spawn()
-	regions := dungeonRegions()
-
 	// The first entry MUST be a spawn-relative offset (>9.5m, clear line of sight):
 	// TestPathOnRealMap routes to it and the offset rule keeps it from aggroing at
 	// battle start. Kept just outside the doubled safe zone (27m, clear LoS down the
 	// entrance corridor). Everything generated after it is absolute.
-	out := []MobSpawn{{Mob: mobGhoul, DX: 9.2, DY: 25.4, Level: 1}}
+	return append([]MobSpawn{{Mob: mobGhoul, DX: 9.2, DY: 25.4, Level: 1}},
+		buildPacks(navGrid40, dungeonRegions(), dungeonReborns40, dungeonBosses)...)
+}
+
+// buildPacks lays out discrete mob PACKS on ng's medial axis and pins the bosses,
+// keeping a mob-free ring around the player start, every respawn checkpoint and every
+// boss. Shared by the crypt (map_4_0, dungeonPack40) and the invasion lair (map_4_1,
+// invasionPack41). Pass 1 seeds pack centres on the medial axis (navClearance); Pass 2
+// builds a 1..5-member pack (skewing bigger with region depth) at each centre from the
+// nearest region's creature pool + level; the bosses are pinned last. Every position is
+// walkable by construction and reachable (the grid is the spawn-connected component), so
+// the per-map mob-walkability tests pass. Deterministic (fixed scan + stable sort).
+func buildPacks(ng *NavGrid, regions []dungeonRegion, reborns []Vec2, bosses []bossPlacement) []MobSpawn {
+	sx, sy := ng.Spawn()
 
 	// clearOf reports whether a point is far enough from the start, every respawn
 	// checkpoint, and every boss to host a pack.
@@ -890,18 +1023,19 @@ func buildDungeonPack40() []MobSpawn {
 		if math.Hypot(wx-sx, wy-sy) < dungeonSpawnClear {
 			return false
 		}
-		for _, r := range dungeonReborns40 {
+		for _, r := range reborns {
 			if math.Hypot(wx-r.X, wy-r.Y) < dungeonRebornClear {
 				return false
 			}
 		}
-		for _, b := range dungeonBosses {
+		for _, b := range bosses {
 			if math.Hypot(wx-b.x, wy-b.y) < dungeonBossClear {
 				return false
 			}
 		}
 		return true
 	}
+	var out []MobSpawn
 
 	// Pass 1: seed pack centres on the medial axis (see navClearance). Collect every
 	// walkable cell whose clearance clears dungeonMinClear and the rings, rank them
@@ -1002,11 +1136,64 @@ func buildDungeonPack40() []MobSpawn {
 		}
 	}
 
-	for _, b := range dungeonBosses {
+	for _, b := range bosses {
 		out = append(out, MobSpawn{Mob: b.mob, DX: b.x, DY: b.y, Abs: true})
 	}
 	return out
 }
+
+// invasionReborns41 are the map_4_1 («Логово вторжения») respawn checkpoints: the 5
+// canonical Reborn_point markers from the scene bundle (world X,Z). (-140.5,3.1) is the
+// battle-start (baked into navGrid41's spawn); the rest activate as the party advances.
+// Shared between the pack generator (kept mob-free) and the HuntMap literal.
+var invasionReborns41 = []Vec2{
+	{X: -140.5, Y: 3.1},
+	{X: 150.0, Y: 104.5},
+	{X: 69.0, Y: -227.2},
+	{X: -208.4, Y: -107.4},
+	{X: -50.6, Y: -64.2},
+}
+
+// invasionBosses41 pins «Логово вторжения»'s four bosses to the cardinal positions the
+// GROUP quest chain (IDS_Quest_Map_4_1_..._PVE_Group_*) names, at the correct minimap
+// bearings: Elgorm in the NORTH (his hall behind the stone guardians, Stage 1), Velial
+// in the CENTRE by the sacrificial well (Stage 2), Cerber in the EAST at the far end
+// (Stage 3, "в самом конце"), Hekata in the SOUTH-WEST at her altar (Stage 4, final).
+// Same four-boss ladder as the crypt, but this is the harder co-op version. Each anchor
+// is the highest-wall-clearance walkable cell of navGrid41 in that minimap cardinal (a
+// roomy arena), computed via the minimap->world transform (tools/navgrid/boss_anchors41).
+var invasionBosses41 = []bossPlacement{
+	{mobBossElgorm, -95.9, -168.8}, // north
+	{mobBossVelial, -113.9, 84.2},  // centre
+	{mobBossCerber, -263.9, 53.2},  // east, far end
+	{mobBossHekata, 178.1, 109.2},  // south-west
+}
+
+// invasionRegions41 themes «Логово вторжения»'s roster by area, matching the quest, and
+// is ELITE-ONLY (no common trash -- user spec: "боссов и только элитных мобов, демонов и
+// нежить"). Undead elites (Одержимый гуль, скелеты-воители/берсерки/снайперы, Зомби
+// губитель) hold the NORTH around the spawn and Elgorm's hall; demon legions -- захватчики
+// (Demon_Melee02) and надзиратели (elite Demon_Range) -- plus elite zombies hold the
+// CENTRE/EAST/SOUTH-WEST toward Velial, Cerber and Hekata (quest: "демоны... на юге и в
+// центре"). Level climbs along the boss ladder (Elgorm ~5 ... Hekata ~20); base elite
+// stats + that scaling make this a group-tier fight.
+func invasionRegions41() []dungeonRegion {
+	undead := []int{mobGhoulPossessed, mobSkeletonBerserk, mobSkeletonWarrior, mobSkeletonSniper, mobZombieBigElite}
+	return []dungeonRegion{
+		{-140.5, 3.1, 5, undead},   // spawn / north entrance (undead elites)
+		{-95.9, -168.8, 6, undead}, // Elgorm's hall, north (undead elites)
+		{-113.9, 84.2, 10, []int{mobDemonMeleeElite, mobDemonRangeElite, mobZombieSoldierElite, mobZombieBigElite}},  // Velial, centre (demon+zombie elites)
+		{-263.9, 53.2, 15, []int{mobDemonMeleeElite, mobDemonRangeElite, mobSkeletonBerserk, mobZombieSoldierElite}}, // Cerber, east (demon+skeleton elites)
+		{178.1, 109.2, 20, []int{mobDemonMeleeElite, mobDemonRangeElite, mobSkeletonWarrior, mobZombieBigElite}},     // Hekata, south-west (demon+skeleton elites)
+	}
+}
+
+// invasionPack41 is the map_4_1 layout: elite-only demon/undead packs generated on the
+// reconstructed navGrid41 (buildPacks) plus the four pinned bosses. Unlike the crypt it
+// has no spawn-relative offset mob -- every position is absolute and walkable by
+// construction (buildPacks rounds-then-tests), so TestMap41MobsSnapToWalkableFloor's
+// clamp is a no-op here.
+var invasionPack41 = buildPacks(navGrid41, invasionRegions41(), invasionReborns41, invasionBosses41)
 
 var huntMaps = []HuntMap{
 	{
@@ -1024,19 +1211,24 @@ var huntMaps = []HuntMap{
 		Reborn: dungeonReborns40,
 	},
 	{
-		// map_4_1 = «Логово вторжения» (group PvE; demon legions on the lower tiers).
-		// NO nav grid yet: this map's authored PassibilityData polygon could not be
-		// located. Unlike map_4_0/4_2 (whose polygons are shuffled into sibling bundles),
-		// none of the scene bundles' polygons contain map_4_1's Reborn markers (its 5
-		// markers span X[-208..150] Z[-227..104]; 2 of them fall in NO polygon). Left
-		// unrestricted (Nav=nil) until the polygon is found or click-mapped. Spawn is a
-		// real Reborn_point from the map_4_1 bundle.
+		// map_4_1 = «Логово вторжения» (GROUP PvE; demon legions on the lower tiers -- the
+		// co-op version of the same four-boss dungeon as the crypt). Walkability
+		// RECONSTRUCTED from the client minimap: map_4_1 is the one hunt map with NO authored
+		// PassibilityData polygon in any scene bundle (its Reborn markers fall inside no
+		// bundle's polygon — it was never exported). navGrid41 is derived from
+		// Map_4_1_2029.png (lit floor minus lava); the minimap→world transform is fit to the
+		// 5 canonical Reborn_point checkpoints (all land on floor). ~F1 0.75-0.83 vs an
+		// authored grid — tighten with a HUNT_CALIBRATE=1 in-game click pass. Roster =
+		// Elgorm/Velial/Cerber/Hekata at the quest cardinals + ELITE-ONLY demon/undead packs
+		// (invasionPack41). See navgrid_map41.go / tools/navgrid.
 		ID: 41, Name: "Map_4_1_Name", Scene: "map_4_1", LevelMin: 1, LevelMax: 50,
 		Desc:       "Map_4_1_Desc",
 		WinDesc:    "Map_4_1_WinDesc",
 		MinPlayers: 1, MaxPlayers: 4,
-		SpawnX: -140.5, SpawnY: 3.1, // real Reborn_point (map_4_1 bundle); no nav grid
-		Spawns: forestPack,
+		Nav:    navGrid41, // minimap-reconstructed; spawn (-140.5,3.1) baked into the grid
+		SpawnX: -140.5, SpawnY: 3.1,
+		Spawns: invasionPack41,
+		Reborn: invasionReborns41,
 	},
 	{
 		// map_4_2 = «Заповедные джунгли» (dinos, tribesmen, a shaman boss). Walkability
@@ -1046,8 +1238,12 @@ var huntMaps = []HuntMap{
 		Desc:       "Map_4_2_Desc",
 		WinDesc:    "Map_4_2_WinDesc",
 		MinPlayers: 1, MaxPlayers: 4,
-		Nav:    navGrid42,
-		Spawns: forestPack,
+		Nav: navGrid42,
+		// Player start confirmed in-game (walk to the spot, read the CLICK target; it is
+		// a real Reborn marker ~(35,30)); overrides navGrid42's seed marker (-335.7,102.6).
+		// Nav still drives clipping. Shared with the generator's safe ring via jungleSpawn.
+		SpawnAt: &jungleSpawn,
+		Spawns:  junglePack,
 	},
 }
 

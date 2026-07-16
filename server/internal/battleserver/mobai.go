@@ -335,17 +335,19 @@ func (s *Server) memberTickLocked(c *conn, now float64) {
 		}
 	}
 
-	// 10. Regen (2s cadence).
-	if now >= hs.nextRegen && hs.deadUntil == 0 {
-		hs.nextRegen = now + 2
+	// 10. Regen -- every combat tick, proportional to elapsed time, so the
+	// bar creeps up smoothly instead of jumping once every couple seconds
+	// (matches the mob leash-return regen below).
+	if hs.deadUntil == 0 {
+		dt := tickInterval.Seconds()
 		var types []uint64
 		maxHP := hs.maxHPLocked(now)
 		if hs.hp < maxHP {
-			hs.hp = math.Min(maxHP, hs.hp+2*(hs.av.HealthRegen+hs.st.modSum(now, "hp_regen")))
+			hs.hp = math.Min(maxHP, hs.hp+dt*(hs.av.HealthRegen+hs.st.modSum(now, "hp_regen")))
 			types = append(types, syncHealth)
 		}
 		if maxMana := hs.maxManaLocked(now); hs.mana < maxMana {
-			hs.mana = math.Min(maxMana, hs.mana+2*(hs.av.ManaRegen+hs.st.modSum(now, "mana_regen")))
+			hs.mana = math.Min(maxMana, hs.mana+dt*(hs.av.ManaRegen+hs.st.modSum(now, "mana_regen")))
 			types = append(types, syncMana)
 		}
 		if len(types) > 0 {
@@ -392,6 +394,22 @@ func (s *Server) tickPlayerStatusLocked(c *conn, now float64) {
 		s.fxEndLocked(c, st.slowFx)
 		st.slowFx = 0
 		s.pushPlayerStatsLocked(c, now)
+	}
+	// Invisibility potion expiry: end the shared shade fx + buff icon.
+	if hs.invisFxUID != 0 && now >= hs.invisibleUntil {
+		s.worldFxEndLocked(c, hs.invisFxUID)
+		hs.invisFxUID = 0
+		if hs.invisBuffEffID != 0 {
+			s.push(c, battleproto.CmdRemEffector, amf.NewArray().Set("id", hs.invisBuffEffID))
+			hs.invisBuffEffID = 0
+		}
+	}
+	// Revelation potion expiry: end the buff icon (no fx to end, see the doc
+	// on huntState.revealInvisibleUntil for why this potion has no other
+	// visible effect yet).
+	if hs.revealBuffEffID != 0 && now >= hs.revealInvisibleUntil {
+		s.push(c, battleproto.CmdRemEffector, amf.NewArray().Set("id", hs.revealBuffEffID))
+		hs.revealBuffEffID = 0
 	}
 
 	// HoT streams.
@@ -1025,7 +1043,7 @@ func mobTargetLocked(m *mobState, members []*conn, now float64) mobTarget {
 		if hs == nil {
 			continue
 		}
-		if hs.deadUntil == 0 {
+		if hs.deadUntil == 0 && now >= hs.invisibleUntil {
 			px, py := mem.posAtLocked(float32(now))
 			if d := math.Hypot(float64(px-m.x), float64(py-m.y)); d < best.dist {
 				best = mobTarget{x: px, y: py, dist: d, radius: hs.av.Radius(), obj: mem.objID, owner: mem}
@@ -1571,6 +1589,18 @@ func (s *Server) revealMobToMemberLocked(mem *conn, m *mobState, now float64) {
 	dmgLo, dmgHi := m.dmgRange()
 	s.push(mem, battleproto.CmdCreateObject, amf.NewArray().
 		Set("id", m.id).Set("proto", mobProtoID(m.mobIdx)))
+	// The enemy target-card (client ObjectInfo) shows the mob's level, read from the
+	// object's InstanceData.Level -- which only SET_AVATAR / LEVEL_UP populate, and it
+	// renders as Level+1. Mobs aren't player-bound, so CREATE_OBJECT/SYNC can't carry a
+	// level; push a LEVEL_UP (OnLevelUp sets Data.Level for ANY object id) so a levelled
+	// mob shows its real level instead of the default "1". mobState.level is 1-based; send
+	// level-1 (0-based wire, matching the avatar path) so the card's +1 lands on the
+	// intended number. Skip level<=1 (unlevelled trash + bosses) -- the card already reads
+	// the intended "1" from the default Data.Level of 0.
+	if m.level > 1 {
+		s.push(mem, battleproto.CmdLevelUp, amf.NewArray().
+			Set("id", m.id).Set("level", int32(m.level-1)))
+	}
 	s.push(mem, battleproto.CmdSync, amf.NewArray().Set("data",
 		newSyncBlob(bt).addObject(m.id).
 			position(idx, m.x, m.y, m.vx, m.vy, bt).
@@ -1581,7 +1611,7 @@ func (s *Server) revealMobToMemberLocked(mem *conn, m *mobState, now float64) {
 			setFloats(syncAttackSpeed, idx, float32(m.mob.AttackSpeed)).
 			setFloats(syncSpeed, idx, float32(m.mob.Speed)).
 			setFloats(syncRadius, idx, float32(m.mob.Radius())).
-			setInt(syncTeam, idx, -1).
+			setInt(syncTeam, idx, m.teamVal()).
 			build(hs.tr.count())))
 	s.addAttackEffectorLocked(mem, m.id, mobAttackProtoID(m.mobIdx), now)
 }
@@ -1878,7 +1908,7 @@ func (s *Server) hitPlayerLocked(c *conn, m *mobState, dmg float64, now float64)
 		return
 	}
 	armor := (hs.av.PhysArmor + hs.st.modSum(now, "phys_armor")) * hs.st.modMul(now, "armor_pct")
-	dmg *= 1 - armor/(armor+50)
+	dmg *= armorMitigation(armor)
 	dmg = hs.st.absorb(now, dmg)
 	if thorns := hs.st.modSum(now, "thorns_pct"); thorns > 0 && dmg > 0 {
 		s.hitMobLocked(c, m, dmg*thorns, c.objID)
@@ -1899,6 +1929,9 @@ func (s *Server) hitPlayerLocked(c *conn, m *mobState, dmg float64, now float64)
 		return
 	}
 	s.syncSelfLocked(c, syncHealth)
+	// «Каменная кожа»-style defensive procs harden the avatar when it is struck (and
+	// survives) -- rolled here, on the incoming-damage path, not on the attack path.
+	s.runDefenseProcsLocked(c, m, now)
 }
 
 func (s *Server) hitSummonLocked(c *conn, m *mobState, sm *summonState, dmg float64, now float64) {

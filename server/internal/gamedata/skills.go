@@ -265,12 +265,28 @@ func registerSkills(ks *AvatarSkills) {
 	// distance -- reads the corrected value.
 	if ks.AttackProjectile {
 		for i := range avatars {
-			if avatars[i].Prefab == ks.Prefab && avatars[i].AttackRange < rangedBasicAttackRange {
+			if avatars[i].Prefab != ks.Prefab {
+				continue
+			}
+			if avatars[i].AttackRange < rangedBasicAttackRange {
 				avatars[i].AttackRange = rangedBasicAttackRange
 			}
+			avatars[i].AttackWindup = rangedAttackWindup(ks.Prefab)
 		}
 	}
 	fixupSkillData(ks)
+}
+
+// rangedAttackWindup is the fraction of a projectile basic-attack swing the caster
+// spends winding up before the bolt is loosed. Every ranged hero looses at the END
+// of the draw/throw animation (0.65) so the projectile flies and lands late, matching
+// the swing -- without it the bolt snapped out at the very start. Plus-Minus is the
+// sole exception: its bolt leaves in the MIDDLE of the animation.
+func rangedAttackWindup(prefab string) float64 {
+	if prefab == "Avtr_Dsb_PlusMinus" {
+		return 0.5 // mid-animation release (exception)
+	}
+	return 0.65 // end-of-animation release (all other ranged heroes)
 }
 
 // fixupSkillData corrects authored skill fields (timings, geometry) that desync

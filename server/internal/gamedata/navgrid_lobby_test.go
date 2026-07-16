@@ -82,14 +82,53 @@ func TestCSHumanWalkable(t *testing.T) {
 	}
 }
 
-// TestCSElfWalkable pins the approximate cs_elf grid: the portal spawn is open and
-// the guild-building footprint is blocked.
+// TestCSElfWalkable pins the reconstructed cs_elf island: the elf city (area 368) is a
+// mesh-terrain island with no authored PassibilityData polygon, so its grid is built from
+// the client minimap (map_cs_elf_267.png) -- bright-green land + wooden bridges walkable,
+// dark-blue water blocked -- with the minimap->world transform constellation-fit to the
+// scene's own anchors (town portal, battle portal, bank, shop, guild, NPCs, bridges). The
+// spawn is the town-portal Reborn; the whole island is one flood-connected component.
 func TestCSElfWalkable(t *testing.T) {
 	g := navGridCSElf
-	if !g.Walkable(-46.4, -36.0) {
-		t.Error("cs_elf town-portal spawn should be walkable")
+	sx, sy := g.Spawn()
+	if !g.Walkable(sx, sy) {
+		t.Errorf("cs_elf spawn (%.1f,%.1f) should be walkable", sx, sy)
 	}
-	if g.Walkable(13, -45) { // CS_Elf_GuildBuilding01 footprint
-		t.Error("cs_elf guild building footprint should be blocked")
+	// Verified walkable landmarks across the island (world X,Z from cs_elf.unity3d):
+	// battle portal, bank, shop, plaza centre, the eastern sub-island, the southern lobe.
+	for _, p := range []struct{ x, y float64 }{
+		{-44.3, 9.8}, {-42.8, -8.1}, {-35.1, 22.4}, {0.0, 0.0}, {50.0, 10.0}, {20.0, 55.0},
+	} {
+		if !g.Walkable(p.x, p.y) {
+			t.Errorf("cs_elf landmark (%.1f,%.1f) should be walkable", p.x, p.y)
+		}
+	}
+	// The four wooden bridges (their collider centres) must be walkable -- they are the
+	// only crossings between the island's water-separated lobes.
+	for _, p := range []struct{ x, y float64 }{
+		{-11.0, -40.4}, {56.8, -15.4}, {-5.9, 51.5}, {4.7, 35.3},
+	} {
+		if !g.Walkable(p.x, p.y) {
+			t.Errorf("cs_elf bridge (%.1f,%.1f) should be walkable", p.x, p.y)
+		}
+	}
+	// Water (all four sides of the island) and the guild-building footprint must be blocked.
+	for _, p := range []struct{ x, y float64 }{
+		{-90.0, -10.0}, {110.0, 0.0}, {0.0, 95.0}, {-40.0, -90.0}, // open water
+		{18.1, -58.0},    // CS_Elf_GuildBuilding01 interior
+		{1000.0, 1000.0}, // far outside
+	} {
+		if g.Walkable(p.x, p.y) {
+			t.Errorf("cs_elf point (%.1f,%.1f) should be blocked", p.x, p.y)
+		}
+	}
+	// Cross-island reachability: from the town-portal spawn the player can path across the
+	// isthmus + bridges to the far battle-portal plaza and the southern lobe (one component).
+	for _, p := range []struct{ x, y float64 }{
+		{-44.3, 9.8}, {20.0, 55.0},
+	} {
+		if path := g.Path(sx, sy, p.x, p.y); len(path) == 0 {
+			t.Errorf("cs_elf point (%.1f,%.1f) is not reachable from spawn", p.x, p.y)
+		}
 	}
 }

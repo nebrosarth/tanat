@@ -10,6 +10,7 @@ package session
 import (
 	"crypto/rand"
 	"encoding/hex"
+	"strings"
 	"sync"
 )
 
@@ -20,6 +21,11 @@ type User struct {
 	Username string
 	HasHero  bool
 	Hero     *Hero
+	// Friends/Ignores are the account's persistent social lists (white/black list in
+	// the client's get_bw_list). Friendship is mutual (both carry each other); ignore
+	// is one-directional.
+	Friends []int32
+	Ignores []int32
 }
 
 type Hero struct {
@@ -41,6 +47,18 @@ type Hero struct {
 	Exp          int32
 	NextExp      int32
 	Dressed      []DressedItem
+	// Bag is the hero's persistent consumable inventory (potions), merged by
+	// article id (one stack per distinct item). Survives logout/restart, unlike
+	// the ephemeral hunt-instance battle state.
+	Bag []BagItem
+}
+
+// BagItem is one persisted consumable stack. ArticleID is the gamedata item
+// catalog id (shared between the Ctrl-channel bag's artikul_id and the Battle
+// channel's inventory "proto").
+type BagItem struct {
+	ArticleID int32
+	Count     int32
 }
 
 // DressedItem is one permanently-equipped hero-set item (gives stats across all
@@ -79,7 +97,9 @@ type Store struct {
 	usersByID    map[int32]*User
 	sessions     map[string]*Session
 	pending      map[int32]PendingBattle
-	lobbyArea    map[int32]int32 // userID -> central-square area the client last requested
+	lobbyArea    map[int32]int32          // userID -> central-square area the client last requested
+	groups       map[int32]*Group         // userID -> the party it belongs to (shared pointer)
+	friendReqs   map[int32]map[int32]bool // target userID -> set of users with a pending friend request to them
 	nextUserID   int32
 	path         string // JSON persistence file; "" = in-memory only
 }
@@ -91,6 +111,8 @@ func NewStore() *Store {
 		sessions:     map[string]*Session{},
 		pending:      map[int32]PendingBattle{},
 		lobbyArea:    map[int32]int32{},
+		groups:       map[int32]*Group{},
+		friendReqs:   map[int32]map[int32]bool{},
 		nextUserID:   1,
 	}
 }
@@ -144,7 +166,121 @@ func (s *Store) AddHeroMoney(userID, delta int32) (money, diamonds int32, ok boo
 	if u.Hero.Money < 0 {
 		u.Hero.Money = 0
 	}
+	s.saveLocked()
 	return u.Hero.Money, u.Hero.DiamondMoney, true
+}
+
+// heroExpNextLevel is the persistent character-level curve: level N needs
+// 100*N exp to advance to N+1. Unlike the ephemeral hunt-instance level (which
+// scales in-battle power and resets every session), this is the account's
+// permanent progression shown in the lobby (HeroGameInfo level/exp/next_exp).
+func heroExpNextLevel(level int32) int32 { return 100 * level }
+
+// AddHeroExp grants the account's persistent character experience and
+// processes level-ups against heroExpNextLevel, saving the result. Only a
+// FRACTION of in-hunt XP is meant to be passed in here (see the Battle
+// server's heroExpShare) -- the hunt-instance level/XP itself is intentionally
+// NOT persisted, per design: battle power scaling stays a per-session thing,
+// while a slice of the XP earned still grows the permanent character.
+func (s *Store) AddHeroExp(userID, delta int32) (level, exp, nextExp int32, ok bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	u, found := s.usersByID[userID]
+	if !found || u.Hero == nil || delta <= 0 {
+		if found && u.Hero != nil {
+			return u.Hero.Level, u.Hero.Exp, u.Hero.NextExp, true
+		}
+		return 0, 0, 0, false
+	}
+	h := u.Hero
+	h.Exp += delta
+	for h.NextExp > 0 && h.Exp >= h.NextExp {
+		h.Exp -= h.NextExp
+		h.Level++
+		h.NextExp = heroExpNextLevel(h.Level)
+	}
+	s.saveLocked()
+	return h.Level, h.Exp, h.NextExp, true
+}
+
+// AddBagItem credits count of articleID to the hero's persistent consumable
+// bag, merging into an existing stack of the same article, and saves.
+func (s *Store) AddBagItem(userID, articleID, count int32) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	u, found := s.usersByID[userID]
+	if !found || u.Hero == nil || count <= 0 {
+		return false
+	}
+	h := u.Hero
+	for i := range h.Bag {
+		if h.Bag[i].ArticleID == articleID {
+			h.Bag[i].Count += count
+			s.saveLocked()
+			return true
+		}
+	}
+	h.Bag = append(h.Bag, BagItem{ArticleID: articleID, Count: count})
+	s.saveLocked()
+	return true
+}
+
+// RemoveBagItem debits count of articleID from the hero's bag (dropping the
+// stack once it reaches zero), and saves. ok=false if the hero has no such
+// stack (nothing to remove).
+func (s *Store) RemoveBagItem(userID, articleID, count int32) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	u, found := s.usersByID[userID]
+	if !found || u.Hero == nil {
+		return false
+	}
+	h := u.Hero
+	for i := range h.Bag {
+		if h.Bag[i].ArticleID == articleID {
+			h.Bag[i].Count -= count
+			if h.Bag[i].Count <= 0 {
+				h.Bag = append(h.Bag[:i], h.Bag[i+1:]...)
+			}
+			s.saveLocked()
+			return true
+		}
+	}
+	return false
+}
+
+// HeroBag returns a copy of the hero's persistent bag contents (nil if no
+// account/hero). Used by the Ctrl-channel lobby bag screen and the Battle
+// channel's hunt-entry inventory sync.
+func (s *Store) HeroBag(userID int32) []BagItem {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	u, found := s.usersByID[userID]
+	if !found || u.Hero == nil {
+		return nil
+	}
+	out := make([]BagItem, len(u.Hero.Bag))
+	copy(out, u.Hero.Bag)
+	return out
+}
+
+// ByUsername resolves a display nick to its user (exact match, then a
+// case-insensitive fallback). Used by private chat to route a message to the nick the
+// sender typed in "[nick]". ok=false if no account carries that name.
+func (s *Store) ByUsername(name string) (*User, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, u := range s.usersByID {
+		if u.Username == name {
+			return u, true
+		}
+	}
+	for _, u := range s.usersByID {
+		if strings.EqualFold(u.Username, name) {
+			return u, true
+		}
+	}
+	return nil, false
 }
 
 func (s *Store) BySessKey(key string) (*User, bool) {

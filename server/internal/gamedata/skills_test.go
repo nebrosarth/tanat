@@ -86,6 +86,54 @@ func TestElgormSkullReleasesDuringThrow(t *testing.T) {
 	}
 }
 
+// TestEisenheimIsRanged locks the requested ranged reach for Eisenheim (id 26), a
+// Killer who would otherwise inherit the 2.5 melee template range. He has no client
+// projectile pool, so this is a hitscan at range (no arrow), hence AttackProjectile
+// stays false while the reach is the ranged 6.0.
+func TestEisenheimIsRanged(t *testing.T) {
+	a, ok := AvatarByID(26)
+	if !ok {
+		t.Fatal("Eisenheim (id 26) missing from roster")
+	}
+	if a.AttackRange < rangedBasicAttackRange {
+		t.Errorf("Eisenheim AttackRange=%.1f, want ranged >= %.1f", a.AttackRange, rangedBasicAttackRange)
+	}
+	if SkillsFor(a).AttackProjectile {
+		t.Error("Eisenheim has no client projectile pool; AttackProjectile must stay false (hitscan)")
+	}
+}
+
+// TestRangedAvatarsLooseLate locks the late-release rule: EVERY avatar whose basic
+// attack fires a projectile must loose it near the end of the swing (AttackWindup a
+// high fraction, not the snap-shot 0), so the bolt flies and lands late instead of
+// popping out at the very start. Plus-Minus is the one exception -- a mid-animation
+// release (~0.5).
+func TestRangedAvatarsLooseLate(t *testing.T) {
+	sawProjectile := false
+	for _, a := range Avatars() {
+		if !SkillsFor(a).AttackProjectile {
+			if a.AttackWindup != 0 {
+				t.Errorf("%s is melee but has AttackWindup=%.2f", a.Prefab, a.AttackWindup)
+			}
+			continue
+		}
+		sawProjectile = true
+		if a.Prefab == "Avtr_Dsb_PlusMinus" {
+			if a.AttackWindup < 0.4 || a.AttackWindup > 0.6 {
+				t.Errorf("Plus-Minus AttackWindup=%.2f, want a mid-animation release (~0.5)", a.AttackWindup)
+			}
+			continue
+		}
+		if a.AttackWindup < 0.6 {
+			t.Errorf("%s fires a projectile but AttackWindup=%.2f is not a late/end release (>= 0.6)",
+				a.Prefab, a.AttackWindup)
+		}
+	}
+	if !sawProjectile {
+		t.Fatal("no projectile avatars found -- rule untested")
+	}
+}
+
 // TestSkillKitInvariants checks structural and wire-safety invariants across
 // every authored skill, including that every fx name exists in the client's
 // registry and passive skills carry no mana/cooldown.

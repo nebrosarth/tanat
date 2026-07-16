@@ -486,6 +486,24 @@ func lineFxEndpoint(cx, cy, px, py float32, sk gamedata.Skill) (float32, float32
 	return cx + float32(dx*k), cy + float32(dy*k)
 }
 
+// targetBuffTTL is how long a skill's target-mode BuffFx should linger on the
+// victim: the longest duration among its TOP-LEVEL OpBuffStat ops that land On the
+// target (e.g. Velial's «Трибунал» 30s armor break). Nested ops -- aura/channel/proc
+// re-applications -- are excluded on purpose: their short, repeated windows would
+// strobe a persistent aura. 0 means the skill applies no top-level target stat-buff,
+// so no target BuffFx is shown (its debuff visual, if any, comes from an op like OpSlow).
+func targetBuffTTL(def gamedata.Skill, level int) float64 {
+	var ttl float64
+	for _, op := range def.Ops {
+		if op.Kind == gamedata.OpBuffStat && op.On == "target" {
+			if d := op.Dur.At(level); d > ttl {
+				ttl = d
+			}
+		}
+	}
+	return ttl
+}
+
 func (s *Server) firePayloadLocked(c *conn, p payload, now float64) {
 	hs := c.huntState
 	def := hs.skillDef(p.slot)
@@ -525,11 +543,37 @@ func (s *Server) firePayloadLocked(c *conn, p payload, now float64) {
 			uid := s.fxStartLocked(c, def.PayloadFx, c.objID, tid, p.hasPos, fpx, fpy)
 			hs.scheduleFxEnd(uid, now+fxLife)
 		case "point":
-			uid := s.fxStartLocked(c, def.PayloadFx, c.objID, 0, true, fpx, fpy)
+			// A SELF-baked ground fx trails the caster; for a skill whose point payload
+			// is SELF-mode (Titanid's «Землетрясение» quake) pin it to an invisible
+			// stationary anchor at the point instead of owning it to the moving avatar.
+			fxOwner, anchor := c.objID, int32(0)
+			if payloadFxUsesAnchor(hs.av.Prefab, p.slot) {
+				anchor = s.spawnTrapAnchorLocked(c, fpx, fpy, now)
+				fxOwner = anchor
+			}
+			uid := s.fxStartLocked(c, def.PayloadFx, fxOwner, 0, true, fpx, fpy)
 			hs.scheduleFxEnd(uid, now+fxLife)
+			if anchor != 0 {
+				hs.anchorEnds = append(hs.anchorEnds, anchorEnd{id: anchor, at: now + fxLife + 0.3})
+			}
 		case "self":
 			uid := s.fxStartLocked(c, def.PayloadFx, c.objID, 0, false, 0, 0)
 			hs.scheduleFxEnd(uid, now+fxLife)
+		}
+		// Target-mode BuffFx: a persistent debuff/buff visual pinned ON the primary
+		// victim for the effect's own duration -- e.g. Velial's «Трибунал» armor-break
+		// aura. The self/ground variants live in addPlayerModLocked (which explicitly
+		// SKIPS BuffFxOn=="target"), and the per-op loop is the wrong home too: it would
+		// double the visual on a multi-buff ult (Urg stacks phys+magic armor in one cast)
+		// and strobe on aura/channel re-application. So it fires once here, on ms, and
+		// self-ends after the buff's own TTL. World-scoped (fxStartLocked -> instance),
+		// so every party member sees the debuffed mob. Parented to the mob (owner=ms.id),
+		// so it dies with the body if the mob is killed before the TTL elapses.
+		if ms != nil && def.BuffFxOn == "target" && def.BuffFx != "" {
+			if ttl := targetBuffTTL(def, p.level); ttl > 0 {
+				uid := s.fxStartLocked(c, def.BuffFx, ms.id, 0, false, 0, 0)
+				hs.scheduleFxEnd(uid, now+ttl)
+			}
 		}
 	}
 	ops := def.Ops

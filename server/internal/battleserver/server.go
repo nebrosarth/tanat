@@ -29,6 +29,7 @@ import (
 	"tanatserver/internal/amf"
 	"tanatserver/internal/battleproto"
 	"tanatserver/internal/gamedata"
+	"tanatserver/internal/mpd"
 	"tanatserver/internal/session"
 )
 
@@ -44,11 +45,24 @@ type Server struct {
 	// one huntInstance: one authoritative mob simulation, one ticker, and every
 	// member sees the others. Guarded by mu.
 	insts map[int32]*huntInstance
+
+	// linsts holds the shared central-square hubs keyed by lobby area (367 cs_human,
+	// 368 cs_elf). Every occupant of one square joins its hub and sees the others
+	// walk around (lobby_render.go). Bounded to one per area, so unlike insts these
+	// are permanent (created on first entry, never disposed). Guarded by mu.
+	linsts map[int32]*lobbyInstance
+
+	// MPD, when set, is the push-channel hub. The Battle server mirrors central-square
+	// occupancy into it (SetArea/ClearArea on lobby join/leave) so area chat -- which
+	// lives in the Ctrl server -- can fan out to the right square without importing
+	// battleserver. nil in tests that don't exercise chat.
+	MPD *mpd.Hub
 }
 
 func New(store *session.Store) *Server {
 	return &Server{Store: store, start: time.Now(), nextBattleID: 1,
-		insts: map[int32]*huntInstance{}}
+		insts:  map[int32]*huntInstance{},
+		linsts: map[int32]*lobbyInstance{}}
 }
 
 // ListenAndServe accepts Battle connections on addr until the listener errors.
@@ -91,6 +105,15 @@ type conn struct {
 	// store for the non-hunt case.
 	lk   *sync.Mutex
 	inst *huntInstance
+
+	// linst / ltr / lready are the lobby analog of inst / huntState.tr /
+	// huntState.worldReady for a central-square occupant (huntState stays nil in the
+	// lobby). linst is the shared square this conn joined; ltr mirrors this client's
+	// object-tracking list (self pinned at index 0, other occupants appended); lready
+	// gates the conn into every fan-out only once its world state is fully built.
+	linst  *lobbyInstance
+	ltr    tracker
+	lready bool
 
 	// name is the display name used when this player's avatar is registered on
 	// other members' clients (PLAYER_REG).
@@ -152,15 +175,33 @@ func (c *conn) lkOr() *sync.Mutex {
 func (c *conn) lock()   { c.lkOr().Lock() }
 func (c *conn) unlock() { c.lkOr().Unlock() }
 
-// members returns the connections that share this conn's hunt world (so mob
-// syncs, aggro and cross-player rendering fan out to all of them). Outside a
-// shared instance -- the lobby, or a bare test conn -- it is just this conn, so
-// every broadcast collapses to a single push and behaviour is unchanged.
+// members returns the connections that share this conn's world -- a hunt instance,
+// a central-square hub, or (bare test conn / not-yet-joined) just this conn, so
+// every broadcast collapses to a single push. A conn is only ever in one kind of
+// world at a time (huntState/inst for hunt, linst for the lobby).
 func (c *conn) members() []*conn {
 	if c.inst != nil {
 		return c.inst.memberList()
 	}
+	if c.linst != nil {
+		return c.linst.memberList()
+	}
 	return []*conn{c}
+}
+
+// renderTr returns the object-tracking list that mirrors this client's rendered
+// world: the hunt tracker for a hunt member, the lobby tracker for a square
+// occupant, or nil for a bare/not-yet-joined conn. It is the single indirection that
+// lets the cross-render fan-out (mobViewersLocked, untrackObjForMemberLocked) serve
+// both modes; for a hunt conn it is exactly &huntState.tr, so hunt is unchanged.
+func (c *conn) renderTr() *tracker {
+	if c.huntState != nil {
+		return &c.huntState.tr
+	}
+	if c.linst != nil {
+		return &c.ltr
+	}
+	return nil
 }
 
 // testHookNewConn, when non-nil, receives each new server-side conn. Tests set it
@@ -205,6 +246,10 @@ func (s *Server) handlePacket(c *conn, p battleproto.Packet) {
 		s.handleDoAction(c, p)
 	case battleproto.CmdUpgradeSkill:
 		s.handleUpgradeSkill(c, p)
+	case battleproto.CmdGetDropInfo:
+		s.handleGetDropInfo(c, p)
+	case battleproto.CmdPickUp:
+		s.handlePickUp(c, p)
 	case battleproto.CmdEnter:
 		log.Printf("battle: %s ENTER", c.RemoteAddr())
 		s.ack(c, p)
@@ -348,6 +393,10 @@ func (s *Server) sendWorldState(c *conn) {
 			nx, ny := nav.Spawn()
 			sx, sy = float32(nx), float32(ny)
 		}
+		// Join the shared square hub for this area so occupants see each other walk
+		// around. This repoints c.lk at the hub mutex, so it must run before the
+		// c.lock() below (which sets the initial position under that same lock).
+		s.joinLobbyInstance(area, c)
 	}
 	if c.hunt != nil {
 		// Join (or create) the shared world for this launch's room. Ctrl assigns a
@@ -360,12 +409,25 @@ func (s *Server) sendWorldState(c *conn) {
 			room = -self
 		}
 		inst := s.joinInstance(room, c.hunt.MapID, c)
-		mx, my := inst.m.Spawn()
-		sx, sy = float32(mx), float32(my)
-		c.nav = inst.nav // enforce this scene's walkability on movement
+		if inst.dota != nil {
+			// «Штурм»: spawn at the player's base near its altar. map_1_0 walkability is
+			// not modeled in v1, so movement is unrestricted (nav stays nil).
+			dx, dy := inst.dota.playerSpawn()
+			sx, sy = float32(dx), float32(dy)
+		} else {
+			mx, my := inst.m.Spawn()
+			sx, sy = float32(mx), float32(my)
+			c.nav = inst.nav // enforce this scene's walkability on movement
+		}
 	}
 	c.lock()
 	c.x, c.y, c.vx, c.vy, c.snapT = sx, sy, 0, 0, s.battleTime()
+	// Pin the self avatar at tracking index 0 of this client's lobby list, matching
+	// the positionSync(add) in the world-state chain below; other occupants append
+	// at 1+. (Hunt seeds its own tracker in sendHuntWorldState.)
+	if c.linst != nil {
+		c.ltr.add(c.objID)
+	}
 	c.unlock()
 	name := "Hero"
 	if u, ok := s.Store.ByID(self); ok && u.Username != "" {
@@ -405,6 +467,18 @@ func (s *Server) sendWorldState(c *conn) {
 	}
 	log.Printf("battle: %s sending world state (self=%d obj=%d name=%q)", c.RemoteAddr(), self, objID, name)
 	s.sendSeq(c, pkts)
+
+	// The self scene is fully built: introduce this occupant to/from everyone already
+	// in the square, then flip lready so the shared fan-out starts including it. Both
+	// steps run under one lock section (mirroring hunt's worldReady handshake) so two
+	// simultaneous joiners can't miss each other -- whoever readies second sees the
+	// first already ready and renders both directions.
+	if c.linst != nil {
+		c.lock()
+		s.introduceLobbyMemberLocked(c, float64(s.battleTime()))
+		c.lready = true
+		c.unlock()
+	}
 }
 
 // sendSeq pushes a list of server-initiated packets in order (Status true,
@@ -752,7 +826,11 @@ func (c *conn) stopArrivalLocked() {
 // walk. The lobby (no huntState) uses the fixed index-0, 1-byte helper. Called
 // under the world lock so syncs for a connection stay ordered.
 func (c *conn) sendPosLocked(s *Server, x, y, vx, vy, t float32) {
-	if c.huntState != nil {
+	// A shared object (hunt member OR lobby-square occupant): the move fans out to
+	// every viewer that renders it, each with its OWN tracking index, so others see
+	// this player walk. renderTr()==nil for a bare/not-yet-joined conn -> the legacy
+	// fixed-index-0 path below (byte-identical to what a solo occupant would emit).
+	if c.renderTr() != nil {
 		c.mobViewersLocked(c.objID, func(mem *conn, idx, count int) {
 			s.push(mem, battleproto.CmdSync, amf.NewArray().Set("data",
 				newSyncBlob(t).position(idx, x, y, vx, vy, t).build(count)))

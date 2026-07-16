@@ -49,6 +49,19 @@ type huntInstance struct {
 	// ground fx parents to a stationary object so it holds the cast point). One space
 	// for the whole party, based clear of summon ids (300000+).
 	nextAnchorID int32
+
+	// drops holds every currently-spawned loot chest, keyed by container object id
+	// (see drops.go). nextDropID/nextDropItemID allocate the container's object id
+	// and the single item-inside-it's own wire id from two more party-wide spaces,
+	// based clear of anchor ids (400000+).
+	drops          map[int32]*dropState
+	nextDropID     int32
+	nextDropItemID int32
+
+	// dota is non-nil for a «Штурм» (MapType.DOTA) world: the two-base lane-pusher
+	// simulation (structures + creeps + win condition) that replaces the Hunt mob
+	// pass in the tick loop. See dota.go. nil = a normal Hunt world.
+	dota *dotaState
 }
 
 // newHuntInstance builds an instance for a map and seeds its shared mob set from
@@ -64,9 +77,12 @@ func newHuntInstance(s *Server, id, mapID int32) *huntInstance {
 		nav:          m.Nav,
 		mobs:         map[int32]*mobState{},
 		members:      map[int32]*conn{},
-		nextFxUID:    1 << 20, // world fx id base, far above per-conn hs.nextFxUID
-		nextSummonID: 300000,  // party-wide summon id base, clear of avatar/mob ids
-		nextAnchorID: 400000,  // party-wide trap-anchor id base, clear of summon ids
+		nextFxUID:      1 << 20, // world fx id base, far above per-conn hs.nextFxUID
+		nextSummonID:   300000,  // party-wide summon id base, clear of avatar/mob ids
+		nextAnchorID:   400000,  // party-wide trap-anchor id base, clear of summon ids
+		drops:          map[int32]*dropState{},
+		nextDropID:     dropChestBaseID,
+		nextDropItemID: dropItemBaseID,
 	}
 	baseX, baseY := m.Spawn()
 	for i, sp := range m.Spawns {
@@ -77,6 +93,18 @@ func newHuntInstance(s *Server, id, mapID int32) *huntInstance {
 		mx, my := baseX+sp.DX, baseY+sp.DY
 		if sp.Abs {
 			mx, my = sp.DX, sp.DY
+		}
+		// Defensive: if a spawn lands off the walkable floor (e.g. a hand-authored boss
+		// coord that drifted, or an offset pack near a wall), snap it to the nearest
+		// reachable cell so nothing spawns inside geometry. A no-op for the current maps,
+		// whose placements are all walkable by construction (crypt/jungle generators and
+		// invasionPack41 round-then-test; bosses pinned to verified cells).
+		if inst.nav != nil && !inst.nav.Walkable(mx, my) {
+			if p := inst.nav.Path(baseX, baseY, mx, my); len(p) > 0 {
+				mx, my = p[len(p)-1].X, p[len(p)-1].Y
+			} else {
+				mx, my = inst.nav.Clip(baseX, baseY, mx, my)
+			}
 		}
 		lvl := sp.Level
 		if lvl < 1 {
@@ -111,7 +139,11 @@ func (s *Server) joinInstance(roomID, mapID int32, c *conn) *huntInstance {
 		s.mu.Lock()
 		inst := s.insts[roomID]
 		if inst == nil {
-			inst = newHuntInstance(s, roomID, mapID)
+			if _, ok := gamedata.DotaMapByID(mapID); ok {
+				inst = newDotaInstance(s, roomID, mapID)
+			} else {
+				inst = newHuntInstance(s, roomID, mapID)
+			}
 			s.insts[roomID] = inst
 			s.mu.Unlock()
 			inst.mu.Lock()
@@ -219,10 +251,16 @@ func (s *Server) runInstanceTicker(inst *huntInstance) {
 				rep = c
 			}
 		}
-		// One shared mob pass for the whole world, driven through any live member
-		// (all members share the same mob set, nav and roster).
+		// One shared object pass for the whole world, driven through any live member.
+		// «Штурм» (DOTA) swaps the Hunt mob simulation for its lane-pusher pass
+		// (creeps + cannons + win condition); everything else about the shared world
+		// (per-member upkeep above, locking, disposal) is identical.
 		if rep != nil {
-			s.tickMobsLocked(rep, now)
+			if inst.dota != nil {
+				s.dotaTickLocked(rep, now)
+			} else {
+				s.tickMobsLocked(rep, now)
+			}
 		}
 		inst.mu.Unlock()
 	}

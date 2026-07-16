@@ -2,6 +2,7 @@ package ctrlserver
 
 import (
 	"crypto/rand"
+	"encoding/binary"
 	"encoding/hex"
 	"log"
 	"strconv"
@@ -45,6 +46,23 @@ func (s *Server) handleArenaMapsInfoReal(req ctrlproto.Request, resp *ctrlproto.
 			Set("max_players", m.MinPlayers).
 			Set("map_max_players", m.MaxPlayers))
 	}
+	// «Штурм» (DOTA) maps: FightHelper.FindMapById must resolve every DOTA map we
+	// accept in fight|join, and its mType (=type_id) is what routes JoinBattle down
+	// the fight|* (not hunt|*) path.
+	for _, m := range gamedata.DotaMaps() {
+		maps.Add(amf.NewArray().
+			Set("id", m.ID).
+			Set("type_id", gamedata.MapTypeDota).
+			Set("name", m.Name).
+			Set("level_min", m.LevelMin).
+			Set("level_max", m.LevelMax).
+			Set("scene", m.Scene).
+			Set("available", true).
+			Set("desc", m.Desc).
+			Set("win_desc", m.WinDesc).
+			Set("max_players", m.MinPlayers).
+			Set("map_max_players", m.MaxPlayers))
+	}
 	resp.Add("arena", "get_maps_info", amf.NewArray().Set("maps_info", maps))
 }
 
@@ -55,6 +73,9 @@ func (s *Server) handleMapTypeDescs(req ctrlproto.Request, resp *ctrlproto.Respo
 	descs.Add(amf.NewArray().
 		Set("type_id", gamedata.MapTypeHunt).
 		Set("desc", "Охота — PvE-режим: истребляйте монстров, зарабатывайте опыт и трофеи."))
+	descs.Add(amf.NewArray().
+		Set("type_id", gamedata.MapTypeDota).
+		Set("desc", "Штурм — командный захват: сокрушите оборону и уничтожьте вражеский алтарь."))
 	resp.Add("arena", "get_map_type_descs", amf.NewArray().Set("descs", descs))
 }
 
@@ -65,6 +86,21 @@ func (s *Server) handleArenaGetMaps(req ctrlproto.Request, resp *ctrlproto.Respo
 	maps := amf.NewArray()
 	if mapType == gamedata.MapTypeHunt {
 		for _, m := range gamedata.HuntMaps() {
+			maps.Set(strconv.Itoa(int(m.ID)), amf.NewArray().
+				Set("name", m.Name).
+				Set("scene", m.Scene).
+				Set("available", true).
+				Set("used", false).
+				Set("level_min", m.LevelMin).
+				Set("level_max", m.LevelMax).
+				Set("desc", m.Desc).
+				Set("win_desc", m.WinDesc).
+				Set("max_players", m.MinPlayers).
+				Set("map_max_players", m.MaxPlayers))
+		}
+	}
+	if mapType == gamedata.MapTypeDota {
+		for _, m := range gamedata.DotaMaps() {
 			maps.Set(strconv.Itoa(int(m.ID)), amf.NewArray().
 				Set("name", m.Name).
 				Set("scene", m.Scene).
@@ -108,6 +144,46 @@ func (s *Server) handleHuntJoin(req ctrlproto.Request, resp *ctrlproto.Response)
 		Set("nick", u.Username).
 		Set("tag", "").
 		Set("add_stats", amf.NewArray()))
+
+	// Party hunt: when a group LEADER joins a hunt, invite the rest of the party so
+	// they get the avatar-select prompt and can enter the same instance together.
+	s.inviteGroupToHunt(u, mapID)
+}
+
+// inviteGroupToHunt pushes fight|invite_mpd to the leader's party members when a
+// group leader joins a hunt, so each member sees the "X invites you to hunt on map
+// Y" dialog (FightView.FriendInvite -> YesNoDialog). Accepting re-sends hunt|join,
+// which opens the member's own avatar-select window and, via huntRoomForMap, lands
+// them in the leader's shared instance.
+//
+// The whole party-hunt flow is server-driven: the client has NO hunt-invite send
+// command (the hunt enum is only join/ready/accept, and fight|invite_mpd is a
+// push-only server->client message), so this push is the only initiator -- and it
+// needs no client edit. The push key is "fight|invite" WITHOUT the _mpd suffix (the
+// client's ParseCmd appends it); the payload rides under "arguments" as {map_id,
+// nick}. leave is omitted (=false, a fresh invite; FightInviteMpdArgParser only
+// reads it when present).
+//
+// No-op for a solo user, a non-leader (so a member accepting -- which re-runs
+// hunt|join -- does NOT re-invite, avoiding a loop), or offline members (Push drops
+// them). Members not standing in the central square have no FightView GUI bound and
+// silently ignore the invite, which is the intended best-effort behaviour.
+func (s *Server) inviteGroupToHunt(leader *session.User, mapID int32) {
+	if s.MPD == nil {
+		return
+	}
+	g := s.Store.GroupOf(leader.ID)
+	if g == nil || g.Leader != leader.ID {
+		return
+	}
+	for _, mid := range g.Members {
+		if mid == leader.ID {
+			continue
+		}
+		s.MPD.Push(mid, "fight|invite", amf.NewArray().
+			Set("map_id", mapID).
+			Set("nick", leader.Username))
+	}
 }
 
 // handleHuntReady answers hunt|ready {map_id, avatar_id} with the battle launch
@@ -121,6 +197,14 @@ func (s *Server) handleHuntReady(req ctrlproto.Request, resp *ctrlproto.Response
 	}
 	mapID := req.Params.IntOr("map_id", -1)
 	avatarID := req.Params.IntOr("avatar_id", -1)
+	// The select window's "random" button sends avatar_id -1: the client does NOT
+	// choose locally (SelectAvatarWindow.OnSelectButton passes the button's mId, which
+	// is -1 for RANDOM_BUTTON), it relies on the server to pick. Resolve it here so the
+	// launch succeeds -- the Battle server renders whatever avatar we store below.
+	if avatarID == -1 {
+		avatarID = randomAvatarID()
+		log.Printf("ctrl: hunt|ready user=%d random avatar -> %d", u.ID, avatarID)
+	}
 	m, ok := gamedata.HuntMapByID(mapID)
 	if !ok {
 		log.Printf("ctrl: hunt|ready unknown map %d from user %d", mapID, u.ID)
@@ -234,4 +318,18 @@ func newBattlePasswd() string {
 	b := make([]byte, 8)
 	_, _ = rand.Read(b)
 	return hex.EncodeToString(b)
+}
+
+// randomAvatarID returns a uniformly random roster avatar id, used to resolve the
+// select-window "random" button (which sends avatar_id -1). Returns -1 only if the
+// roster is empty (which would fail the launch, correctly).
+func randomAvatarID() int32 {
+	avs := gamedata.Avatars()
+	if len(avs) == 0 {
+		return -1
+	}
+	var b [4]byte
+	_, _ = rand.Read(b[:])
+	idx := binary.BigEndian.Uint32(b[:]) % uint32(len(avs))
+	return avs[idx].ID
 }

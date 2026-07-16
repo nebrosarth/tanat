@@ -221,6 +221,31 @@ func TestLobbyHeroData(t *testing.T) {
 		t.Errorf("user|money missing money_d")
 	}
 
+	// user|bag: real persisted consumable stacks, not the old hardcoded empty
+	// array (the bug this session fixed).
+	srv.Store.AddBagItem(userID, 5000, 3)
+	bagResp, _ := postEnvelope(t, url, mkReq("user", "bag", 10)).GetArray(ctrlproto.CmdKey("user", "bag"))
+	if bagResp == nil {
+		t.Fatal("no user|bag response")
+	}
+	if _, ok := bagResp.GetInt("user_money"); !ok {
+		t.Errorf("user|bag missing user_money")
+	}
+	bag, ok := bagResp.GetArray("bag")
+	if !ok || len(bag.Dense) != 1 {
+		t.Fatalf("user|bag.bag = %#v, want a 1-entry dense array", bagResp.Assoc["bag"])
+	}
+	item, ok := bag.Dense[0].(*amf.MixedArray)
+	if !ok {
+		t.Fatalf("bag entry is not a MixedArray: %#v", bag.Dense[0])
+	}
+	if art, _ := item.GetInt("artikul_id"); art != 5000 {
+		t.Errorf("bag entry artikul_id = %d, want 5000", art)
+	}
+	if cnt, _ := item.GetInt("cnt"); cnt != 3 {
+		t.Errorf("bag entry cnt = %d, want 3", cnt)
+	}
+
 	// user|full_hero_info: visual_data{"<id>":{load,...}}, hero_data{user_id,...}
 	fhi, _ := postEnvelope(t, url, mkReq("user", "full_hero_info", 4)).GetArray(ctrlproto.CmdKey("user", "full_hero_info"))
 	if fhi == nil {
@@ -267,6 +292,88 @@ func TestLobbyHeroData(t *testing.T) {
 	}
 	if _, ok := data.GetArray(key); !ok {
 		t.Errorf("get_data_list.data missing hero %q", key)
+	}
+}
+
+// TestHeroDataByIdForOtherPlayer covers the central-square multiplayer appearance
+// path: when a client binds ANOTHER occupant's "Hero" avatar it auto-fires
+// hero|get_data_list{id:[otherId]} and user|game_info{user_id:otherId} on the Ctrl
+// channel, and the server must answer for the requested id (not the requester's own
+// hero) or the other player renders bodiless. Here player A asks for player B's data.
+func TestHeroDataByIdForOtherPlayer(t *testing.T) {
+	srv := New()
+	ts := httptest.NewServer(srv.Handler())
+	defer ts.Close()
+	url := ts.URL + "/entry_point.php"
+
+	// login + create returns the user's id and session key.
+	loginCreate := func(email string, race int32, counterBase int32) (int32, string) {
+		lr, _ := postEnvelope(t, url, loginEnvelope(email, "pw", "1.11", "0", "", counterBase)).
+			GetArray(ctrlproto.CmdKey("user", "login"))
+		sk, _ := lr.GetString("sess_key")
+		uid, _ := lr.GetInt("id")
+		postEnvelope(t, url, amf.NewArray().Set("object", "hero").Set("action", "create").
+			Set("params", amf.NewArray().Set("race", race).Set("gender", int32(1)).
+				Set("face", int32(0)).Set("hair", int32(0)).Set("dist_mark", int32(0)).
+				Set("skin_color", int32(0)).Set("hair_color", int32(0))).
+			Set("sess_uid", uid).Set("sess_key", sk).Set("counter", counterBase+1))
+		return uid, sk
+	}
+
+	_, skA := loginCreate("a@example.com", 1 /*human*/, 1)
+	bID, _ := loginCreate("b@example.com", 2 /*elf*/, 10)
+
+	// A requests B's hero data by id.
+	gdl, _ := postEnvelope(t, url, amf.NewArray().Set("object", "hero").Set("action", "get_data_list").
+		Set("params", amf.NewArray().Set("id", amf.NewArray().Add(bID))).
+		Set("sess_uid", int32(0)).Set("sess_key", skA).Set("counter", int32(20))).
+		GetArray(ctrlproto.CmdKey("hero", "get_data_list"))
+	if gdl == nil {
+		t.Fatal("no hero|get_data_list response")
+	}
+	data, ok := gdl.GetArray("data")
+	if !ok {
+		t.Fatal("get_data_list missing data")
+	}
+	entry, ok := data.GetArray(strconv.Itoa(int(bID)))
+	if !ok {
+		t.Fatalf("get_data_list.data missing player B's hero %d: %#v", bID, data.Assoc)
+	}
+	load, _ := entry.GetArray("load")
+	if race, _ := load.GetInt("race"); race != 2 {
+		t.Errorf("player B's load.race = %d, want 2 (elf) -- served the wrong hero", race)
+	}
+
+	// A binds B's avatar AFTER load -> hero|get_data (singular) for B. Must return
+	// {load:{id, race,...}} (load key => mPersExists=true) or B renders bodiless.
+	gd, _ := postEnvelope(t, url, amf.NewArray().Set("object", "hero").Set("action", "get_data").
+		Set("params", amf.NewArray().Set("id", bID)).
+		Set("sess_uid", int32(0)).Set("sess_key", skA).Set("counter", int32(22))).
+		GetArray(ctrlproto.CmdKey("hero", "get_data"))
+	if gd == nil {
+		t.Fatal("no hero|get_data response")
+	}
+	gdLoad, ok := gd.GetArray("load")
+	if !ok {
+		t.Fatalf("hero|get_data missing load (=> mPersExists=false, no body): %#v", gd.Assoc)
+	}
+	if hid, _ := gdLoad.GetInt("id"); hid != bID {
+		t.Errorf("get_data load.id = %d, want player B %d", hid, bID)
+	}
+	if race, _ := gdLoad.GetInt("race"); race != 2 {
+		t.Errorf("get_data load.race = %d, want 2 (elf)", race)
+	}
+
+	// A requests B's game info by user_id (needed for the online roster row too).
+	gi, _ := postEnvelope(t, url, amf.NewArray().Set("object", "user").Set("action", "game_info").
+		Set("params", amf.NewArray().Set("user_id", bID)).
+		Set("sess_uid", int32(0)).Set("sess_key", skA).Set("counter", int32(21))).
+		GetArray(ctrlproto.CmdKey("user", "game_info"))
+	if gi == nil {
+		t.Fatal("no user|game_info response")
+	}
+	if uid, _ := gi.GetInt("user_id"); uid != bID {
+		t.Errorf("game_info.user_id = %d, want player B %d", uid, bID)
 	}
 }
 
