@@ -59,7 +59,7 @@ func TestWTFModeFreeCastsNoCooldown(t *testing.T) {
 	defer c.mvMu.Unlock()
 
 	startMana := hs.mana
-	s.execCastLocked(c, slot, nil, 0, 0, false)
+	s.execCastLocked(c, slot, nil, 0, 0, false, 0)
 	if hs.mana != startMana {
 		t.Errorf("WTF cast spent mana: %g -> %g (want unchanged)", startMana, hs.mana)
 	}
@@ -69,7 +69,7 @@ func TestWTFModeFreeCastsNoCooldown(t *testing.T) {
 	}
 
 	// Immediate recast: still free, still not blocked by cooldown.
-	s.execCastLocked(c, slot, nil, 0, 0, false)
+	s.execCastLocked(c, slot, nil, 0, 0, false, 0)
 	if hs.mana != startMana {
 		t.Errorf("second WTF cast spent mana: now %g (want %g)", hs.mana, startMana)
 	}
@@ -78,7 +78,7 @@ func TestWTFModeFreeCastsNoCooldown(t *testing.T) {
 	debugWTFMode = false
 	hs.cooldownUntil[slot-1] = 0
 	hs.mana = 200
-	s.execCastLocked(c, slot, nil, 0, 0, false)
+	s.execCastLocked(c, slot, nil, 0, 0, false, 0)
 	if hs.mana >= 200 {
 		t.Errorf("non-WTF cast did not spend mana (still %g) — the wrapper leaked into the off state", hs.mana)
 	}

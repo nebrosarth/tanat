@@ -305,6 +305,47 @@ func (s *Server) applyInvisibilityLocked(c *conn, it gamedata.Item, dur float64,
 	}
 }
 
+// applySkillStealthLocked grants timed stealth from an avatar SKILL (OpStealth), reusing
+// the exact aggro-suppression the Invisibility potion uses: mobTargetLocked ignores a
+// hidden avatar (hs.invisibleUntil) and the shared shade fx shows the party the vanish.
+// Unlike the potion it mints no separate buff-effector -- the skill's own BuffFx/BuffIcon
+// (e.g. InvisibilityEffect) carries the buff-bar timer. Stealth breaks the moment the
+// player next acts (breakInvisibilityLocked at cast/attack time).
+func (s *Server) applySkillStealthLocked(c *conn, dur, now float64) {
+	if dur <= 0 {
+		return
+	}
+	hs := c.huntState
+	if hs == nil {
+		return
+	}
+	hs.invisibleUntil = now + dur
+	if hs.invisFxUID == 0 {
+		hs.invisFxUID = s.worldFxStartLocked(c, mobShadeFx, c.objID, 0, false, 0, 0)
+	}
+}
+
+// breakInvisibilityLocked ends active stealth immediately -- called when the player
+// attacks or casts, so acting reveals them (mobs re-aggro at once). A cheap no-op when
+// not stealthed. Mirrors the potion-expiry cleanup in tickPlayerStatusLocked (end the
+// shared shade fx + drop the buff icon), but forces invisibleUntil to 0 rather than
+// waiting for the timer, so the very next mobTargetLocked can see them again.
+func (s *Server) breakInvisibilityLocked(c *conn, now float64) {
+	hs := c.huntState
+	if hs == nil || now >= hs.invisibleUntil {
+		return // not currently stealthed
+	}
+	hs.invisibleUntil = 0
+	if hs.invisFxUID != 0 {
+		s.worldFxEndLocked(c, hs.invisFxUID)
+		hs.invisFxUID = 0
+	}
+	if hs.invisBuffEffID != 0 {
+		s.push(c, battleproto.CmdRemEffector, amf.NewArray().Set("id", hs.invisBuffEffID))
+		hs.invisBuffEffID = 0
+	}
+}
+
 // applyRevelationLocked grants timed "see invisible enemies" state
 // (Revelation potion). Currently a no-op beyond its own buff icon/timer --
 // see huntState.revealInvisibleUntil's doc for why (co-op PvE hunt mode, no

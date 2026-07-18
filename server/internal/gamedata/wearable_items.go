@@ -10,8 +10,12 @@ import (
 // onto a paperdoll slot (user|dress) for permanent, cross-match stat bonuses. This is a
 // SEPARATE system from AvatarItem (the in-battle DotA tree, avatar_items.go) and from the
 // consumable potions (items.go). Names/icons/descriptions come 1:1 from the client's baked
-// IDS_Set_* assets (transcribed in wearable_items_gen.go); only the stat VALUES and prices
-// are authored here, kept numerically identical to what the Battle server later applies.
+// IDS_Set_* assets (transcribed in wearable_items_gen.go); the stat VALUES come from the
+// official wiki «Геройские комплекты» (wearable_stats_gen.go, keyed by color+tier+slot+stat)
+// where the wiki publishes them, falling back to the synthetic wearableStatValue for the
+// pieces the wiki does not cover (weapons, the Violet S5 «Каратель» set, the Grey S1 belt
+// anomaly). Prices are authored here. All values are kept numerically identical to what the
+// Battle server later applies (wearableModStat) and to what the client tooltip renders.
 
 const wearableArticleBase int32 = 80000
 
@@ -79,11 +83,14 @@ func wearablePriceMul(color string) float64 {
 	return 1.0 // Grey
 }
 
-// wearableStatValue authors one stat's bonus for an item of the given baked level and rarity.
-// Every wearable stat is additive (impact 0); the values scale with level and color and are
-// kept > 0 so no tooltip placeholder renders blank. The Battle server applies these exact
-// numbers (wearableModStat maps each name to an engine stat). The eleven possible stat names
-// are the placeholders found across all 348 baked LongDescs.
+// wearableStatValue is the SYNTHETIC fallback for the stat values the wiki does not publish:
+// weapon pieces (the wiki lists no weapons -> DamageMin here), the Violet S5 «Каратель» set
+// (wiki: coming soon) and the Grey S1 belt (its wiki row lists stats the baked item cannot
+// render). It authors one stat's additive bonus (impact 0) scaling with the item's baked level
+// and rarity, kept > 0 so no tooltip placeholder renders blank. Where wikiWearableStats has an
+// entry, that authored wiki number is used instead (see init). The Battle server applies these
+// exact numbers (wearableModStat maps each name to an engine stat). The eleven possible stat
+// names are the placeholders found across all 348 baked LongDescs.
 func wearableStatValue(stat string, level int32, color string) float64 {
 	l := float64(level)
 	cm := wearableColorMul(color)
@@ -151,9 +158,15 @@ func init() {
 		}
 		w.SellPrice = w.Price / 4
 		for _, name := range d.Stats {
+			// Prefer the exact value the wiki published for this piece; the synthetic formula
+			// only fills the stats the wiki does not cover (weapons, Violet S5, the S1 belt).
+			val, ok := wikiWearableStats[wikiStatKey{Color: d.Color, Tier: d.Tier, Slot: d.Slot, Stat: name}]
+			if !ok {
+				val = wearableStatValue(name, d.Level, d.Color)
+			}
 			w.Stats = append(w.Stats, AvatarItemStat{
 				Name:  name,
-				Value: wearableStatValue(name, d.Level, d.Color),
+				Value: val,
 				Mul:   false,
 			})
 		}

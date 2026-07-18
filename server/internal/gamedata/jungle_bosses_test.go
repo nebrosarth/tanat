@@ -105,8 +105,11 @@ func TestJungleTrashGenerated(t *testing.T) {
 		if d := math.Hypot(sp.DX-sx, sp.DY-sy); d < dungeonSpawnClear {
 			t.Errorf("trash Mob %d is %.1fm from spawn -- inside the safe ring (%.0f)", sp.Mob, d, dungeonSpawnClear)
 		}
-		if sp.Mob < mobSpider || sp.Mob > mobGolemElite {
-			t.Errorf("spawn Mob %d is not a jungle-roster creature", sp.Mob)
+		// The jungle roster is mobSpider..mobGolemElite, PLUS the deliberate cross-roster
+		// «Деревенский пожар» burning-skeleton pin (jungleBurntVillage) -- still walkable and
+		// spawn-clear (checked above), just not a native jungle creature.
+		if sp.Mob != mobSkeletonBurning && (sp.Mob < mobSpider || sp.Mob > mobGolemElite) {
+			t.Errorf("spawn Mob %d is not a jungle-roster creature (or the burnt-village pin)", sp.Mob)
 		}
 	}
 	if trash < 20 {
@@ -149,6 +152,39 @@ func TestBossArenasClearOnAllMaps(t *testing.T) {
 		jb[i] = [2]float64{b.x, b.y}
 	}
 	check("jungle map_4_2", junglePack, jb, isJungleBoss)
+}
+
+// TestBurntVillageInJungle: the «Деревенский пожар» quest (Map_4_2 Stage2_2) is now completable --
+// burning skeletons really spawn in the jungle CENTRE, on walkable floor, clear of the spawn/boss
+// rings. Pins the user's request that this creature exist on map_4_2.
+func TestBurntVillageInJungle(t *testing.T) {
+	m, _ := HuntMapByID(42)
+	sx, sy := m.Spawn()
+	fx, fy := -32.56, 5.96 // Fairy = the central hill
+	n := 0
+	for _, sp := range m.Spawns {
+		if sp.Mob != mobSkeletonBurning {
+			continue
+		}
+		n++
+		if !navGrid42.Walkable(sp.DX, sp.DY) {
+			t.Errorf("burnt-village skeleton at (%.1f,%.1f) is not walkable", sp.DX, sp.DY)
+		}
+		if d := math.Hypot(sp.DX-sx, sp.DY-sy); d < dungeonSpawnClear {
+			t.Errorf("burnt-village skeleton is %.1fm from spawn -- inside the safe ring", d)
+		}
+		for _, b := range jungleBosses {
+			if d := math.Hypot(sp.DX-b.x, sp.DY-b.y); d < dungeonBossClear {
+				t.Errorf("burnt-village skeleton at (%.1f,%.1f) is %.1fm from a boss -- inside its arena", sp.DX, sp.DY, d)
+			}
+		}
+		if d := math.Hypot(sp.DX-fx, sp.DY-fy); d > 90 {
+			t.Errorf("burnt-village skeleton at (%.1f,%.1f) is %.1fm from the central hill -- not central", sp.DX, sp.DY, d)
+		}
+	}
+	if n < 3 {
+		t.Errorf("expected a burnt-village cluster of burning skeletons in the jungle, got %d", n)
+	}
 }
 
 // TestGolemGating: golems spawn ONLY on the Titanid trail (golemAllowed), never toward

@@ -3,6 +3,7 @@ package battleserver
 import (
 	"log"
 	"math"
+	"math/rand"
 	"sort"
 	"strings"
 
@@ -96,10 +97,11 @@ type fxEnd struct {
 
 // pendingCast is a skill order waiting for the avatar to get in range.
 type pendingCast struct {
-	slot   int
-	target int32 // mob id, 0 for point/self casts
-	px, py float32
-	hasPos bool
+	slot    int
+	target  int32 // mob id, 0 for point/self casts
+	allyObj int32 // friendly avatar objID for a FRIEND cast, 0 otherwise
+	px, py  float32
+	hasPos  bool
 }
 
 // orderDoneLocked tells AvatarAI the order finished (mandatory: without it the
@@ -149,44 +151,52 @@ func (s *Server) startSkillOrderLocked(c *conn, slot int, target int32, px, py f
 	// own target type, NOT the presence of a position, or the avatar would run
 	// toward the origin treating {0,0} as a ground-target point.
 	if def.Target == "" || def.Target == "SELF" {
-		s.execCastLocked(c, slot, nil, 0, 0, false)
+		s.execCastLocked(c, slot, nil, 0, 0, false, 0)
 		return
 	}
 
 	// Resolve where the cast lands.
 	var ms *mobState
+	var allyObj int32
 	tx, ty := px, py
 	if target > 0 && target != c.objID {
 		ms = hs.mobs[target]
-		if ms == nil || ms.dead {
+		switch {
+		case ms == nil:
+			// Not a mob: a FRIEND-castable skill (Arianna's «Щит хранителя» / «Касание
+			// спасителя») may be aimed at a party member's avatar. Resolve it and carry the
+			// ally objID through the cast so its heal/shield/buff lands on THAT ally, not the
+			// caster. Anything else (a stale/dead id) fizzles.
+			ally := c.friendlyMember(target)
+			if ally == nil || !skillHasTargetFlag(def, "FRIEND") {
+				s.orderDoneLocked(c, parent)
+				return
+			}
+			allyObj = target
+			tx, ty = ally.posAtLocked(s.battleTime())
+			hasPos = true
+		case ms.dead:
 			s.orderDoneLocked(c, parent)
 			return
+		default:
+			// «Штурм» friendly fire, single-target arm. The AoE scans filter allies
+			// themselves (mobsWithinLocked), but damageTargetsLocked hands an op with no
+			// radius its ctx.target VERBATIM -- and that target starts here. This is also
+			// where OpPull's victim comes from, which bypasses opTargetsLocked entirely.
+			// Gate on the skill's own declared mask: FRIEND skills are castable on an ally
+			// creep/building; a hostile-only skill turns an ally target away.
+			if !ms.hostile() && !skillHasTargetFlag(def, "FRIEND") {
+				s.orderDoneLocked(c, parent)
+				return
+			}
+			tx, ty = ms.x, ms.y
+			hasPos = true
 		}
-		// «Штурм» friendly fire, single-target arm. The AoE scans filter allies
-		// themselves (mobsWithinLocked), but damageTargetsLocked hands an op with no
-		// radius its ctx.target VERBATIM -- and that target starts here. This is also
-		// where OpPull's victim comes from, which bypasses opTargetsLocked entirely.
-		//
-		// Gate on the skill's own declared mask rather than on hostile() alone: the four
-		// FRIEND skills (Vigilans' «Щит хранителя»/«Касание спасителя», the druid's
-		// «Древесный камуфляж»/«Дубовая кора») are declared castable on an ally.
-		//
-		// Scope, precisely: an ally that reaches here is a «Штурм» creep or building --
-		// hs.mobs holds mobStates only, so an ally PLAYER's objID misses the lookup above
-		// and the cast fizzles before this line (a separate, pre-existing gap: those
-		// skills do not work on party members, and their OpShield/OpHot apply to the
-		// caster regardless of who was targeted).
-		if !ms.hostile() && !skillHasTargetFlag(def, "FRIEND") {
-			s.orderDoneLocked(c, parent)
-			return
-		}
-		tx, ty = ms.x, ms.y
-		hasPos = true
 	}
 
 	// A unit-target skill cast with no valid target/position: fire in place.
-	if ms == nil && !hasPos {
-		s.execCastLocked(c, slot, nil, 0, 0, false)
+	if ms == nil && allyObj == 0 && !hasPos {
+		s.execCastLocked(c, slot, nil, 0, 0, false, 0)
 		return
 	}
 
@@ -197,10 +207,10 @@ func (s *Server) startSkillOrderLocked(c *conn, slot int, target int32, px, py f
 		maxDist = 2.5
 	}
 	if math.Hypot(float64(tx-cx), float64(ty-cy)) <= maxDist+0.5 {
-		s.execCastLocked(c, slot, ms, tx, ty, hasPos)
+		s.execCastLocked(c, slot, ms, tx, ty, hasPos, allyObj)
 		return
 	}
-	hs.order = &pendingCast{slot: slot, target: target, px: px, py: py, hasPos: hasPos}
+	hs.order = &pendingCast{slot: slot, target: target, allyObj: allyObj, px: px, py: py, hasPos: hasPos}
 	c.resetChaseLocked() // new chase session: path now, then throttle the tick re-issues
 	c.chaseMoveLocked(s, tx, ty)
 }
@@ -215,7 +225,17 @@ func (s *Server) tickOrderLocked(c *conn, now float64) {
 	def := hs.skillDef(o.slot)
 	tx, ty := o.px, o.py
 	var ms *mobState
-	if o.target > 0 {
+	switch {
+	case o.allyObj != 0:
+		// Chasing to cast a FRIEND skill on a party member: track the ally's position.
+		ally := c.friendlyMember(o.allyObj)
+		if ally == nil {
+			hs.order = nil
+			s.orderDoneLocked(c, skillProtoID(hs.av, o.slot))
+			return
+		}
+		tx, ty = ally.posAtLocked(float32(now))
+	case o.target > 0:
 		ms = hs.mobs[o.target]
 		if ms == nil || ms.dead {
 			hs.order = nil
@@ -235,7 +255,7 @@ func (s *Server) tickOrderLocked(c *conn, now float64) {
 		c.stopArrivalLocked()
 		c.x, c.y, c.vx, c.vy, c.snapT = cx, cy, 0, 0, float32(now)
 		c.sendPosLocked(s, cx, cy, 0, 0, float32(now))
-		s.execCastLocked(c, o.slot, ms, tx, ty, o.hasPos)
+		s.execCastLocked(c, o.slot, ms, tx, ty, o.hasPos, o.allyObj)
 		return
 	}
 	c.chaseMoveLocked(s, tx, ty) // retarget a moving mob (throttled for a static one)
@@ -322,7 +342,7 @@ func (s *Server) breakInterruptibleChannelsLocked(c *conn) {
 }
 
 // execCastLocked performs the actual cast: mana, packets, payload scheduling.
-func (s *Server) execCastLocked(c *conn, slot int, ms *mobState, px, py float32, hasPos bool) {
+func (s *Server) execCastLocked(c *conn, slot int, ms *mobState, px, py float32, hasPos bool, allyObj int32) {
 	hs := c.huntState
 	def := hs.skillDef(slot)
 	level := int(hs.skillLevel[slot-1])
@@ -343,6 +363,13 @@ func (s *Server) execCastLocked(c *conn, slot int, ms *mobState, px, py float32,
 
 	cd := skillCooldown(float64(def.Cooldown[level-1]))
 	hs.cooldownUntil[slot-1] = now + cd
+
+	// Acting breaks stealth: a successful skill cast reveals the player, so mobs can
+	// re-aggro at once ("атаки и способности не снимают невидимость"). Placed after the
+	// mana/cooldown gate so a fizzled cast doesn't reveal them. This runs BEFORE this cast's
+	// ops, so a stealth skill's own OpStealth (Lirvein/Wilfang) survives -- it re-cloaks after
+	// this reveal and then breaks on the NEXT action.
+	s.breakInvisibilityLocked(c, now)
 
 	// A new cast supersedes a sustained (interruptible) channel the caster was
 	// holding -- Elgorm's arrow rain ends the instant he casts something else. This
@@ -396,7 +423,7 @@ func (s *Server) execCastLocked(c *conn, slot int, ms *mobState, px, py float32,
 	}
 	hs.payloads = append(hs.payloads, payload{
 		at: now + delay, slot: slot, level: level,
-		target: targetID, px: px, py: py, hasPos: hasPos,
+		target: targetID, allyObj: allyObj, px: px, py: py, hasPos: hasPos,
 	})
 	if delay <= 0 {
 		s.runDuePayloadsLocked(c, now)
@@ -441,8 +468,11 @@ type payload struct {
 	slot   int
 	level  int
 	target int32
-	px, py float32
-	hasPos bool
+	// allyObj is the friendly avatar objID a FRIEND skill was cast on (0 otherwise);
+	// firePayloadLocked resolves it to ctx.allyTarget at impact time.
+	allyObj int32
+	px, py  float32
+	hasPos  bool
 	// ops, when non-nil, is the exact op list to run instead of the whole skill's
 	// def.Ops -- used to defer a dash's follow-up ops (damage/root) until arrival.
 	ops []gamedata.Op
@@ -600,6 +630,9 @@ func (s *Server) firePayloadLocked(c *conn, p payload, now float64) {
 		ops = p.ops
 	}
 	ctx := opCtx{slot: p.slot, level: p.level, target: ms, px: p.px, py: p.py, hasPos: p.hasPos}
+	if p.allyObj != 0 {
+		ctx.allyTarget = c.friendlyMember(p.allyObj) // may be nil if the ally left/died
+	}
 	s.applyOpsLocked(c, ops, ctx, now)
 	// A charge's strike lands here, AFTER the dash cleared hasDest -- so this is the
 	// point where auto-attack can actually re-engage (the earlier action-done attempt
@@ -649,6 +682,13 @@ func (s *Server) toggleSkillLocked(c *conn, slot int) {
 		if op.Kind == gamedata.OpBuffStat && op.On != "target" {
 			s.applyOpsLocked(c, []gamedata.Op{op}, ctx, now)
 		}
+		if op.Kind == gamedata.OpShieldExplode {
+			// Rognar's «Костяной щит»: arm the hit-counted blast (three incoming hits detonate
+			// it). Remembered so the incoming-damage path can tick it down.
+			hs.shieldExplodeSlot = slot
+			hs.shieldStartedAt = now
+			hs.shieldHitsLeft = shieldExplodeHits
+		}
 	}
 }
 
@@ -661,6 +701,9 @@ func (s *Server) toggleOffLocked(c *conn, slot int, now float64, byUser bool) {
 	def := hs.skillDef(slot)
 	level := int(hs.skillLevel[slot-1])
 	hs.toggleOn[slot-1] = false
+	if hs.shieldExplodeSlot == slot {
+		hs.shieldExplodeSlot = 0 // bone shield down: stop counting hits
+	}
 	s.fxEndLocked(c, hs.toggleFx[slot-1])
 	hs.toggleFx[slot-1] = 0
 	// Drop the toggle's self-buff mods immediately.
@@ -678,6 +721,54 @@ func (s *Server) toggleOffLocked(c *conn, slot int, now float64, byUser bool) {
 
 func toggleSrc(slot int) string { return "toggle" + string(rune('0'+slot)) }
 
+const (
+	// shieldExplodeHits is how many incoming hits Rognar's «Костяной щит» absorbs before it
+	// detonates («при получении трёх ударов»).
+	shieldExplodeHits = 3
+	// shieldExplodeFullWindow is the age (seconds) at which the blast has decayed all the way
+	// from its max to its min. The client says only «чем меньше времени — тем больше урон»
+	// with no explicit ceiling, so this is a chosen span that makes an instant pop hit
+	// hardest and a long-standing shield hit softest.
+	shieldExplodeFullWindow = 8.0
+)
+
+// explodeBoneShieldLocked detonates Rognar's «Костяной щит»: it blasts enemies within the
+// op's radius for a magnitude that decays from Value2 (max, just cast) toward Value (min,
+// stood the full window), then switches the toggle off. A no-op if no bone shield is up.
+func (s *Server) explodeBoneShieldLocked(c *conn, now float64) {
+	hs := c.huntState
+	slot := hs.shieldExplodeSlot
+	if slot < 1 {
+		return
+	}
+	level := int(hs.skillLevel[slot-1])
+	for _, op := range hs.skillDef(slot).Ops {
+		if op.Kind != gamedata.OpShieldExplode || level < 1 {
+			continue
+		}
+		frac := (now - hs.shieldStartedAt) / shieldExplodeFullWindow
+		if frac < 0 {
+			frac = 0
+		} else if frac > 1 {
+			frac = 1
+		}
+		mn := op.Value.At(level) * hs.powerMul()
+		mx := op.Value2.At(level) * hs.powerMul()
+		if op.PerSP > 0 {
+			sp := hs.spellPowerLocked(now) * op.PerSP
+			mn, mx = mn+sp, mx+sp
+		}
+		dmg := mx - frac*(mx-mn) // max when fresh, min when it stood the full window
+		px, py := c.posAtLocked(float32(now))
+		for _, m := range c.mobsWithinLocked(px, py, op.Radius) {
+			s.hitMobLocked(c, m, dmg, c.objID)
+		}
+		break
+	}
+	// The shield is spent -> switch it off (also clears shieldExplodeSlot).
+	s.toggleOffLocked(c, slot, now, false)
+}
+
 // ---- op execution ----
 
 // opCtx carries the resolution context of one ops batch.
@@ -688,6 +779,10 @@ type opCtx struct {
 	px, py float32
 	hasPos bool
 	toggle bool
+	dmgIn  float64 // size of the hit that triggered an on-damaged proc (0 otherwise)
+	// allyTarget is the friendly avatar a FRIEND-castable skill was aimed at (nil for a
+	// self/AoE cast). Ops with On=="ally" apply to it (or the caster if nil).
+	allyTarget *conn
 }
 
 // centerLocked returns the AoE center: target mob, else point, else caster.
@@ -717,6 +812,109 @@ func (c *conn) mobsWithinLocked(x, y float32, r float64) []*mobState {
 		}
 	}
 	return out
+}
+
+// friendlyMember resolves an object id to a same-instance party member's conn (a
+// world-ready avatar on the caster's side), or nil. Used to aim FRIEND-castable skills
+// at another player. In solo (no instance) only the caster's own id resolves.
+func (c *conn) friendlyMember(objID int32) *conn {
+	if c.inst == nil {
+		if objID == c.objID {
+			return c
+		}
+		return nil
+	}
+	mem := c.inst.members[objID]
+	if mem == nil || mem.huntState == nil || arenaEnemies(c, mem) {
+		return nil
+	}
+	return mem
+}
+
+// allyTargetsLocked resolves the friendly-avatar recipients of an ally-targeting op:
+//   - On=="ally"   -> the single aimed ally (ctx.allyTarget) or the caster if none/gone.
+//   - On=="allies" -> every living party member within the op's radius of the AoE centre.
+//
+// Self is an ally: a self-centred AoE always catches the caster (distance 0), and a
+// point AoE catches the caster only if they stand in it -- matching «все союзники в
+// области». In solo (members() == [caster]) both forms collapse to the caster, so these
+// skills stay visible in single-player.
+func (s *Server) allyTargetsLocked(c *conn, ctx opCtx, op gamedata.Op) []*conn {
+	switch op.On {
+	case "ally":
+		if a := ctx.allyTarget; a != nil && a.huntState != nil && a.huntState.deadUntil == 0 {
+			return []*conn{a}
+		}
+		return []*conn{c}
+	case "allies":
+		cx, cy := s.centerLocked(c, ctx)
+		r := op.Radius
+		if r <= 0 {
+			r = float64(c.huntState.skillDef(ctx.slot).AoERadius)
+		}
+		if r <= 0 {
+			r = 4
+		}
+		now := s.battleTime()
+		var out []*conn
+		for _, mem := range c.members() {
+			hs := mem.huntState
+			if hs == nil || hs.deadUntil > 0 || arenaEnemies(c, mem) {
+				continue
+			}
+			mx, my := mem.posAtLocked(now)
+			if math.Hypot(float64(mx-cx), float64(my-cy)) <= r {
+				out = append(out, mem)
+			}
+		}
+		return out
+	}
+	return nil
+}
+
+// applyShieldLocked sets an absorb shield on any member (self or ally) and starts the
+// shared shield VFX on that avatar, so every viewer sees it. Mirrors the self OpShield
+// path but is parameterized by target conn.
+func (s *Server) applyShieldLocked(target *conn, amount, until float64) {
+	hs := target.huntState
+	if hs == nil {
+		return
+	}
+	hs.st.shield = amount
+	hs.st.shieldUntil = until
+	if hs.st.shieldFx == 0 {
+		hs.st.shieldFx = s.fxStartLocked(target, "RuneShieldEffect3", target.objID, 0, false, 0, 0)
+	}
+}
+
+// addAllyHotLocked arms a heal-over-time on any member (self or ally); the recipient's
+// own tick drains it. perSec/until come from the CASTER's power (the heal is the
+// caster's), applied to the ally's status block.
+func (s *Server) addAllyHotLocked(target *conn, perSec, until, now float64) {
+	hs := target.huntState
+	if hs == nil {
+		return
+	}
+	hs.st.hots = append(hs.st.hots, overTime{perSec: perSec, until: until, nextTick: now + 1})
+}
+
+// addAllyModLocked applies a stat mod to ANOTHER member (an ally) and re-syncs that
+// member's affected stats to its own client. Unlike addPlayerModLocked it does NOT add a
+// buff-bar effector, because the buff icon/fx protos resolve against the CASTER's kit,
+// not the ally's -- the stat still works and syncs, only the icon is omitted.
+func (s *Server) addAllyModLocked(target *conn, op gamedata.Op, ctx opCtx, now float64) {
+	hs := target.huntState
+	if hs == nil {
+		return
+	}
+	until := 0.0
+	if d := op.Dur.At(ctx.level); d > 0 {
+		until = now + d
+	}
+	hs.st.mods = append(hs.st.mods, statMod{
+		stat: op.Stat, value: op.Value.At(ctx.level), until: until, src: castSrc(ctx),
+	})
+	s.pushPlayerStatsLocked(target, now)
 }
 
 // mobsAlongLineLocked collects living mobs inside a line/rift swath: within
@@ -855,6 +1053,10 @@ func (s *Server) skillDamageLocked(c *conn, op gamedata.Op, ctx opCtx, victim *m
 	} else if op.Scale == "magic" {
 		dmg += hs.spellPowerLocked(now)
 	}
+	// Soul-scaled bonus (Gellar's «Армия душ»: +damagePerSoul per banked soul).
+	if ps := op.PerSoul.At(ctx.level); ps > 0 {
+		dmg += ps * float64(hs.soulStacks) * hs.powerMul()
+	}
 	if op.Scale == "phys" {
 		dmg *= hs.st.modMul(now, "dmg_pct")
 	}
@@ -880,6 +1082,30 @@ func (s *Server) applyOpsLocked(c *conn, ops []gamedata.Op, ctx opCtx, now float
 	hs := c.huntState
 	for i := 0; i < len(ops); i++ {
 		op := ops[i]
+		// A non-proc op may carry its own Chance to fire PROBABILISTICALLY inside an
+		// aura/channel tick -- Zamaran's «Пламя войны» roots the enemy it damages only
+		// «с вероятностью 20%». OpProc keeps its own semantics (registered passives, or
+		// unconditional when nested in an active cast), so it is exempt here. The roll is
+		// server-side and its result is broadcast, so every client sees the same outcome.
+		if op.Kind != gamedata.OpProc {
+			if ch := op.Chance.At(ctx.level); ch > 0 && ch < 1 && rand.Float64() >= ch {
+				continue
+			}
+		}
+		// Friend-or-foe DUAL cast: an "enemy" op fires only when a foe was aimed, an "ally"
+		// op only when a friend was aimed (Kiona's «Страж леса», Frost's «Гробница холода»,
+		// Hekata's «Выбор скверны»). This keeps the enemy half from splashing a friend's
+		// surroundings and the ally half from defaulting to self on an enemy cast.
+		switch op.TargetSide {
+		case "enemy":
+			if ctx.target == nil {
+				continue
+			}
+		case "ally":
+			if ctx.allyTarget == nil {
+				continue
+			}
+		}
 		switch op.Kind {
 		case gamedata.OpDamage:
 			if op.Apply == "self" {
@@ -892,6 +1118,135 @@ func (s *Server) applyOpsLocked(c *conn, ops []gamedata.Op, ctx opCtx, now float
 			for _, m := range s.opTargetsLocked(c, ctx, op) {
 				s.hitMobLocked(c, m, s.skillDamageLocked(c, op, ctx, m), c.objID)
 			}
+
+		case gamedata.OpExecute:
+			// «Казнь»: instant-kill the target if its HP is at/below the threshold (Value2),
+			// otherwise deal Value damage. The kill deals exactly the target's remaining HP
+			// (pre-divided by armor mitigation) so the client shows a clean lethal blow, not
+			// an overkill number, and armor can't save a target under the threshold.
+			if m := ctx.target; m != nil && !m.dead {
+				if m.hp <= op.Value2.At(ctx.level) {
+					mult := s.armorMultLocked(c, m, c.objID, now)
+					if mult <= 0 {
+						mult = 1
+					}
+					s.hitMobLocked(c, m, m.hp/mult, c.objID)
+				} else {
+					s.hitMobLocked(c, m, s.skillDamageLocked(c, op, ctx, m), c.objID)
+				}
+			}
+
+		case gamedata.OpAttackDamage:
+			// Gektor's «Разящий удар»: bonus = Value × the caster's base attack, dealt to the
+			// struck target. Sits in a Chance-1 on-hit proc, so ctx.target is the swing's mob.
+			if m := ctx.target; m != nil && !m.dead {
+				if dmg := op.Value.At(ctx.level) * hs.baseAttackLocked(now); dmg > 0 {
+					s.hitMobLocked(c, m, dmg, c.objID)
+				}
+			}
+
+		case gamedata.OpManaScaledDamage:
+			// Neirofim's «Паралич воли»: damage grows with the target's MISSING mana, the slow
+			// with its REMAINING mana. Manaless (melee) mobs take only the base and no slow.
+			if m := ctx.target; m != nil && !m.dead {
+				dmg := op.Value.At(ctx.level) * hs.powerMul()
+				if op.PerSP > 0 {
+					dmg += hs.spellPowerLocked(now) * op.PerSP
+				}
+				dmg += op.Value2.At(ctx.level) * (m.maxMana - m.mana)
+				s.hitMobLocked(c, m, dmg, c.objID)
+				if dur := op.Dur.At(ctx.level); dur > 0 && m.maxMana > 0 {
+					m.st.slowUntil = now + dur
+					m.st.slowFactor = 1 - 0.5*(m.mana/m.maxMana)
+					s.ensureMobStatusFxLocked(c, m, &m.st.slowFx, "SlowMoveEffect")
+					s.syncMobSpeedLocked(c, m, now)
+				}
+			}
+
+		case gamedata.OpManaBurnHit:
+			// BlackDragon's «Выжигание маны» / Neirofim's «Пожирание магии» / Inshari's siphon:
+			// drain mana from the struck target on a basic attack (nested in a Chance-1 proc).
+			if m := ctx.target; m != nil && !m.dead {
+				amt := op.Value.At(ctx.level)
+				if op.Apply == "own_mana" {
+					amt *= hs.maxManaLocked(now) // a % of the caster's own pool
+				}
+				if drained := m.drainManaLocked(amt); drained > 0 {
+					switch {
+					case op.Apply == "restore":
+						hs.mana = math.Min(hs.maxManaLocked(now), hs.mana+drained)
+						s.syncSelfLocked(c, syncMana)
+					default:
+						if frac := op.Value2.At(ctx.level); frac > 0 {
+							s.hitMobLocked(c, m, drained*frac, c.objID)
+						}
+					}
+				}
+			}
+
+		case gamedata.OpSilenceAll:
+			// Neirofim's «Молчание»: silence every hostile mob on the map, and drain mana from
+			// those nearby. Boss casting honours silenceUntil (tryBossSkillLocked).
+			dur := op.Dur.At(ctx.level)
+			for _, m := range hs.mobs {
+				if m.dead || !m.hostile() {
+					continue
+				}
+				m.st.silenceUntil = math.Max(m.st.silenceUntil, now+dur)
+				if m.shown {
+					s.ensureMobStatusFxLocked(c, m, &m.st.silenceFx, "SilenceEffect")
+				}
+			}
+			if drain := op.Value.At(ctx.level); drain > 0 {
+				cx, cy := s.centerLocked(c, ctx)
+				for _, m := range c.mobsWithinLocked(cx, cy, op.Radius) {
+					m.drainManaLocked(drain)
+				}
+			}
+
+		case gamedata.OpChill:
+			// Frost «озноб»: chilling an already-chilled target instead stuns it and clears the
+			// chill (the signature combo); otherwise it just marks the chill window.
+			for _, m := range s.opTargetsLocked(c, ctx, op) {
+				if now < m.st.chillUntil {
+					s.stunMobLocked(c, m, now, op.Value2.At(ctx.level))
+					m.st.chillUntil = 0
+					if m.st.chillFx != 0 {
+						s.worldFxEndLocked(c, m.st.chillFx)
+						m.st.chillFx = 0
+					}
+				} else {
+					m.st.chillUntil = now + op.Dur.At(ctx.level)
+					s.ensureMobStatusFxLocked(c, m, &m.st.chillFx, "FrozenEffect")
+				}
+			}
+
+		case gamedata.OpEmpowerNextHit:
+			// Rognar's «Окропление кровью»: spend Value2 fraction of current HP, store a bonus
+			// magic hit of Value × the HP spent onto the next basic attack.
+			cost := op.Value2.At(ctx.level) * hs.hp
+			if cost > 0 {
+				hs.hp = math.Max(1, hs.hp-cost)
+				s.syncSelfLocked(c, syncHealth)
+				hs.nextHitBonus += op.Value.At(ctx.level) * cost
+			}
+
+		case gamedata.OpConsumeSouls:
+			// Gellar's «Армия душ»: «теряет половину из накопленных душ» on cast.
+			hs.soulStacks /= 2
+
+		case gamedata.OpDeathLink:
+			// Rognar's «Канал смерти»: link the target so a share of incoming blows forwards
+			// to it (or heals it, if a friend).
+			if a := ctx.allyTarget; a != nil {
+				hs.deathLinkObj, hs.deathLinkAlly = a.objID, true
+			} else if m := ctx.target; m != nil && !m.dead {
+				hs.deathLinkObj, hs.deathLinkAlly = m.id, false
+			} else {
+				break
+			}
+			hs.deathLinkUntil = now + op.Dur.At(ctx.level)
+			hs.deathLinkFrac = op.Value2.At(ctx.level)
 
 		case gamedata.OpConsumeDots:
 			for _, m := range s.opTargetsLocked(c, ctx, op) {
@@ -933,13 +1288,32 @@ func (s *Server) applyOpsLocked(c *conn, ops []gamedata.Op, ctx opCtx, now float
 			if op.PerSP > 0 {
 				amt += hs.spellPowerLocked(now) * op.PerSP
 			}
-			s.healPlayerLocked(c, amt)
+			// Value2 scales the heal by the size of the hit that triggered this op --
+			// Nerlag's «Прилив крови» (on-damaged proc) heals for the damage just taken.
+			if v2 := op.Value2.At(ctx.level); v2 > 0 && ctx.dmgIn > 0 {
+				amt += ctx.dmgIn * v2
+			}
+			// On:"allies"/"ally" spreads the heal to friendly avatars (self included) --
+			// Arianna's «Исцеление», Kiona/Edilia's «heal allies», Tangren's totem tick.
+			if op.On == "allies" || op.On == "ally" {
+				for _, mem := range s.allyTargetsLocked(c, ctx, op) {
+					s.healPlayerLocked(mem, amt)
+				}
+			} else {
+				s.healPlayerLocked(c, amt)
+			}
 
 		case gamedata.OpHot:
-			hs.st.hots = append(hs.st.hots, overTime{
-				perSec: op.Value.At(ctx.level) * hs.powerMul(), until: now + op.Dur.At(ctx.level),
-				nextTick: now + 1,
-			})
+			perSec := op.Value.At(ctx.level) * hs.powerMul()
+			if op.On == "allies" || op.On == "ally" {
+				for _, mem := range s.allyTargetsLocked(c, ctx, op) {
+					s.addAllyHotLocked(mem, perSec, now+op.Dur.At(ctx.level), now)
+				}
+			} else {
+				hs.st.hots = append(hs.st.hots, overTime{
+					perSec: perSec, until: now + op.Dur.At(ctx.level), nextTick: now + 1,
+				})
+			}
 
 		case gamedata.OpManaRestore:
 			hs.mana = math.Min(hs.maxManaLocked(now), hs.mana+op.Value.At(ctx.level)*hs.powerMul())
@@ -989,7 +1363,28 @@ func (s *Server) applyOpsLocked(c *conn, ops []gamedata.Op, ctx opCtx, now float
 			// for DAMAGE ops and hands a friendly buff to whatever stands nearby. That
 			// scan is hostile-only, so a self-cast «Щит хранителя» was handing +30
 			// magic_armor to the enemies around it and nothing to the caster.
-			if op.On == "target" && ctx.target == nil {
+			if op.On == "allies" || op.On == "ally" {
+				// Buff friendly avatars (self + nearby / aimed allies): Arianna's «Аура
+				// стойкости», Sandariel's «Прыжок» speed, Hekata's «Пепельный смерч» ally
+				// attack. Self keeps the caster's own buff icon; allies get the stat only.
+				for _, mem := range s.allyTargetsLocked(c, ctx, op) {
+					if mem == c {
+						s.addPlayerModLocked(c, ctx, op, now)
+					} else {
+						s.addAllyModLocked(mem, op, ctx, now)
+					}
+				}
+			} else if op.On == "enemies" {
+				// AoE hostile stat debuff regardless of an aimed unit (Hekata's «Пепельный
+				// смерч» weakens every enemy's attack around her); uses op.Radius.
+				for _, m := range s.opTargetsLocked(c, ctx, op) {
+					m.st.mods = append(m.st.mods, statMod{
+						stat: op.Stat, value: op.Value.At(ctx.level),
+						until: now + op.Dur.At(ctx.level), src: castSrc(ctx),
+					})
+					s.syncMobSpeedLocked(c, m, now)
+				}
+			} else if op.On == "target" && ctx.target == nil {
 				s.addPlayerModLocked(c, ctx, op, now)
 			} else if op.On == "target" {
 				for _, m := range s.opTargetsLocked(c, ctx, op) {
@@ -1004,10 +1399,16 @@ func (s *Server) applyOpsLocked(c *conn, ops []gamedata.Op, ctx opCtx, now float
 			}
 
 		case gamedata.OpShield:
-			hs.st.shield = op.Value.At(ctx.level) * hs.powerMul()
-			hs.st.shieldUntil = now + op.Dur.At(ctx.level)
-			if hs.st.shieldFx == 0 {
-				hs.st.shieldFx = s.fxStartLocked(c, "RuneShieldEffect3", c.objID, 0, false, 0, 0)
+			amount := op.Value.At(ctx.level) * hs.powerMul()
+			until := now + op.Dur.At(ctx.level)
+			// On:"ally"/"allies" puts the absorb shield on the aimed friend / nearby allies
+			// (Arianna's «Щит хранителя» / «Касание спасителя») instead of the caster.
+			if op.On == "allies" || op.On == "ally" {
+				for _, mem := range s.allyTargetsLocked(c, ctx, op) {
+					s.applyShieldLocked(mem, amount, until)
+				}
+			} else {
+				s.applyShieldLocked(c, amount, until)
 			}
 
 		case gamedata.OpBlink:
@@ -1040,6 +1441,12 @@ func (s *Server) applyOpsLocked(c *conn, ops []gamedata.Op, ctx opCtx, now float
 			for _, m := range s.opTargetsLocked(c, ctx, op) {
 				s.knockbackMobLocked(c, m, op.Value.At(ctx.level), now)
 			}
+
+		case gamedata.OpStealth:
+			// Cloak the caster (Lirvein/Sandariel/Astarot/Wilfang stealth skills). The
+			// cast's own breakInvisibilityLocked already fired at the top of doSkillLocked
+			// (before ops run), so this grant survives until the NEXT attack/cast reveals it.
+			s.applySkillStealthLocked(c, op.Dur.At(ctx.level), now)
 
 		case gamedata.OpOnKill:
 			// Run the nested ops only if this cast's primary target died from it
@@ -1095,9 +1502,24 @@ func (s *Server) applyOpsLocked(c *conn, ops []gamedata.Op, ctx opCtx, now float
 		case gamedata.OpAura:
 			// aura pulses run from the tick while the toggle is on; nothing here.
 
-		case gamedata.OpRevive, gamedata.OpImmune, gamedata.OpHealOnKill:
-			// Passive-only mechanics: registered at world-build and honored in the
-			// death / player-CC / on-kill gates. Nothing to run inside an ops batch.
+		case gamedata.OpRevive, gamedata.OpImmune, gamedata.OpHealOnKill,
+			gamedata.OpConsecutiveHit, gamedata.OpAttackSpeedStreak, gamedata.OpShieldExplode:
+			// Passive/toggle-only mechanics: registered at world-build (or on toggle-on) and
+			// honored in the death / player-CC / on-kill / basic-attack / incoming-hit gates.
+			// Nothing to run inside an ops batch.
+
+		case gamedata.OpOnKillStack:
+			// Hekata's «Культ жнеца» cast: open (or refresh) the kill-window so kills during
+			// it grow her base attack. The persistent soul flavour (Dur 0, Gellar) is passive
+			// and never reaches here. Stacks reset on each activation.
+			if hs := c.huntState; hs != nil {
+				if dur := op.Dur.At(ctx.level); dur > 0 {
+					hs.killWindowUntil = now + dur
+					hs.killWindowPerKill = op.Value.At(ctx.level)
+					hs.killWindowCap = int(op.Value2.At(ctx.level))
+					hs.killWindowStacks = 0
+				}
+			}
 
 		default:
 			log.Printf("battle: %s unknown op kind %q", c.RemoteAddr(), op.Kind)
@@ -1347,10 +1769,30 @@ func (s *Server) dashLocked(c *conn, ctx opCtx, speed float64, now float64, noCl
 	c.moveStraightExLocked(s, tx, ty, !noClip)
 }
 
+// knockbackSpeed is how fast a shoved mob slides to its landing spot (world units/sec):
+// fast, so the push is snappy, but a real velocity the client can dead-reckon rather than
+// a teleport. knockbackMinTime floors the glide so a tiny shove still animates a beat.
+const (
+	knockbackSpeed   = 18.0
+	knockbackMinTime = 0.12
+)
+
 // knockbackMobLocked shoves a mob directly away from the caster by dist units (the
 // inverse of pullMobLocked), clipped to walkable ground -- Dutnik's «Взрыв» blast and
 // Miriam's «Выстрел бури».
+//
+// The mob's authoritative position moves to the landing spot at once (it is stunned /
+// being shoved, so nothing walks it further, and hit resolution stays simple). What
+// changed is the WIRE: instead of the old zero-velocity teleport snapshot -- which the
+// client could only render as an instant jump ("визуально не отталкивает + рассинхрон")
+// -- we broadcast the shove FROM the old spot carrying a real velocity, so every client
+// glides the model to the landing point. The mob tick loop sends the matching stop at
+// kbUntil and keeps the AI/stun gates off the mob until then, so the server never fights
+// the glide.
 func (s *Server) knockbackMobLocked(c *conn, m *mobState, dist float64, now float64) {
+	if m.structure || m.mob.Stationary {
+		return // immovable: an altar/cannon is not shoved out of its emplacement
+	}
 	if dist <= 0 {
 		dist = 3
 	}
@@ -1360,13 +1802,43 @@ func (s *Server) knockbackMobLocked(c *conn, m *mobState, dist float64, now floa
 	if d < 1e-6 {
 		dx, dy, d = 1, 0, 1 // degenerate overlap: push along +x
 	}
-	tx := m.x + float32(dx/d*dist)
-	ty := m.y + float32(dy/d*dist)
+	ux, uy := dx/d, dy/d
+	fromX, fromY := m.x, m.y
+	tx := m.x + float32(ux*dist)
+	ty := m.y + float32(uy*dist)
 	if c.nav != nil {
 		nx, ny := c.nav.Clip(float64(m.x), float64(m.y), float64(tx), float64(ty))
 		tx, ty = float32(nx), float32(ny)
 	}
-	s.teleportMobLocked(c, m, tx, ty, now)
+	adist := math.Hypot(float64(tx-fromX), float64(ty-fromY))
+	if adist < 1e-3 {
+		return // nowhere to go (already against a wall on the away side): no move, no glide
+	}
+	dur := adist / knockbackSpeed
+	if dur < knockbackMinTime {
+		dur = knockbackMinTime
+	}
+	// Authoritative rest position (server velocity stays 0 so the dead-reckon can't carry
+	// it past the spot); the client is sent the glide velocity separately.
+	m.x, m.y = tx, ty
+	m.vx, m.vy = 0, 0
+	m.kbUntil = now + dur
+	s.broadcastPosLocked(c, m.id, fromX, fromY,
+		float32(ux*knockbackSpeed), float32(uy*knockbackSpeed), float32(now))
+}
+
+// advanceKnockbackLocked reports whether a shoved mob is still mid-glide (caller then
+// keeps every AI/stun gate off it). When the window elapses it clears the flag and
+// broadcasts the stop at the landing spot the server has held all along, so the client
+// settles exactly where the server is.
+func (s *Server) advanceKnockbackLocked(c *conn, m *mobState, now float64) bool {
+	if now < m.kbUntil {
+		return true
+	}
+	m.kbUntil = 0
+	m.vx, m.vy = 0, 0
+	s.broadcastPosLocked(c, m.id, m.x, m.y, 0, 0, float32(now))
+	return false
 }
 
 // resetCooldownsLocked clears every skill cooldown for the caster, server-side AND on

@@ -191,11 +191,14 @@ func (s *Store) CompleteQuest(userID, questID int32) (QuestReward, bool) {
 	return QuestReward{Quest: q, Money: h.Money, Diamonds: h.DiamondMoney, Level: h.Level, Exp: h.Exp, NextExp: h.NextExp}, true
 }
 
-// AddQuestKill credits one Hunt kill on mapID toward every IN_PROGRESS quest the hero holds for
-// that map, bumping Progress and flipping to DONE at the objective count. Returns the states that
-// actually changed (for the quest|update_mpd push); nil if nothing advanced. All of it happens
-// under the store lock, so simultaneous kills can neither race the threshold nor lose a tick.
-func (s *Store) AddQuestKill(userID, mapID int32) []QuestState {
+// AddQuestKill credits one Hunt kill on mapID -- of the mob roster index mobIdx -- toward every
+// IN_PROGRESS quest the hero holds for that map WHOSE TARGET the slain creature matches, bumping
+// Progress and flipping to DONE at the objective count. A quest is advanced only when
+// gamedata.QuestCreditsKill(q, mobIdx) holds, so a «kill 10 ghouls» quest no longer counts an
+// unrelated mob (the reported bug). Returns the states that actually changed (for the
+// quest|update_mpd push); nil if nothing advanced. All of it happens under the store lock, so
+// simultaneous kills can neither race the threshold nor lose a tick.
+func (s *Store) AddQuestKill(userID, mapID int32, mobIdx int) []QuestState {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	u, found := s.usersByID[userID]
@@ -212,6 +215,9 @@ func (s *Store) AddQuestKill(userID, mapID int32) []QuestState {
 		q, ok := gamedata.QuestByID(qs.QuestID)
 		if !ok || q.MapID != mapID {
 			continue
+		}
+		if !gamedata.QuestCreditsKill(q, mobIdx) {
+			continue // wrong creature for this quest's objective
 		}
 		if qs.Progress >= q.Count {
 			continue // already at objective (awaiting turn-in)

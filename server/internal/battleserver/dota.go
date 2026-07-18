@@ -60,6 +60,14 @@ type dotaState struct {
 	// guns without a back-pointer to the huntInstance.
 	instMobs map[int32]*mobState
 
+	// altarGuards maps an altar's object id to the object ids of the BASE cannons guarding
+	// it (the guns flanking that altar, per gamedata.AltarGuardGunIDs). An altar opens to
+	// damage once every gun in its OWN list is dead -- not once every gun on the whole side
+	// is: map_1_0 gives each side 11 guns but only the 2 base cannons guard the altar, so
+	// the old "any same-side gun alive" rule kept the altar invulnerable while 9 far-off
+	// lane guns still stood. An empty list means "not gun-guarded" (always vulnerable).
+	altarGuards map[int32][]int32
+
 	ended  bool
 	winner int32
 }
@@ -89,15 +97,17 @@ func (d *dotaState) playerSpawn() (float64, float64) {
 	return d.m.SpawnHuman.X, d.m.SpawnHuman.Y
 }
 
-// altarVulnerableLocked reports whether an altar can currently take damage: true once
-// every cannon on its side is destroyed (the «Штурм» push rule). Caller holds the
-// world lock.
+// altarVulnerableLocked reports whether an altar can currently take damage: true once every
+// BASE cannon guarding THIS altar is destroyed (the «Штурм» push rule -- "smash the cannons
+// next to the altar"). It consults only the altar's own guard set (altarGuards), NOT every gun
+// on the side, so razing the two flanking cannons opens the altar even while the side's distant
+// lane guns still stand. Caller holds the world lock.
 func (d *dotaState) altarVulnerableLocked(altar *mobState) bool {
 	if !d.m.AltarGuardedByGuns() {
 		return true
 	}
-	for _, m := range d.instMobs {
-		if m.structure && m.dotaRole == gamedata.DotaGun && m.team == altar.team && !m.dead {
+	for _, gid := range d.altarGuards[altar.id] {
+		if g := d.instMobs[gid]; g != nil && !g.dead {
 			return false
 		}
 	}
@@ -177,6 +187,19 @@ func newDotaInstance(s *Server, id, mapID int32) *huntInstance {
 		}
 	}
 	d.instMobs = inst.mobs
+	// Resolve each altar's base-cannon guard set from the map geometry, keyed by object id so
+	// altarVulnerableLocked never has to re-derive it. The altar opens once these -- and only
+	// these -- are dead.
+	d.altarGuards = map[int32][]int32{}
+	for _, sc := range dm.Structures {
+		if sc.Role != gamedata.DotaAltar {
+			continue
+		}
+		altarObjID := dotaStructIDBase + sc.ID
+		for _, gid := range dm.AltarGuardGunIDs(sc.ID) {
+			d.altarGuards[altarObjID] = append(d.altarGuards[altarObjID], dotaStructIDBase+gid)
+		}
+	}
 	log.Printf("battle: created «Штурм» (DOTA) instance room=%d map=%d structures=%d", id, mapID, len(dm.Structures))
 	return inst
 }
@@ -674,6 +697,13 @@ func (s *Server) dotaCreepTickLocked(rep *conn, m *mobState, now float64) {
 	}
 	m.lastSync = now
 
+	// Knockback glide (see knockbackMobLocked): the shove already moved the creep to its
+	// landing spot and broadcast a client-side glide there. Hold its AI until the window
+	// elapses, then advanceKnockbackLocked broadcasts the stop.
+	if m.kbUntil > 0 && s.advanceKnockbackLocked(rep, m, now) {
+		return
+	}
+
 	// Stand still while the strike animation plays: a creature never marches or chases
 	// mid-swing. This is what makes the creep plant its feet for the blow instead of
 	// sliding down the lane with its weapon swinging (the client blends the attack clip
@@ -815,6 +845,7 @@ func (t dotaTarget) id() int32 {
 // dotaAcquireTargetLocked returns the nearest ENEMY of m (an enemy-team mob or an
 // enemy-team player) within `radius`, or nil.
 func (s *Server) dotaAcquireTargetLocked(rep *conn, m *mobState, radius, now float64) *dotaTarget {
+	dota := rep.inst.dota
 	r2 := radius * radius
 	var best *dotaTarget
 	bestD := math.Inf(1)
@@ -827,6 +858,15 @@ func (s *Server) dotaAcquireTargetLocked(rep *conn, m *mobState, radius, now flo
 	// enemy mobs (creeps + structures)
 	for _, o := range rep.inst.mobs {
 		if o.dead || o.id == m.id || o.teamVal() == m.teamVal() {
+			continue
+		}
+		// An enemy altar still shielded by its base cannons is not a valid target: creeps
+		// (and cannons/towers, which share this picker) would otherwise plant on it and swing
+		// into the void -- dotaDamageLocked refuses the hit -- while its guns still stand. Skip
+		// it so the nearest-enemy pick falls to a guarding cannon instead; once the guns die
+		// altarVulnerableLocked flips and the altar re-enters the candidate set. This mirrors
+		// the player's altarShieldedLocked gate and the client PHYS_IMM the altar advertises.
+		if o.altar && dota != nil && !dota.altarVulnerableLocked(o) {
 			continue
 		}
 		consider(&dotaTarget{mob: o, x: o.x, y: o.y, radius: float32(o.mob.Radius())})

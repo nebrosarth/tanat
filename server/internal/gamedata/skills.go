@@ -68,6 +68,84 @@ const (
 	// OpKnockback shoves the targeted enemies away from the caster by Value units
 	// (the inverse of OpPull) — Dutnik's «Взрыв» detonation blast.
 	OpKnockback OpKind = "knockback"
+	// OpStealth cloaks the CASTER (Lirvein's «Единение с ветром», Sandariel's
+	// «Сокрывающая вуаль», Astarot's «Слуга тьмы», Wilfang's «Засада»): it sets the
+	// player's invisibleUntil for Dur seconds, reusing the same stealth the
+	// Invisibility potion grants — mobs stop targeting a hidden avatar, and the
+	// stealth breaks the instant the player attacks or casts (revealSelfLocked). The
+	// engine had no skill-driven stealth before (only the potion), so these skills
+	// previously shipped a cosmetic InvisibilityEffect VFX with no gameplay effect.
+	OpStealth OpKind = "stealth"
+	// OpExecute is a threshold finisher (Gektor's «Казнь»): if the target's current
+	// HP is at or below Value2 (the execute threshold) it dies outright; otherwise it
+	// takes Value damage (scaled like OpDamage). Resolved on the single locked target.
+	OpExecute OpKind = "execute"
+	// OpConsecutiveHit is a PASSIVE marker (Mihalych's «Трепка»): every basic attack that
+	// lands on the SAME target as the previous one deals Value extra damage per stack, the
+	// streak resetting when the avatar switches targets. Not run through applyOpsLocked --
+	// the basic-attack path reads it via consecutiveHitBonusLocked.
+	OpConsecutiveHit OpKind = "consecutive_hit"
+	// OpOnKillStack grows the caster's flat base attack for every enemy it kills.
+	// Two flavours, told apart by Dur:
+	//   Dur == 0 -> a PERSISTENT passive (Gellar's «Порабощение» souls): every kill adds
+	//     one stack (+Value attack each), capped at Value2 stacks; HalveOnDeath drops half
+	//     the souls when the caster dies. Registered at world-build (soulSlot).
+	//   Dur  > 0 -> an ACTIVE window (Hekata's «Культ жнеца»): casting it opens a Dur-second
+	//     window during which each kill adds +Value flat attack (capped at Value2, 0 =
+	//     uncapped); the bonus vanishes when the window ends. Run through applyOpsLocked to
+	//     open/refresh the window; the kills are tallied in the mob-death branch.
+	// The accumulated attack feeds the basic-attack `flat` channel (killAttackBonusLocked).
+	OpOnKillStack OpKind = "on_kill_stack"
+	// OpAttackSpeedStreak is a PASSIVE marker (Lirvein's «Неумолимость»): each consecutive
+	// basic attack on the SAME target raises attack speed by Value (attacks/sec), capped at
+	// Value2, resetting when the avatar switches targets. It shares the hitStreak counter
+	// with OpConsecutiveHit and is read when the swing interval is (re)computed, not run
+	// through applyOpsLocked. Registered at world-build (attackSpeedStreakSlot).
+	OpAttackSpeedStreak OpKind = "attack_speed_streak"
+	// OpAttackDamage deals bonus damage equal to Value × the caster's current base attack
+	// to the struck target (Gektor's «Разящий удар»: «+{damageCoef%}% урона от своей базовой
+	// атаки»). Meant to sit inside a Chance-1 on-hit OpProc so it lands on every swing, next
+	// to an OpSlow. Scale flags phys/magic for the hit flavour.
+	OpAttackDamage OpKind = "attack_damage"
+	// OpShieldExplode marks a TOGGLE that blows up after taking a fixed number of hits
+	// (Rognar's «Костяной щит»: «при получении трёх ударов щит взрывается»). While the toggle
+	// is on, each incoming hit is counted; on the third the shield deals AoE magic damage to
+	// enemies within Radius and switches off. Value/Value2 are the min/max blast (PerSP-
+	// scaled); the magnitude decays from max toward min the longer the shield stood («чем
+	// меньше времени — тем больше урон»). Handled by the toggle/incoming-hit gates, not run
+	// through applyOpsLocked.
+	OpShieldExplode OpKind = "shield_explode"
+	// OpManaScaledDamage deals magic damage to the single target that scales with how much
+	// mana it is MISSING (Neirofim's «Паралич воли»: «чем меньше маны, тем больше урон»):
+	// Value base + Value2 × (target.maxMana - target.mana), plus a slow whose strength scales
+	// with the target's REMAINING mana (strong when full, none when dry). Manaless (melee)
+	// mobs take only the base and no slow.
+	OpManaScaledDamage OpKind = "mana_scaled_damage"
+	// OpManaBurnHit drains mana from the struck target on a basic attack (sit it inside a
+	// Chance-1 on-hit OpProc). Value = amount; Apply "own_mana" makes it Value × the caster's
+	// OWN max mana (Neirofim's «Пожирание магии» drains a % of his pool), otherwise a flat
+	// burn (BlackDragon's «Выжигание маны»). Value2 = fraction of the drained mana dealt back
+	// as magic damage (Neirofim=1, BlackDragon=0). Apply "restore" instead refunds the drained
+	// mana to the caster (Inshari's «Изъятие сущности» siphon). Melee mobs have no mana → 0.
+	OpManaBurnHit OpKind = "mana_burn_hit"
+	// OpSilenceAll silences EVERY hostile mob in the instance for Dur (Neirofim's «Молчание»)
+	// and drains Value mana from mobs within Radius of the cast.
+	OpSilenceAll OpKind = "silence_all"
+	// OpChill applies the Frost «озноб» debuff for Dur; casting it on an ALREADY-chilled
+	// target instead STUNS it for Value2 seconds and clears the chill (the signature Frost
+	// combo). Value is unused. Resolved on the op's area targets.
+	OpChill OpKind = "chill"
+	// OpEmpowerNextHit spends Apply-fraction of the caster's CURRENT HP and stores a bonus
+	// magic hit of Value × the HP spent onto the next basic attack (Rognar's «Окропление
+	// кровью»). Consumed by scheduleHitAfterLocked.
+	OpEmpowerNextHit OpKind = "empower_next_hit"
+	// OpConsumeSouls halves the caster's banked Gellar souls (soulStacks) — «При применении
+	// теряет половину из накопленных душ» (Gellar's «Армия душ»).
+	OpConsumeSouls OpKind = "consume_souls"
+	// OpDeathLink links the caster to the target for Dur (Rognar's «Канал смерти»): while it
+	// holds, Value2 fraction of every blow the caster takes is forwarded to the linked enemy
+	// as magic damage (or heals a linked ally). The link's objID/until live on huntState.
+	OpDeathLink OpKind = "death_link"
 )
 
 // PerLevel holds one value per skill RANK. Slots 1-3 carry 5 ranks, the ult
@@ -114,6 +192,25 @@ type Op struct {
 	// MaxTargets, when >0, caps a damaging/CC op to the N nearest enemies in its area
 	// (Rognar's «Могильный холод» hits only two). 0 = no cap (hit everything in range).
 	MaxTargets int
+	// HalveOnDeath drops half of a persistent OpOnKillStack's accumulated stacks when the
+	// caster dies (Gellar's souls — «При смерти теряет половину из накопленных душ»).
+	HalveOnDeath bool
+	// TargetSide gates a friend-or-foe DUAL cast: "enemy" ops fire only when the aimed unit
+	// is an enemy (ctx.target set), "ally" ops only when it is a friend (ctx.allyTarget set).
+	// Empty = fire regardless. Lets one skill do X to a foe and Y to a friend (Kiona's «Страж
+	// леса», Frost's «Гробница холода», Hekata's «Выбор скверны»).
+	TargetSide string
+	// PerSoul adds Value×soulStacks bonus damage to a damage op (Gellar's «Армия душ» scales
+	// with banked souls). 0 = no soul scaling.
+	PerSoul PerLevel
+
+	// OnDamaged marks a PASSIVE OpProc that fires when the avatar is STRUCK rather than
+	// when it hits (Titanid's «Каменная кожа» hardens on being hit; Gektor's «Реванш»
+	// counter-novas the attacker; Dutnik's «Детонация» cooks off ammo when damaged). The
+	// world-build proc split reads this instead of a hard-coded prefab list. When true and
+	// Value>0, the nested heal/damage ops may also read the size of the hit that triggered
+	// them (Nerlag's «Прилив крови» heals for the damage just taken).
+	OnDamaged bool
 
 	// summon
 	Unit                     string // loadable character prefab

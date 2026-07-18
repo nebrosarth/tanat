@@ -11,8 +11,10 @@ import (
 // PvE quest progress in battle: a Hunt mob kill advances the killer's accepted KILL/COLLECT
 // quests for that map. The Ctrl channel owns the quest catalog, accept/turn-in and rewards
 // (ctrlserver/quests.go); the Battle server only feeds progress, because the objective source --
-// mobs dying -- lives here. Progress is map-scoped: any Hunt kill on the quest's map counts (the
-// journal text tells the player which map + creature; per-mob targeting is a future refinement).
+// mobs dying -- lives here. Progress is map- AND creature-scoped: a kill advances a quest only
+// when the slain mob is one of that quest's authored targets (gamedata.QuestCreditsKill), so a
+// «kill 10 ghouls» quest no longer counts unrelated mobs. The «убить N любых существ» quests and
+// unmodelled world-interaction objectives are flagged AnyMob and still count any Hunt kill.
 // Штурм creeps (homeless) and Arena carry no PvE quests and are excluded.
 
 // creditQuestKillLocked advances the killer's quests for one slain Hunt mob and pushes the
@@ -31,7 +33,7 @@ func (s *Server) creditQuestKillLocked(killer *conn, ms *mobState) {
 	if _, ok := gamedata.HuntMapByID(mapID); !ok {
 		return // killer is not in a Hunt (Штурм/Arena map) -> no PvE quests here
 	}
-	changed := s.Store.AddQuestKill(killer.selfPlayerID, mapID)
+	changed := s.Store.AddQuestKill(killer.selfPlayerID, mapID, ms.mobIdx)
 	if len(changed) == 0 {
 		return
 	}

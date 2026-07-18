@@ -77,6 +77,39 @@ func TestMobCardsResolve(t *testing.T) {
 	}
 }
 
+// TestMapCardsResolve is the "no EMPTY! on the map card" guard. SelectGameMenu runs a map's
+// Name, Desc and WinDesc each through GuiSystem.GetLocaleText (:81, :92-93), so all three must
+// be baked locale KEYS -- a display string renders the literal "EMPTY!" on the card. This is the
+// test that was missing when «Штурм» shipped Name="IDS_DOTA_Text" (absent) and literal-Russian
+// Desc/WinDesc, and the DM map shipped literal Desc/WinDesc. It covers every mode's maps at once.
+func TestMapCardsResolve(t *testing.T) {
+	keys := validLocaleKeys(t)
+	check := func(scene, field, key string) {
+		if key == "" {
+			t.Errorf("map %s: empty %s -> the card renders \"\"", scene, field)
+			return
+		}
+		if !keys[key] {
+			t.Errorf("map %s: %s key %q is not in the baked locale -> the card renders \"EMPTY!\"", scene, field, key)
+		}
+	}
+	for _, m := range HuntMaps() {
+		check(m.Scene, "Name", m.Name)
+		check(m.Scene, "Desc", m.Desc)
+		check(m.Scene, "WinDesc", m.WinDesc)
+	}
+	for _, m := range DotaMaps() {
+		check(m.Scene, "Name", m.Name)
+		check(m.Scene, "Desc", m.Desc)
+		check(m.Scene, "WinDesc", m.WinDesc)
+	}
+	for _, m := range ArenaMaps() {
+		check(m.Scene, "Name", m.Name)
+		check(m.Scene, "Desc", m.Desc)
+		check(m.Scene, "WinDesc", m.WinDesc)
+	}
+}
+
 // TestDotaBuildingCardsResolve covers all four «Штурм» structure roles on both sides.
 func TestDotaBuildingCardsResolve(t *testing.T) {
 	icons, keys := validCardIcons(t), validLocaleKeys(t)

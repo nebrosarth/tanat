@@ -55,6 +55,12 @@ type unitStatus struct {
 	atkSlowUntil  float64
 	atkSlowFactor float64
 
+	// chillUntil is the Frost «озноб» window: re-chilling an already-chilled unit stuns it
+	// (OpChill). Purely a marker for the combo -- it carries no movement penalty of its own
+	// (Frost's slow rides slowUntil/slowFactor).
+	chillUntil float64
+	chillFx    int32
+
 	shield      float64 // absorb pool
 	shieldUntil float64
 

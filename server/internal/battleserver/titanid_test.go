@@ -122,7 +122,7 @@ func TestStoneSkinRegistersAsOnDamaged(t *testing.T) {
 		for _, op := range sk.Ops {
 			if op.Kind == gamedata.OpProc {
 				pr := procState{slot: i + 1, chance: op.Chance, ops: op.Ops}
-				if procOnDamaged(ti.Prefab, i+1) {
+				if op.OnDamaged {
 					defense = append(defense, pr)
 				} else {
 					procs = append(procs, pr)
@@ -145,7 +145,6 @@ func TestStoneSkinRegistersAsOnDamaged(t *testing.T) {
 // path) does not.
 func TestStoneSkinStacksArmorWhenStruck(t *testing.T) {
 	s, c, hs, _, _ := newTitanidCapture(t)
-	ti := hs.av
 	kit := hs.kit
 
 	// Register Stone Skin the way world-build does.
@@ -154,7 +153,7 @@ func TestStoneSkinStacksArmorWhenStruck(t *testing.T) {
 			continue
 		}
 		for _, op := range sk.Ops {
-			if op.Kind == gamedata.OpProc && procOnDamaged(ti.Prefab, i+1) {
+			if op.Kind == gamedata.OpProc && op.OnDamaged {
 				hs.defenseProcs = append(hs.defenseProcs, procState{slot: i + 1, chance: op.Chance, ops: op.Ops})
 			}
 		}

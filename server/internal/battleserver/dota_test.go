@@ -225,8 +225,10 @@ func TestDotaCreepWaveSpawns(t *testing.T) {
 func TestDotaCreepTargetsEnemyNotAlly(t *testing.T) {
 	s, c, inst, cleanup := newDotaConn(t, "Avtr_Tank_Velial")
 	defer cleanup()
-	// An enemy-team creep (team -1) sitting between an ally altar (team 1) and an enemy
-	// gun (team -1). It must pick the ally altar (its enemy), not the enemy gun (ally).
+	// An enemy-team creep (team -1) sitting next to the player's own altar (team 1). That
+	// altar is its enemy; it must pick it, never a same-team object. The altar is guarded by
+	// the player's base cannons, so it starts invulnerable and (by the «Штурм» targeting rule)
+	// is not a valid target -- raze its guards first so it opens.
 	own := altarOf(inst, dotaPlayerTeam)
 	creep := &mobState{
 		id: 61000, mobIdx: inst.dota.m.ElfCreepMelee,
@@ -237,6 +239,11 @@ func TestDotaCreepTargetsEnemyNotAlly(t *testing.T) {
 	inst.mobs[creep.id] = creep
 
 	c.lock()
+	for _, gid := range inst.dota.altarGuards[own.id] {
+		if g := inst.mobs[gid]; g != nil {
+			g.dead = true
+		}
+	}
 	tgt := s.dotaAcquireTargetLocked(c, creep, 50, float64(s.battleTime()))
 	c.unlock()
 	if tgt == nil || tgt.mob == nil {
@@ -247,6 +254,100 @@ func TestDotaCreepTargetsEnemyNotAlly(t *testing.T) {
 	}
 	if tgt.mob.id != own.id {
 		t.Errorf("creep targeted obj %d, want the nearby ally altar %d", tgt.mob.id, own.id)
+	}
+}
+
+// TestDotaAltarOpensOnBaseCannons pins the fix for "the altar stays invulnerable after I destroy
+// the two cannons next to it": the altar is gated by its OWN base cannons, not by all 11 of the
+// side's guns. Killing a distant lane gun does nothing; killing the two base cannons opens the
+// altar even while lane guns still stand.
+func TestDotaAltarOpensOnBaseCannons(t *testing.T) {
+	_, c, inst, cleanup := newDotaConn(t, "Avtr_Tank_Velial")
+	defer cleanup()
+	enemy := altarOf(inst, dotaEnemyTeam)
+	if enemy == nil {
+		t.Fatal("no enemy altar")
+	}
+	guards := inst.dota.altarGuards[enemy.id]
+	if len(guards) != 2 {
+		t.Fatalf("enemy altar guard set = %v, want exactly 2 base cannons", guards)
+	}
+	guardSet := map[int32]bool{guards[0]: true, guards[1]: true}
+
+	c.lock()
+	defer c.unlock()
+	// Kill a NON-base enemy gun (a lane gun): the altar must stay shielded.
+	killedLane := false
+	for _, m := range inst.mobs {
+		if m.dotaRole == gamedata.DotaGun && m.team == dotaEnemyTeam && !guardSet[m.id] {
+			m.dead = true
+			killedLane = true
+			break
+		}
+	}
+	if !killedLane {
+		t.Fatal("no lane gun found to kill")
+	}
+	if inst.dota.altarVulnerableLocked(enemy) {
+		t.Fatal("altar opened after a mere LANE gun died -- it should need its base cannons gone")
+	}
+	// Raze the two base cannons (only them); lane guns remain.
+	for _, gid := range guards {
+		inst.mobs[gid].dead = true
+	}
+	laneAlive := 0
+	for _, m := range inst.mobs {
+		if m.dotaRole == gamedata.DotaGun && m.team == dotaEnemyTeam && !m.dead && !guardSet[m.id] {
+			laneAlive++
+		}
+	}
+	if laneAlive == 0 {
+		t.Fatal("precondition: expected lane guns still standing")
+	}
+	if !inst.dota.altarVulnerableLocked(enemy) {
+		t.Fatalf("altar still invulnerable after both base cannons fell (%d lane guns alive)", laneAlive)
+	}
+}
+
+// TestDotaCreepSkipsShieldedAltar pins the fix for "creeps attack the invulnerable altar while
+// cannons stand": a creep next to a shielded enemy altar targets a guarding cannon, and only
+// once the cannons fall does the (now open) altar become its target.
+func TestDotaCreepSkipsShieldedAltar(t *testing.T) {
+	s, c, inst, cleanup := newDotaConn(t, "Avtr_Tank_Velial")
+	defer cleanup()
+	enemyAltar := altarOf(inst, dotaEnemyTeam)
+	guards := inst.dota.altarGuards[enemyAltar.id]
+	if len(guards) == 0 {
+		t.Fatal("enemy altar has no guard cannons")
+	}
+	// A player-side (team 1) creep standing right on the enemy altar while its cannons stand.
+	creep := &mobState{
+		id: 60009, mobIdx: inst.dota.m.HumanCreepMelee,
+		mob:  gamedata.Mobs()[inst.dota.m.HumanCreepMelee],
+		x:    enemyAltar.x - 2, y: enemyAltar.y,
+		team: dotaPlayerTeam,
+	}
+	inst.mobs[creep.id] = creep
+
+	c.lock()
+	defer c.unlock()
+	tgt := s.dotaAcquireTargetLocked(c, creep, 50, float64(s.battleTime()))
+	if tgt == nil || tgt.mob == nil {
+		t.Fatal("creep acquired no target next to the enemy base")
+	}
+	if tgt.mob.id == enemyAltar.id {
+		t.Fatal("creep targeted the SHIELDED altar -- it should skip it and hit the guard cannons")
+	}
+	if tgt.mob.dotaRole != gamedata.DotaGun {
+		t.Errorf("creep targeted role %d next to the base, want a guarding cannon (DotaGun)", tgt.mob.dotaRole)
+	}
+	// Raze the base cannons: the altar opens and becomes the creep's (nearest) target.
+	for _, gid := range guards {
+		inst.mobs[gid].dead = true
+	}
+	tgt2 := s.dotaAcquireTargetLocked(c, creep, 50, float64(s.battleTime()))
+	if tgt2 == nil || tgt2.mob == nil || tgt2.mob.id != enemyAltar.id {
+		t.Fatalf("after the base cannons fell, creep should target the open altar, got %+v", tgt2)
 	}
 }
 

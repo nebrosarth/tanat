@@ -324,31 +324,87 @@ func TestDungeonPlacement(t *testing.T) {
 }
 
 // TestFullBestiaryPlaced is the guard for "use every skeleton/ghoul/zombie/demon
-// variant": every mob index from mobGhoul through mobDemonRangeElite must appear
-// at least once in dungeonPack40, so no shipped-and-named creature sits unused.
+// variant". The COMMON tier must appear on the normal dungeon (map_4_0, dungeonPack40);
+// the "_g" ELITE tier no longer spawns there (task: elites belong to the group invasion)
+// so it is validated on the invasion map (map_4_1, invasionPack41) instead. Between the
+// two packs no shipped-and-named creature sits unused.
 func TestFullBestiaryPlaced(t *testing.T) {
-	bestiary := []struct {
+	commons := []struct {
 		idx  int
 		name string
 	}{
-		{mobGhoul, "Голодный гуль"}, {mobGhoulPossessed, "Одержимый гуль"},
+		{mobGhoul, "Голодный гуль"},
 		{mobSkeleton, "Скелет мечник"}, {mobSkeletonHewer, "Скелет рубака"},
+		{mobSkeletonArcher, "Скелет лучник"}, {mobSkeletonBurning, "Горящий скелет"},
+		{mobZombie, "Зомби крушитель"}, {mobZombieSoldier, "Зомби солдат"},
+		{mobDemon, "Демон страж"}, {mobDemonRange, "Демон воитель"},
+	}
+	elites := []struct {
+		idx  int
+		name string
+	}{
+		{mobGhoulPossessed, "Одержимый гуль"},
 		{mobSkeletonWarrior, "Скелет воитель"}, {mobSkeletonBerserk, "Скелет берсерк"},
-		{mobSkeletonArcher, "Скелет лучник"}, {mobSkeletonSniper, "Скелет снайпер"},
-		{mobSkeletonBurning, "Горящий скелет"},
-		{mobZombie, "Зомби крушитель"}, {mobZombieBigElite, "Зомби губитель"},
-		{mobZombieSoldier, "Зомби солдат"}, {mobZombieSoldierElite, "Зомби ратоборец"},
-		{mobDemon, "Демон страж"}, {mobDemonMeleeElite, "Демон захватчик"},
-		{mobDemonRange, "Демон воитель"}, {mobDemonRangeElite, "Демон надзиратель"},
+		{mobSkeletonSniper, "Скелет снайпер"},
+		{mobZombieBigElite, "Зомби губитель"}, {mobZombieSoldierElite, "Зомби ратоборец"},
+		{mobDemonMeleeElite, "Демон захватчик"}, {mobDemonRangeElite, "Демон надзиратель"},
 	}
-	seen := map[int]int{}
+	crypt := map[int]int{}
 	for _, sp := range dungeonPack40 {
-		seen[sp.Mob]++
+		crypt[sp.Mob]++
 	}
-	for _, b := range bestiary {
-		if seen[b.idx] == 0 {
-			t.Errorf("%s (index %d) is never placed on map_4_0", b.name, b.idx)
+	for _, b := range commons {
+		if crypt[b.idx] == 0 {
+			t.Errorf("common %s (index %d) is never placed on map_4_0", b.name, b.idx)
 		}
+		if isEliteTier(b.idx) {
+			t.Errorf("%s (index %d) is a common but flagged elite -- tiering table is wrong", b.name, b.idx)
+		}
+	}
+	invasion := map[int]int{}
+	for _, sp := range invasionPack41 {
+		invasion[sp.Mob]++
+	}
+	for _, b := range elites {
+		if crypt[b.idx] != 0 {
+			t.Errorf("elite %s (index %d) must NOT spawn on the normal dungeon map_4_0", b.name, b.idx)
+		}
+		if invasion[b.idx] == 0 {
+			t.Errorf("elite %s (index %d) is never placed on the invasion map_4_1", b.name, b.idx)
+		}
+	}
+}
+
+// isEliteTier reports whether a roster index is a "_g" (гневный) elite variant. Single
+// source for the tiering used by the normal-dungeon exclusion test below.
+func isEliteTier(idx int) bool {
+	switch idx {
+	case mobGhoulPossessed, mobSkeletonWarrior, mobSkeletonBerserk, mobSkeletonSniper,
+		mobZombieBigElite, mobZombieSoldierElite, mobDemonMeleeElite, mobDemonRangeElite:
+		return true
+	}
+	return false
+}
+
+// TestNoElitesInNormalDungeon pins the task fix: NO "_g" elite mob spawns on the normal
+// dungeon (map_4_0 «Подземный город»). Elites are the group invasion's (map_4_1) domain.
+func TestNoElitesInNormalDungeon(t *testing.T) {
+	for _, sp := range dungeonPack40 {
+		if isEliteTier(sp.Mob) {
+			t.Errorf("elite mob index %d spawns on map_4_0 at (%.0f,%.0f); the normal dungeon must be common-tier only",
+				sp.Mob, sp.DX, sp.DY)
+		}
+	}
+	// And the invasion map still HAS its elites (guards against gutting the wrong pack).
+	anyElite := false
+	for _, sp := range invasionPack41 {
+		if isEliteTier(sp.Mob) {
+			anyElite = true
+			break
+		}
+	}
+	if !anyElite {
+		t.Error("invasion map_4_1 has no elite mobs -- the exclusion hit the wrong pack")
 	}
 }
 

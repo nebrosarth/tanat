@@ -98,12 +98,12 @@ const (
 	// path does NOT consult it (SelfPlayer.PerformAttack checks only
 	// Destructible/Health/ENEMY), so this stops the avatar picking a fight by itself but
 	// the server must still refuse an explicit order -- both halves are needed.
-	syncPhysImm     uint64 = 0x4000000
-	syncPhysArmor   uint64 = 0x40000
-	syncMagicArmor  uint64 = 0x80000
-	syncMaxMana     uint64 = 0x100000
-	syncManaRegen   uint64 = 0x200000
-	syncSpeed       uint64 = 0x400000
+	syncPhysImm    uint64 = 0x4000000
+	syncPhysArmor  uint64 = 0x40000
+	syncMagicArmor uint64 = 0x80000
+	syncMaxMana    uint64 = 0x100000
+	syncManaRegen  uint64 = 0x200000
+	syncSpeed      uint64 = 0x400000
 	// syncViewRadius is SyncType.VIEW_RADIUS: a unit's fog-of-war VISION radius (NOT
 	// its body radius -- that is syncRadius/SyncType.RADIUS). It feeds
 	// SyncedParams.mViewRadius, which is the fog gate in WarFogObject.Update
@@ -115,13 +115,13 @@ const (
 	// rendered black. Pairs with syncTeam: without a TEAM sync SyncedParams.
 	// IsTeamInited stays false and TeamRecognizer.GetFriendliness returns UNKNOWN,
 	// which fails the same gate.
-	syncViewRadius  uint64 = 0x800000
-	syncTeam        uint64 = 0x1000000
-	syncCastCost    uint64 = 0x100000000
-	syncCastStr     uint64 = 0x200000000
-	syncCastCd      uint64 = 0x400000000
-	syncRadius      uint64 = 0x800000000 // SyncType.RADIUS: body/collision radius
-	syncSpellPower  uint64 = 0x1000000000
+	syncViewRadius uint64 = 0x800000
+	syncTeam       uint64 = 0x1000000
+	syncCastCost   uint64 = 0x100000000
+	syncCastStr    uint64 = 0x200000000
+	syncCastCd     uint64 = 0x400000000
+	syncRadius     uint64 = 0x800000000 // SyncType.RADIUS: body/collision radius
+	syncSpellPower uint64 = 0x1000000000
 )
 
 // Fog-of-war vision radii (syncViewRadius), in world units.
@@ -560,6 +560,47 @@ type huntState struct {
 	// healOnKillSlot is the 1-based slot of a learned PASSIVE carrying an OpHealOnKill
 	// (Cerber's «Кровавый пир»), 0 = none. Honored in hitMobLocked's death branch.
 	healOnKillSlot int
+	// consecutiveHitSlot is the 1-based slot of a learned PASSIVE carrying an
+	// OpConsecutiveHit (Mihalych's «Трепка»), 0 = none. hitStreakTarget/hitStreak track the
+	// current same-target basic-attack streak that feeds its escalating bonus damage. The
+	// same streak drives Lirvein's attack-speed ramp (attackSpeedStreakSlot) below.
+	consecutiveHitSlot int
+	hitStreakTarget    int32
+	hitStreak          int
+	// attackSpeedStreakSlot is the 1-based slot of a learned PASSIVE carrying an
+	// OpAttackSpeedStreak (Lirvein's «Неумолимость»), 0 = none. When set, the swing interval
+	// is recomputed each swing so the same-target hitStreak speeds attacks up (capped).
+	attackSpeedStreakSlot int
+	// soulSlot is the 1-based slot of a learned PERSISTENT OpOnKillStack passive (Gellar's
+	// «Порабощение» souls), 0 = none. soulStacks is how many enemies it has banked (each
+	// worth +Value flat attack); halved when the avatar dies.
+	soulSlot   int
+	soulStacks int
+	// killWindow* track an ACTIVE OpOnKillStack window (Hekata's «Культ жнеца»): casting it
+	// sets killWindowUntil, and every kill before then adds a killWindowStacks stack (each
+	// worth +killWindowPerKill flat attack, capped at killWindowCap; 0 = uncapped). The
+	// bonus lapses when the window closes.
+	killWindowUntil   float64
+	killWindowStacks  int
+	killWindowPerKill float64
+	killWindowCap     int
+	// shieldExplode* track an active OpShieldExplode toggle (Rognar's «Костяной щит»):
+	// shieldExplodeSlot is the toggle slot (0 = no bone shield up), shieldStartedAt the
+	// battle-time it went on (for the time-decayed blast), shieldHitsLeft the incoming hits
+	// remaining before it detonates.
+	shieldExplodeSlot int
+	shieldStartedAt   float64
+	shieldHitsLeft    int
+	// nextHitBonus is bonus magic damage stored onto the caster's NEXT basic attack by
+	// Rognar's «Окропление кровью» (spend HP now, empower the next swing), consumed on use.
+	nextHitBonus float64
+	// deathLink* is Rognar's «Канал смерти»: while deathLinkUntil is in the future, a share
+	// of every blow the caster takes is forwarded to deathLinkObj (a mob id) as magic damage,
+	// or heals it when deathLinkAlly.
+	deathLinkObj   int32
+	deathLinkUntil float64
+	deathLinkFrac  float64
+	deathLinkAlly  bool
 
 	st unitStatus // self-avatar status effects
 
@@ -720,6 +761,11 @@ type mobState struct {
 	// is what stops the next shared pass from making it again.
 	homed bool
 
+	// boss marks a named boss (gamedata.IsBoss): it holds its arena on a MUCH tighter
+	// spawn-leash than trash (bossSpawnLeash vs mobSpawnLeash), so it can't be kited away
+	// from its spawn. Set once at spawn in newHuntInstance.
+	boss bool
+
 	// Level-scaled per-instance stats, computed at spawn from the mob's level-1
 	// base and MobSpawn.Level (bosses use their authored values unscaled). Zero
 	// means "not spawned through the scaling path" (a directly-constructed test
@@ -730,6 +776,14 @@ type mobState struct {
 	dmgMax float64
 	xp     float64
 	coins  int32
+
+	// mana / maxMana: ONLY ranged mobs (AttackRange>0) and bosses carry a mana pool;
+	// melee trash has maxMana 0 and never touches this. A ranged mob spends mana per shot
+	// and a boss per skill cast, both self-sustaining via regen; the pool exists so player
+	// mana-drain / mana-burn skills (Neirofim, BlackDragon, Inshari) have something to bite,
+	// starving a caster/archer of its ranged output. Set at spawn (newHuntInstance).
+	mana    float64
+	maxMana float64
 
 	st        unitStatus
 	aggro     bool
@@ -761,6 +815,12 @@ type mobState struct {
 	hitDmg      float64
 	hitTarget   int32
 	swingDoneAt float64 // when to send ACTION_DONE for the last swing (0 = none pending)
+
+	// kbUntil is the battle-time a knockback GLIDE ends (0 = not being shoved). While live
+	// the mob slides along m.vx/m.vy (set + broadcast by knockbackMobLocked) ahead of every
+	// AI/stun gate, so a shove reads as an animated push in lock-step with the client instead
+	// of a zero-velocity teleport snap. See the glide handlers in the two mob tick loops.
+	kbUntil float64
 	// projLaunchAt is when a ranged mob (skeleton archer, shooter plant, caster) lets
 	// its projectile fly -- a point late in the attack wind-up, NOT its start, so the
 	// arrow leaves the bow near the release frame and streaks the last stretch to the
@@ -798,18 +858,18 @@ type mobState struct {
 	// mobs with a team + a lane to march (lane waypoints, laneIdx = next waypoint,
 	// laneFwd = walk direction). dtarget is the object the creep/cannon is currently
 	// engaging.
-	team      int32
-	structure bool
-	altar     bool
+	team       int32
+	structure  bool
+	altar      bool
 	dotaRole   gamedata.DotaRole
 	dotaPrefab string
 	// physImm is the PHYS_IMM value last SENT to the clients for this object, so the
 	// re-sync can skip a no-op. Only an altar uses it (see altarPhysImm).
 	physImm int32
-	lane      []gamedata.Vec2
-	laneIdx   int
-	laneFwd   bool
-	dtarget   int32
+	lane    []gamedata.Vec2
+	laneIdx int
+	laneFwd bool
+	dtarget int32
 
 	// hasProj marks a unit whose CLIENT prefab actually ships a projectile pool
 	// (VisualEffectOptions.mProjectiles), so SET_PROJECTILE flies a visible bolt.
@@ -878,6 +938,23 @@ func (m *mobState) maxHealth() float64 {
 		return m.maxHP
 	}
 	return m.mob.Health
+}
+
+// hasMana reports whether this mob carries a mana pool (ranged mobs + bosses only).
+func (m *mobState) hasMana() bool { return m.maxMana > 0 }
+
+// drainManaLocked removes up to amount mana (never below 0) and returns how much was
+// actually taken -- 0 for a manaless (melee) mob. Used by player mana-drain / mana-burn
+// skills.
+func (m *mobState) drainManaLocked(amount float64) float64 {
+	if m.maxMana <= 0 || amount <= 0 {
+		return 0
+	}
+	if amount > m.mana {
+		amount = m.mana
+	}
+	m.mana -= amount
+	return amount
 }
 
 func (m *mobState) dmgRange() (lo, hi float64) {
@@ -1146,9 +1223,10 @@ func (s *Server) sendHuntWorldState(c *conn, name string) {
 			case gamedata.OpProc:
 				pr := procState{slot: i + 1, chance: op.Chance, ops: op.Ops}
 				// Most procs fire when the avatar HITS (runProcsLocked, basic-attack path).
-				// A defensive proc like Titanid's «Каменная кожа» instead hardens when the
-				// avatar is STRUCK, so it is rolled from the incoming-damage path.
-				if procOnDamaged(hs.av.Prefab, i+1) {
+				// A proc flagged OnDamaged instead fires when the avatar is STRUCK, so it is
+				// rolled from the incoming-damage path (Titanid «Каменная кожа», Gektor
+				// «Реванш», Dutnik «Детонация», Nerlag «Прилив крови»).
+				if op.OnDamaged {
 					hs.defenseProcs = append(hs.defenseProcs, pr)
 				} else {
 					hs.procs = append(hs.procs, pr)
@@ -1159,6 +1237,17 @@ func (s *Server) sendHuntWorldState(c *conn, name string) {
 				hs.ccImmuneSlot = i + 1
 			case gamedata.OpHealOnKill:
 				hs.healOnKillSlot = i + 1
+			case gamedata.OpConsecutiveHit:
+				hs.consecutiveHitSlot = i + 1
+			case gamedata.OpAttackSpeedStreak:
+				hs.attackSpeedStreakSlot = i + 1
+			case gamedata.OpOnKillStack:
+				// Only the PERSISTENT soul flavour (Dur 0) is a passive: it is banked in the
+				// mob-death branch. The ACTIVE window flavour (Dur > 0) is opened by its cast
+				// through applyOpsLocked, so it never reaches this passive-only loop.
+				if op.Dur.At(1) == 0 {
+					hs.soulSlot = i + 1
+				}
 			}
 		}
 	}
@@ -1176,7 +1265,7 @@ func (s *Server) sendHuntWorldState(c *conn, name string) {
 			continue
 		}
 		for _, op := range sk.Ops {
-			if op.Kind == gamedata.OpBuffStat && op.On != "target" && op.Dur.At(1) == 0 {
+			if op.Kind == gamedata.OpBuffStat && (op.On == "self" || op.On == "") && op.Dur.At(1) == 0 {
 				hs.st.mods = append(hs.st.mods, statMod{
 					stat: op.Stat, value: op.Value.At(level), until: 0, src: "passive" + itoa(i+1)})
 			}
@@ -1540,7 +1629,7 @@ func (s *Server) startAttackLocked(c *conn, ms *mobState) {
 	s.orderPetsAttackLocked(c, ms.id)
 	c.resetChaseLocked() // new pursuit: the first out-of-range check paths at once
 	hs.attackSeq++
-	s.armAttackTimer(c, hs.attackSeq, 0, time.Duration(float64(time.Second)/s.attackPeriodLocked(hs)))
+	s.armAttackTimer(c, hs.attackSeq, 0, s.swingIntervalLocked(hs))
 }
 
 // resumeAutoAttackLocked makes the avatar keep fighting after an ability finishes,
@@ -1607,6 +1696,52 @@ func (s *Server) attackPeriodLocked(hs *huntState) float64 {
 	return sp
 }
 
+// swingIntervalLocked is the delay between basic-attack swings: the base attack period
+// plus Lirvein's «Неумолимость» same-target ramp (attackSpeedStreakBonusLocked). It is
+// computed once per swing for an avatar carrying that passive so the ramp actually takes
+// hold; everyone else keeps a fixed per-session interval (armAttackTimer only recomputes
+// when attackSpeedStreakSlot is set), so their timing is byte-identical to before.
+func (s *Server) swingIntervalLocked(hs *huntState) time.Duration {
+	rate := s.attackPeriodLocked(hs) + s.attackSpeedStreakBonusLocked(hs)
+	if rate < 0.1 {
+		rate = 0.1
+	}
+	return time.Duration(float64(time.Second) / rate)
+}
+
+// attackSpeedStreakBonusLocked returns the extra attacks/sec Lirvein's «Неумолимость»
+// grants for the current same-target basic-attack streak: +Value per consecutive hit,
+// capped at Value2. 0 when the avatar has no such passive (or the streak is fresh).
+func (s *Server) attackSpeedStreakBonusLocked(hs *huntState) float64 {
+	slot := hs.attackSpeedStreakSlot
+	if slot < 1 || hs.hitStreak == 0 {
+		return 0
+	}
+	level := int(hs.skillLevel[slot-1])
+	if level < 1 {
+		return 0
+	}
+	for _, op := range hs.kit.Skills[slot-1].Ops {
+		if op.Kind == gamedata.OpAttackSpeedStreak {
+			bonus := float64(hs.hitStreak) * op.Value.At(level)
+			if cap := op.Value2.At(level); cap > 0 && bonus > cap {
+				bonus = cap
+			}
+			return bonus
+		}
+	}
+	return 0
+}
+
+// baseAttackLocked is the avatar's current effective base attack -- the mid of its
+// DmgMin..DmgMax band plus flat attack bonuses, scaled by the attack multiplier and level.
+// Used by attack-power-scaled effects (Gektor's «Разящий удар») that add a share of the
+// avatar's own attack to a hit.
+func (hs *huntState) baseAttackLocked(now float64) float64 {
+	mid := (float64(hs.av.DmgMin) + float64(hs.av.DmgMax)) / 2
+	return (mid + hs.st.modSum(now, "dmg_flat")) * hs.st.modMul(now, "dmg_pct") * hs.powerMul()
+}
+
 func (s *Server) armAttackTimer(c *conn, seq int, delay, interval time.Duration) {
 	time.AfterFunc(delay, func() {
 		c.lock()
@@ -1637,6 +1772,10 @@ func (s *Server) armAttackTimer(c *conn, seq int, delay, interval time.Duration)
 			c.x, c.y, c.vx, c.vy, c.snapT = cx, cy, 0, 0, now
 			c.sendPosLocked(s, cx, cy, 0, 0, now)
 		}
+		// Acting breaks stealth: a landed swing reveals the player, so mobs re-aggro
+		// ("атаки и способности не снимают невидимость"). Here -- once the swing actually
+		// commits in range -- covers both a click-ordered and a server-resumed auto-attack.
+		s.breakInvisibilityLocked(c, float64(now))
 		// The avatar's basic-attack ACTION goes to this player AND to every teammate
 		// that renders this avatar: renderAvatarForLocked put the matching ATTACK
 		// effector (attackProtoID) on the remote object, so a teammate resolves the
@@ -1646,6 +1785,13 @@ func (s *Server) armAttackTimer(c *conn, seq int, delay, interval time.Duration)
 		actionArgs := newActionArgs(c.objID, attackProtoID(hs.av), ms.id, float64(now),
 			amf.NewArray().Set("x", 0.0).Set("y", 0.0))
 		s.pushAvatarAllLocked(c, battleproto.CmdAction, actionArgs)
+		// Lirvein's «Неумолимость» speeds up the more you stay on one target, so recompute
+		// the swing interval each swing from the live streak. Scoped to that passive so no
+		// other avatar's fixed-per-session cadence changes (the streak advanced on the last
+		// landed hit, one swing back).
+		if hs.attackSpeedStreakSlot != 0 {
+			interval = s.swingIntervalLocked(hs)
+		}
 		if hs.hasProjectile {
 			// Release the projectile after the attack wind-up: 0 fires it now (a snap
 			// shot, the default) so it flies immediately and the hit lands on arrival;
@@ -1762,8 +1908,18 @@ func (s *Server) scheduleHitAfterLocked(c *conn, seq int, targetID int32, windup
 		if !hs.hasProjectile && math.Hypot(float64(ms.x-cx), float64(ms.y-cy)) > hs.effAttackRangeLocked(float64(now))+av.Radius()+ms.mob.Radius()+0.3 {
 			return
 		}
-		flat := hs.st.modSum(float64(now), "dmg_flat") // +attack from avatar tree items
+		// +attack from avatar tree items, plus any banked on-kill attack (Gellar's souls /
+		// Hekata's kill-window), which grow the base attack floor exactly like gear does.
+		flat := hs.st.modSum(float64(now), "dmg_flat") + s.killAttackBonusLocked(hs, float64(now))
 		dmg := (float64(av.DmgMin) + flat + rand.Float64()*float64(av.DmgMax-av.DmgMin)) * hs.st.modMul(float64(now), "dmg_pct") * hs.powerMul()
+		// «Трепка» (Mihalych): each basic attack that lands on the SAME target as the last
+		// deals escalating bonus damage; switching targets resets the streak.
+		dmg += s.consecutiveHitBonusLocked(hs, ms.id)
+		// Rognar's «Окропление кровью»: a stored one-shot magic bonus rides the next swing.
+		if hs.nextHitBonus > 0 {
+			dmg += hs.nextHitBonus
+			hs.nextHitBonus = 0
+		}
 		// Crit: crit_pct chance to strike for 1.5× base (+ crit_dmg_pct bonus magnitude),
 		// flagged 2 on the RECEIVE_HIT so the client plays its CritStrikeEffect. (Skill
 		// damage does not crit -- only the basic attack.)
@@ -1780,6 +1936,93 @@ func (s *Server) scheduleHitAfterLocked(c *conn, seq int, targetID int32, windup
 		// On-hit passive procs.
 		s.runProcsLocked(c, ms, float64(now))
 	})
+}
+
+// consecutiveHitBonusLocked advances the same-target basic-attack streak and returns the
+// bonus damage «Трепка» (Mihalych's OpConsecutiveHit passive) adds for it: 0 on the first
+// hit of a target, then +Value per subsequent same-target hit. Switching targets resets
+// the streak. Returns 0 when the avatar has no such passive learned.
+func (s *Server) consecutiveHitBonusLocked(hs *huntState, targetID int32) float64 {
+	if targetID == hs.hitStreakTarget {
+		hs.hitStreak++
+	} else {
+		hs.hitStreakTarget = targetID
+		hs.hitStreak = 0
+	}
+	slot := hs.consecutiveHitSlot
+	if slot < 1 || hs.hitStreak == 0 {
+		return 0
+	}
+	level := int(hs.skillLevel[slot-1])
+	if level < 1 {
+		return 0
+	}
+	var per float64
+	for _, op := range hs.kit.Skills[slot-1].Ops {
+		if op.Kind == gamedata.OpConsecutiveHit {
+			per = op.Value.At(level)
+			break
+		}
+	}
+	return float64(hs.hitStreak) * per * hs.powerMul()
+}
+
+// onKillStackOp returns the OpOnKillStack op (and its learned level) in a slot, if any.
+func (hs *huntState) onKillStackOp(slot int) (gamedata.Op, int, bool) {
+	if slot < 1 {
+		return gamedata.Op{}, 0, false
+	}
+	level := int(hs.skillLevel[slot-1])
+	if level < 1 {
+		return gamedata.Op{}, 0, false
+	}
+	for _, op := range hs.skillDef(slot).Ops {
+		if op.Kind == gamedata.OpOnKillStack {
+			return op, level, true
+		}
+	}
+	return gamedata.Op{}, 0, false
+}
+
+// killAttackBonusLocked is the flat base-attack bonus the avatar's banked kills add to a
+// basic attack right now: Gellar's persistent souls (always) plus Hekata's kill-window
+// stacks (only while the window is open). Raw values -- the caller folds them into `flat`,
+// which the damage formula then scales by powerMul like the rest of the base attack.
+func (s *Server) killAttackBonusLocked(hs *huntState, now float64) float64 {
+	var bonus float64
+	if hs.soulSlot != 0 && hs.soulStacks > 0 {
+		if op, level, ok := hs.onKillStackOp(hs.soulSlot); ok {
+			bonus += float64(hs.soulStacks) * op.Value.At(level)
+		}
+	}
+	if now < hs.killWindowUntil && hs.killWindowStacks > 0 {
+		bonus += float64(hs.killWindowStacks) * hs.killWindowPerKill
+	}
+	return bonus
+}
+
+// applyOnKillStacksLocked banks a kill for the killer's OpOnKillStack mechanics: it adds a
+// persistent soul (Gellar, capped) and, if a kill-window is open (Hekata), one window stack
+// (capped). A no-op for avatars with neither. Assists are not modelled -- only the killer
+// is credited (client text says «убийство или помощь»; the помощь half is deferred).
+func (s *Server) applyOnKillStacksLocked(c *conn, now float64) {
+	hs := c.huntState
+	if hs == nil {
+		return
+	}
+	if hs.soulSlot != 0 {
+		if op, level, ok := hs.onKillStackOp(hs.soulSlot); ok {
+			cap := int(op.Value2.At(level))
+			if cap == 0 || hs.soulStacks < cap {
+				hs.soulStacks++
+			}
+		}
+	}
+	if now < hs.killWindowUntil {
+		if hs.killWindowCap == 0 || hs.killWindowStacks < hs.killWindowCap {
+			hs.killWindowStacks++
+		}
+	}
 }
 
 // runProcsLocked rolls each registered on-hit passive against a struck mob.
@@ -1802,7 +2045,7 @@ func (s *Server) runProcsLocked(c *conn, ms *mobState, now float64) {
 // Titanid's «Каменная кожа» hardens (stacks +phys_armor) when he is STRUCK, not when
 // he strikes. attacker is the mob that hit; the ops (a self armor buff) ignore it, but
 // it feeds the ctx like a struck-target would for runProcsLocked.
-func (s *Server) runDefenseProcsLocked(c *conn, attacker *mobState, now float64) {
+func (s *Server) runDefenseProcsLocked(c *conn, attacker *mobState, dmg float64, now float64) {
 	hs := c.huntState
 	if len(hs.defenseProcs) == 0 {
 		return
@@ -1816,17 +2059,11 @@ func (s *Server) runDefenseProcsLocked(c *conn, attacker *mobState, now float64)
 		if rand.Float64() >= pr.chance.At(level) {
 			continue
 		}
-		ctx := opCtx{slot: pr.slot, level: level, target: attacker, px: px, py: py, hasPos: true}
+		// dmgIn carries the size of the blow that triggered the proc, so an op can heal
+		// for the damage just taken (Nerlag's «Прилив крови»: OpHeal with Value2>0).
+		ctx := opCtx{slot: pr.slot, level: level, target: attacker, px: px, py: py, hasPos: true, dmgIn: dmg}
 		s.applyOpsLocked(c, pr.ops, ctx, now)
 	}
-}
-
-// procOnDamaged reports whether a passive's OpProc fires on taking damage (rather than
-// on hitting). Hand-maintained by prefab+slot -- the trigger mode is a semantic of the
-// skill, not present in the data. Titanid's «Каменная кожа» (slot 3) is the one such
-// passive: it stacks armor as he is struck.
-func procOnDamaged(prefab string, slot int) bool {
-	return prefab == "Avtr_Tank_Titanid" && slot == 3
 }
 
 func (s *Server) stopAttackLocked(c *conn, silent bool) {
@@ -1891,6 +2128,21 @@ func (s *Server) hitMobLocked(c *conn, ms *mobState, dmg float64, damager int32)
 
 // hitMobFlagsLocked is hitMobLocked with an explicit RECEIVE_HIT flags value (2 =
 // crit, so the client plays its CritStrikeEffect over the impact).
+// armorMultLocked is the damage multiplier a hit on ms suffers from its physical armor
+// (shared armor/(armor+50) curve), after the attacker's armor penetration chips positive
+// armor toward 0. Velial's «Трибунал» can push armor negative -> multiplier > 1
+// (amplified). Factored out so OpExecute can pre-divide by it to deal an exactly-lethal
+// blow (a clean "remaining HP" number, not an overkill).
+func (s *Server) armorMultLocked(c *conn, ms *mobState, damager int32, now float64) float64 {
+	armor := ms.physArmor(now)
+	if armor > 0 {
+		if pen := s.attackerArmorPenLocked(c, damager, now); pen > 0 {
+			armor = math.Max(0, armor-pen)
+		}
+	}
+	return armorMitigation(armor)
+}
+
 func (s *Server) hitMobFlagsLocked(c *conn, ms *mobState, dmg float64, damager int32, flags int32) {
 	if ms.dead {
 		return
@@ -1905,14 +2157,14 @@ func (s *Server) hitMobFlagsLocked(c *conn, ms *mobState, dmg float64, damager i
 	// takes AMPLIFIED damage (armorMitigation > 1). Zero-armor mobs (most trash) get a 1.0
 	// multiplier -- damage lands in full, exactly as before armor existed.
 	now := float64(s.battleTime())
-	armor := ms.physArmor(now)
-	if armor > 0 {
-		if pen := s.attackerArmorPenLocked(c, damager, now); pen > 0 {
-			armor = math.Max(0, armor-pen)
-		}
+	dmg *= s.armorMultLocked(c, ms, damager, now)
+	// A leashed mob walking home ignores the hit for AGGRO purposes -- it still takes
+	// the damage (a fleeing mob can be finished off) but won't turn around to fight
+	// until it has reset at spawn. Without this, a ranged hit would pre-arm aggro that
+	// fires the instant the mob reaches home, defeating the evade.
+	if !ms.returning {
+		ms.aggro = true
 	}
-	dmg *= armorMitigation(armor)
-	ms.aggro = true
 	ms.hp -= dmg
 	s.broadcastObjLocked(c, ms.id, battleproto.CmdReceiveHit, amf.NewArray().
 		Set("object", ms.id).
@@ -1957,6 +2209,9 @@ func (s *Server) hitMobFlagsLocked(c *conn, ms *mobState, dmg float64, damager i
 	// On-kill heal (Cerber's «Кровавый пир»): the killer restores a fraction of the
 	// slain enemy's max HP, capped.
 	s.applyHealOnKillLocked(killer, ms, float64(s.battleTime()))
+	// On-kill attack stacks (Gellar's souls / Hekata's kill-window): bank the kill so the
+	// killer's base attack grows.
+	s.applyOnKillStacksLocked(killer, float64(s.battleTime()))
 	// Loot: a ground chest with a single random consumable, shared party-wide
 	// loot rights. Bosses always drop; trash rolls a flat 1-in-N chance.
 	if s.rollDropLocked(c, ms) {

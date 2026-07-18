@@ -773,6 +773,20 @@ const (
 // a region regardless of common/elite tier).
 var demonFamily = []int{mobDemon, mobDemonRange, mobDemonMeleeElite, mobDemonRangeElite}
 
+// IsBoss reports whether a roster index is one of the eight named bosses -- the crypt
+// ladder (Elgorm/Velial/Cerber/Hekata) and the jungle ladder (Grimlok/Titanid/Fairy/
+// Anhel). Unlike the battle server's runtime `len(Mob.Skills) > 0` test, this also
+// covers the four jungle bosses, which ship no BossSkill list. The battle server uses
+// it to give a boss a much tighter spawn-leash than trash (it must hold its arena).
+func IsBoss(mobIdx int) bool {
+	switch mobIdx {
+	case mobBossElgorm, mobBossVelial, mobBossCerber, mobBossHekata,
+		mobBossGrimlok, mobBossTitanid, mobBossFairy, mobBossAnhel:
+		return true
+	}
+	return false
+}
+
 // Mobs returns the mob roster; index is the per-map spawn reference.
 func Mobs() []Mob { return mobs }
 
@@ -881,23 +895,77 @@ func nearestRegion(regions []dungeonRegion, wx, wy float64) (dungeonRegion, int)
 	return r, ri
 }
 
+// regionLevelAt returns a SMOOTHLY interpolated mob level for a pack at (wx,wy): the
+// nearest region's band, distance-blended toward whichever of its two ROUTE-adjacent
+// anchors (prev/next in the region list) is geographically closer. A pack sitting between
+// two zones on the same trail takes an intermediate level instead of snapping to the
+// nearer anchor's whole band -- so the level rises ~1 at a time along a trail rather than
+// jumping by the full band gap when nearestRegion flips (the "+5 сразу" the player saw).
+//
+// Blending with the ROUTE neighbour (not the geometric second-nearest) is what keeps the
+// ramp well-behaved: the region lists run start->deep, so a route neighbour is a same-trail
+// band one step away, never a distant high-level zone whose Voronoi cell happens to abut
+// the entrance (which is how the geometric blend pulled starter ghouls up to level 5). It
+// also keeps the entrance low (its only neighbour is another low band) and works for the
+// branching jungle (the CLOSER of the two list neighbours is the same-trail one).
+//
+// The CREATURE POOL still comes from nearestRegion; only the level number is smoothed.
+// Bounded between the nearest band and its closer route-neighbour's band (never below 1).
+func regionLevelAt(regions []dungeonRegion, wx, wy float64) int {
+	if len(regions) == 1 {
+		return regions[0].level
+	}
+	r, ri := nearestRegion(regions, wx, wy)
+	d0 := math.Hypot(wx-r.x, wy-r.y)
+	if d0 < 1e-6 { // sitting on an anchor: take its band exactly
+		return r.level
+	}
+	// The closer of the two route-adjacent anchors (list index +-1).
+	nb, nbD := -1, math.Inf(1)
+	for _, j := range []int{ri - 1, ri + 1} {
+		if j < 0 || j >= len(regions) {
+			continue
+		}
+		if d := math.Hypot(wx-regions[j].x, wy-regions[j].y); d < nbD {
+			nbD, nb = d, j
+		}
+	}
+	if nb < 0 {
+		return r.level
+	}
+	// Inverse-distance blend of the nearest band and the closer route-neighbour's band:
+	// (Lr*nbD + Lnb*d0)/(d0+nbD) -- the nearer anchor dominates, equal at the midpoint.
+	lvl := (float64(r.level)*nbD + float64(regions[nb].level)*d0) / (d0 + nbD)
+	n := int(math.Round(lvl))
+	if n < 1 {
+		n = 1
+	}
+	return n
+}
+
 func dungeonRegions() []dungeonRegion {
 	return []dungeonRegion{
 		// Pools mix races (ghoul/skeleton/zombie/demon) so a pack is a MOTLEY band, not
 		// a monoculture -- except demons stay TERRITORIAL: concentrated at Velial's lair
 		// and the Cerber->Hekata half (per the original demon-placement spec). The base
 		// ghoul is confined to the two level-1 entrance regions (starter 80 HP / 6 coins).
-		{493, 64, 1, []int{mobGhoul, mobGhoul, mobGhoulPossessed}},                                                        // spawn mouth (ghouls)
-		{455, 117, 1, []int{mobGhoul, mobSkeleton, mobGhoulPossessed, mobSkeletonArcher}},                                 // first corridor (ghoul+skel)
-		{384, 140, 3, []int{mobSkeleton, mobSkeletonHewer, mobZombieSoldier, mobSkeletonArcher, mobSkeletonBurning}},      // toward Elgorm
-		{304, 121, 5, []int{mobSkeletonWarrior, mobSkeletonBerserk, mobZombie, mobSkeletonSniper, mobZombieSoldier}},      // Elgorm's hall
-		{389, 328, 8, []int{mobZombie, mobSkeleton, mobZombieBigElite, mobSkeletonArcher, mobZombieSoldierElite}},         // mid (CP3)
-		{486, 306, 10, []int{mobDemon, mobDemonMeleeElite, mobZombieSoldierElite, mobDemonRange, mobZombieBigElite}},      // Velial's lair (demons)
-		{306, 444, 12, []int{mobZombieBigElite, mobDemon, mobSkeletonBerserk, mobZombieSoldierElite, mobDemonMeleeElite}}, // toward Cerber (CP4)
-		{239, 434, 14, []int{mobDemon, mobDemonMeleeElite, mobDemonRange, mobZombieBigElite}},                             // Cerber's gate (demons)
-		{170, 300, 16, []int{mobDemon, mobDemonMeleeElite, mobDemonRange, mobDemonRangeElite, mobZombieSoldierElite}},     // Cerber->Hekata connector (demons)
-		{124, 346, 18, []int{mobDemonMeleeElite, mobSkeletonSniper, mobDemon, mobSkeletonWarrior, mobDemonRangeElite}},    // CP5
-		{120, 212, 20, []int{mobDemonMeleeElite, mobDemonRangeElite, mobDemon, mobSkeletonWarrior, mobZombieBigElite}},    // Hekata's chamber
+		//
+		// NO ELITES: the normal dungeon («Подземный город», map_4_0) spawns only COMMON-tier
+		// mobs -- the "_g" (гневный) elites (Одержимый гуль, Скелет воитель/берсерк/снайпер,
+		// Зомби губитель/ратоборец, Демон захватчик/надзиратель) belong to the GROUP invasion
+		// (map_4_1, invasionRegions41). Difficulty here comes from level scaling, not eliteness.
+		// Guarded by TestNoElitesInNormalDungeon.
+		{493, 64, 1, []int{mobGhoul}},                                                                       // spawn mouth (ghouls)
+		{455, 117, 1, []int{mobGhoul, mobSkeleton, mobSkeletonArcher}},                                      // first corridor (ghoul+skel)
+		{384, 140, 3, []int{mobSkeleton, mobSkeletonHewer, mobZombieSoldier, mobSkeletonArcher, mobSkeletonBurning}}, // toward Elgorm
+		{304, 121, 5, []int{mobSkeleton, mobSkeletonHewer, mobZombie, mobSkeletonArcher, mobZombieSoldier}}, // Elgorm's hall
+		{389, 328, 8, []int{mobZombie, mobSkeleton, mobSkeletonArcher, mobZombieSoldier}},                   // mid (CP3)
+		{486, 306, 10, []int{mobDemon, mobZombieSoldier, mobDemonRange, mobZombie}},                         // Velial's lair (demons)
+		{306, 444, 12, []int{mobZombie, mobDemon, mobSkeletonHewer, mobZombieSoldier}},                      // toward Cerber (CP4)
+		{239, 434, 14, []int{mobDemon, mobDemonRange, mobZombie}},                                           // Cerber's gate (demons)
+		{170, 300, 16, []int{mobDemon, mobDemonRange, mobZombieSoldier}},                                    // Cerber->Hekata connector (demons)
+		{124, 346, 18, []int{mobDemon, mobSkeletonArcher, mobSkeleton, mobDemonRange}},                      // CP5
+		{120, 212, 20, []int{mobDemon, mobDemonRange, mobSkeleton, mobZombie}},                              // Hekata's chamber
 	}
 }
 
@@ -1139,6 +1207,7 @@ func buildPacks(ng *NavGrid, regions []dungeonRegion, reborns []Vec2, bosses []b
 			effRad = 1.0
 		}
 		rg, ri := nearestRegion(regions, cx, cy)
+		lvl := regionLevelAt(regions, cx, cy) // smooth level; POOL still from the nearest region
 		size := dungeonPackSize(rg.level, pi)
 		// Cap the count to what the local clearance can hold at ~1.8m spacing (the
 		// battle server's mobSepRange): otherwise a big pack in a tight corridor would
@@ -1174,7 +1243,7 @@ func buildPacks(ng *NavGrid, regions []dungeonRegion, reborns []Vec2, bosses []b
 				DX:    mx,
 				DY:    my,
 				Abs:   true,
-				Level: rg.level,
+				Level: lvl,
 			})
 			regionCounter[ri]++
 		}

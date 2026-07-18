@@ -30,6 +30,25 @@ var jungleBosses = []struct {
 	{mobBossAnhel, 104.94, 322.66},    // 4 final, N (ranged)
 }
 
+// jungleBurntVillage pins the «Деревенский пожар» cluster: a small band of BURNING SKELETONS
+// (mobSkeletonBurning / Mob_Skeleton_1H_Melee_05 «Горящий скелет») in the central-south pocket
+// just below the central hill (Fairy's arena). These are the only cross-roster creatures in the
+// jungle -- they exist to give the quest «Деревенский пожар» (Map_4_2 Stage2_2 «Уничтожить
+// горящих скелетов в центре карты Заповедные джунгли») a real, correct target instead of counting
+// any mob. Every coord is individually walkable on navGrid42 and sits 54-62m from every boss and
+// 80-88m from spawn -- well outside the arena (dungeonBossClear 39m) and safe (dungeonSpawnClear
+// 26m) rings, so it needs no clearance tuning. Level 2 matches the surrounding terrain tier
+// (regionLevelAt at the pocket), so the burnt village reads as part of the map. Pinned like the
+// bosses (Abs), appended BEFORE them in buildJunglePack42 so the boss pins stay the tail.
+var jungleBurntVillage = []MobSpawn{
+	{Mob: mobSkeletonBurning, DX: -3.71, DY: -44.32, Abs: true, Level: 2},
+	{Mob: mobSkeletonBurning, DX: -0.20, DY: -44.32, Abs: true, Level: 2},
+	{Mob: mobSkeletonBurning, DX: -6.00, DY: -41.40, Abs: true, Level: 2},
+	{Mob: mobSkeletonBurning, DX: -6.00, DY: -47.20, Abs: true, Level: 2},
+	{Mob: mobSkeletonBurning, DX: -1.00, DY: -41.00, Abs: true, Level: 2},
+	{Mob: mobSkeletonBurning, DX: -1.00, DY: -47.60, Abs: true, Level: 2},
+}
+
 // golemGate is the point on the trail to Titanid the user marked: golems (heavy stone
 // guardians) may only spawn FROM here on -- the western Titanid approach. Enforced as a
 // longitude gate west of the gate/Titanid (x -226/-239) but east of Fairy (x -138), so
@@ -140,6 +159,7 @@ func buildJunglePack42() []MobSpawn {
 			effRad = 1.0
 		}
 		rg, ri := nearestRegion(regions, cx, cy)
+		lvl := regionLevelAt(regions, cx, cy) // smooth level; POOL still from the nearest region
 		size := dungeonPackSize(rg.level, pi)
 		if fit := 1 + int((effRad/1.8)*(effRad/1.8)); size > fit {
 			size = fit
@@ -169,9 +189,14 @@ func buildJunglePack42() []MobSpawn {
 			if isGolem(mob) && !golemAllowed(mx, my) {
 				mob = firstNonGolem(rg.pool)
 			}
-			out = append(out, MobSpawn{Mob: mob, DX: mx, DY: my, Abs: true, Level: rg.level})
+			out = append(out, MobSpawn{Mob: mob, DX: mx, DY: my, Abs: true, Level: lvl})
 		}
 	}
+
+	// The pinned «Деревенский пожар» burnt-village cluster (central burning skeletons for the
+	// Map_4_2 Stage2_2 quest). Appended BEFORE the bosses so the four boss pins stay the tail
+	// of the spawn list (TestJungleBossesPinned relies on that ordering).
+	out = append(out, jungleBurntVillage...)
 
 	for _, b := range jungleBosses {
 		out = append(out, MobSpawn{Mob: b.mob, DX: b.x, DY: b.y, Abs: true})

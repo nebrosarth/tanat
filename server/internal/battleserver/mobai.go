@@ -28,6 +28,15 @@ const (
 	mobAggroRange = 9.0  // mobs turn hostile inside this radius
 	mobLeashRange = 22.0 // and give up beyond this distance from the player
 
+	// Spawn leash: a homed mob may not stray more than this from its OWN spawn point while
+	// chasing (independent of the player-relative mobLeashRange -- whichever trips first
+	// wins). A boss is pinned to its arena so it cannot be kited away (2m, user spec «у
+	// боссов радиус 2 метра»); regular trash may roam roughly a pack's width before it
+	// turns back. Past it the mob gives up and walks home, and does not re-aggro until it
+	// is back within the radius, so it does not thrash at the edge.
+	bossSpawnLeash = 2.0
+	mobSpawnLeash  = 12.0
+
 	// mobReturnRegenPerSec is how fast a leashed mob heals while walking home, as a
 	// fraction of its max HP per second. At ~40%/s a full reset takes ~2.5s, which
 	// comfortably tops it off over the walk back from leash range so it arrives (and
@@ -85,7 +94,7 @@ const (
 	// pack falls under threshold and goes silent. mobSidestepFrac is the reduced speed of
 	// that shuffle -- it reads as a shuffle, not a charge, and does not outrun the strike.
 	// One rule, shared by both drivers (Hunt's in-range arm and «Штурм»'s).
-	mobSepStep     = 0.5
+	mobSepStep      = 0.5
 	mobSidestepFrac = 0.6
 
 	// mobArrowSpeed is a ranged mob's projectile speed (world units/sec) used to size
@@ -117,6 +126,16 @@ const (
 
 	respawnDelay = 6.0 // seconds from death to revive
 	corpseHide   = 3.0 // seconds from death to SYNC-remove (death anim shows)
+
+	// Fountain regen: a LIVING player standing near their respawn point (base/checkpoint)
+	// recovers fast, ON TOP of the normal trickle. «Штурм» (DOTA) heals a big fraction of
+	// max per second so a player who walks back to base is topped off in ~2s (a MOBA
+	// fountain); «Охота» gives a flat +10 HP/s, +5 mana/s at a checkpoint. NOT applied in
+	// «Арена» -- its respawn points are transient combat spawns, not a safe base.
+	fountainRegenRadius    = 8.0  // within this of the respawn point to get the bonus
+	dotaFountainFracPerSec = 0.5  // «Штурм»: +50% of max HP/mana per second (~2s to full)
+	huntFountainHPPerSec   = 10.0 // «Охота»: +10 HP/sec
+	huntFountainManaPerSec = 5.0  // «Охота»: +5 mana/sec
 
 	// Mob respawn: every creature (trash and boss) revives mobRespawnDelay after
 	// death at its authored spawn point, so the location can be farmed. The corpse
@@ -196,11 +215,11 @@ type summonState struct {
 	// owner's own order state does not survive: hs.attackTarget clears the moment their
 	// target dies and c.hasDest clears the moment THEY arrive -- while the pet, slower
 	// and further back, is still walking. The pet owns its orders.
-	pet       bool
-	slot      int
-	ordTarget int32 // enemy the owner ordered it onto (0 = none)
+	pet        bool
+	slot       int
+	ordTarget  int32 // enemy the owner ordered it onto (0 = none)
 	ordX, ordY float32
-	ordMove   bool // walking to an ordered ground point
+	ordMove    bool // walking to an ordered ground point
 
 	pf pathState // routed chase waypoints when the straight line is wall-blocked
 }
@@ -385,23 +404,53 @@ func (s *Server) memberTickLocked(c *conn, now float64) {
 
 	// 10. Regen -- every combat tick, proportional to elapsed time, so the
 	// bar creeps up smoothly instead of jumping once every couple seconds
-	// (matches the mob leash-return regen below).
+	// (matches the mob leash-return regen below). A living player standing on their
+	// respawn point (base/checkpoint) adds a FOUNTAIN bonus on top -- fast in «Штурм»,
+	// a flat +10 HP/s +5 mana/s in «Охота».
 	if hs.deadUntil == 0 {
 		dt := tickInterval.Seconds()
 		var types []uint64
 		maxHP := hs.maxHPLocked(now)
+		maxMana := hs.maxManaLocked(now)
+		hpRate := hs.av.HealthRegen + hs.st.modSum(now, "hp_regen")
+		manaRate := hs.av.ManaRegen + hs.st.modSum(now, "mana_regen")
+		if s.atRespawnFountainLocked(c, now) {
+			switch {
+			case c.inst != nil && c.inst.dota != nil: // «Штурм» base fountain: ~2s to full
+				hpRate += maxHP * dotaFountainFracPerSec
+				manaRate += maxMana * dotaFountainFracPerSec
+			case c.inst == nil || c.inst.arena == nil: // «Охота» checkpoint (never «Арена»)
+				hpRate += huntFountainHPPerSec
+				manaRate += huntFountainManaPerSec
+			}
+		}
 		if hs.hp < maxHP {
-			hs.hp = math.Min(maxHP, hs.hp+dt*(hs.av.HealthRegen+hs.st.modSum(now, "hp_regen")))
+			hs.hp = math.Min(maxHP, hs.hp+dt*hpRate)
 			types = append(types, syncHealth)
 		}
-		if maxMana := hs.maxManaLocked(now); hs.mana < maxMana {
-			hs.mana = math.Min(maxMana, hs.mana+dt*(hs.av.ManaRegen+hs.st.modSum(now, "mana_regen")))
+		if hs.mana < maxMana {
+			hs.mana = math.Min(maxMana, hs.mana+dt*manaRate)
 			types = append(types, syncMana)
 		}
 		if len(types) > 0 {
 			s.syncSelfLocked(c, types...)
 		}
 	}
+}
+
+// atRespawnFountainLocked reports whether a LIVING player is standing near their respawn
+// point -- the active checkpoint / team base (hs.respawnX/Y, kept current by
+// tickRebornLocked), falling back to the map spawn before any checkpoint is reached.
+// Drives the fountain regen bonus.
+func (s *Server) atRespawnFountainLocked(c *conn, now float64) bool {
+	hs := c.huntState
+	hx, hy := hs.respawnX, hs.respawnY
+	if hx == 0 && hy == 0 {
+		sx, sy := hs.m.Spawn()
+		hx, hy = float32(sx), float32(sy)
+	}
+	px, py := c.posAtLocked(float32(now))
+	return math.Hypot(float64(px-hx), float64(py-hy)) <= fountainRegenRadius
 }
 
 // ---- player status upkeep ----
@@ -1421,8 +1470,27 @@ func (s *Server) closeMobSwingLocked(c *conn, m *mobState, now float64) {
 // Shared by the Hunt mob pass (tickMobsLocked) and the «Штурм» tick, which replaces that
 // pass wholesale: without this, statuses on a lane creep never expired (a stun's VFX
 // hung on it forever), DoTs never bled it, and its swing was never closed out.
+const (
+	// Ranged mobs and bosses carry a mana pool (mobState.maxMana); melee trash has none.
+	// mobRangedManaCost is spent per ranged basic-attack shot, bossSkillManaCost per boss
+	// skill cast. Regen (mobManaRegenFrac of the pool per second) comfortably outpaces a
+	// mob's own steady spend, so a mob never self-starves -- only a player's active
+	// mana-drain / mana-burn skill can, which is exactly the tactical window those skills
+	// promise. defaultRangedMana/defaultBossMana back-fill unauthored pools.
+	mobRangedManaCost = 6.0
+	bossSkillManaCost = 25.0
+	mobManaRegenFrac  = 0.06
+	defaultRangedMana = 120.0
+	defaultBossMana   = 320.0
+)
+
 func (s *Server) mobUpkeepLocked(c *conn, m *mobState, now float64) bool {
 	st := &m.st
+
+	// Mana regen for the ranged/boss pool (private server-side resource; no client bar).
+	if m.maxMana > 0 && m.mana < m.maxMana {
+		m.mana = math.Min(m.maxMana, m.mana+m.maxMana*mobManaRegenFrac*tickInterval.Seconds())
+	}
 
 	// Status fx expiry (world-scoped: ended on every viewer).
 	if st.stunFx != 0 && now >= st.stunUntil {
@@ -1445,6 +1513,10 @@ func (s *Server) mobUpkeepLocked(c *conn, m *mobState, now float64) bool {
 	if st.silenceFx != 0 && now >= st.silenceUntil {
 		s.worldFxEndLocked(c, st.silenceFx)
 		st.silenceFx = 0
+	}
+	if st.chillFx != 0 && now >= st.chillUntil {
+		s.worldFxEndLocked(c, st.chillFx)
+		st.chillFx = 0
 	}
 	var expMods []statMod
 	for _, mod := range st.mods {
@@ -1512,6 +1584,16 @@ func (s *Server) mobUpkeepLocked(c *conn, m *mobState, now float64) bool {
 // ticker (c is any live member -- all members share the mob set, nav and roster).
 // Mobs target the nearest party member and every visual is broadcast to all
 // viewers. With one member it is the old single-player pass, unchanged.
+// mobSpawnLeashRadius is how far a homed mob may stray from its spawn before it turns
+// back: a boss is pinned to its arena (bossSpawnLeash), everything else roams wider
+// (mobSpawnLeash).
+func mobSpawnLeashRadius(m *mobState) float64 {
+	if m.boss {
+		return bossSpawnLeash
+	}
+	return mobSpawnLeash
+}
+
 func (s *Server) tickMobsLocked(c *conn, now float64) {
 	hs := c.huntState
 	dt := tickInterval.Seconds()
@@ -1536,6 +1618,13 @@ func (s *Server) tickMobsLocked(c *conn, now float64) {
 
 		if !s.mobUpkeepLocked(c, m, now) {
 			continue // a DoT tick finished it off
+		}
+
+		// Knockback glide owns the mob until it lands: the shove already moved its
+		// authoritative position and broadcast a client-side glide there, so hold every
+		// AI/stun gate off it until the window elapses (then the stop is broadcast).
+		if m.kbUntil > 0 && s.advanceKnockbackLocked(c, m, now) {
+			continue
 		}
 
 		// Dead-reckon our copy of the mob position, clamped to walkable ground so
@@ -1598,17 +1687,17 @@ func (s *Server) tickMobsLocked(c *conn, now float64) {
 			continue
 		}
 
-		// Leashed and walking home: regenerate and steer back to spawn, ignoring the
-		// world -- UNLESS a member has come back inside aggro range, which cancels the
-		// retreat and re-engages (with whatever HP the mob has regained by now).
+		// Leashed and walking home: regenerate and steer back to spawn, IGNORING the
+		// world entirely (WoW-style evade). A returning mob may not be re-aggroed --
+		// not by a player stepping back into range, nor by being hit (hitMobFlagsLocked
+		// skips the aggro flag while returning) -- until it actually reaches spawn.
+		// returnHomeStepLocked clears m.returning at mobHomeEpsilon, and the normal
+		// aggro gate below picks it up FRESH on the next tick only if a target is still
+		// in range. This stops a leashed mob (or kited boss) from being dragged right
+		// back out the instant it turns for home.
 		if m.returning {
-			if t := mobTargetLocked(m, members, now); t.obj != 0 && t.dist <= mobAggroRange {
-				m.returning = false
-				m.aggro = true
-			} else {
-				s.returnHomeStepLocked(c, m, now)
-				continue
-			}
+			s.returnHomeStepLocked(c, m, now)
+			continue
 		}
 
 		// Target: the nearest of every party member's avatar and their summons.
@@ -1624,7 +1713,11 @@ func (s *Server) tickMobsLocked(c *conn, now float64) {
 				continue
 			}
 		}
-		if dist > mobLeashRange || tgt.obj == 0 {
+		// Strayed too far from its OWN spawn (boss pinned to 2m, trash to mobSpawnLeash):
+		// give up and walk home even if a player is still right next to it, so a boss can't
+		// be dragged out of its arena. Only homed mobs have a spawn to leash to.
+		strayed := m.homed && math.Hypot(float64(m.x-m.spawnX), float64(m.y-m.spawnY)) > mobSpawnLeashRadius(m)
+		if dist > mobLeashRange || tgt.obj == 0 || strayed {
 			// Gave up: nobody (avatar or summon) is in reach. Walk back to spawn and
 			// regenerate to full instead of freezing wherever the chase ended -- the
 			// early returning branch above drives it home on subsequent ticks.
@@ -1723,6 +1816,16 @@ func (s *Server) tickMobsLocked(c *conn, now float64) {
 		}
 		atkSpeed := m.mob.AttackSpeed * st.attackFactor(now)
 		if now >= m.nextSwing && atkSpeed > 0 {
+			// A ranged mob pays mana per shot; a starved caster/archer can't loose one and
+			// waits for regen (melee mobs have maxMana 0 and skip this). This is the tactical
+			// bite of the player's mana-drain / mana-burn skills (Neirofim, BlackDragon).
+			if m.mob.AttackRange > 0 && m.maxMana > 0 && m.mana < mobRangedManaCost {
+				m.nextSwing = now + 0.5
+				continue
+			}
+			if m.mob.AttackRange > 0 && m.maxMana > 0 {
+				m.mana -= mobRangedManaCost
+			}
 			m.nextSwing = now + 1/atkSpeed
 			target := tgt.obj
 			s.broadcastObjLocked(c, m.id, battleproto.CmdAction,
@@ -2021,6 +2124,7 @@ func (m *mobState) resetToSpawn() {
 	m.x, m.y = m.spawnX, m.spawnY
 	m.vx, m.vy = 0, 0
 	m.hp = m.maxHealth()
+	m.mana = m.maxMana // ranged/boss mana tops off with HP at home
 	m.aggro = false
 	m.returning = false
 	m.st = unitStatus{}
@@ -2036,6 +2140,7 @@ func (s *Server) respawnMobLocked(c *conn, m *mobState, now float64) {
 	m.dead = false
 	m.respawnAt = 0
 	m.hp = m.maxHealth()
+	m.mana = m.maxMana // full mana on respawn
 	m.x, m.y = m.spawnX, m.spawnY
 	m.vx, m.vy = 0, 0
 	m.aggro = false
@@ -2178,6 +2283,9 @@ func (s *Server) tryBossSkillLocked(c *conn, m *mobState, members []*conn, now f
 	if len(m.mob.Skills) == 0 || m.skillHitAt > 0 {
 		return false
 	}
+	if now < m.st.silenceUntil {
+		return false // a silenced boss (Neirofim's «Молчание») can't cast
+	}
 	tgt, dist, px, py := nearestMemberLocked(members, m, now)
 	if tgt == nil {
 		return false // no target: the whole party is down
@@ -2189,6 +2297,15 @@ func (s *Server) tryBossSkillLocked(c *conn, m *mobState, members []*conn, now f
 		sk := m.mob.Skills[i]
 		if now < m.skillReady[i] || dist > sk.Range {
 			continue
+		}
+		// A boss pays mana to cast; a mana-starved boss (drained by Neirofim/Inshari) can't
+		// and falls back to basic attacks. Bosses regen fast enough to self-sustain, so this
+		// only bites under active player mana pressure.
+		if m.maxMana > 0 && m.mana < bossSkillManaCost {
+			continue
+		}
+		if m.maxMana > 0 {
+			m.mana -= bossSkillManaCost
 		}
 		m.skillReady[i] = now + sk.Cooldown
 		// Play an attack animation (reuse the boss's attack action) turned to the
@@ -2313,6 +2430,18 @@ func (s *Server) hitPlayerFromLocked(c *conn, damagerID int32, dmg float64, now 
 	if dmg <= 0 {
 		return
 	}
+	// Rognar's «Канал смерти»: forward a share of the blow to the linked unit -- as magic
+	// damage to a linked enemy, or as healing to a linked friend.
+	if hs.deathLinkObj != 0 && now < hs.deathLinkUntil && hs.deathLinkFrac > 0 {
+		share := dmg * hs.deathLinkFrac
+		if hs.deathLinkAlly {
+			if a := c.friendlyMember(hs.deathLinkObj); a != nil {
+				s.healPlayerLocked(a, share)
+			}
+		} else if lm := hs.mobs[hs.deathLinkObj]; lm != nil && !lm.dead {
+			s.hitMobLocked(c, lm, share, c.objID)
+		}
+	}
 	hs.hp -= dmg
 	s.broadcastAvatarObjLocked(c, battleproto.CmdReceiveHit, amf.NewArray().
 		Set("object", c.objID).
@@ -2332,7 +2461,14 @@ func (s *Server) hitPlayerFromLocked(c *conn, damagerID int32, dmg float64, now 
 	// «Каменная кожа»-style defensive procs harden the avatar when it is struck (and
 	// survives) -- rolled here, on the incoming-damage path, not on the attack path.
 	// thornsMob is nil in PvP: a self-buff proc still fires, a retaliate proc no-ops.
-	s.runDefenseProcsLocked(c, thornsMob, now)
+	s.runDefenseProcsLocked(c, thornsMob, dmg, now)
+	// Rognar's «Костяной щит» counts down its hits and detonates on the third.
+	if hs.shieldExplodeSlot != 0 {
+		hs.shieldHitsLeft--
+		if hs.shieldHitsLeft <= 0 {
+			s.explodeBoneShieldLocked(c, now)
+		}
+	}
 }
 
 func (s *Server) hitSummonLocked(c *conn, m *mobState, sm *summonState, dmg float64, now float64) {
@@ -2452,6 +2588,15 @@ func (s *Server) playerDieLocked(c *conn, killer int32, now float64) {
 	hs.deadUntil = now + respawnDelay
 	hs.diedAt = now
 	hs.corpseHidden = false
+
+	// Gellar's «Порабощение»: «При смерти теряет половину из накопленных душ». Death also
+	// cleanses Hekata's kill-window (its +30% buff is dropped with the other timed mods
+	// below, so the on-kill bonus should end with it).
+	if hs.soulSlot != 0 {
+		hs.soulStacks /= 2
+	}
+	hs.killWindowUntil = 0
+	hs.killWindowStacks = 0
 
 	s.cancelOrderLocked(c)
 	hs.channels = nil

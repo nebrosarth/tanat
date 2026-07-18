@@ -125,10 +125,25 @@ func newHuntInstance(s *Server, id, mapID int32) *huntInstance {
 			// when a player respawns on top of it, and revives here on its timer.
 			// «Штурм» creeps set this false -- see mobState.homed.
 			homed: true,
+			boss:  gamedata.IsBoss(sp.Mob),
 			level: lvl,
 		}
 		ms.maxHP, ms.dmgMin, ms.dmgMax, ms.xp, ms.coins = mobT.ScaledStats(lvl)
 		ms.hp = ms.maxHP
+		// Mana pool: ranged mobs (AttackRange>0) and bosses only -- melee trash stays at 0.
+		// Prefer the authored Mob.Mana (skeleton archers carry 150/200); fall back to a
+		// sensible default so unauthored casters/bosses still have something to drain.
+		if mobT.AttackRange > 0 || ms.boss {
+			ms.maxMana = mobT.Mana
+			if ms.maxMana <= 0 {
+				if ms.boss {
+					ms.maxMana = defaultBossMana
+				} else {
+					ms.maxMana = defaultRangedMana
+				}
+			}
+			ms.mana = ms.maxMana
+		}
 		if len(mobT.Skills) > 0 {
 			ms.skillReady = make([]float64, len(mobT.Skills))
 		}

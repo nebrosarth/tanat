@@ -61,8 +61,11 @@ var map00 = ArenaMap{
 	Scene:      "map_0_0",
 	LevelMin:   1,
 	LevelMax:   20,
-	Desc:       "Арена — бой насмерть. Сражайтесь с другими игроками до предела фрагов.",
-	WinDesc:    "Наберите больше фрагов, чем противник.",
+	// Desc/WinDesc are locale KEYS too: SelectGameMenu resolves them via GetLocaleText
+	// (:92-93), so a literal string renders "EMPTY!" in the card's history/win-condition
+	// detail panel. Map_0_0_Desc/WinDesc are the baked keys for scene map_0_0.
+	Desc:       "Map_0_0_Desc",
+	WinDesc:    "Map_0_0_WinDesc",
 	MinPlayers: 1,
 	MaxPlayers: 10,
 	FragLimit:  20,

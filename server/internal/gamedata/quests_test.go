@@ -80,9 +80,6 @@ func TestQuestMapsValid(t *testing.T) {
 		if q.Money <= 0 || q.Exp <= 0 {
 			t.Errorf("quest %s reward money=%d exp=%d, both must be > 0", q.Key, q.Money, q.Exp)
 		}
-		if q.NpcID != questGiverNpcID {
-			t.Errorf("quest %s giver = %d, want %d", q.Key, q.NpcID, questGiverNpcID)
-		}
 	}
 }
 
@@ -122,13 +119,43 @@ func TestQuestNpcsResolve(t *testing.T) {
 			if n.Race != 0 && n.Race != race {
 				t.Errorf("race %d got wrong-race npc %d (race %d)", race, n.ID, n.Race)
 			}
-			if n.ID == questGiverNpcID {
+			if n.ID == QuestGiverNpcID(race) {
 				giverQuests = len(n.QuestIDs)
 			}
 		}
 		if giverQuests != len(Quests()) {
 			t.Errorf("race %d quest-giver offers %d quests, want %d", race, giverQuests, len(Quests()))
 		}
+	}
+}
+
+// TestQuestNpcIdsMatchScene pins npc|list's ids to the baked NPCSelector.mNPC values in the
+// cs_human / cs_elf scene bundles. The client's OnNpcClicked matches a clicked square NPC to
+// npc|list by this id, so a drift here silently reverts bug "clicking a quest NPC shows
+// «...в городе вашей расы»" -- every click would fall through to GUI_ANOTHER_NPC.
+func TestQuestNpcIdsMatchScene(t *testing.T) {
+	want := map[int32]map[int32]bool{
+		1: {npcHumanGiver: true, npcHumanLore: true, npcHumanNeutral: true}, // {4,3,9}
+		2: {npcElfGiver: true, npcElfLore: true, npcElfNeutral: true},       // {8,7,10}
+	}
+	for race, wantIDs := range want {
+		got := map[int32]bool{}
+		for _, n := range QuestNpcsForRace(race) {
+			got[n.ID] = true
+		}
+		if len(got) != len(wantIDs) {
+			t.Errorf("race %d npc ids = %v, want %v", race, got, wantIDs)
+		}
+		for id := range wantIDs {
+			if !got[id] {
+				t.Errorf("race %d missing baked npc id %d", race, id)
+			}
+		}
+	}
+	// The two squares' neutral NPCs are DIFFERENT baked ids, so a hero never sees the other
+	// square's ids (which is what still, correctly, yields GUI_ANOTHER_NPC in the wrong city).
+	if npcHumanNeutral == npcElfNeutral {
+		t.Error("human and elf neutral NPCs must have distinct baked ids")
 	}
 }
 

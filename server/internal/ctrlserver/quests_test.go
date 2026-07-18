@@ -27,6 +27,15 @@ func questReq(sessKey string, action string, questID int32) ctrlproto.Request {
 	return ctrlproto.Request{Object: "quest", Action: action, Params: p, SessKey: sessKey}
 }
 
+// questKillIdx returns a mob roster index that credits quest q (its first authored target, or
+// any mob for an AnyMob quest).
+func questKillIdx(q gamedata.Quest) int {
+	if q.AnyMob || len(q.Targets) == 0 {
+		return 0
+	}
+	return q.Targets[0]
+}
+
 // driveToDone accepts questID and advances it to DONE via the store kill path.
 func driveToDone(t *testing.T, srv *Server, uid int32, q gamedata.Quest) {
 	t.Helper()
@@ -34,7 +43,7 @@ func driveToDone(t *testing.T, srv *Server, uid int32, q gamedata.Quest) {
 		t.Fatal("AcceptQuest failed")
 	}
 	for i := int32(0); i < q.Count; i++ {
-		srv.Store.AddQuestKill(uid, q.MapID)
+		srv.Store.AddQuestKill(uid, q.MapID, questKillIdx(q))
 	}
 }
 
@@ -50,7 +59,7 @@ func TestNpcListRaceScoped(t *testing.T) {
 	if !ok || len(npcs.Assoc) == 0 {
 		t.Fatal("npc|list returned no NPCs for an Elf hero")
 	}
-	giver, ok := npcs.Assoc[strconv.Itoa(int(gamedata.QuestGiverNpcID()))].(*amf.MixedArray)
+	giver, ok := npcs.Assoc[strconv.Itoa(int(gamedata.QuestGiverNpcID(2)))].(*amf.MixedArray)
 	if !ok {
 		t.Fatal("quest-giver NPC missing from npc|list")
 	}
@@ -139,7 +148,7 @@ func TestQuestDonePaysRewardOnce(t *testing.T) {
 
 	// Drive to DONE, then turn in.
 	for i := int32(0); i < q.Count; i++ {
-		srv.Store.AddQuestKill(uid, q.MapID)
+		srv.Store.AddQuestKill(uid, q.MapID, questKillIdx(q))
 	}
 	moneyBefore, _, _ := srv.Store.HeroMoney(uid)
 	lvlBefore, expBefore, _, _ := srv.Store.AddHeroExp(uid, 0)

@@ -40,9 +40,22 @@ const (
 	QuestStatusClosed       int32 = 3
 )
 
-// questGiverNpcID is NPC1, the single quest-giver in both race squares (all 103 PvE quests are
-// keyed NPC1_PVE_*). NPC2 and the neutral NPC carry lore but offer no quests.
-const questGiverNpcID int32 = 1
+// Baked central-square NPC ids: the NPCSelector.mNPC values the cs_human / cs_elf scene bundles
+// ship (extracted with UnityPy). The client's OnNpcClicked (CentralSquareScreen.cs) matches a
+// clicked square NPC to the npc|list roster BY THIS ID, so npc|list MUST echo the scene's ids
+// exactly -- otherwise every click falls through to the "wrong NPC" dialog (GUI_ANOTHER_NPC:
+// «Персонажи, которые могут дать вам задания, находятся в городе вашей расы»). The quest-giver,
+// the lore NPC and even the neutral NPC each have a DIFFERENT id per square, so there is no
+// single giver id -- it is race-scoped. (The old code advertised 1/2/3, which match nothing in
+// either scene, so NO quest NPC was ever clickable in either city.)
+const (
+	npcHumanGiver   int32 = 4  // Npc_Human_01: the quest hub (offers every PvE quest)
+	npcHumanLore    int32 = 3  // Npc_Human_02: lore, no quests
+	npcHumanNeutral int32 = 9  // Npc_Neutral_01 in the human square
+	npcElfGiver     int32 = 8  // Npc_Elf_01: the quest hub
+	npcElfLore      int32 = 7  // Npc_Elf_03: lore, no quests
+	npcElfNeutral   int32 = 10 // Npc_Neutral_01 in the elf square (distinct id from the human one)
+)
 
 // questProgressID is the fixed progress-slot id used for every quest's single objective. The
 // AMF `progress` map and the per-hero cur-progress map are both keyed by it.
@@ -54,16 +67,31 @@ const questReplayCooldown int32 = 3600 // 1 hour
 
 // Quest is one baked PvE quest with its authored mechanics + reward.
 type Quest struct {
-	ID       int32
-	Key      string // stable identity infix (IDS_Quest_<Key>_...)
-	NpcID    int32  // giver NPC
-	MapID    int32  // Hunt map fought on (40/41/42)
+	ID  int32
+	Key string // stable identity infix (IDS_Quest_<Key>_...)
+	// No giver id here: the quest-giver is race-scoped (Npc_Human_01=4 / Npc_Elf_01=8), and
+	// the client associates quests to an NPC via that NPC's own QuestIDs list in npc|list,
+	// not via a per-quest giver field. See questNpcs / QuestGiverNpcID.
+	MapID int32 // Hunt map fought on (40/41/42)
 	Kind     int32  // QuestType (KILL/COLLECT) -- drives the client's category icon
 	PveType  int32  // QuestPvEType (SINGLE/GROUP/REPLAY)
 	Count    int32  // objective count (kills needed on MapID)
 	Money    int32  // gold reward
 	Exp      int32  // persistent-hero experience reward
 	Cooldown int32  // seconds before repeatable (REPLAY only; 0 = one-time)
+
+	// Targets lists the mob roster indices whose death advances this quest -- the
+	// creature(s) the journal text actually names ("10 голодных гулей" -> {mobGhoul}).
+	// A Hunt kill credits the quest iff AnyMob || the slain mob is in Targets, so a
+	// kill quest no longer counts UNRELATED mobs (the reported ghoul-quest bug). The
+	// per-Key mapping is authored in quest_targets.go and attached in init().
+	Targets []int
+	// AnyMob means any Hunt kill on MapID advances the quest, regardless of creature.
+	// Used for the two explicit «убить N любых существ/монстров» quests AND for quests
+	// whose objective is a world interaction we do not simulate (place amulet, bring
+	// gold to a well, cut drums...): there is no creature to gate on, so they stay
+	// completable by fighting on the map. Mutually exclusive with a non-empty Targets.
+	AnyMob bool
 
 	// Locale keys (pre-resolved to non-empty baked values by the generator).
 	NameKey  string
@@ -135,7 +163,6 @@ func init() {
 		q := Quest{
 			ID:       questIDBase + int32(i) + 1,
 			Key:      d.Key,
-			NpcID:    questGiverNpcID,
 			MapID:    d.MapID,
 			Kind:     d.Kind,
 			PveType:  d.PveType,
@@ -152,24 +179,36 @@ func init() {
 		if q.PveType == QuestPveReplay {
 			q.Cooldown = questReplayCooldown
 		}
+		// Attach the per-quest kill targeting (quest_targets.go). A missing entry falls
+		// back to AnyMob so a quest is never silently uncreditable; TestEveryQuestHasTargeting
+		// guarantees the map is complete, so the fallback never fires in practice.
+		if tg, ok := questKillTargets[d.Key]; ok {
+			q.AnyMob = tg.anyMob
+			q.Targets = tg.targets
+		} else {
+			q.AnyMob = true
+		}
 		quests = append(quests, q)
 		questByID[q.ID] = q
 		questsForMap[q.MapID] = append(questsForMap[q.MapID], q)
 	}
 
-	// The quest-giver offers every PvE quest (all are NPC1_PVE_*). Same id in both squares,
-	// race-skinned name/desc/icon.
+	// The quest-giver offers every PvE quest (all are NPC1_PVE_*), race-skinned name/desc/icon.
+	// Ids below are the baked NPCSelector.mNPC values so a clicked square NPC resolves in
+	// npc|list. The neutral NPC is split per square because its scene id differs (9 vs 10).
 	allIDs := make([]int32, len(quests))
 	for i, q := range quests {
 		allIDs[i] = q.ID
 	}
 	questNpcs = []QuestNPC{
-		{ID: 1, Race: 1, NameKey: "IDS_NPC1_Human_Name", DescKey: "IDS_NPC1_Human_Desc", Icon: "npc1_human", NeedShow: true, QuestIDs: allIDs},
-		{ID: 1, Race: 2, NameKey: "IDS_NPC1_Elf_Name", DescKey: "IDS_NPC1_Elf_Desc", Icon: "npc1_elf", NeedShow: true, QuestIDs: allIDs},
-		// Lore NPCs with no quests -- shown so the square's NPC roster matches the baked scene.
-		{ID: 2, Race: 1, NameKey: "IDS_NPC2_Human_Name", DescKey: "IDS_NPC2_Human_Desc", Icon: "npc2_human", NeedShow: true},
-		{ID: 2, Race: 2, NameKey: "IDS_NPC2_Elf_Name", DescKey: "IDS_NPC2_Elf_Desc", Icon: "npc2_elf", NeedShow: true},
-		{ID: 3, Race: 0, NameKey: "IDS_Npc_Neutral_01_Name", DescKey: "IDS_Npc_Neutral_01_Desc", Icon: "npc_event", NeedShow: true},
+		// Human square (cs_human).
+		{ID: npcHumanGiver, Race: 1, NameKey: "IDS_NPC1_Human_Name", DescKey: "IDS_NPC1_Human_Desc", Icon: "npc1_human", NeedShow: true, QuestIDs: allIDs},
+		{ID: npcHumanLore, Race: 1, NameKey: "IDS_NPC2_Human_Name", DescKey: "IDS_NPC2_Human_Desc", Icon: "npc2_human", NeedShow: true},
+		{ID: npcHumanNeutral, Race: 1, NameKey: "IDS_Npc_Neutral_01_Name", DescKey: "IDS_Npc_Neutral_01_Desc", Icon: "npc_event", NeedShow: true},
+		// Elf square (cs_elf).
+		{ID: npcElfGiver, Race: 2, NameKey: "IDS_NPC1_Elf_Name", DescKey: "IDS_NPC1_Elf_Desc", Icon: "npc1_elf", NeedShow: true, QuestIDs: allIDs},
+		{ID: npcElfLore, Race: 2, NameKey: "IDS_NPC2_Elf_Name", DescKey: "IDS_NPC2_Elf_Desc", Icon: "npc2_elf", NeedShow: true},
+		{ID: npcElfNeutral, Race: 2, NameKey: "IDS_Npc_Neutral_01_Name", DescKey: "IDS_Npc_Neutral_01_Desc", Icon: "npc_event", NeedShow: true},
 	}
 }
 
@@ -182,6 +221,23 @@ func QuestByID(id int32) (Quest, bool) {
 	return q, ok
 }
 
+// QuestCreditsKill reports whether slaying mob roster index mobIdx advances quest q.
+// (Map scope is enforced separately by the caller -- a kill must also be on q.MapID.)
+// AnyMob matches any creature; otherwise the slain mob must be one of the quest's
+// authored Targets. This is the gate that stops a «kill 10 ghouls» quest from counting
+// skeletons, spiders, or any other mob.
+func QuestCreditsKill(q Quest, mobIdx int) bool {
+	if q.AnyMob {
+		return true
+	}
+	for _, t := range q.Targets {
+		if t == mobIdx {
+			return true
+		}
+	}
+	return false
+}
+
 // IsQuestID reports whether id names a quest.
 func IsQuestID(id int32) bool {
 	_, ok := questByID[id]
@@ -192,8 +248,15 @@ func IsQuestID(id int32) bool {
 // server to know which accepted quests a kill on that map can advance.
 func QuestsOnMap(mapID int32) []Quest { return questsForMap[mapID] }
 
-// QuestGiverNpcID is NPC1, the id every quest is offered under.
-func QuestGiverNpcID() int32 { return questGiverNpcID }
+// QuestGiverNpcID returns the baked NPCSelector id of the quest-giver in a hero's own square:
+// Npc_Elf_01 (8) for an Elf, Npc_Human_01 (4) otherwise. This is the id the giver is advertised
+// under in npc|list for that race, and the id the client sends when its NPC is clicked.
+func QuestGiverNpcID(race int32) int32 {
+	if race == 2 {
+		return npcElfGiver
+	}
+	return npcHumanGiver
+}
 
 // QuestProgressID is the fixed progress-slot id (both the AMF progress map and the per-hero
 // cur-progress are keyed by it).

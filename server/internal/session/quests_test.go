@@ -26,6 +26,15 @@ func findQuest(t *testing.T, pred func(gamedata.Quest) bool) gamedata.Quest {
 	return gamedata.Quest{}
 }
 
+// killIdx returns a mob roster index that credits quest q (its first authored target, or any
+// mob for an AnyMob quest), so the lifecycle tests below can drive q to completion.
+func killIdx(q gamedata.Quest) int {
+	if q.AnyMob || len(q.Targets) == 0 {
+		return 0
+	}
+	return q.Targets[0]
+}
+
 // TestQuestAcceptProgressComplete walks the whole one-time lifecycle: accept -> kills advance
 // progress -> DONE at the objective count -> CompleteQuest transitions to CLOSED exactly once.
 func TestQuestAcceptProgressComplete(t *testing.T) {
@@ -40,12 +49,12 @@ func TestQuestAcceptProgressComplete(t *testing.T) {
 	if q.MapID == 41 {
 		otherMap = 42
 	}
-	if got := s.AddQuestKill(u.ID, otherMap); len(got) != 0 {
+	if got := s.AddQuestKill(u.ID, otherMap, killIdx(q)); len(got) != 0 {
 		t.Errorf("kill on map %d advanced a map-%d quest", otherMap, q.MapID)
 	}
 	// Kills on the right map advance one step each until DONE.
 	for i := int32(1); i < q.Count; i++ {
-		changed := s.AddQuestKill(u.ID, q.MapID)
+		changed := s.AddQuestKill(u.ID, q.MapID, killIdx(q))
 		if len(changed) != 1 || changed[0].Progress != i {
 			t.Fatalf("kill %d: progress = %+v", i, changed)
 		}
@@ -53,12 +62,12 @@ func TestQuestAcceptProgressComplete(t *testing.T) {
 			t.Fatalf("kill %d flipped status early: %d", i, changed[0].Status)
 		}
 	}
-	final := s.AddQuestKill(u.ID, q.MapID)
+	final := s.AddQuestKill(u.ID, q.MapID, killIdx(q))
 	if len(final) != 1 || final[0].Status != gamedata.QuestStatusDone {
 		t.Fatalf("objective count not DONE: %+v", final)
 	}
 	// Further kills do not overshoot a DONE quest.
-	if got := s.AddQuestKill(u.ID, q.MapID); len(got) != 0 {
+	if got := s.AddQuestKill(u.ID, q.MapID, killIdx(q)); len(got) != 0 {
 		t.Errorf("kill advanced an already-DONE quest: %+v", got)
 	}
 	// CompleteQuest fires once; a second call is rejected (no double reward).
@@ -79,7 +88,7 @@ func TestQuestCannotDoneBeforeObjective(t *testing.T) {
 	s, u := questHero(t)
 	q := findQuest(t, func(q gamedata.Quest) bool { return q.Count >= 2 })
 	s.AcceptQuest(u.ID, q.ID)
-	s.AddQuestKill(u.ID, q.MapID) // 1 of >=2 -> still IN_PROGRESS
+	s.AddQuestKill(u.ID, q.MapID, killIdx(q)) // 1 of >=2 -> still IN_PROGRESS
 	if _, ok := s.CompleteQuest(u.ID, q.ID); ok {
 		t.Error("turned in a quest before its objective was met")
 	}
@@ -113,7 +122,7 @@ func TestQuestCancelCannotReArmClosedReward(t *testing.T) {
 	q := findQuest(t, func(q gamedata.Quest) bool { return !q.Repeatable() })
 	s.AcceptQuest(u.ID, q.ID)
 	for i := int32(0); i < q.Count; i++ {
-		s.AddQuestKill(u.ID, q.MapID)
+		s.AddQuestKill(u.ID, q.MapID, killIdx(q))
 	}
 	if _, ok := s.CompleteQuest(u.ID, q.ID); !ok {
 		t.Fatal("could not complete the one-time quest")
@@ -148,7 +157,7 @@ func TestQuestCancelCannotBypassReplayCooldown(t *testing.T) {
 
 	s.AcceptQuest(u.ID, q.ID)
 	for i := int32(0); i < q.Count; i++ {
-		s.AddQuestKill(u.ID, q.MapID)
+		s.AddQuestKill(u.ID, q.MapID, killIdx(q))
 	}
 	s.CompleteQuest(u.ID, q.ID) // -> WAIT_COOLDOWN
 	if s.CancelQuest(u.ID, q.ID) {
@@ -178,7 +187,7 @@ func TestQuestReplayCooldown(t *testing.T) {
 
 	s.AcceptQuest(u.ID, q.ID)
 	for i := int32(0); i < q.Count; i++ {
-		s.AddQuestKill(u.ID, q.MapID)
+		s.AddQuestKill(u.ID, q.MapID, killIdx(q))
 	}
 	if _, ok := s.CompleteQuest(u.ID, q.ID); !ok {
 		t.Fatal("could not complete replay quest")
@@ -204,13 +213,36 @@ func TestQuestReplayCooldown(t *testing.T) {
 	}
 }
 
+// TestAddQuestKillGatesByCreature: a kill only advances a quest when the slain creature is one
+// of the quest's targets -- the fix for «kill 10 ghouls» counting any mob.
+func TestAddQuestKillGatesByCreature(t *testing.T) {
+	s, u := questHero(t)
+	q := findQuest(t, func(q gamedata.Quest) bool { return q.Key == "NPC1_PVE_Single_Stage1_3" }) // «10 ghouls»
+	if q.AnyMob || len(q.Targets) == 0 {
+		t.Fatal("the ghoul quest must target a specific creature")
+	}
+	if _, ok := s.AcceptQuest(u.ID, q.ID); !ok {
+		t.Fatal("AcceptQuest failed")
+	}
+	right := q.Targets[0]
+	wrong := right + 1 // a different roster index, not a ghoul
+	// A wrong-creature kill (right map, wrong mob) must NOT advance it.
+	if got := s.AddQuestKill(u.ID, q.MapID, wrong); len(got) != 0 {
+		t.Fatalf("a non-target kill advanced the ghoul quest: %+v", got)
+	}
+	// The correct creature advances it.
+	if got := s.AddQuestKill(u.ID, q.MapID, right); len(got) != 1 || got[0].Progress != 1 {
+		t.Fatalf("a ghoul kill did not advance the quest: %+v", got)
+	}
+}
+
 // TestQuestUnknownAndNoHero: guards fail safe.
 func TestQuestUnknownAndNoHero(t *testing.T) {
 	s, u := questHero(t)
 	if _, ok := s.AcceptQuest(u.ID, 123456); ok {
 		t.Error("accepted a non-existent quest")
 	}
-	if got := s.AddQuestKill(9999, 40); got != nil {
+	if got := s.AddQuestKill(9999, 40, 0); got != nil {
 		t.Error("AddQuestKill for unknown user returned progress")
 	}
 	if s.HeroQuests(9999) != nil {

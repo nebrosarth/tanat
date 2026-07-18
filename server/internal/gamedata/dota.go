@@ -135,12 +135,18 @@ type DotaMap struct {
 // map10 is the map_1_0 «Штурм» layout, ids/positions from the bundle extraction.
 var map10 = DotaMap{
 	ID:         101,
-	Name:       "IDS_DOTA_Text", // mode blurb key; falls back gracefully if absent
+	// Name/Desc/WinDesc are client locale KEYS: SelectGameMenu runs each through
+	// GuiSystem.GetLocaleText (name at :81, desc/win_desc at :92-93), and a non-key renders
+	// as the literal "EMPTY!" -- which is exactly what the old "IDS_DOTA_Text" (a key the
+	// baked locale does not ship) produced on the «Штурм» map card. Map_1_0_* are the real
+	// baked keys for scene map_1_0, matching the Map_<scene>_* convention every other map
+	// already uses (Hunt Map_4_x_*, Арена Map_0_0_*).
+	Name:       "Map_1_0_Name",
 	Scene:      "map_1_0",
 	LevelMin:   1,
 	LevelMax:   20,
-	Desc:       "Штурм — командный захват: сокрушите пушки противника и уничтожьте вражеский алтарь.",
-	WinDesc:    "Уничтожьте вражеский алтарь.",
+	Desc:       "Map_1_0_Desc",
+	WinDesc:    "Map_1_0_WinDesc",
 	MinPlayers: 1,
 	MaxPlayers: 16,
 	SpawnHuman: Vec2{X: -186, Y: -4},
@@ -246,9 +252,45 @@ func DotaMapByID(id int32) (DotaMap, bool) {
 	return DotaMap{}, false
 }
 
-// AltarGuardedByGuns reports whether an altar is invulnerable until its side's guns
-// are all destroyed (the «Штурм» push rule).
+// AltarGuardedByGuns reports whether an altar is invulnerable until its guarding cannons
+// are destroyed (the «Штурм» push rule).
 func (DotaMap) AltarGuardedByGuns() bool { return dotaAltarGuardedByGuns }
+
+// dotaAltarGuardRadius: a gun within this distance of an altar is one of its BASE cannons --
+// the guns flanking the altar whose destruction opens it. On map_1_0 the two base cannons sit
+// ~11.6-13.7u from their altar, while the NEXT-nearest gun (a lane gun) is ~51u away, so the
+// threshold cleanly selects exactly the two base cannons per altar (pinned by
+// TestAltarGuardedByBaseCannons). The push rule is "smash the cannons NEXT TO the altar", not
+// "destroy all 11 of the side's guns" -- the latter is what the naive "all same-side guns"
+// reading produced, leaving the altar invulnerable long after its base was razed.
+const dotaAltarGuardRadius = 25.0
+
+// AltarGuardGunIDs returns the structure ids of the base cannons guarding the altar with struct
+// id altarID: the same-side guns within dotaAltarGuardRadius of it. Empty for a non-altar id.
+// The Battle server keys these by object id to decide when an altar opens to damage.
+func (m DotaMap) AltarGuardGunIDs(altarID int32) []int32 {
+	var altar DotaStructure
+	found := false
+	for _, sc := range m.Structures {
+		if sc.ID == altarID && sc.Role == DotaAltar {
+			altar, found = sc, true
+			break
+		}
+	}
+	if !found {
+		return nil
+	}
+	var ids []int32
+	for _, sc := range m.Structures {
+		if sc.Role != DotaGun || sc.Side != altar.Side {
+			continue
+		}
+		if math.Hypot(sc.X-altar.X, sc.Z-altar.Z) <= dotaAltarGuardRadius {
+			ids = append(ids, sc.ID)
+		}
+	}
+	return ids
+}
 
 // StructByID finds a baked structure by its ExportObjectData id (the Battle server derives this
 // from a structure object's id via id-dotaStructIDBase). Used by PvP battle-tasks to resolve a
