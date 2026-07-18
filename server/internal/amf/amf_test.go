@@ -5,6 +5,29 @@ import (
 	"testing"
 )
 
+// TestEncodeTypedNilArray guards the crash behind the «Штурм» "server dies when creeps
+// meet" bug: a *MixedArray field left nil (e.g. an action's targetPos) is stored in the
+// interface as a TYPED nil, which skips `case nil` and reached encodeArray, which
+// dereferenced the nil pointer and panicked -- on the battle ticker goroutine, taking the
+// whole server down. Encoding it must not panic; a null marker is the safe result.
+func TestEncodeTypedNilArray(t *testing.T) {
+	var nilArr *MixedArray // typed nil: an interface holding a nil *MixedArray
+	// A top-level typed-nil array, and one nested as a value, both used to encode without
+	// panicking (the pre-fix encodeArray dereferenced the nil pointer's .Dense field).
+	for _, msg := range []*MixedArray{
+		nilArr,
+		NewArray().Set("targetPos", nilArr),
+	} {
+		var buf bytes.Buffer
+		if err := NewEncoder().EncodeMessage(&buf, msg); err != nil {
+			t.Fatalf("encode typed-nil array: %v", err)
+		}
+		if buf.Len() == 0 {
+			t.Fatal("encoder produced no bytes for a typed-nil array")
+		}
+	}
+}
+
 func TestIntRoundTrip(t *testing.T) {
 	cases := []int32{0, 1, 127, 128, 16383, 16384, 2097151, 2097152, 268435455, -1, -268435456, 1234567}
 	for _, c := range cases {

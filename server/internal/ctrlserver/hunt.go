@@ -63,6 +63,23 @@ func (s *Server) handleArenaMapsInfoReal(req ctrlproto.Request, resp *ctrlproto.
 			Set("max_players", m.MinPlayers).
 			Set("map_max_players", m.MaxPlayers))
 	}
+	// «Арена» (DM) maps: same fight|* path as DOTA (only HUNT routes down hunt|*),
+	// so FindMapById must resolve these too or the client NPEs on join. type_id=DM
+	// makes the client file them under the «Арена» tab.
+	for _, m := range gamedata.ArenaMaps() {
+		maps.Add(amf.NewArray().
+			Set("id", m.ID).
+			Set("type_id", gamedata.MapTypeDM).
+			Set("name", m.Name).
+			Set("level_min", m.LevelMin).
+			Set("level_max", m.LevelMax).
+			Set("scene", m.Scene).
+			Set("available", true).
+			Set("desc", m.Desc).
+			Set("win_desc", m.WinDesc).
+			Set("max_players", m.MinPlayers).
+			Set("map_max_players", m.MaxPlayers))
+	}
 	resp.Add("arena", "get_maps_info", amf.NewArray().Set("maps_info", maps))
 }
 
@@ -76,6 +93,9 @@ func (s *Server) handleMapTypeDescs(req ctrlproto.Request, resp *ctrlproto.Respo
 	descs.Add(amf.NewArray().
 		Set("type_id", gamedata.MapTypeDota).
 		Set("desc", "Штурм — командный захват: сокрушите оборону и уничтожьте вражеский алтарь."))
+	descs.Add(amf.NewArray().
+		Set("type_id", gamedata.MapTypeDM).
+		Set("desc", "Арена — бой насмерть: сражайтесь с другими игроками до предела фрагов."))
 	resp.Add("arena", "get_map_type_descs", amf.NewArray().Set("descs", descs))
 }
 
@@ -101,6 +121,21 @@ func (s *Server) handleArenaGetMaps(req ctrlproto.Request, resp *ctrlproto.Respo
 	}
 	if mapType == gamedata.MapTypeDota {
 		for _, m := range gamedata.DotaMaps() {
+			maps.Set(strconv.Itoa(int(m.ID)), amf.NewArray().
+				Set("name", m.Name).
+				Set("scene", m.Scene).
+				Set("available", true).
+				Set("used", false).
+				Set("level_min", m.LevelMin).
+				Set("level_max", m.LevelMax).
+				Set("desc", m.Desc).
+				Set("win_desc", m.WinDesc).
+				Set("max_players", m.MinPlayers).
+				Set("map_max_players", m.MaxPlayers))
+		}
+	}
+	if mapType == gamedata.MapTypeDM {
+		for _, m := range gamedata.ArenaMaps() {
 			maps.Set(strconv.Itoa(int(m.ID)), amf.NewArray().
 				Set("name", m.Name).
 				Set("scene", m.Scene).
@@ -234,13 +269,13 @@ func (s *Server) handleHuntReady(req ctrlproto.Request, resp *ctrlproto.Response
 	log.Printf("ctrl: hunt|ready user=%d map=%d avatar=%d scene=%s room=%d -> launch",
 		u.ID, mapID, avatarID, m.Scene, room)
 
-	ports := amf.NewArray()
-	for _, p := range s.BattlePorts {
-		ports.Add(p)
-	}
+	// Route the client to this room's dedicated Battle server (own clock, so the
+	// in-battle timer counts from entry rather than server uptime) when a launcher
+	// is configured; everyone on this map (room = map id) shares the one server.
+	ip, ports := s.launchTarget(mapID, room)
 	resp.Add("hunt", "ready", amf.NewArray().
 		Set("params", amf.NewArray().
-			Set("ip", s.BattleHost).
+			Set("ip", ip).
 			Set("port", ports).
 			Set("passwd", passwd).
 			Set("scene", m.Scene).

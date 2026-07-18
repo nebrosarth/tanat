@@ -212,6 +212,13 @@ func (e *Encoder) encodeValue(w *bufio.Writer, v interface{}) error {
 		_, err := w.Write(val)
 		return err
 	case *MixedArray:
+		// A typed nil (*MixedArray)(nil) stored in an interface does NOT match `case nil`
+		// above -- it lands here with val==nil. Encoding it as a null marker (instead of
+		// dereferencing val.Dense in encodeArray, which panics) matches an untyped nil and
+		// keeps a stray nil array from taking down the whole battle server.
+		if val == nil {
+			return w.WriteByte(byte(MarkerNull))
+		}
 		return e.encodeArray(w, val)
 	default:
 		return fmt.Errorf("amf: unsupported value type %T", v)

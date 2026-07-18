@@ -122,6 +122,8 @@ func TestMobFogHideResetsToSpawn(t *testing.T) {
 		id: 2202, mobIdx: idx, mob: mob,
 		x: sx + 5, y: sy, spawnX: sx + 20, spawnY: sy,
 		hp: mob.Health * 0.2, shown: true, aggro: true,
+		// A Hunt mob: it owns its spawn, so the abandon path may send it home.
+		homed: true,
 	}
 
 	c.mvMu.Lock()
@@ -131,7 +133,7 @@ func TestMobFogHideResetsToSpawn(t *testing.T) {
 	c.huntState.mobs[m.id] = m
 	c.huntState.tr.add(m.id)
 
-	s.updateMobVisibilityLocked(c, m, 0.2)
+	s.mobInterestLocked(c, m, 0.2)
 
 	if m.shown {
 		t.Fatal("mob past hide radius should be hidden")

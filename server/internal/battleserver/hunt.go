@@ -91,17 +91,64 @@ const (
 	syncMaxHealth   uint64 = 0x1000
 	syncHealthRegen uint64 = 0x2000
 	syncSilence     uint64 = 0x8000000
+	// syncPhysImm is SyncType.PHYS_IMM -> SyncedParams.mPhysImm (an INT, not a float).
+	// It is the client's own "do not attack this" flag: AvatarAI's DEFENCE loop only
+	// auto-acquires a target when `Proto.Destructible != null && friendliness == ENEMY
+	// && Params.Health != 0 && Params.mPhysImm == 0` (AvatarAI.cs:181). Note the click
+	// path does NOT consult it (SelfPlayer.PerformAttack checks only
+	// Destructible/Health/ENEMY), so this stops the avatar picking a fight by itself but
+	// the server must still refuse an explicit order -- both halves are needed.
+	syncPhysImm     uint64 = 0x4000000
 	syncPhysArmor   uint64 = 0x40000
 	syncMagicArmor  uint64 = 0x80000
 	syncMaxMana     uint64 = 0x100000
 	syncManaRegen   uint64 = 0x200000
 	syncSpeed       uint64 = 0x400000
+	// syncViewRadius is SyncType.VIEW_RADIUS: a unit's fog-of-war VISION radius (NOT
+	// its body radius -- that is syncRadius/SyncType.RADIUS). It feeds
+	// SyncedParams.mViewRadius, which is the fog gate in WarFogObject.Update
+	// (_decompiled/Assembly-CSharp/WarFogObject.cs): a unit only ever spawns its
+	// VFX_WarFogZone_prop01 reveal zone `if (mViewRadius > 0f && friendliness !=
+	// UNKNOWN)`, and only when FRIEND/NEUTRAL. We never sent VIEW_RADIUS, so on the
+	// «Штурм» map (map_1_0 bakes a WarFog plane that starts fully opaque) no unit --
+	// not even the player's own avatar -- ever cleared anything: the whole map
+	// rendered black. Pairs with syncTeam: without a TEAM sync SyncedParams.
+	// IsTeamInited stays false and TeamRecognizer.GetFriendliness returns UNKNOWN,
+	// which fails the same gate.
+	syncViewRadius  uint64 = 0x800000
 	syncTeam        uint64 = 0x1000000
 	syncCastCost    uint64 = 0x100000000
 	syncCastStr     uint64 = 0x200000000
 	syncCastCd      uint64 = 0x400000000
 	syncRadius      uint64 = 0x800000000 // SyncType.RADIUS: body/collision radius
 	syncSpellPower  uint64 = 0x1000000000
+)
+
+// Fog-of-war vision radii (syncViewRadius), in world units.
+//
+// EVERY friendly unit gets one -- avatar, building, creep, summon -- through the one
+// shared reveal path. Fog is a purely VISUAL layer: it is what a player is shown, and
+// nothing in the simulation may read it (a creep breaks a tower in fog just as well as
+// out of it; see the shown/active comment on mobState).
+//
+// Which map renders it is a CLIENT fact, not ours. WarFog.InitWarFogPlane resolves the
+// plane by exact name -- GameObject.Find("WarFogPlane_prop01") -- and only map_0_0 and
+// map_1_0 contain that object; map_4_0/4_1/4_2 («Охота») contain no war-fog object of
+// any kind, and map_5_0/6_0 have only a similarly-named VFX_WarFogPlane_prop01 that the
+// Find misses. So on a Hunt map these values are inert and the sole visibility cue is
+// mobShadeFx (mobInterestLocked), which is a hand-rolled stand-in, not fog. Verified by
+// enumerating the scene bundles, not inferred.
+//
+// Sized against map_1_0, whose lane runs roughly x=-180 (own base) to x=+180 (enemy
+// base). Only FRIEND/NEUTRAL units reveal, so the enemy base stays fogged until it is
+// approached (WarFogObject sets mVisible=false for an ENEMY-team object and never
+// spawns a zone). A creep sees less than the avatar it fights for but enough to light
+// the stretch of lane ahead of it; a summon is a short-lived escort and lights less.
+const (
+	avatarViewRadius float32 = 60
+	structViewRadius float32 = 40
+	creepViewRadius  float32 = 25
+	summonViewRadius float32 = 18
 )
 
 // ---- battle prototype ids ----
@@ -201,6 +248,14 @@ func addEffectorArgs(id, proto, owner, parent int32, start float64, args *amf.Mi
 // {0,0} for a plain swing) and pick the emit path (pushAvatarAllLocked for avatars,
 // broadcastObjLocked for mobs/summons).
 func newActionArgs(objID, action, targetObj int32, start float64, targetPos *amf.MixedArray) *amf.MixedArray {
+	// A nil targetPos must NOT be stored as a typed *MixedArray nil: the AMF encoder
+	// type-switch matches `case *MixedArray` (not `case nil`) and then dereferences
+	// m.Dense on the nil pointer -> panic that crashes the whole battle server. Every
+	// object-targeted swing carries an object id, not a point, so a nil degrades to the
+	// proven {0,0} "plain swing" form the mob/summon paths already send.
+	if targetPos == nil {
+		targetPos = amf.NewArray().Set("x", 0.0).Set("y", 0.0)
+	}
 	return amf.NewArray().
 		Set("id", objID).Set("action", action).Set("targetObj", targetObj).
 		Set("start", start).Set("item", false).Set("targetPos", targetPos)
@@ -311,17 +366,13 @@ func mobProtoDesc(m gamedata.Mob) string {
 }
 
 // summonUnitProtoDesc builds an attackable allied-unit prototype for a summon.
-// The summon prefab is a mob model (e.g. Elgorm's guls reuse Mob_ZombieCrawl_01),
-// so it borrows that mob's shipped name + enemy-card icon; without them the unit
-// card renders blank (the reported "no icon" bug).
+// Most summon prefabs are mob models (e.g. Elgorm's guls reuse Mob_ZombieCrawl_01) and
+// borrow that mob's shipped name + card icon; the two that aren't are carried by
+// gamedata's summon table. A prefab that resolves to neither renders a blank card --
+// the reported "no icon" bug -- so TestSummonUnitsHaveCards fails on it rather than
+// letting it ship silently, which is exactly how the last two got out.
 func summonUnitProtoDesc(prefab string, hp float64) string {
-	name, icon := "", ""
-	for _, m := range gamedata.Mobs() {
-		if m.Prefab == prefab {
-			name, icon = m.NameKey, m.Icon
-			break
-		}
-	}
+	name, icon, _ := gamedata.UnitDesc(prefab)
 	return `<Proto>` +
 		`<PPrefab value="` + xmlEsc(prefab) + `"/>` +
 		`<PDesc><Name value="` + xmlEsc(name) + `"/><Short value=""/><Long value=""/><Icon value="` + xmlEsc(icon) + `"/></PDesc>` +
@@ -458,6 +509,10 @@ type huntState struct {
 	tr   tracker
 	mobs map[int32]*mobState // aliases inst.mobs (shared authoritative set)
 
+	// pvp holds this player's live «Штурм» battle-tasks (nil outside «Штурм» / before the world
+	// state is built); assigned at world-ready and driven over QUEST_TASK (see pvptasks.go).
+	pvp *pvpTaskRun
+
 	hp, mana float64
 	xp       float64
 	level    int32 // 0-based (client displays level+1)
@@ -562,6 +617,14 @@ type huntState struct {
 	// one flat 15s cooldown across every potion kind.
 	itemCooldownUntil map[int32]float64
 
+	// ownedTreeItems is the set of avatar battle-tree item article ids this
+	// player has bought THIS MATCH (gamedata.AvatarItems). Server-authoritative:
+	// gates re-buys and the tree_parents unlock chain, and each purchase appends
+	// permanent (until=0) stat mods that survive death/respawn. Reset per match
+	// (never persisted) -- these are DotA-style in-battle items, not the hero's
+	// wearable inventory.
+	ownedTreeItems map[int32]bool
+
 	// invisibleUntil / invisFxUID: an active Invisibility potion. While live, mobs
 	// ignore this avatar as a target candidate (mobTargetLocked) -- it suppresses
 	// NEW aggro, but doesn't retroactively break a mob already mid-chase (a
@@ -598,7 +661,39 @@ type huntState struct {
 	// client that is still building its scene.
 	worldReady bool
 
+	// team is the player's side. 0 means "unset": Hunt and «Штурм» leave it 0, and
+	// playerTeam() reads that as the local co-op side (dotaPlayerTeam), which is exactly
+	// how every avatar was rendered before Arena existed. «Арена» sets it to ArenaTeamA
+	// or ArenaTeamB so two players can be enemies. frags is this player's kill count,
+	// shown nowhere yet but summed per team for the win check.
+	team  int32
+	frags int32
+	// pvpTarget is the enemy avatar's objID this player is auto-attacking in «Арена» (0 =
+	// none). It is the player-vs-player twin of attackTarget, which only ever holds a mob
+	// id; keeping them separate means the mob attack loop and the PvP loop never confuse a
+	// mob id for an avatar id (both live in the 1000+/2000+ spaces).
+	pvpTarget int32
+
 	closed bool
+}
+
+// playerTeam is the side this player's avatar renders and fights on. Unset (Hunt,
+// «Штурм») means the local co-op side, so nothing outside «Арена» changes behaviour.
+func (c *conn) playerTeam() int32 {
+	if c.huntState != nil && c.huntState.team != 0 {
+		return c.huntState.team
+	}
+	return dotaPlayerTeam
+}
+
+// arenaEnemies reports whether two players are on opposing «Арена» sides -- i.e. legal
+// targets for each other. False outside «Арена» (both teams are the co-op side), which
+// keeps friendly fire off in Hunt and «Штурм».
+func arenaEnemies(a, b *conn) bool {
+	if a == nil || b == nil || a == b {
+		return false
+	}
+	return a.playerTeam() != b.playerTeam()
 }
 
 type mobState struct {
@@ -613,6 +708,18 @@ type mobState struct {
 	hp        float64
 	dead      bool
 
+	// homed marks a mob that BELONGS to spawnX/spawnY: it leashes back there, is
+	// evicted there when a player respawns on top of it, and revives there on its
+	// respawn timer. «Штурм» creeps are homeless (false): a wave generator produces
+	// them, they march a lane and are deleted on death.
+	//
+	// This is stated as a unit CAPABILITY rather than read off the world ("is this a
+	// Hunt map") on purpose. The Hunt passes are shared, and each one silently assumed
+	// every mobState had a home; a homeless creep hitting them was sent to its
+	// zero-valued spawn and teleported to the middle of the map. Naming the assumption
+	// is what stops the next shared pass from making it again.
+	homed bool
+
 	// Level-scaled per-instance stats, computed at spawn from the mob's level-1
 	// base and MobSpawn.Level (bosses use their authored values unscaled). Zero
 	// means "not spawned through the scaling path" (a directly-constructed test
@@ -624,13 +731,30 @@ type mobState struct {
 	xp     float64
 	coins  int32
 
-	st         unitStatus
-	aggro      bool
-	returning  bool  // leashed: walking home to spawn, regenerating, ignoring targets
-	shown      bool  // created on the client (within fog-of-war reveal range)
-	shaded     bool  // rendered translucent (outer fog ring) via mobShadeFx
+	st        unitStatus
+	aggro     bool
+	returning bool // leashed: walking home to spawn, regenerating, ignoring targets
+
+	// shown and active are two DIFFERENT questions that must never be conflated:
+	// shown = "is this object created on the clients" (a render concern), active =
+	// "did its AI run this tick" (a simulation concern). They are set by the same
+	// interest-management pass and, per world, happen to agree -- but what a player
+	// can see may never decide what a unit is allowed to DO. Conflating them is what
+	// kept «Штурм» from reusing this machinery at all: a lane creep must keep
+	// breaking a tower while it stands in fog with no player for 200 units.
+	// See mobInterestLocked (Hunt) and dotaTickLocked («Штурм», always both).
+	shown      bool
+	active     bool
+	shaded     bool  // rendered translucent (outer ring) via mobShadeFx
 	shadeFxUID int32 // live InvisibilityEffect uid while shaded (0 = none)
 	lastSync   float64
+	// posSyncAt is when this mob's velocity was last broadcast -- NOT lastSync, whose
+	// meaning depends on the driver: Hunt keeps it as the sync clock, but the «Штурм»
+	// tick re-stamps it every tick as its dead-reckoning clock (dotaCreepTickLocked),
+	// so there it is always `now` and can never measure how stale a sync is. Separation
+	// perturbs the heading a little every tick, which makes that distinction load-bearing:
+	// syncing on any change at all would put one POSITION per creep per tick on the wire.
+	posSyncAt float64
 
 	nextSwing   float64
 	hitAt       float64
@@ -643,6 +767,17 @@ type mobState struct {
 	// target rather than drifting across the whole animation. 0 = none pending.
 	projLaunchAt float64
 	projTarget   int32
+	// projFlying marks a shell that has ALREADY been loosed: SET_PROJECTILE is out and
+	// the client is flying the prefab to the hit_at we promised it. There is no recall
+	// opcode, and the prefab is re-parented away from the shooter ("/objects") the
+	// moment it spawns, so it arrives no matter what the shooter does next -- which
+	// makes the pending hit UNCANCELLABLE from here on, or the client renders an impact
+	// for nothing. The player path settled this same rule long ago
+	// (scheduleProjectileHitLocked commits deliberately; projectile_cancel_test.go calls
+	// the alternative "the bug"), and a melee swing is its contrast: interruptible right
+	// up to the moment it connects. Distinguishing the two needs its own flag --
+	// projLaunchAt==0 && hitAt>0 is equally true of a hitscan tower mid-swing.
+	projFlying bool
 
 	// boss abilities (Mob.Skills): per-skill next-ready time + the in-flight cast.
 	skillReady     []float64
@@ -666,12 +801,37 @@ type mobState struct {
 	team      int32
 	structure bool
 	altar     bool
-	dotaRole  gamedata.DotaRole
+	dotaRole   gamedata.DotaRole
 	dotaPrefab string
+	// physImm is the PHYS_IMM value last SENT to the clients for this object, so the
+	// re-sync can skip a no-op. Only an altar uses it (see altarPhysImm).
+	physImm int32
 	lane      []gamedata.Vec2
 	laneIdx   int
 	laneFwd   bool
 	dtarget   int32
+
+	// hasProj marks a unit whose CLIENT prefab actually ships a projectile pool
+	// (VisualEffectOptions.mProjectiles), so SET_PROJECTILE flies a visible bolt.
+	// Shooting one from a prefab with an empty pool only logs "Object projectile
+	// prefab is null" client-side and draws nothing, so this is a per-prefab fact and
+	// is NOT implied by AttackRange: the «Штурм» cannons (GA_Human/Elf_Gun_prop01) and
+	// the ranged creeps (Mnst_*_Creep2_prop01) carry a pool, but the creep TOWERS --
+	// which shoot just as far -- ship an EMPTY one and stay hitscan. Verified against
+	// the bundles (data/buildings/Functional/Fn_{Human,Elf}.unity3d).
+	hasProj bool
+}
+
+// attackProtoID is the ATTACK effector prototype this unit swings with. It is the id
+// an ACTION/ACTION_DONE for the unit must carry: the client animates a swing only for
+// the action matching the object's own AttackActionId (its first ATTACK effector), and
+// StopAction removes it by that same id. «Штурм» structures share one cannon/tower
+// effector; every other unit uses its mob roster entry's.
+func (m *mobState) attackProtoID() int32 {
+	if m.structure {
+		return dotaStructAttackProtoID
+	}
+	return mobAttackProtoID(m.mobIdx)
 }
 
 // teamVal is the object's sync TEAM value: the explicit DOTA team, or -1 (enemy of
@@ -680,8 +840,35 @@ func (m *mobState) teamVal() int32 {
 	if m.team != 0 {
 		return m.team
 	}
-	return -1
+	return dotaEnemyTeam
 }
+
+// altarShieldedLocked reports whether ms is an altar (Fortress Crystal) still under its
+// side's cannons -- the core «Штурм» push rule: the altar shrugs off ALL damage until
+// they are destroyed. No effect on Hunt (ms.altar is false there).
+//
+// This is a TARGETING rule, not just a damage one. It was only ever consulted on the
+// incoming-damage path, so a shielded altar still looked like an ordinary enemy: the
+// player could order an attack on it, the avatar walked over and swung at it forever,
+// and every blow silently evaporated. Now it refuses the order and the client is told
+// via PHYS_IMM (see syncPhysImm) so it stops auto-acquiring it as well.
+func (c *conn) altarShieldedLocked(ms *mobState) bool {
+	return ms.altar && c.inst != nil && c.inst.dota != nil && !c.inst.dota.altarVulnerableLocked(ms)
+}
+
+// hostile reports whether m is a legal target for the PLAYER's side: anything that
+// is not one of the player's own «Штурм» units.
+//
+// Every scan that picks a mob to harm must consult it. mobState is one type serving
+// two roles, and in «Штурм» inst.mobs holds the player's own creeps and buildings
+// right beside the enemy's -- so an unfiltered "nearest living mob" scan is a scan
+// for allies too. That is not hypothetical: it is why a skill, an AoE, a DoT and the
+// auto-attack all happily killed the creeps they were escorting.
+//
+// Hunt is unaffected by construction, twice over: its mobs never set team, so
+// teamVal() is dotaEnemyTeam; and summons are not in inst.mobs at all (they live in
+// huntState.summons), so this can never filter out a pet.
+func (m *mobState) hostile() bool { return m.teamVal() != dotaPlayerTeam }
 
 // maxHealth / rollDamage / xpReward / coinReward return the mob's effective
 // (level-scaled) stats, falling back to the raw Mob fields when maxHP is unset --
@@ -791,12 +978,26 @@ func (s *Server) sendHuntWorldState(c *conn, name string) {
 	protoID := avatarProtoID(a.ID)
 	bt := s.battleTime()
 	c.lock()
+	// «Арена»: assign this player a side and move them to their side's spawn BEFORE the
+	// position/team syncs below carry it to the client. playerTeam() reads hs.team, so it
+	// must be set (and c.huntState assigned) before any self world-state or teammate
+	// reveal is built. c.lk points at the instance mutex here, so assignTeam's shared
+	// mutation is safe.
+	if c.inst != nil && c.inst.arena != nil {
+		hs.team = c.inst.arena.assignTeam()
+		ax, ay := arenaInitialSpawn(c.inst.arena, hs.team)
+		c.x, c.y = float32(ax), float32(ay)
+	}
 	sx, sy := c.x, c.y
 	// Start checkpoint = the battle-start Reborn_point (the spawn). The first tick
 	// re-activates whichever Reborn the player is standing on.
 	hs.respawnX, hs.respawnY = c.x, c.y
 	hs.rebornIdx = -1
 	c.huntState = hs
+	// Fold the hero's dressed gear ("предметы героев") into the avatar as permanent stat
+	// mods NOW, before the world-state stat packets read modSum, so the sim and the initial
+	// pools already include gear. Shared by all modes (Hunt/Arena/Штурм).
+	s.applyDressedItemStatsLocked(c, now)
 	c.unlock()
 
 	// 1. Static data + prototypes.
@@ -853,6 +1054,12 @@ func (s *Server) sendHuntWorldState(c *conn, name string) {
 	// (see itemProtoDesc's doc) -- without it, clicking any bag item is a
 	// total client-side no-op: no DO_ACTION packet is ever sent.
 	pkts = append(pkts, protoInfoPkt(itemUseActionProtoID, itemUseActionProtoDesc()))
+	// Avatar battle-tree item prototypes: the client's item tree buys by mapping
+	// a Ctrl article id to its battle proto id (Battle.ArticleToProto), which is
+	// populated ONLY from a <PItem><Article> prototype -- without these, every
+	// tree buy is silently dropped and no hover tooltip renders. See
+	// avatar_items.go. The tree itself is a permanent HUD element in every mode.
+	pkts = append(pkts, avatarItemProtoPkts()...)
 
 	// 2. Self player + avatar object. SET_AVATAR level is 0-based on the wire.
 	c.lock()
@@ -860,7 +1067,7 @@ func (s *Server) sendHuntWorldState(c *conn, name string) {
 	c.unlock()
 	pkts = append(pkts,
 		battleproto.Packet{Cmd: battleproto.CmdPlayerReg, Args: amf.NewArray().
-			Set("id", self).Set("name", name).Set("team", int32(1)).Set("avatar", a.ID)},
+			Set("id", self).Set("name", name).Set("team", c.playerTeam()).Set("avatar", a.ID)},
 		battleproto.Packet{Cmd: battleproto.CmdCreateObject, Args: amf.NewArray().
 			Set("id", objID).Set("proto", protoID)},
 		battleproto.Packet{Cmd: battleproto.CmdSetAvatar, Args: amf.NewArray().
@@ -885,6 +1092,8 @@ func (s *Server) sendHuntWorldState(c *conn, name string) {
 				setFloats(syncManaRegen, avatarIdx, float32(a.ManaRegen)).
 				setFloats(syncSpeed, avatarIdx, lobbyMoveSpeed).
 				setFloats(syncRadius, avatarIdx, float32(a.Radius())).
+				setFloats(syncViewRadius, avatarIdx, avatarViewRadius).
+				setInt(syncTeam, avatarIdx, c.playerTeam()).
 				setFloats(syncSpellPower, avatarIdx, float32(a.SpellPower)).
 				setFloats(syncCastCost, avatarIdx, 1.0).
 				setFloats(syncCastStr, avatarIdx, 1.0).
@@ -1014,6 +1223,12 @@ func (s *Server) sendHuntWorldState(c *conn, name string) {
 	// inventory so a hunt session starts with the same bag the lobby shows.
 	c.lock()
 	s.sendInitialBagLocked(c)
+	// Seed the in-battle gold balance so the item tree's affordability check has a
+	// real number (else every priced tree item is greyed out client-side).
+	s.sendInitialMoneyLocked(c)
+	// Now the avatar object exists client-side, sync the gear-boosted stat display (the
+	// dressed-item mods were folded in at world-build; this carries the numbers).
+	s.pushPlayerStatsLocked(c, now)
 	c.unlock()
 
 	// Cross-player rendering: show the existing members to this newcomer and this
@@ -1021,16 +1236,25 @@ func (s *Server) sendHuntWorldState(c *conn, name string) {
 	// ticker (started at instance creation) drives the shared simulation -- no
 	// per-connection combat goroutine any more.
 	c.lock()
-	s.introduceMemberLocked(c, float64(s.battleTime()))
 	// «Штурм»: register the structure/creep prototypes and render every base structure
 	// (altars, cannons, towers, generators) on this member's client. Must run before
-	// worldReady so the first DOTA tick's creep syncs don't race the scene build.
+	// worldReady so the first DOTA tick's creep syncs don't race the scene build, and
+	// before introduceMemberLocked, which now hands this member the live creeps: those
+	// are CREATE_OBJECTs against the creep prototypes registered here, so registering
+	// second would be a PROTOTYPE_INFO race for every creep already on the lane.
+	// Structures are not double-rendered -- they are never `shown`, so introduce skips
+	// them (and must: their mobIdx is -1, which the shared reveal would turn into a
+	// request for proto 499).
 	if c.inst != nil && c.inst.dota != nil {
 		s.dotaWorldSetupLocked(c, float64(s.battleTime()))
 	}
+	s.introduceMemberLocked(c, float64(s.battleTime()))
 	// The world is fully built: join the shared tick + broadcast set now, so no
 	// mob/teammate packet could have raced ahead of this member's scene load.
 	hs.worldReady = true
+	// «Штурм»: hand this player their PvP battle-tasks and send the initial QUEST_TASK for each
+	// (no-op on Hunt/Арена). Done after worldReady so the client's task handler is live.
+	s.assignPvpTasksLocked(c)
 	c.unlock()
 }
 
@@ -1251,6 +1475,13 @@ func (s *Server) handleDoAction(c *conn, p battleproto.Packet) {
 
 	c.lock()
 	defer c.unlock()
+	s.doActionLocked(c, itemID, action, target, px, py, hasPos)
+}
+
+// doActionLocked is the DO_ACTION body: dispatch one client order (use an item, attack a
+// target, or start a skill). Split from the packet plumbing so the order RULES -- which
+// targets are legal -- can be exercised without a live socket. Caller holds the lock.
+func (s *Server) doActionLocked(c *conn, itemID, action, target int32, px, py float32, hasPos bool) {
 	hs := c.huntState
 	a := hs.av
 
@@ -1261,19 +1492,33 @@ func (s *Server) handleDoAction(c *conn, p battleproto.Packet) {
 		// proto id). itemID indexes hs.bagArticleByID, not any object/proto space.
 		s.useItemLocked(c, itemID, float64(s.battleTime()))
 	case action == attackProtoID(a):
-		ms := hs.mobs[target]
-		if ms == nil || ms.dead {
+		if ms := hs.mobs[target]; ms != nil {
+			if ms.dead {
+				return
+			}
+			// «Штурм» friendly fire: never attack an ally (own-team creep/structure). Hunt
+			// mobs are team -1 (teamVal), so this never blocks a PvE target.
+			if !ms.hostile() {
+				return
+			}
+			// A guarded altar refuses the order. The client's own auto-acquire already skips
+			// it (PHYS_IMM), but PerformAttack does not consult that flag, so an explicit
+			// click still arrives here and must be turned away.
+			if c.altarShieldedLocked(ms) {
+				return
+			}
+			// A client-issued attack means its DEFENCE loop is live and will re-pick the
+			// next enemy itself: hand retargeting back to the client.
+			hs.autoResumed = false
+			s.startAttackLocked(c, ms)
 			return
 		}
-		// «Штурм» friendly fire: never attack an ally (own-team creep/structure). Hunt
-		// mobs are team -1 (teamVal), so this never blocks a PvE target.
-		if ms.teamVal() == 1 {
-			return
+		// «Арена»: the target isn't a mob -- it may be an enemy player's avatar. Only an
+		// opposing, living arena member is a legal victim; anyone else falls through and
+		// the order is dropped (a click on an ally, or a stale id).
+		if victim := c.arenaMember(target); victim != nil && arenaEnemies(c, victim) && victim.huntState.deadUntil == 0 {
+			s.startPvpAttackLocked(c, victim)
 		}
-		// A client-issued attack means its DEFENCE loop is live and will re-pick the
-		// next enemy itself: hand retargeting back to the client.
-		hs.autoResumed = false
-		s.startAttackLocked(c, ms)
 	case skillSlotByProto(a, action) != 0:
 		s.startSkillOrderLocked(c, skillSlotByProto(a, action), target, px, py, hasPos)
 	default:
@@ -1290,6 +1535,9 @@ func (s *Server) startAttackLocked(c *conn, ms *mobState) {
 	}
 	s.cancelOrderLocked(c)
 	hs.attackTarget = ms.id
+	// Pets fight on the player's orders: the same click that sends the avatar at this
+	// target sends them. (A no-op for a swarm summon, which picks its own fights.)
+	s.orderPetsAttackLocked(c, ms.id)
 	c.resetChaseLocked() // new pursuit: the first out-of-range check paths at once
 	hs.attackSeq++
 	s.armAttackTimer(c, hs.attackSeq, 0, time.Duration(float64(time.Second)/s.attackPeriodLocked(hs)))
@@ -1322,15 +1570,21 @@ func (s *Server) resumeAutoAttackLocked(c *conn, now float64, preferred int32) {
 	hs.autoResumed = true
 }
 
-// nearestAttackableMobLocked returns the closest living mob whose body is within r
+// nearestAttackableMobLocked returns the closest living ENEMY whose body is within r
 // of the avatar (nil if none) -- the target it auto-acquires when it goes idle.
+//
+// The hostile() filter is load-bearing here, not defensive. The client-issued attack
+// path checks allies itself (DO_ACTION, above), but this scan is the SERVER-driven
+// resume: after any ability finishes, resumeAutoAttackLocked re-acquires through here
+// with no client involved. Without the filter the avatar turned on the nearest own
+// creep the moment a cast ended and beat it to death.
 func (s *Server) nearestAttackableMobLocked(c *conn, now float64, r float64) *mobState {
 	hs := c.huntState
 	cx, cy := c.posAtLocked(float32(now))
 	var best *mobState
 	bestD := r
 	for _, m := range hs.mobs {
-		if m.dead {
+		if m.dead || !m.hostile() || c.altarShieldedLocked(m) {
 			continue
 		}
 		d := math.Hypot(float64(m.x-cx), float64(m.y-cy)) - m.mob.Radius()
@@ -1344,7 +1598,9 @@ func (s *Server) nearestAttackableMobLocked(c *conn, now float64, r float64) *mo
 // attackPeriodLocked returns the effective attacks-per-second.
 func (s *Server) attackPeriodLocked(hs *huntState) float64 {
 	now := float64(s.battleTime())
-	sp := hs.av.AttackSpeed * hs.st.attackFactor(now)
+	// atk_speed_flat is a flat bonus from avatar tree items (a "+0.3 attack
+	// speed" reads as-is); attackFactor stays the multiplicative buff/slow axis.
+	sp := (hs.av.AttackSpeed + hs.st.modSum(now, "atk_speed_flat")) * hs.st.attackFactor(now)
 	if sp < 0.1 {
 		sp = 0.1
 	}
@@ -1506,7 +1762,8 @@ func (s *Server) scheduleHitAfterLocked(c *conn, seq int, targetID int32, windup
 		if !hs.hasProjectile && math.Hypot(float64(ms.x-cx), float64(ms.y-cy)) > hs.effAttackRangeLocked(float64(now))+av.Radius()+ms.mob.Radius()+0.3 {
 			return
 		}
-		dmg := (float64(av.DmgMin) + rand.Float64()*float64(av.DmgMax-av.DmgMin)) * hs.st.modMul(float64(now), "dmg_pct") * hs.powerMul()
+		flat := hs.st.modSum(float64(now), "dmg_flat") // +attack from avatar tree items
+		dmg := (float64(av.DmgMin) + flat + rand.Float64()*float64(av.DmgMax-av.DmgMin)) * hs.st.modMul(float64(now), "dmg_pct") * hs.powerMul()
 		// Crit: crit_pct chance to strike for 1.5× base (+ crit_dmg_pct bonus magnitude),
 		// flagged 2 on the RECEIVE_HIT so the client plays its CritStrikeEffect. (Skill
 		// damage does not crit -- only the basic attack.)
@@ -1638,9 +1895,7 @@ func (s *Server) hitMobFlagsLocked(c *conn, ms *mobState, dmg float64, damager i
 	if ms.dead {
 		return
 	}
-	// «Штурм»: the altar (Fortress Crystal) shrugs off all damage until its side's
-	// cannons are destroyed -- the core push rule. No effect on Hunt (ms.altar false).
-	if ms.altar && c.inst != nil && c.inst.dota != nil && !c.inst.dota.altarVulnerableLocked(ms) {
+	if c.altarShieldedLocked(ms) {
 		return
 	}
 	// Armor mitigation. The mob's physical armor softens the blow via the shared
@@ -1694,24 +1949,41 @@ func (s *Server) hitMobFlagsLocked(c *conn, ms *mobState, dmg float64, damager i
 	}
 	s.grantXPLocked(killer, ms.xpReward())
 	s.awardCoinsLocked(killer, ms.id, ms.coinReward())
+	// Advance any accepted PvE quest whose objective is a kill on this Hunt map.
+	s.creditQuestKillLocked(killer, ms)
+	// Advance any «Штурм» PvP battle-task whose objective is destroying this enemy structure
+	// (team-credited; the creep-landed twin of this call lives in dotaDamageLocked).
+	s.creditPvpStructureKillLocked(c.inst, ms)
 	// On-kill heal (Cerber's «Кровавый пир»): the killer restores a fraction of the
 	// slain enemy's max HP, capped.
 	s.applyHealOnKillLocked(killer, ms, float64(s.battleTime()))
 	// Loot: a ground chest with a single random consumable, shared party-wide
 	// loot rights. Bosses always drop; trash rolls a flat 1-in-N chance.
-	if s.rollDropLocked(ms) {
+	if s.rollDropLocked(c, ms) {
 		s.spawnDropLocked(c, ms.x, ms.y, float64(s.battleTime()))
 	}
 
-	// Schedule the revive: every creature -- trash and boss alike -- respawns
+	// Schedule the revive: every HOMED creature -- trash and boss alike -- respawns
 	// mobRespawnDelay (5 min) after death, so the location can be farmed. The
 	// combat tick revives it at its authored spawn point once the timer elapses.
-	ms.respawnAt = float64(s.battleTime()) + mobRespawnDelay
+	//
+	// A homeless mob (a «Штурм» creep) never comes back -- its generator simply makes
+	// more -- and arming the timer on it leaked. This path is reached by ANY attacker
+	// that is not another unit's swing (player attack, skill, DoT, summon, thorns), so
+	// in «Штурм» the despawn rule used to depend on WHO landed the killing blow: kill a
+	// creep with a tower and dotaDamageLocked deletes it; kill the same creep yourself
+	// and it stayed in inst.mobs for the rest of the match, growing the target scan by
+	// roughly eight entries a minute per generator -- faster the better you played.
+	// Gating on the unit's own policy makes it a property of the world instead.
+	if ms.homed {
+		ms.respawnAt = float64(s.battleTime()) + mobRespawnDelay
+	}
 
-	// After the death animation, remove the corpse from every client but KEEP the
-	// mobState (dead) so the tick can respawn it later. If a barrier is anchored to
-	// this body, delay the removal past the barrier's expiry (+0.5s so its EFFECT_END
-	// fires first) so the SELF-mode VFX never orphans onto the caster.
+	// After the death animation, remove the corpse from every client; a homed mob KEEPS
+	// its mobState (dead) so the tick can respawn it later, a homeless one is dropped.
+	// If a barrier is anchored to this body, delay the removal past the barrier's expiry
+	// (+0.5s so its EFFECT_END fires first) so the SELF-mode VFX never orphans onto the
+	// caster.
 	mobID := ms.id
 	corpseDelay := corpseDeleteDelay
 	if extra := time.Duration((anchorUntil - float64(s.battleTime()) + 0.5) * float64(time.Second)); extra > corpseDelay {
@@ -1740,6 +2012,13 @@ func (s *Server) hitMobFlagsLocked(c *conn, ms *mobState, dmg float64, damager i
 			return // already respawned (or gone)
 		}
 		s.removeMobFromClientsLocked(c, m, float64(s.battleTime()))
+		// A homeless mob is gone for good, so drop the state with the corpse:
+		// removeMobFromClientsLocked only clears the render flags, and nothing else
+		// would ever collect it. hs.mobs aliases inst.mobs in a shared world, so this
+		// one delete covers both.
+		if !m.homed {
+			delete(hs.mobs, mobID)
+		}
 	})
 }
 

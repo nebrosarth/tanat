@@ -29,9 +29,16 @@ type Server struct {
 
 	// BattleHost/BattlePorts are handed to the client in the common|area_conf
 	// response so it knows where to open the Battle TCP connection. Set by
-	// cmd/ctrlserver after starting the battle listener.
+	// cmd/ctrlserver after starting the battle listener. Used for the central
+	// square (and as the fallback launch target when MatchLauncher is nil).
 	BattleHost  string
 	BattlePorts []int32
+
+	// MatchLauncher, when set, provides a dedicated per-match Battle server (with
+	// its own battle clock) for each Штурм/Охота launch, so the in-battle timer
+	// counts from match start rather than the shared server's uptime. nil falls
+	// back to the shared BattleHost/BattlePorts. Set by cmd/ctrlserver.
+	MatchLauncher MatchLauncher
 
 	// MPD is the push-channel hub (chat lines, party invites, online status). Set by
 	// cmd/ctrlserver after starting the MPD listener; nil in tests that don't push.
@@ -67,6 +74,36 @@ func New() *Server {
 	}
 }
 
+// MatchLauncher creates (or reuses) a per-match Battle server for a room and
+// returns the host and port the client should reconnect to for that battle.
+// Implemented by battleserver.MatchHost; kept as an interface here so ctrlserver
+// does not import battleserver (preserving the layer boundary).
+type MatchLauncher interface {
+	Launch(mapID, room int32) (host string, port int32, err error)
+}
+
+// launchTarget returns the {ip, port[]} the client should reconnect to for a
+// battle in room. With a MatchLauncher set it is that room's dedicated per-match
+// server (its own clock makes the in-battle timer match-relative); otherwise the
+// shared BattleHost/BattlePorts. A launcher error is logged and falls back to the
+// shared server so a launch never fails outright on this account.
+func (s *Server) launchTarget(mapID, room int32) (ip string, ports *amf.MixedArray) {
+	if s.MatchLauncher != nil {
+		if host, port, err := s.MatchLauncher.Launch(mapID, room); err == nil {
+			out := amf.NewArray()
+			out.Add(port)
+			return host, out
+		} else {
+			log.Printf("ctrl: per-match battle server for map=%d room=%d failed (%v); using shared server", mapID, room, err)
+		}
+	}
+	ports = amf.NewArray()
+	for _, p := range s.BattlePorts {
+		ports.Add(p)
+	}
+	return s.BattleHost, ports
+}
+
 // DotaMatchMin/Max bound the configurable «Штурм» match size.
 const (
 	DotaMatchMin int32 = 1
@@ -99,8 +136,10 @@ func (s *Server) Handler() http.Handler {
 	// forever. Real content can be filled in later.
 	mux.HandleFunc("/xml/items.amf", s.handleItemsAmf)
 	mux.HandleFunc("/xml/avatars.amf", s.handleAvatarsAmf)
-	mux.HandleFunc("/xml/quests.amf", s.handleEmptyProto)
-	mux.HandleFunc("/xml/tasks.amf", s.handleEmptyProto)
+	mux.HandleFunc("/xml/quests.amf", s.handleQuestsAmf)
+	// tasks.amf carries the PvP battle-tasks (map_1_0 «Штурм», QUEST_TASK). The client merges it
+	// into the SAME QuestStore as quests.amf, so it uses the identical encoder (see tasks.go).
+	mux.HandleFunc("/xml/tasks.amf", s.handleTasksAmf)
 	return mux
 }
 
@@ -131,6 +170,19 @@ func (s *Server) handleAvatarsAmf(w http.ResponseWriter, r *http.Request) {
 // CtrlProto.Article.X unconditionally), aborting that UI's entire refresh.
 func (s *Server) handleItemsAmf(w http.ResponseWriter, r *http.Request) {
 	writeAMF(w, s.handleItemsProto(), "items.amf ")
+}
+
+// handleQuestsAmf serves /xml/quests.amf: the baked PvE quest catalog the client's
+// QuestStore.Retrieve parses at connect (CtrlServerConnection.DownloadQuests). See quests.go.
+func (s *Server) handleQuestsAmf(w http.ResponseWriter, r *http.Request) {
+	writeAMF(w, s.handleQuestsProto(), "quests.amf ")
+}
+
+// handleTasksAmf serves /xml/tasks.amf: the baked PvP battle-task catalog. The client downloads
+// it into the SAME QuestStore as quests.amf (CtrlServerConnection.DownloadQuests(TasksUrl)), so
+// its shape is identical -- a dense array of quest objects. See tasks.go.
+func (s *Server) handleTasksAmf(w http.ResponseWriter, r *http.Request) {
+	writeAMF(w, s.handleTasksProto(), "tasks.amf ")
 }
 
 // ctrlItemKindPotion is ShopGUI.ItemType.POTION (=19 in the decompiled enum).
@@ -171,7 +223,63 @@ func (s *Server) handleItemsProto() *amf.MixedArray {
 			Set("sort", int32(0)).
 			Set("flags", int32(0)))
 	}
+	// Avatar battle-tree items ("предметы аватаров"): the in-battle DotA-style
+	// item build. Same items.amf blob, but each carries tree_id/tree_slot/
+	// tree_parents (which is what routes it into a BattleItemMenu tab and gates
+	// its purchase) and a params list the tooltip resolves against the item's
+	// baked LongDesc placeholders. price is real here (checked against the
+	// player's in-battle VirtualMoney before the buy is allowed).
+	for _, it := range gamedata.AvatarItems() {
+		root.Add(treeArticleEntry(it))
+	}
+	// Hero gear ("предметы героев"): the persistent WEARABLE Set pieces the city shop
+	// sells and the paperdoll equips. Each is a plain PArticle (price/kind_id/params +
+	// the baked title/icon/long) the shop's article-id lists resolve against.
+	for _, w := range gamedata.Wearables() {
+		root.Add(wearableArticleEntry(w))
+	}
 	return root
+}
+
+// treeArticleEntry builds one avatar-tree article for items.amf. Beyond the five
+// structurally-required PCtrlDesc keys (id/title/short/long/icon), it carries the
+// PArticle fields the item tree actually reads: tree_id (the tab), tree_slot (the
+// grid cell), tree_parents (the purchase edges -- empty for a root), price/
+// price_type (affordability), min_ava_level, and params (the stat tooltip).
+// params is a DENSE array of {skill_id, impact, value}; tree_parents a dense
+// array of ints -- exactly the shapes CtrlPrototype.PArticle.Load parses.
+func treeArticleEntry(it gamedata.AvatarItem) *amf.MixedArray {
+	parents := amf.NewArray()
+	for _, p := range it.Parents {
+		parents.Add(p)
+	}
+	params := amf.NewArray()
+	for _, st := range it.Stats {
+		params.Add(amf.NewArray().
+			Set("skill_id", st.Name).
+			Set("impact", st.Impact()).
+			Set("value", st.Value))
+	}
+	return amf.NewArray().
+		Set("id", it.ArticleID).
+		Set("title", it.NameKey).
+		Set("short", "").
+		Set("long", it.DescKey).
+		Set("icon", it.Icon).
+		Set("price", it.Price).
+		Set("sell_price", int32(0)).
+		Set("type_id", int32(2)). // CtrlThing.PlaceType.AVATAR
+		Set("kind_id", gamedata.AvatarItemKindID()).
+		Set("min_hero_level", int32(1)).
+		Set("min_ava_level", it.MinAvaLvl).
+		Set("cnt", int32(1)).
+		Set("price_type", int32(1)). // virtual money (in-battle gold)
+		Set("sort", it.TreeSlot).
+		Set("flags", int32(0)).
+		Set("tree_id", it.TreeID).
+		Set("tree_slot", it.TreeSlot).
+		Set("tree_parents", parents).
+		Set("params", params)
 }
 
 // clientVersion must match TanatApp.mVersion (the Launcher component's
@@ -257,6 +365,14 @@ func (s *Server) dispatch(req ctrlproto.Request, resp *ctrlproto.Response) {
 		s.handleAvatarListReal(req, resp)
 	case ctrlproto.CmdKey("store", "list"):
 		s.handleStoreList(req, resp)
+	case ctrlproto.CmdKey("store", "buy"):
+		s.handleStoreBuy(req, resp)
+	case ctrlproto.CmdKey("store", "sell"):
+		s.handleStoreSell(req, resp)
+	case ctrlproto.CmdKey("user", "dress"):
+		s.handleUserDress(req, resp)
+	case ctrlproto.CmdKey("user", "undress"):
+		s.handleUserUndress(req, resp)
 	case ctrlproto.CmdKey("castle", "list"):
 		s.handleCastleList(req, resp)
 	case ctrlproto.CmdKey("user", "group_list"):
@@ -321,14 +437,18 @@ func (s *Server) dispatch(req ctrlproto.Request, resp *ctrlproto.Response) {
 			Set("labels_limit", int32(0)).
 			Set("time", int32(0)))
 	case ctrlproto.CmdKey("npc", "list"):
-		// CentralSquareScreen.Show calls Npcs.UpdateContent(); NpcListArgParser
-		// requires an "npcs" associative map (empty = no NPCs). A bare ack
-		// throws "key not found: npcs at list" on the client.
-		resp.Add("npc", "list", amf.NewArray().Set("npcs", amf.NewArray()))
+		// CentralSquareScreen.Show calls Npcs.UpdateContent(): the race-appropriate
+		// quest NPCs (quests.go).
+		s.handleNpcList(req, resp)
 	case ctrlproto.CmdKey("quest", "update"):
-		// Likewise SelfQuests.UpdateContent(); QuestListArgParser requires a
-		// "quests" associative map (empty = no quests).
-		resp.Add("quest", "update", amf.NewArray().Set("quests", amf.NewArray()))
+		// SelfQuests.UpdateContent(): the hero's accepted quest state.
+		s.handleQuestUpdate(req, resp)
+	case ctrlproto.CmdKey("quest", "accept"):
+		s.handleQuestAccept(req, resp)
+	case ctrlproto.CmdKey("quest", "cancel"):
+		s.handleQuestCancel(req, resp)
+	case ctrlproto.CmdKey("quest", "done"):
+		s.handleQuestDone(req, resp)
 	default:
 		log.Printf("ctrl: UNHANDLED %s|%s -> generic ack", req.Object, req.Action)
 		resp.Ack(req.Object, req.Action)

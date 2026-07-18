@@ -89,9 +89,9 @@ func (s *Server) handleFightJoin(req ctrlproto.Request, resp *ctrlproto.Response
 		return
 	}
 	mapID := req.Params.IntOr("map_id", -1)
-	dm, ok := gamedata.DotaMapByID(mapID)
+	scene, ok := fightSceneForMap(mapID)
 	if !ok {
-		log.Printf("ctrl: fight|join unknown DOTA map %d from user %d", mapID, u.ID)
+		log.Printf("ctrl: fight|join unknown fight map %d from user %d", mapID, u.ID)
 		resp.Fail("fight", "join", 8011)
 		return
 	}
@@ -160,7 +160,20 @@ func (s *Server) handleFightJoin(req ctrlproto.Request, resp *ctrlproto.Response
 			Set("deny_for_map", amf.NewArray()).
 			Set("add_stats", amf.NewArray()))
 	}
-	log.Printf("ctrl: «Штурм» match formed map=%d scene=%s room=%d players=%v", mapID, dm.Scene, room, match)
+	log.Printf("ctrl: fight match formed map=%d scene=%s room=%d players=%v", mapID, scene, room, match)
+}
+
+// fightSceneForMap resolves the scene bundle for a fight|join / fight|ready map id,
+// accepting both «Штурм» (DOTA) and «Арена» (DM) maps -- the two modes matched through
+// this same queue. Returns ("", false) for anything else.
+func fightSceneForMap(mapID int32) (string, bool) {
+	if dm, ok := gamedata.DotaMapByID(mapID); ok {
+		return dm.Scene, true
+	}
+	if am, ok := gamedata.ArenaMapByID(mapID); ok {
+		return am.Scene, true
+	}
+	return "", false
 }
 
 // handleFightInRequest answers fight|in_request: a plain success ack, which flips the
@@ -222,7 +235,7 @@ func (s *Server) handleFightReady(req ctrlproto.Request, resp *ctrlproto.Respons
 		log.Printf("ctrl: fight|ready user=%d with no selection -- ignoring", u.ID)
 		return
 	}
-	dm, ok := gamedata.DotaMapByID(sel.mapID)
+	scene, ok := fightSceneForMap(sel.mapID)
 	if !ok {
 		return
 	}
@@ -239,25 +252,25 @@ func (s *Server) handleFightReady(req ctrlproto.Request, resp *ctrlproto.Respons
 		MapID:    sel.mapID,
 		AvatarID: avatarID,
 		Passwd:   passwd,
-		Scene:    dm.Scene,
+		Scene:    scene,
 		Room:     room,
 	})
 	s.clearFightSel(u.ID)
 	log.Printf("ctrl: fight|ready user=%d map=%d avatar=%d scene=%s room=%d -> launch",
-		u.ID, sel.mapID, avatarID, dm.Scene, room)
+		u.ID, sel.mapID, avatarID, scene, room)
 	if s.MPD == nil {
 		return
 	}
 	s.MPD.Push(u.ID, "fight|ready", amf.NewArray().Set("user_id", u.ID))
-	ports := amf.NewArray()
-	for _, p := range s.BattlePorts {
-		ports.Add(p)
-	}
+	// Route the client to this match's dedicated Battle server (own clock, so the
+	// in-battle timer counts from match start) when a launcher is configured; every
+	// player of this room gets the same server.
+	ip, ports := s.launchTarget(sel.mapID, room)
 	s.MPD.Push(u.ID, "fight|launch", amf.NewArray().
-		Set("ip", s.BattleHost).
+		Set("ip", ip).
 		Set("port", ports).
 		Set("passwd", passwd).
-		Set("scene", dm.Scene).
+		Set("scene", scene).
 		Set("map_id", sel.mapID))
 }
 

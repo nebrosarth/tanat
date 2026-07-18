@@ -62,6 +62,11 @@ type huntInstance struct {
 	// simulation (structures + creeps + win condition) that replaces the Hunt mob
 	// pass in the tick loop. See dota.go. nil = a normal Hunt world.
 	dota *dotaState
+
+	// arena is non-nil for an «Арена» (MapType.DM) world: player-versus-player
+	// deathmatch, no mobs. It holds the two sides' frag counts, the win condition and
+	// the respawn-point pool. See arena.go. nil = not an arena.
+	arena *arenaState
 }
 
 // newHuntInstance builds an instance for a map and seeds its shared mob set from
@@ -116,7 +121,11 @@ func newHuntInstance(s *Server, id, mapID int32) *huntInstance {
 			y:      float32(my),
 			spawnX: float32(mx),
 			spawnY: float32(my),
-			level:  lvl,
+			// A Hunt mob belongs to this spawn: it leashes back here, is evicted here
+			// when a player respawns on top of it, and revives here on its timer.
+			// «Штурм» creeps set this false -- see mobState.homed.
+			homed: true,
+			level: lvl,
 		}
 		ms.maxHP, ms.dmgMin, ms.dmgMax, ms.xp, ms.coins = mobT.ScaledStats(lvl)
 		ms.hp = ms.maxHP
@@ -139,9 +148,14 @@ func (s *Server) joinInstance(roomID, mapID int32, c *conn) *huntInstance {
 		s.mu.Lock()
 		inst := s.insts[roomID]
 		if inst == nil {
-			if _, ok := gamedata.DotaMapByID(mapID); ok {
+			_, isDota := gamedata.DotaMapByID(mapID)
+			_, isArena := gamedata.ArenaMapByID(mapID)
+			switch {
+			case isDota:
 				inst = newDotaInstance(s, roomID, mapID)
-			} else {
+			case isArena:
+				inst = newArenaInstance(s, roomID, mapID)
+			default:
 				inst = newHuntInstance(s, roomID, mapID)
 			}
 			s.insts[roomID] = inst

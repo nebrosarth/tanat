@@ -50,6 +50,11 @@ const (
 	// mob's own AttackRange replaces this base.
 	meleeReach = 0.6
 
+	// summonTeam is the sync TEAM a summon is rendered with: it fights for its owner,
+	// so it shares the player's side (the client's self team = FRIEND). It is also the
+	// team a summon must NOT attack.
+	summonTeam int32 = 1
+
 	summonSeek        = 12.0 // summons pick fights inside this radius
 	summonRing        = 2.8  // escort radius: summons hold a ring slot AROUND the follow point
 	summonSpawnRadius = 1.2  // tighter ring the burst spawns on, around its cast point
@@ -64,8 +69,24 @@ const (
 	// than this push apart so a pack surrounds the target instead of stacking on
 	// one spot. Kept below the effective melee reach so a spread pack still
 	// reaches the target. mobSepWeight scales the push against the chase direction.
+	//
+	// It is a FLOOR, not the whole rule -- see bodySeparation, which widens it to the
+	// two bodies' radii. Flat spacing was fine while every body was a same-sized Hunt
+	// mob; it is not, once an altar is 3.0m across.
 	mobSepRange  = 1.8
 	mobSepWeight = 0.9
+	// sepMargin is the breathing room added on top of two bodies' radii: the gap they
+	// settle at when nothing but each other acts on them. Deliberately small -- this is
+	// a collision rule ("do not stand inside each other"), not a formation.
+	sepMargin = 0.35
+	// mobSepStep is the deadband on the in-place sidestep: a unit already engaging a
+	// target sidesteps a crowding neighbour only once the push clears this, then holds.
+	// Without the deadband it would jitter at the tick rate forever; with it, a spread
+	// pack falls under threshold and goes silent. mobSidestepFrac is the reduced speed of
+	// that shuffle -- it reads as a shuffle, not a charge, and does not outrun the strike.
+	// One rule, shared by both drivers (Hunt's in-range arm and «Штурм»'s).
+	mobSepStep     = 0.5
+	mobSidestepFrac = 0.6
 
 	// mobArrowSpeed is a ranged mob's projectile speed (world units/sec) used to size
 	// the arrow's flight from the release point to the target. Fast, like a real arrow.
@@ -141,6 +162,15 @@ type channelState struct {
 // every ready member (owner + teammates), each in its own tracker index, so proto
 // (the party-wide prototype id) is stored to rebuild the model on a newcomer's
 // client.
+// alive is THE liveness test for a summon: not reaped, not at zero HP, not expired.
+// tickSummonsLocked's own reap uses exactly these three, and `dead` alone is not enough
+// -- it is set lazily on the owner's next tick, so a pet can be at 0 HP or past its
+// expiry and still read dead==false for the rest of the pass. Every scan that can pick a
+// summon must agree, or one of them targets a corpse.
+func (sm *summonState) alive(now float64) bool {
+	return !sm.dead && sm.hp > 0 && sm.until >= now
+}
+
 type summonState struct {
 	id          int32
 	proto       int32
@@ -153,6 +183,24 @@ type summonState struct {
 	nextSwing   float64
 	swingDoneAt float64 // battle-time to send ACTION_DONE closing the current swing
 	dead        bool
+	// posSyncAt is when this summon's velocity was last broadcast. Separation nudges the
+	// heading a little every tick, so syncing on any change at all would put one POSITION
+	// per pet per tick on the wire; this bounds the client's dead-reckoning drift instead.
+	posSyncAt float64
+
+	// A PET (gamedata.Op.Pet -- Grimlok's dinosaur) takes ORDERS from its owner instead
+	// of seeking the nearest enemy and escorting them. slot is the skill that summoned
+	// it, which is also its identity: re-casting that slot replaces it.
+	//
+	// The order is latched HERE rather than read off the owner each tick, because the
+	// owner's own order state does not survive: hs.attackTarget clears the moment their
+	// target dies and c.hasDest clears the moment THEY arrive -- while the pet, slower
+	// and further back, is still walking. The pet owns its orders.
+	pet       bool
+	slot      int
+	ordTarget int32 // enemy the owner ordered it onto (0 = none)
+	ordX, ordY float32
+	ordMove   bool // walking to an ordered ground point
 
 	pf pathState // routed chase waypoints when the straight line is wall-blocked
 }
@@ -674,7 +722,7 @@ func (s *Server) nearestMobLocked(c *conn, x, y float32, r float64, exclude int3
 	var best *mobState
 	bestD := r
 	for _, m := range c.huntState.mobs {
-		if m.dead || m.id == exclude {
+		if m.dead || m.id == exclude || !m.hostile() {
 			continue
 		}
 		if d := math.Hypot(float64(m.x-x), float64(m.y-y)); d <= bestD {
@@ -693,7 +741,7 @@ func (s *Server) nearestMobLocked(c *conn, x, y float32, r float64, exclude int3
 func (s *Server) randomMobInRangeLocked(c *conn, x, y float32, r float64, exclude int32) *mobState {
 	var cands []*mobState
 	for _, m := range c.huntState.mobs {
-		if m.dead || m.id == exclude {
+		if m.dead || m.id == exclude || !m.hostile() {
 			continue
 		}
 		if math.Hypot(float64(m.x-x), float64(m.y-y)) <= r {
@@ -780,6 +828,20 @@ func (s *Server) summonLocked(c *conn, op gamedata.Op, ctx opCtx, now float64) {
 	if n < 1 {
 		n = 1
 	}
+	// A pet is UNIQUE: re-casting the skill replaces the one it made last time rather
+	// than adding a second. Without this the player just spams the button and fields a
+	// pack -- Grimlok's dinosaur lives 180s, so they would all still be alive.
+	if op.Pet {
+		for id, old := range hs.summons {
+			if !old.pet || old.slot != ctx.slot || old.dead {
+				continue
+			}
+			old.dead = true
+			old.swingDoneAt = 0
+			delete(hs.summons, id)
+			s.removeSummonFromClientsLocked(c, old, now)
+		}
+	}
 	// Spawn at the cast point for a ground-targeted summon (Elgorm's «Гвардия
 	// мертвых» is aimed where the player clicks); fall back to the caster for a
 	// self/untargeted summon.
@@ -800,6 +862,12 @@ func (s *Server) summonLocked(c *conn, op gamedata.Op, ctx opCtx, now float64) {
 			hp: op.HP.At(ctx.level), maxHP: op.HP.At(ctx.level),
 			dmg:   op.Dmg.At(ctx.level),
 			until: now + op.Lifetime.At(ctx.level),
+			pet:   op.Pet, slot: ctx.slot,
+		}
+		// A pet summoned onto a target inherits that as its first order -- casting the
+		// summon at an enemy means "go get it", not "stand there".
+		if op.Pet && ctx.target != nil && !ctx.target.dead && ctx.target.hostile() {
+			sm.ordTarget = ctx.target.id
 		}
 		hs.summons[id] = sm
 		// Render on every ready member (owner + teammates), each in its own tracker.
@@ -838,7 +906,10 @@ func (s *Server) revealSummonToMemberLocked(mem *conn, sm *summonState, now floa
 			// actually animates (same latent bug the ally avatar had).
 			setFloats(syncAttackSpeed, idx, 1.0).
 			setFloats(syncRadius, idx, float32(summonRadius)).
-			setInt(syncTeam, idx, 1).
+			// Vision -- a pet is always FRIEND, so unlike a mob's this always spawns a
+			// reveal zone on a map that renders fog. See creepViewRadius.
+			setFloats(syncViewRadius, idx, summonViewRadius).
+			setInt(syncTeam, idx, summonTeam).
 			build(hs.tr.count())))
 	// ATTACK effector so the model swings when we push its ACTIONs.
 	s.addAttackEffectorLocked(mem, sm.id, summonAttackProtoID, now)
@@ -855,6 +926,71 @@ func (s *Server) hideSummonFromMemberLocked(mem *conn, sm *summonState, now floa
 func (s *Server) removeSummonFromClientsLocked(c *conn, sm *summonState, now float64) {
 	for _, mem := range c.members() {
 		s.hideSummonFromMemberLocked(mem, sm, now)
+	}
+}
+
+// petTargetLocked resolves a pet's current victim from its standing attack order, or
+// nil if it has none. A live order survives; a dead/invalid one is RE-AIMED at the
+// nearest enemy in seek range rather than dropped, mirroring how the player's own
+// auto-attack chains onto the next mob after a kill (hitMobLocked/autoResumed) -- a pet
+// that downs its target and then just stands there reads as broken.
+//
+// Re-aiming is the ONE thing a pet decides for itself, and only ever while it is already
+// under an attack order: it never opens a fight the player did not start.
+func (s *Server) petTargetLocked(c *conn, sm *summonState, now float64) *mobState {
+	hs := c.huntState
+	if sm.ordTarget == 0 {
+		return nil
+	}
+	if m := hs.mobs[sm.ordTarget]; m != nil && !m.dead && m.hostile() {
+		return m
+	}
+	sm.ordTarget = 0
+	var best *mobState
+	bestD := summonSeek
+	for _, m := range hs.mobs {
+		if m.dead || !m.hostile() {
+			continue
+		}
+		if d := math.Hypot(float64(m.x-sm.x), float64(m.y-sm.y)); d < bestD {
+			bestD, best = d, m
+		}
+	}
+	if best != nil {
+		sm.ordTarget = best.id
+		sm.ordMove = false
+	}
+	return best
+}
+
+// orderPetsAttackLocked / orderPetsMoveLocked push the owner's order to their pets. The
+// two hooks sit on the player's own order paths (startAttackLocked, handleMove), so a
+// pet reacts on the same click the avatar does.
+func (s *Server) orderPetsAttackLocked(c *conn, targetID int32) {
+	hs := c.huntState
+	if hs == nil {
+		return
+	}
+	for _, sm := range hs.summons {
+		if sm.pet && !sm.dead {
+			sm.ordTarget = targetID
+			sm.ordMove = false
+		}
+	}
+}
+
+func (s *Server) orderPetsMoveLocked(c *conn, x, y float32) {
+	hs := c.huntState
+	if hs == nil {
+		return
+	}
+	for _, sm := range hs.summons {
+		if sm.pet && !sm.dead {
+			// A move order BREAKS the fight, exactly as it does for the avatar itself
+			// (handleMove calls stopAttackLocked): the click means "disengage and go".
+			sm.ordTarget = 0
+			sm.ordX, sm.ordY, sm.ordMove = x, y, true
+		}
 	}
 }
 
@@ -885,18 +1021,45 @@ func (s *Server) tickSummonsLocked(c *conn, now float64) {
 				Set("item", false).
 				Set("cooldown", now))
 		}
-		// Find something to fight.
+		// Find something to fight. Only ENEMIES: a summon fights for its owner, so it
+		// is team 1 (see revealSummonToMemberLocked) and must skip the player's own
+		// side. In Hunt every mob is team 0 -> teamVal() -1, so all of them stay
+		// targets; in «Штурм» the mob set ALSO holds the player's allied creeps and
+		// their base structures (team 1), which a pet would otherwise happily maul --
+		// nearest-first, so it picked the friendly creeps marching right past it.
 		var target *mobState
 		best := summonSeek
-		for _, m := range hs.mobs {
-			if m.dead {
+
+		if sm.pet {
+			// A PET fights on ORDERS. It does not pick its own fights and it does not
+			// escort -- where it stands is the player's call.
+			target = s.petTargetLocked(c, sm, now)
+			if target == nil {
+				if sm.ordMove {
+					if math.Hypot(float64(sm.ordX-sm.x), float64(sm.ordY-sm.y)) > summonSlotTol {
+						s.moveSummonLocked(c, sm, sm.ordX, sm.ordY, true, now)
+					} else {
+						sm.ordMove = false // arrived: hold here until told otherwise
+						s.moveSummonLocked(c, sm, 0, 0, false, now)
+					}
+				} else {
+					s.moveSummonLocked(c, sm, 0, 0, false, now) // no order: hold
+				}
 				continue
 			}
-			d := math.Hypot(float64(m.x-sm.x), float64(m.y-sm.y))
-			if d < best {
-				best, target = d, m
+			best = math.Hypot(float64(target.x-sm.x), float64(target.y-sm.y))
+		} else {
+			for _, m := range hs.mobs {
+				if m.dead || m.teamVal() == summonTeam {
+					continue
+				}
+				d := math.Hypot(float64(m.x-sm.x), float64(m.y-sm.y))
+				if d < best {
+					best, target = d, m
+				}
 			}
 		}
+
 		if target == nil {
 			// No enemy nearby: escort the owner like a pet instead of freezing in
 			// place. Each summon holds its own slot on a ring AROUND the owner
@@ -928,7 +1091,11 @@ func (s *Server) tickSummonsLocked(c *conn, now float64) {
 			s.moveSummonLocked(c, sm, gx, gy, true, now)
 			continue
 		}
-		s.moveSummonLocked(c, sm, 0, 0, false, now)
+		// Strike FIRST, then settle. Committing the swing here sets swingDoneAt, so the
+		// hold/sidestep below sees "mid-strike" on the very tick the swing starts and keeps
+		// the pet planted -- otherwise it would shuffle off a crowding body on the same tick
+		// it begins its strike, the exact «двигается во время замаха» regression the creep
+		// path was already fixed for (and which the Hunt mob arm still has as a wart).
 		if now >= sm.nextSwing {
 			sm.nextSwing = now + 1.0
 			s.broadcastObjLocked(c, sm.id, battleproto.CmdAction,
@@ -939,6 +1106,7 @@ func (s *Server) tickSummonsLocked(c *conn, now float64) {
 			sm.swingDoneAt = now + 0.9
 			s.hitMobLocked(c, target, sm.dmg, sm.id)
 		}
+		s.moveSummonLocked(c, sm, 0, 0, false, now)
 	}
 }
 
@@ -967,22 +1135,77 @@ func (s *Server) moveSummonLocked(c *conn, sm *summonState, tx, ty float32, chas
 			sm.pf.idx = len(sm.pf.pts)
 		}
 	}
+	// Separation from every other body. Without it a pet walked through mobs, creeps and
+	// its packmates and came to rest inside whatever it was next to: ringPoint spreads
+	// several pets of the SAME owner around a shared anchor, but a fixed formation angle
+	// knows nothing about other bodies and was never collision.
+	//
+	// Never mid-swing, in either arm below: the client blends the attack clip over the run
+	// clip, so an attacker that slides reads as broken. That is the same rule that keeps a
+	// «Штурм» creep planted for its strike, and it was a reported bug once already.
+	var sepx, sepy float32
+	if sm.swingDoneAt == 0 {
+		sepx, sepy = c.huntState.bodySeparation(c.instMembers(), now, sm.id, sm.x, sm.y, summonRadius)
+	}
+	sepN := float32(math.Hypot(float64(sepx), float64(sepy)))
+
 	var nvx, nvy float32
-	if chase {
+	switch {
+	case chase:
 		blocked := c.nav != nil && !c.mobHasLoSLocked(sm.x, sm.y, tx, ty)
 		gx, gy := c.aimAlong(&sm.pf, sm.x, sm.y, tx, ty, blocked, now)
 		dx, dy := gx-sm.x, gy-sm.y
 		d := float32(math.Hypot(float64(dx), float64(dy)))
 		if d > 0.3 {
-			nvx, nvy = dx/d*summonSpeed, dy/d*summonSpeed
+			ux, uy := dx/d, dy/d
+			stx, sty := ux+sepx*mobSepWeight, uy+sepy*mobSepWeight
+			sn := float32(math.Hypot(float64(stx), float64(sty)))
+			if sn < 1e-3 {
+				stx, sty, sn = ux, uy, 1
+			}
+			nvx, nvy = stx/sn*summonSpeed, sty/sn*summonSpeed
 		}
-	} else {
+	default:
 		sm.pf.pts = nil
+		// Holding is not the same as being welded in place. A pet ordered onto a spot
+		// another body already occupies still has to get OUT of it -- otherwise it walks
+		// the order straight into a creep and stops there, which is the whole complaint.
+		// This is not drift: the push is zero the moment it is clear, so the pet settles
+		// just outside the body it was standing in and holds there. Reduced speed so
+		// getting unstuck reads as a shuffle, not a charge (mirrors the Hunt mob arm).
+		if sepN > mobSepStep {
+			nvx, nvy = sepx/sepN*summonSpeed*mobSidestepFrac, sepy/sepN*summonSpeed*mobSidestepFrac
+		}
+	}
+	// A push is lateral, so it can aim at ground the straight heading never touched. Keep
+	// the pet on the map: drop the push rather than step into geometry (the clamp above
+	// would only drag it back out afterwards, which reads as sticking on the wall).
+	if c.nav != nil && sepN > 0 && (nvx != 0 || nvy != 0) {
+		step := float32(tickInterval.Seconds())
+		if !c.nav.Walkable(float64(sm.x+nvx*step), float64(sm.y+nvy*step)) {
+			nvx, nvy = 0, 0
+			if chase {
+				if dx, dy := tx-sm.x, ty-sm.y; math.Hypot(float64(dx), float64(dy)) > 0.3 {
+					d := float32(math.Hypot(float64(dx), float64(dy)))
+					nvx, nvy = dx/d*summonSpeed, dy/d*summonSpeed
+				}
+			}
+		}
 	}
 	if nvx == sm.vx && nvy == sm.vy {
 		return
 	}
+	// Sync a stop or a real course change at once; throttle the rest. Not syncing is
+	// self-consistent, not a lie: the summon keeps integrating on the velocity the
+	// client was last told, so the two stay aligned and the push simply applies once it
+	// is worth a packet. Mirrors the mob chase guard.
+	stopping := nvx == 0 && nvy == 0
+	if !stopping && now-sm.posSyncAt <= 0.7 &&
+		math.Hypot(float64(nvx-sm.vx), float64(nvy-sm.vy)) <= summonSpeed*0.3 {
+		return
+	}
 	sm.vx, sm.vy = nvx, nvy
+	sm.posSyncAt = now
 	// Re-sync the new velocity to every viewer, each with its own tracking index.
 	s.broadcastPosLocked(c, sm.id, sm.x, sm.y, sm.vx, sm.vy, float32(now))
 }
@@ -1003,6 +1226,34 @@ func (s *Server) stunMobLocked(c *conn, m *mobState, now, dur float64) {
 	m.st.stunUntil = math.Max(m.st.stunUntil, now+dur)
 	s.ensureMobStatusFxLocked(c, m, &m.st.stunFx, "StunEffect")
 	s.stopMobLocked(c, m, now)
+	s.cancelSwingLocked(c, m, now)
+}
+
+// cancelSwingLocked aborts m's committed-but-UNRELEASED swing or cast. The ACTION_DONE
+// goes out FIRST -- resetInFlight would otherwise zero swingDoneAt without ever telling
+// the client the swing ended, leaving the attack clip looping. The attack CADENCE
+// (nextSwing) is deliberately preserved across the reset: losing the swing is the
+// interrupt; handing back the cooldown too would make being stunned a reward.
+//
+// An ALREADY-LOOSED shell (projFlying) survives: its hit is a promise made to the client
+// that cannot be withdrawn, so cancelling it would render a visible impact for zero
+// damage. See mobState.projFlying. A melee swing has no such promise and is dropped.
+//
+// A stun is the only caller today, and wiring it here settles a rule the two drivers
+// disagreed on. Hunt gated its AI on stunned() AFTER committing, so the release and the
+// impact just waited and fired late -- an arrow leaving a bow that had been frozen for
+// two seconds. «Штурм» had no stun gate upstream of dotaResolveSwingLocked at all, so a
+// stunned cannon fired dead on schedule. Interrupting the wind-up is what the client
+// renders either way: the stun clip replaces the attack clip.
+func (s *Server) cancelSwingLocked(c *conn, m *mobState, now float64) {
+	flying, hitAt, hitDmg, hitTarget := m.projFlying, m.hitAt, m.hitDmg, m.hitTarget
+	s.closeMobSwingLocked(c, m, now)
+	next := m.nextSwing
+	m.resetInFlight()
+	m.nextSwing = next
+	if flying {
+		m.projFlying, m.hitAt, m.hitDmg, m.hitTarget = true, hitAt, hitDmg, hitTarget
+	}
 }
 
 // stopMobLocked zeroes a mob's velocity (with sync) if it was moving. The stop
@@ -1015,11 +1266,24 @@ func (s *Server) stopMobLocked(c *conn, m *mobState, now float64) {
 	s.broadcastPosLocked(c, m.id, m.x, m.y, 0, 0, float32(now))
 }
 
+// mobSpeed is a mob's effective move speed: its authored base times the status
+// multiplier. THE ONE place that multiplier is computed, so a mob moves at the speed
+// its SYNC advertises and every driver agrees.
+//
+// moveFactor already folds both the slow and every move_speed_pct mod (status.go), so
+// it is applied exactly once. The three mob call sites used to re-multiply by
+// modMul("move_speed_pct") on top of it, squaring the mod -- self-consistently, which
+// is why it hid: movement matched the SYNC, both were just wrong. A 1.4x haste ran at
+// 1.96x. The player path (effects.go, lobbyMoveSpeed * moveFactor) never carried the
+// extra factor, which is what shows this was a slip and not a rule.
+func mobSpeed(m *mobState, now float64) float64 {
+	return m.mob.Speed * m.st.moveFactor(now)
+}
+
 // syncMobSpeedLocked pushes the mob's current SPEED stat (slow visuals) to every
 // viewer.
 func (s *Server) syncMobSpeedLocked(c *conn, m *mobState, now float64) {
-	sp := m.mob.Speed * m.st.moveFactor(now) * m.st.modMul(now, "move_speed_pct")
-	s.broadcastStatLocked(c, m.id, syncSpeed, float32(sp), float32(now))
+	s.broadcastStatLocked(c, m.id, syncSpeed, float32(mobSpeed(m, now)), float32(now))
 }
 
 // mobTarget is the enemy a mob has picked this tick: the nearest member's avatar
@@ -1144,9 +1408,104 @@ func (s *Server) closeMobSwingLocked(c *conn, m *mobState, now float64) {
 	m.swingDoneAt = 0
 	s.broadcastObjLocked(c, m.id, battleproto.CmdActionDone, amf.NewArray().
 		Set("id", m.id).
-		Set("action", mobAttackProtoID(m.mobIdx)).
+		Set("action", m.attackProtoID()).
 		Set("item", false).
 		Set("cooldown", now))
+}
+
+// mobUpkeepLocked runs the timed upkeep every live mob needs whichever world
+// simulation drives it: expiring status fx/mods, bleeding DoT streams and closing out a
+// finished swing. It reports whether the mob is still alive -- a DoT slice can finish it
+// off, and the caller must then skip the rest of its pass for it.
+//
+// Shared by the Hunt mob pass (tickMobsLocked) and the «Штурм» tick, which replaces that
+// pass wholesale: without this, statuses on a lane creep never expired (a stun's VFX
+// hung on it forever), DoTs never bled it, and its swing was never closed out.
+func (s *Server) mobUpkeepLocked(c *conn, m *mobState, now float64) bool {
+	st := &m.st
+
+	// Status fx expiry (world-scoped: ended on every viewer).
+	if st.stunFx != 0 && now >= st.stunUntil {
+		s.worldFxEndLocked(c, st.stunFx)
+		st.stunFx = 0
+	}
+	if st.rootFx != 0 && now >= st.rootUntil {
+		s.worldFxEndLocked(c, st.rootFx)
+		st.rootFx = 0
+	}
+	if st.slowFx != 0 && now >= st.slowUntil {
+		s.worldFxEndLocked(c, st.slowFx)
+		st.slowFx = 0
+		s.syncMobSpeedLocked(c, m, now)
+	}
+	if st.atkSlowFx != 0 && now >= st.atkSlowUntil {
+		s.worldFxEndLocked(c, st.atkSlowFx)
+		st.atkSlowFx = 0
+	}
+	if st.silenceFx != 0 && now >= st.silenceUntil {
+		s.worldFxEndLocked(c, st.silenceFx)
+		st.silenceFx = 0
+	}
+	var expMods []statMod
+	for _, mod := range st.mods {
+		if mod.until == 0 || mod.until > now {
+			expMods = append(expMods, mod)
+		}
+	}
+	if len(expMods) != len(st.mods) {
+		st.mods = expMods
+		s.syncMobSpeedLocked(c, m, now)
+	}
+
+	// DoT streams. Snapshot the slice first: a tick that kills the mob resets
+	// m.st (clearing st.dots) mid-loop, so indexing the live slice would panic.
+	// Damage is applied in small dotTickInterval slices and the health bar is
+	// synced ONCE per combat tick (5x/sec) so poison bleeds down smoothly instead
+	// of lurching once a second. No RECEIVE_HIT per slice -- that would spray an
+	// impact particle every tick; the acid VFX already signals the poison. Only
+	// the KILLING slice goes through hitMobLocked (for the death sequence).
+	dots := st.dots
+	var dotKeep []overTime
+	drained := false
+	for i := range dots {
+		if m.dead {
+			break
+		}
+		d := dots[i]
+		for d.nextTick <= now && d.nextTick <= d.until && !m.dead {
+			slice := d.perSec * dotTickInterval
+			if m.hp-slice <= 0 {
+				s.hitMobLocked(c, m, slice, d.srcObj) // finishing tick: full death path
+			} else {
+				m.hp -= slice
+				drained = true
+			}
+			d.nextTick += dotTickInterval
+		}
+		if !m.dead && d.until > now {
+			dotKeep = append(dotKeep, d)
+		}
+	}
+	if m.dead {
+		return false
+	}
+	if drained {
+		s.syncMobHealthLocked(c, m)
+	}
+	st.dots = dotKeep
+	// Poison fully cleared -> drop the shared acid visual.
+	if len(dotKeep) == 0 && st.dotFx != 0 {
+		s.worldFxEndLocked(c, st.dotFx)
+		st.dotFx = 0
+	}
+
+	// Close out a finished swing: tell every viewer the attack action is done so
+	// it drops the attack-animation overlay (and attacker highlight). Runs in
+	// every branch, so a mob that leaves attack range mid-swing still stops.
+	if m.swingDoneAt > 0 && now >= m.swingDoneAt {
+		s.closeMobSwingLocked(c, m, now)
+	}
+	return true
 }
 
 // tickMobsLocked is the shared mob simulation, run once per world by the instance
@@ -1167,94 +1526,16 @@ func (s *Server) tickMobsLocked(c *conn, now float64) {
 			}
 			continue
 		}
-		// Fog of war (unified for the party): create/remove the mob when ANY member
-		// is near/far. A mob no member is near runs no AI and pushes nothing.
-		s.updateMobVisibilityLocked(c, m, now)
-		if !m.shown {
+		// Interest management (create/remove on the party's clients, skip the AI of a
+		// mob nobody is near). Provably a no-op rather than a rule -- see
+		// mobInterestLocked.
+		if !s.mobInterestLocked(c, m, now) {
 			continue
 		}
 		st := &m.st
 
-		// Status fx expiry (world-scoped: ended on every viewer).
-		if st.stunFx != 0 && now >= st.stunUntil {
-			s.worldFxEndLocked(c, st.stunFx)
-			st.stunFx = 0
-		}
-		if st.rootFx != 0 && now >= st.rootUntil {
-			s.worldFxEndLocked(c, st.rootFx)
-			st.rootFx = 0
-		}
-		if st.slowFx != 0 && now >= st.slowUntil {
-			s.worldFxEndLocked(c, st.slowFx)
-			st.slowFx = 0
-			s.syncMobSpeedLocked(c, m, now)
-		}
-		if st.atkSlowFx != 0 && now >= st.atkSlowUntil {
-			s.worldFxEndLocked(c, st.atkSlowFx)
-			st.atkSlowFx = 0
-		}
-		if st.silenceFx != 0 && now >= st.silenceUntil {
-			s.worldFxEndLocked(c, st.silenceFx)
-			st.silenceFx = 0
-		}
-		var expMods []statMod
-		for _, mod := range st.mods {
-			if mod.until == 0 || mod.until > now {
-				expMods = append(expMods, mod)
-			}
-		}
-		if len(expMods) != len(st.mods) {
-			st.mods = expMods
-			s.syncMobSpeedLocked(c, m, now)
-		}
-
-		// DoT streams. Snapshot the slice first: a tick that kills the mob resets
-		// m.st (clearing st.dots) mid-loop, so indexing the live slice would panic.
-		// Damage is applied in small dotTickInterval slices and the health bar is
-		// synced ONCE per combat tick (5x/sec) so poison bleeds down smoothly instead
-		// of lurching once a second. No RECEIVE_HIT per slice -- that would spray an
-		// impact particle every tick; the acid VFX already signals the poison. Only
-		// the KILLING slice goes through hitMobLocked (for the death sequence).
-		dots := st.dots
-		var dotKeep []overTime
-		drained := false
-		for i := range dots {
-			if m.dead {
-				break
-			}
-			d := dots[i]
-			for d.nextTick <= now && d.nextTick <= d.until && !m.dead {
-				slice := d.perSec * dotTickInterval
-				if m.hp-slice <= 0 {
-					s.hitMobLocked(c, m, slice, d.srcObj) // finishing tick: full death path
-				} else {
-					m.hp -= slice
-					drained = true
-				}
-				d.nextTick += dotTickInterval
-			}
-			if !m.dead && d.until > now {
-				dotKeep = append(dotKeep, d)
-			}
-		}
-		if m.dead {
-			continue
-		}
-		if drained {
-			s.syncMobHealthLocked(c, m)
-		}
-		st.dots = dotKeep
-		// Poison fully cleared -> drop the shared acid visual.
-		if len(dotKeep) == 0 && st.dotFx != 0 {
-			s.worldFxEndLocked(c, st.dotFx)
-			st.dotFx = 0
-		}
-
-		// Close out a finished swing: tell every viewer the attack action is done so
-		// it drops the attack-animation overlay (and attacker highlight). Runs in
-		// every branch, so a mob that leaves attack range mid-swing still stops.
-		if m.swingDoneAt > 0 && now >= m.swingDoneAt {
-			s.closeMobSwingLocked(c, m, now)
+		if !s.mobUpkeepLocked(c, m, now) {
+			continue // a DoT tick finished it off
 		}
 
 		// Dead-reckon our copy of the mob position, clamped to walkable ground so
@@ -1274,6 +1555,43 @@ func (s *Server) tickMobsLocked(c *conn, now float64) {
 			if len(m.pf.pts) > 0 {
 				m.pf.idx = len(m.pf.pts)
 			}
+		}
+
+		// Resolve COMMITTED actions before any gate below can skip this mob. They are
+		// promises already made -- a loosed shell is flying on the client, and a swing
+		// connects because range was met when it STARTED. A stun cancels the wind-up at
+		// the moment it lands (cancelSwingLocked), so nothing reachable here is stale;
+		// what must not happen is a committed hit STALLING behind the stun gate and
+		// firing late. «Штурм» resolves in the same position, ahead of its own gates
+		// (dotaResolveSwingLocked), so the two drivers now agree.
+		//
+		// Release a ranged mob's committed arrow once the draw animation ends (its
+		// scheduled bow-release point). The client flies the projectile prefab over
+		// hit_at-now, so compute the flight NOW from the live gap and set the hit to
+		// land on arrival. Capped to resolve before the next swing so the cycle stays
+		// clean.
+		if m.projLaunchAt > 0 && now >= m.projLaunchAt {
+			m.projLaunchAt = 0
+			m.hitAt = now + mobArrowFlightLocked(m, members, now)
+			m.projFlying = true
+			s.broadcastObjLocked(c, m.id, battleproto.CmdSetProjectile, amf.NewArray().
+				Set("source", m.id).
+				Set("target", m.projTarget).
+				Set("hit_at", m.hitAt))
+		}
+		// Land committed hits even if the target has since moved: a swing/cast connects
+		// because range (or aim) was met when it STARTED, matching the client, which
+		// locks onto the target at the start of the action. Basic attack hit -- resolved
+		// to whichever member/summon it was aimed at:
+		if m.hitAt > 0 && now >= m.hitAt {
+			m.hitAt = 0
+			m.projFlying = false
+			s.resolveMobHitLocked(m, members, now)
+		}
+		// Boss skill impact:
+		if m.skillHitAt > 0 && now >= m.skillHitAt {
+			m.skillHitAt = 0
+			s.landBossSkillLocked(c, m, members, now)
 		}
 
 		if st.stunned(now) {
@@ -1322,32 +1640,6 @@ func (s *Server) tickMobsLocked(c *conn, now float64) {
 			continue
 		}
 
-		// Release a ranged mob's committed arrow once the draw animation ends (its
-		// scheduled bow-release point). The client flies the projectile prefab over
-		// hit_at-now, so compute the flight NOW from the live gap and set the hit to
-		// land on arrival. Capped to resolve before the next swing so the cycle stays
-		// clean. Fired from the same "committed" gate as the hit below.
-		if m.projLaunchAt > 0 && now >= m.projLaunchAt {
-			m.projLaunchAt = 0
-			m.hitAt = now + mobArrowFlightLocked(m, members, now)
-			s.broadcastObjLocked(c, m.id, battleproto.CmdSetProjectile, amf.NewArray().
-				Set("source", m.id).
-				Set("target", m.projTarget).
-				Set("hit_at", m.hitAt))
-		}
-		// Land committed hits even if the target has since moved: a swing/cast
-		// connects because range (or aim) was met when it STARTED, matching the
-		// client, which locks onto the target at the start of the action. Basic
-		// attack hit -- resolved to whichever member/summon it was aimed at:
-		if m.hitAt > 0 && now >= m.hitAt {
-			m.hitAt = 0
-			s.resolveMobHitLocked(m, members, now)
-		}
-		// Boss skill impact:
-		if m.skillHitAt > 0 && now >= m.skillHitAt {
-			m.skillHitAt = 0
-			s.landBossSkillLocked(c, m, members, now)
-		}
 		// Stand still while an attack/cast animation is playing: a creature never
 		// chases or shuffles mid-swing. swingDoneAt is cleared when the animation's
 		// ACTION_DONE fires; skillHitAt while a cast wind-up is still pending.
@@ -1393,11 +1685,11 @@ func (s *Server) tickMobsLocked(c *conn, now float64) {
 				s.stopMobLocked(c, m, now) // wall-blocked: hold position
 				continue
 			}
-			sp := m.mob.Speed * st.moveFactor(now) * st.modMul(now, "move_speed_pct")
+			sp := mobSpeed(m, now)
 			// Steer = chase direction + separation from packmates, so a group
 			// converging on the target fans out instead of overlapping.
 			ux, uy := dx/d, dy/d
-			sepx, sepy := hs.mobSeparation(m)
+			sepx, sepy := hs.bodySeparation(c.instMembers(), now, m.id, m.x, m.y, m.mob.Radius())
 			stx, sty := ux+sepx*mobSepWeight, uy+sepy*mobSepWeight
 			sn := float32(math.Hypot(float64(stx), float64(sty)))
 			if sn < 1e-3 {
@@ -1416,11 +1708,11 @@ func (s *Server) tickMobsLocked(c *conn, now float64) {
 		// In range with a clear path. If crowding a packmate, sidestep so the pack
 		// spreads around the target rather than stacking on one point; otherwise
 		// hold position. Either way it still swings (attacking while shuffling).
-		sepx, sepy := hs.mobSeparation(m)
+		sepx, sepy := hs.bodySeparation(c.instMembers(), now, m.id, m.x, m.y, m.mob.Radius())
 		sn := float32(math.Hypot(float64(sepx), float64(sepy)))
-		if sn > 0.5 && !st.rooted(now) && !m.mob.Stationary {
-			sp := m.mob.Speed * st.moveFactor(now) * st.modMul(now, "move_speed_pct")
-			m.vx, m.vy = sepx/sn*float32(sp)*0.6, sepy/sn*float32(sp)*0.6
+		if sn > mobSepStep && !st.rooted(now) && !m.mob.Stationary {
+			sp := mobSpeed(m, now)
+			m.vx, m.vy = sepx/sn*float32(sp)*mobSidestepFrac, sepy/sn*float32(sp)*mobSidestepFrac
 			m.lastSync = now
 			s.broadcastMobPosLocked(c, m, now)
 		} else {
@@ -1482,35 +1774,93 @@ func (s *Server) broadcastMobPosLocked(c *conn, m *mobState, now float64) {
 	s.broadcastPosLocked(c, m.id, m.x, m.y, m.vx, m.vy, float32(now))
 }
 
-// mobSeparation returns a steering push that moves m away from other living mobs
-// within mobSepRange, so a pack spreads around the target instead of piling onto
-// one point. The magnitude grows as mobs overlap more (0 at mobSepRange, ~1 when
-// touching). Two mobs sharing the exact same point are parted deterministically
-// by id so they never stay welded together.
-func (hs *huntState) mobSeparation(m *mobState) (float32, float32) {
+// bodySeparation returns a steering push that keeps the body (selfID, x, y, radius r)
+// clear of every other living body in the battle, so units converging on one target --
+// or filing down one lane -- spread out instead of piling onto a single point. The
+// magnitude grows as the two overlap more (0 at the pair's range, ~1 when touching).
+// Bodies sharing the exact same point are parted deterministically by id so they never
+// stay welded together.
+//
+// Range is per PAIR: max(mobSepRange, r+or+sepMargin). The floor keeps Hunt's packs
+// spaced exactly as they were tuned; the radius term is what «Штурм» needs, where the
+// bodies run from a 0.55m archer to a 3.0m altar and one flat number cannot serve both
+// -- at a flat 1.8m a creep stands well inside the altar it is hitting.
+//
+// Widening the range never costs a unit its target: dotaReach adds BOTH radii on top of
+// the 2.2m melee reach, so a creep held 3.95m off the altar's centre still swings at it
+// from 5.8m. The two rules are measured the same way and cannot cross.
+//
+// members carries every player's summons (nil is fine). It is a separate argument
+// because summons live in their OWNER's map, never in inst.mobs -- which is exactly why
+// Grimlok's dinosaur had no collision at all: nothing pushed it and it pushed nothing.
+func (hs *huntState) bodySeparation(members map[int32]*conn, now float64, selfID int32, x, y float32, r float64) (float32, float32) {
 	var sx, sy float32
-	for _, o := range hs.mobs {
-		// Only shown mobs can be within mobSepRange (1.8m): a hidden mob is >34m
-		// away (past mobHideRadius), so skipping them is a free optimization that
-		// keeps this O(shown^2) instead of O(shown x total) -- important now that a
-		// map can hold thousands of spawns.
-		if o == m || o.dead || !o.shown {
-			continue
+	push := func(oid int32, ox, oy float32, or float64) {
+		if oid == selfID {
+			return
 		}
-		dx, dy := m.x-o.x, m.y-o.y
+		rng := float32(math.Max(mobSepRange, r+or+sepMargin))
+		dx, dy := x-ox, y-oy
 		d := float32(math.Hypot(float64(dx), float64(dy)))
-		if d >= mobSepRange {
-			continue
+		if d >= rng {
+			return
 		}
 		if d < 1e-3 {
-			a := float64(m.id) * 2.3999632 // golden angle: distinct dir per id
+			a := float64(selfID) * 2.3999632 // golden angle: distinct dir per id
 			dx, dy, d = float32(math.Cos(a)), float32(math.Sin(a)), 1
 		}
-		w := (mobSepRange - d) / mobSepRange
+		w := (rng - d) / rng
 		sx += dx / d * w
 		sy += dy / d * w
 	}
+	for _, o := range hs.mobs {
+		// Only an ACTIVE mob can be near enough to matter with a current position: an
+		// inactive one is >34m away (past mobHideRadius) and its coordinates are stale
+		// anyway, so skipping it is free and keeps this O(active^2) rather than
+		// O(active x total) -- a Hunt map carries 400-600 spawns.
+		//
+		// Gate on active, not on shown: they agree in Hunt, but a «Штурм» creep is
+		// always active, and testing the render flag here would silently return (0,0)
+		// for a whole mode.
+		if o.dead || !o.active {
+			continue
+		}
+		push(o.id, o.x, o.y, o.mob.Radius())
+	}
+	for _, mem := range members {
+		mhs := mem.huntState
+		if mhs == nil {
+			continue
+		}
+		// Liveness matches tickSummonsLocked's own test, not just the lazily-set flag:
+		// an expired summon still sits in the map until its tick removes it.
+		for _, sm := range mhs.summons {
+			if !sm.alive(now) {
+				continue
+			}
+			push(sm.id, sm.x, sm.y, summonRadius)
+		}
+	}
+	// Clamp to unit length. Every neighbour contributes up to 1, so a unit boxed in by
+	// five others yielded a push ~5 long, which mobSepWeight then scaled to ~4.5 against a
+	// chase direction of exactly 1 -- separation outvoting the goal by more than 4:1. The
+	// units did not settle beside each other, they oscillated: flung apart, dragged back
+	// by the march, flung apart again, at full speed, re-syncing every tick of it. Bounded,
+	// the push is what it is meant to be: a correction to a course, never the course.
+	if n := float32(math.Hypot(float64(sx), float64(sy))); n > 1 {
+		sx, sy = sx/n, sy/n
+	}
 	return sx, sy
+}
+
+// instMembers is every conn sharing this one's battle (nil when unattached, as in a
+// directly-constructed test state). Handed around as the live map rather than a copied
+// slice: bodySeparation runs per unit per tick and must not allocate.
+func (c *conn) instMembers() map[int32]*conn {
+	if c.inst == nil {
+		return nil
+	}
+	return c.inst.members
 }
 
 // nearestMemberDistLocked is the distance from a mob to the closest party member
@@ -1530,28 +1880,44 @@ func nearestMemberDistLocked(members []*conn, m *mobState, now float64) float64 
 	return best
 }
 
-// updateMobVisibilityLocked reveals a mob to the party when any member draws
-// within mobRevealRadius and hides it once every member is past mobHideRadius
-// (fog of war). m.shown is the shared "on the clients / simulate" flag; the
-// per-member CREATE/DELETE fan out to every member. With one member this is the
-// old single-player pass verbatim.
-func (s *Server) updateMobVisibilityLocked(c *conn, m *mobState, now float64) {
+// mobInterestLocked runs Hunt's INTEREST MANAGEMENT for m -- create it on the party's
+// clients when any member draws within mobRevealRadius, remove it once every member is
+// past mobHideRadius -- and reports whether its AI should run this tick.
+//
+// This is not fog of war, despite what this pass used to be called. The Hunt scenes
+// bake no WarFogPlane_prop01 at all (verified: map_4_0/4_1/4_2 contain zero war-fog
+// objects; only map_0_0 and map_1_0 have one), so there is no fog on a Hunt map to
+// gate anything. What this actually is: an object budget, plus mobShadeFx as a
+// hand-rolled stand-in for the fog the map cannot render.
+//
+// Skipping the AI here is an OPTIMISATION, and provably not a rule: mobHideRadius (34)
+// > mobLeashRange (22) > mobAggroRange (9), so a mob nobody is within 34 of has no
+// legal action to take this tick. Nothing that IS a rule may be attached to it -- see
+// the shown/active comment on mobState. «Штурм» keeps every unit active and rendered
+// instead, which is why creeps go on breaking towers in fog.
+func (s *Server) mobInterestLocked(c *conn, m *mobState, now float64) bool {
 	d := nearestMemberDistLocked(c.members(), m, now)
 	if m.shown {
 		if d >= mobHideRadius {
 			s.hideMobLocked(c, m, now)
-			// Nobody is near (all members past the hide radius): fully heal and snap
-			// home so the mob is pristine at its spawn when the party returns. Covers
-			// the case a mob is abandoned mid-fight faster than the leash walk-home can
-			// finish (blink/teleport away, party wipe far off).
-			m.resetToSpawn()
-			return
+			// Abandoned: hand it back pristine. Only a HOMED mob has anywhere to go --
+			// this is the leash rule finishing early, not a consequence of being
+			// unrendered, and it is why it is gated on the policy and not on the flag.
+			// The party is already past the leash range, so the mob is walking home and
+			// regenerating; resetToSpawn just lands it in the state that walk reaches.
+			if m.homed {
+				m.resetToSpawn()
+			}
+			m.active = false
+			return false
 		}
 		s.updateMobShadeLocked(c, m, d)
 	} else if d <= mobRevealRadius {
 		s.revealMobLocked(c, m, now)
 		s.updateMobShadeLocked(c, m, d)
 	}
+	m.active = m.shown
+	return m.active
 }
 
 // updateMobShadeLocked toggles the translucent fog-ring overlay on a shown mob
@@ -1611,6 +1977,13 @@ func (s *Server) revealMobToMemberLocked(mem *conn, m *mobState, now float64) {
 			setFloats(syncAttackSpeed, idx, float32(m.mob.AttackSpeed)).
 			setFloats(syncSpeed, idx, float32(m.mob.Speed)).
 			setFloats(syncRadius, idx, float32(m.mob.Radius())).
+			// Vision. One value is correct for both modes because the CLIENT gates the
+			// reveal zone on friendliness itself: WarFogObject.Update spawns one only
+			// for a FRIEND/NEUTRAL object, so this is inert on a Hunt mob and on an
+			// enemy creep, and lights the lane for the player's own creeps. Omitting it
+			// is what left a «Штурм» lane black -- mViewRadius > 0f is the other half of
+			// that gate, and the escorting creeps failed it.
+			setFloats(syncViewRadius, idx, creepViewRadius).
 			setInt(syncTeam, idx, m.teamVal()).
 			build(hs.tr.count())))
 	s.addAttackEffectorLocked(mem, m.id, mobAttackProtoID(m.mobIdx), now)
@@ -1634,7 +2007,7 @@ func (s *Server) revealMobLocked(c *conn, m *mobState, now float64) {
 // return-home paths so the two can't drift as new in-flight fields are added.
 func (m *mobState) resetInFlight() {
 	m.hitAt, m.hitDmg, m.hitTarget = 0, 0, 0
-	m.projLaunchAt, m.projTarget = 0, 0
+	m.projLaunchAt, m.projTarget, m.projFlying = 0, 0, false
 	m.swingDoneAt, m.nextSwing = 0, 0
 	m.skillHitAt, m.skillDmg, m.skillRadius = 0, 0, 0
 }
@@ -1668,6 +2041,11 @@ func (s *Server) respawnMobLocked(c *conn, m *mobState, now float64) {
 	m.aggro = false
 	m.returning = false
 	m.shown = false
+	// Not simulated until the interest pass says so. active must never outlive shown
+	// here: this runs from the top of the mob loop, which then skips the rest of the
+	// tick for this mob, so a stale active=true would let mobSeparation steer the OTHER
+	// mobs away from an invisible body that just teleported to its spawn.
+	m.active = false
 	m.shaded = false
 	m.shadeFxUID = 0
 	m.st = unitStatus{}
@@ -1754,6 +2132,7 @@ func (s *Server) hideMobFromMemberLocked(mem *conn, m *mobState, now float64) {
 // model, so the shade state is just cleared (no EFFECT_END needed).
 func (s *Server) removeMobFromClientsLocked(c *conn, m *mobState, now float64) {
 	m.shown = false
+	m.active = false // off the clients and out of the simulation -- see mobState.active
 	m.shaded = false
 	m.shadeFxUID = 0
 	for _, mem := range c.members() {
@@ -1883,13 +2262,9 @@ func (c *conn) mobHasLoSLocked(mx, my, tx, ty float32) bool {
 // ---- damage to the player / summons, death, respawn ----
 
 func (s *Server) hitPlayerLocked(c *conn, m *mobState, dmg float64, now float64) {
-	hs := c.huntState
-	if hs.deadUntil > 0 {
-		return
-	}
-	if debugCombat {
+	if debugCombat && c.huntState != nil && c.huntState.deadUntil == 0 {
 		alive := 0
-		for _, mm := range hs.mobs {
+		for _, mm := range c.huntState.mobs {
 			if !mm.dead {
 				alive++
 			}
@@ -1898,11 +2273,25 @@ func (s *Server) hitPlayerLocked(c *conn, m *mobState, dmg float64, now float64)
 		log.Printf("battle: %s HIT-BY mob=%d mobpos=(%.1f,%.1f) selfpos=(%.1f,%.1f) dmg=%.0f aliveMobs=%d",
 			c.RemoteAddr(), m.id, m.x, m.y, px, py, dmg, alive)
 	}
+	s.hitPlayerFromLocked(c, m.id, dmg, now, m, nil)
+}
+
+// hitPlayerFromLocked applies incoming damage to player c and, on a lethal blow, kills
+// it. The attacker is identified two ways: damagerID is the wire id shown on the
+// RECEIVE_HIT / ON_KILL (a mob id or an enemy avatar's objID), while thornsMob XOR
+// pvpAttacker names the live source so thorns can bounce back to it and, in «Арена», the
+// killer can be credited a frag. Exactly one of the two is non-nil (both nil = an
+// environmental hit that neither retaliates nor scores).
+func (s *Server) hitPlayerFromLocked(c *conn, damagerID int32, dmg float64, now float64, thornsMob *mobState, pvpAttacker *conn) {
+	hs := c.huntState
+	if hs.deadUntil > 0 {
+		return
+	}
 	// Dodge?
 	if rand.Float64() < hs.st.modSum(now, "dodge_pct") {
 		s.broadcastAvatarObjLocked(c, battleproto.CmdReceiveHit, amf.NewArray().
 			Set("object", c.objID).
-			Set("damager", m.id).
+			Set("damager", damagerID).
 			Set("flags", int32(1)).
 			Set("damage", 0.0))
 		return
@@ -1911,7 +2300,15 @@ func (s *Server) hitPlayerLocked(c *conn, m *mobState, dmg float64, now float64)
 	dmg *= armorMitigation(armor)
 	dmg = hs.st.absorb(now, dmg)
 	if thorns := hs.st.modSum(now, "thorns_pct"); thorns > 0 && dmg > 0 {
-		s.hitMobLocked(c, m, dmg*thorns, c.objID)
+		// Reflect a share of the blow back at whatever dealt it: a mob directly, an enemy
+		// player through the same PvP path (with the roles reversed so its own thorns
+		// don't re-reflect endlessly -- the bounce passes no attacker).
+		switch {
+		case thornsMob != nil:
+			s.hitMobLocked(c, thornsMob, dmg*thorns, c.objID)
+		case pvpAttacker != nil && pvpAttacker.huntState != nil:
+			s.hitPlayerFromLocked(pvpAttacker, c.objID, dmg*thorns, now, nil, nil)
+		}
 	}
 	if dmg <= 0 {
 		return
@@ -1919,22 +2316,35 @@ func (s *Server) hitPlayerLocked(c *conn, m *mobState, dmg float64, now float64)
 	hs.hp -= dmg
 	s.broadcastAvatarObjLocked(c, battleproto.CmdReceiveHit, amf.NewArray().
 		Set("object", c.objID).
-		Set("damager", m.id).
+		Set("damager", damagerID).
 		Set("flags", int32(0)).
 		Set("damage", dmg))
 	if hs.hp <= 0 {
 		hs.hp = 0
 		s.syncSelfLocked(c, syncHealth)
-		s.playerDieLocked(c, m.id, now)
+		s.playerDieLocked(c, damagerID, now)
+		if pvpAttacker != nil {
+			s.arenaCreditKillLocked(pvpAttacker, c, now)
+		}
 		return
 	}
 	s.syncSelfLocked(c, syncHealth)
 	// «Каменная кожа»-style defensive procs harden the avatar when it is struck (and
 	// survives) -- rolled here, on the incoming-damage path, not on the attack path.
-	s.runDefenseProcsLocked(c, m, now)
+	// thornsMob is nil in PvP: a self-buff proc still fires, a retaliate proc no-ops.
+	s.runDefenseProcsLocked(c, thornsMob, now)
 }
 
 func (s *Server) hitSummonLocked(c *conn, m *mobState, sm *summonState, dmg float64, now float64) {
+	// Already down: drop the hit. The summon twin of hitMobFlagsLocked's dead guard, and
+	// needed for the same reason -- the reap runs in tickSummonsLocked on the OWNER's
+	// tick, so a pet killed by one attacker stays in hs.summons with dead==false for the
+	// rest of the pass. A second committed swing landing in that window (ordinary lane
+	// focus-fire) would drive its HP further negative and broadcast a SECOND ON_KILL for
+	// the same body. Guarding here rather than at the call sites covers both drivers.
+	if sm.dead || sm.hp <= 0 {
+		return
+	}
 	sm.hp -= dmg
 	// Fan the hit flash + HP-bar drop out to every viewer (owner + teammates), each
 	// with its own tracking index for the health SYNC.
@@ -2129,6 +2539,13 @@ func (s *Server) respawnPlayerLocked(c *conn, now float64) {
 	hs.hp = hs.maxHPLocked(now)
 	hs.mana = hs.maxManaLocked(now)
 
+	// «Арена»: pick a fresh spawn far from the enemy each death rather than a fixed
+	// checkpoint, so a killed player doesn't rematerialise where they just fell. Set it
+	// into the checkpoint fields the read below already uses.
+	if c.inst != nil && c.inst.arena != nil {
+		hs.respawnX, hs.respawnY = s.arenaSpawnLocked(c.inst, c, now)
+	}
+
 	// Respawn at the last-activated checkpoint (falls back to Spawn() before any
 	// Reborn_point has been reached / when the map has no checkpoints).
 	sx, sy := hs.respawnX, hs.respawnY
@@ -2166,9 +2583,20 @@ func (s *Server) respawnPlayerLocked(c *conn, now float64) {
 	// resurrects inside an aggro bubble (spawn-camp death loop). The mob-free spawn
 	// ring only controls where mobs SPAWN -- leash is player-relative, so without
 	// this a chased pack freezes on the checkpoint and re-aggros the fresh player.
+	//
+	// Only HOMED mobs may be evicted. A «Штурм» creep has no home: it was produced by
+	// a wave generator and its spawnX/spawnY are the zero value, so this used to
+	// teleport the player's own lane to the middle of the map -- silently, since a
+	// creep is never `shown` (so no DELETE_OBJECT) and returnMobHomeLocked zeroes the
+	// velocity (so the position sync was suppressed too). The trigger is the ordinary
+	// losing scenario: dying near your own base while your creeps push past it. Their
+	// aggro is still cleared -- a creep re-picks its target every tick regardless.
 	for _, m := range hs.mobs {
 		m.aggro = false
-		if !m.dead && math.Hypot(float64(m.x-sx), float64(m.y-sy)) < respawnEvictRange {
+		if !m.homed || m.dead {
+			continue
+		}
+		if math.Hypot(float64(m.x-sx), float64(m.y-sy)) < respawnEvictRange {
 			s.returnMobHomeLocked(c, m, now)
 		}
 	}

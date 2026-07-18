@@ -71,6 +71,12 @@ func main() {
 	hub := mpd.NewHub(srv.Store)
 	srv.MPD = hub
 	battle.MPD = hub
+	// Штурм/Охота launches get a dedicated per-match Battle server (its own clock)
+	// so the in-battle timer counts from match start, not process uptime. It shares
+	// the session store (pending-battle handoff) and MPD hub with the main server,
+	// and is advertised under the same host; the central square stays on the main
+	// battle listener above.
+	srv.MatchLauncher = battleserver.NewMatchHost(srv.Store, hub, *battleHost)
 	// Party co-members get online/offline pushes as a user's MPD socket comes and goes.
 	hub.OnConnect = srv.NotifyOnline
 	hub.OnDisconnect = srv.NotifyOffline

@@ -118,6 +118,15 @@ type Op struct {
 	// summon
 	Unit                     string // loadable character prefab
 	Count, Lifetime, HP, Dmg PerLevel
+	// Pet marks a persistent COMMANDED companion rather than a fire-and-forget swarm.
+	// Grimlok's dinosaur is the one: it lives 180s (the others are 15-30s swarms of
+	// 1-3), so it is a unit the player keeps and directs, not a burst of temporary
+	// bodies. A pet: (1) is unique -- re-casting the skill replaces it instead of
+	// stacking; (2) obeys the OWNER'S ORDERS (it attacks what the player ordered an
+	// attack on and walks where the player ordered a move) instead of seeking the
+	// nearest enemy on its own; (3) does not escort the owner -- with no order it
+	// simply holds, because its position is the player's to decide.
+	Pet bool
 
 	// trap / channel / aura
 	TriggerRadius float64

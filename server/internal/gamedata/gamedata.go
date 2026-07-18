@@ -442,6 +442,41 @@ type BossSkill struct {
 	Dmg      float64 // damage dealt on impact
 }
 
+// summonUnits carries the object-card strings for summon prefabs the mob roster does
+// NOT hold. Summons normally reuse a mob model and borrow that mob's name and icon, so
+// this table only exists for the two whose prefab is an avatar-side asset with no mob
+// entry to borrow from -- and which therefore came up with a blank name AND a blank
+// card, the same defect the «Штурм» creeps had, arrived at from the other direction.
+//
+// The elemental's real strings are shipped and were simply never wired up. The totem's
+// are not: the client has no unit name for it (IDS_MorlokaySkill4_Name is the SKILL's
+// name, which reads correctly on the unit too) and no totem art at object-card
+// resolution (only item-sized totem icons, which lack the "_03" variant ObjectInfo
+// demands), so its icon is a deliberate stand-in. Leaving it blank is NOT the cheaper
+// option: ObjectInfo appends "_03" before loading, so "" makes the client hunt for a
+// texture named "_03" and log a failure on every single selection.
+var summonUnits = map[string]struct{ NameKey, Icon string }{
+	"Avtr_Dsb_Frost_Elemental":        {"IDS_Mob_FrostElemental_Name", "Gui/Mobs/Icons/summon_elemental_frost"},
+	"Avtr_Dsb_Morlokay_Skill4_prop01": {"IDS_MorlokaySkill4_Name", "Gui/Mobs/Icons/neitral_creep_tree"},
+}
+
+// UnitDesc returns the name key and object-card icon for a summonable unit prefab: the
+// mob roster first (most summons are mob models), then the summon-only table. ok is
+// false for a prefab the client ships no strings for -- a caller must never paper over
+// that with empty strings, which the client renders as the literal text "EMPTY!" and a
+// failed texture load rather than as "no card".
+func UnitDesc(prefab string) (nameKey, icon string, ok bool) {
+	for _, m := range mobs {
+		if m.Prefab == prefab {
+			return m.NameKey, m.Icon, true
+		}
+	}
+	if d, found := summonUnits[prefab]; found {
+		return d.NameKey, d.Icon, true
+	}
+	return "", "", false
+}
+
 // mobs: creatures for the map_4_* hunt scenes, with the display names the
 // original locale shipped for them. Indices are referenced by MobSpawn.Mob.
 // Move speeds are set slightly ABOVE the avatar's base run speed (lobbyMoveSpeed
@@ -569,13 +604,13 @@ var mobs = []Mob{
 	// their attack animation; confirm in-game. Fairy is a genuine Boss_* prefab.
 	// Fairy/Anhel are ranged (AttackRange set): the client model's own attack spawns
 	// its shipped projectile (Boss_Fairy_pojectile / Anhel VFX), same as ranged mobs.
-	{NameKey: "IDS_Avtr_HK_Grimlok_Name", Prefab: "Avtr_HK_Grimlok", Icon: "Gui/Mobs/Icons/Avtr_HK_Grimlok",
+	{NameKey: "IDS_Avtr_HK_Grimlok_Name", Prefab: "Avtr_HK_Grimlok", Icon: "Gui/Avatars/Icons/Avtr_HK_Grimlok",
 		Health: 5000, DmgMin: 24, DmgMax: 38, AttackSpeed: 0.9, Speed: 4.2, XP: 500, Coins: 90, PhysArmor: 12, CollisionRadius: 1.8},
-	{NameKey: "IDS_Avtr_Tank_Titanid_Name", Prefab: "Avtr_Tank_Titanid", Icon: "Gui/Mobs/Icons/Avtr_Tank_Titanid",
+	{NameKey: "IDS_Avtr_Tank_Titanid_Name", Prefab: "Avtr_Tank_Titanid", Icon: "Gui/Avatars/Icons/Avtr_Tank_Titanid",
 		Health: 9000, DmgMin: 40, DmgMax: 56, AttackSpeed: 0.85, Speed: 4.0, XP: 2000, Coins: 240, PhysArmor: 25, CollisionRadius: 2.0}, // stone tank
 	{NameKey: "IDS_Boss_Fairy_Name", Prefab: "Boss_Fairy", Icon: "Gui/Mobs/Icons/Boss_Fairy",
 		Health: 7000, DmgMin: 34, DmgMax: 50, AttackSpeed: 0.9, Speed: 4.3, XP: 1000, Coins: 150, AttackRange: 8.0, PhysArmor: 10, CollisionRadius: 1.6},
-	{NameKey: "IDS_Avtr_Psh_Anhel_Name", Prefab: "Avtr_Psh_Anhel", Icon: "Gui/Mobs/Icons/Avtr_Psh_Anhel",
+	{NameKey: "IDS_Avtr_Psh_Anhel_Name", Prefab: "Avtr_Psh_Anhel", Icon: "Gui/Avatars/Icons/Avtr_Psh_Anhel",
 		Health: 12000, DmgMin: 44, DmgMax: 62, AttackSpeed: 0.9, Speed: 4.0, XP: 4000, Coins: 360, AttackRange: 7.0, PhysArmor: 22, CollisionRadius: 1.9},
 	// 27-39 -- map_4_2 («Заповедные джунгли») TRASH ROSTER for the procedural pack
 	// generator (buildJunglePack42). Jungle theme: spiders, tribesmen (natives),
@@ -585,9 +620,9 @@ var mobs = []Mob{
 	// Icons are best-effort (the GUI icon atlas isn't in resources.assets, same as the
 	// crypt mobs) -- a missing one renders a blank enemy card, never a crash.
 	// Spiders: small, fast, fragile swarmers at the mouth.
-	{NameKey: "IDS_Mob_Spider_01_Name", Prefab: "Mob_Spider_01", Icon: "Gui/Mobs/Icons/mob_spider",
+	{NameKey: "IDS_Mob_Spider_01_Name", Prefab: "Mob_Spider_01", Icon: "Gui/Mobs/Icons/mob_spider_g1",
 		Health: 90, DmgMin: 8, DmgMax: 12, AttackSpeed: 1.1, Speed: 4.8, XP: 12, Coins: 6, CollisionRadius: 0.6},
-	{NameKey: "IDS_Mob_Spider_02_Name", Prefab: "Mob_Spider_02", Icon: "Gui/Mobs/Icons/mob_spider",
+	{NameKey: "IDS_Mob_Spider_02_Name", Prefab: "Mob_Spider_02", Icon: "Gui/Mobs/Icons/mob_spider_g2",
 		Health: 130, DmgMin: 12, DmgMax: 16, AttackSpeed: 1.0, Speed: 4.7, XP: 16, Coins: 7, CollisionRadius: 0.7},
 	// Tribesmen: native humanoids -- melee spearmen, ranged blowgunners, undead.
 	{NameKey: "IDS_Mob_Tribesman_Melee_01_Name", Prefab: "Mob_Tribesman_Melee_01", Icon: "Gui/Mobs/Icons/mob_tribesman",
@@ -599,11 +634,11 @@ var mobs = []Mob{
 	{NameKey: "IDS_Mob_TribesmanBig_Melee_01_Name", Prefab: "Mob_TribesmanBig_Melee_01", Icon: "Gui/Mobs/Icons/mob_tribesman",
 		Health: 300, DmgMin: 26, DmgMax: 36, AttackSpeed: 0.7, Speed: 3.9, XP: 24, Coins: 10, PhysArmor: 8, CollisionRadius: 0.9}, // heavy native
 	// Dinosaurs: fast melee raptors + a ranged spitter.
-	{NameKey: "IDS_Mob_Dinosaur_Melee_01_Name", Prefab: "Mob_Dinosaur_Melee_01", Icon: "Gui/Mobs/Icons/mob_dino",
+	{NameKey: "IDS_Mob_Dinosaur_Melee_01_Name", Prefab: "Mob_Dinosaur_Melee_01", Icon: "Gui/Mobs/Icons/mob_dinosaur",
 		Health: 220, DmgMin: 20, DmgMax: 28, AttackSpeed: 0.9, Speed: 4.6, XP: 20, Coins: 8, CollisionRadius: 0.9},
-	{NameKey: "IDS_Mob_Dinosaur_Melee_02_Name", Prefab: "Mob_Dinosaur_Melee_02", Icon: "Gui/Mobs/Icons/mob_dino",
+	{NameKey: "IDS_Mob_Dinosaur_Melee_02_Name", Prefab: "Mob_Dinosaur_Melee_02", Icon: "Gui/Mobs/Icons/mob_dinosaur",
 		Health: 300, DmgMin: 28, DmgMax: 38, AttackSpeed: 0.9, Speed: 4.7, XP: 26, Coins: 10, CollisionRadius: 1.0},
-	{NameKey: "IDS_Mob_Dinosaur_Range_01_Name", Prefab: "Mob_Dinosaur_Range_01", Icon: "Gui/Mobs/Icons/mob_dino",
+	{NameKey: "IDS_Mob_Dinosaur_Range_01_Name", Prefab: "Mob_Dinosaur_Range_01", Icon: "Gui/Mobs/Icons/mob_dinosaur",
 		Health: 160, DmgMin: 22, DmgMax: 30, AttackSpeed: 0.8, Speed: 4.4, XP: 22, Coins: 9, AttackRange: 10.0, CollisionRadius: 0.9},
 	// Gorillas: heavy bruisers; the GorillaBoss model is reused as an ELITE mob here.
 	{NameKey: "IDS_Mob_Gorilla_Melee_01_Name", Prefab: "Mob_Gorilla_Melee_01", Icon: "Gui/Mobs/Icons/mob_gorilla",
@@ -617,17 +652,26 @@ var mobs = []Mob{
 		Health: 650, DmgMin: 38, DmgMax: 52, AttackSpeed: 0.6, Speed: 3.3, XP: 48, Coins: 16, PhysArmor: 16, CollisionRadius: 1.4}, // greater stone golem
 	// «Штурм» racial troops (mobHumanCreepMelee..mobElfCreepRange). Prefabs verified in
 	// data/Characters/Creeps (H_Creep*/Elf_Creep* bundles expose Mnst_Human_Creep1..3 /
-	// Mnst_Elf_Creep1..3). Creep1 = melee footman, Creep2 = ranged (ships a projectile).
+	// Mnst_Elf_Creep1..3). Creep1 = melee footman, Creep2 = ranged (ships a projectile);
+	// Creep3 is the siege unit (Катапультозавр / Осадный медведь) and is not rostered.
 	// Modest HP so a hero clears a wave but a lone hero can't solo a whole lane of
 	// cannons+creeps instantly. XP/coins low (lane farm, not boss bounty). Team is set
 	// per battle by the DOTA instance, not here.
-	{NameKey: "IDS_Mnst_Sobor_Creep1_Name", Prefab: "Mnst_Human_Creep1_prop01", Icon: "Gui/Mobs/Icons/Mnst_Sobor_Creep1",
+	//
+	// These four were the ONLY roster entries whose name AND icon were both invented:
+	// the IDS_Mnst_* keys were never in the locale, and the icons never lived under
+	// Gui/Mobs/Icons. The client resolves both by name against baked tables and cannot
+	// be handed a key that does not exist -- an unknown locale id renders the literal
+	// text "EMPTY!" and a missing texture renders nothing -- so «Штурм» creeps came up
+	// nameless and blank. The real keys and the real Gui/Creeps/Icons folder are below;
+	// side naming is the client's own: Sobor = Human, Apostate = Elf.
+	{NameKey: "IDS_DotaCreepMeleeSobor_Name", Prefab: "Mnst_Human_Creep1_prop01", Icon: "Gui/Creeps/Icons/Mnst_Sobor_Creep1",
 		Health: 200, DmgMin: 14, DmgMax: 20, AttackSpeed: 0.9, Speed: 4.0, XP: 12, Coins: 4, CollisionRadius: 0.6},
-	{NameKey: "IDS_Mnst_Sobor_Creep2_Name", Prefab: "Mnst_Human_Creep2_prop01", Icon: "Gui/Mobs/Icons/Mnst_Sobor_Creep2",
+	{NameKey: "IDS_DotaCreepRangeSobor_Name", Prefab: "Mnst_Human_Creep2_prop01", Icon: "Gui/Creeps/Icons/Mnst_Sobor_Creep2",
 		Health: 130, DmgMin: 16, DmgMax: 22, AttackSpeed: 0.8, Speed: 4.0, XP: 14, Coins: 5, AttackRange: 9.0, CollisionRadius: 0.55},
-	{NameKey: "IDS_Mnst_Apostate_Creep1_Name", Prefab: "Mnst_Elf_Creep1_prop01", Icon: "Gui/Mobs/Icons/Mnst_Apostate_Creep1",
+	{NameKey: "IDS_DotaCreepMeleeApostate_Name", Prefab: "Mnst_Elf_Creep1_prop01", Icon: "Gui/Creeps/Icons/Mnst_Apostate_Creep1",
 		Health: 200, DmgMin: 14, DmgMax: 20, AttackSpeed: 0.9, Speed: 4.0, XP: 12, Coins: 4, CollisionRadius: 0.6},
-	{NameKey: "IDS_Mnst_Apostate_Creep2_Name", Prefab: "Mnst_Elf_Creep2_prop01", Icon: "Gui/Mobs/Icons/Mnst_Apostate_Creep2",
+	{NameKey: "IDS_DotaCreepRangeApostate_Name", Prefab: "Mnst_Elf_Creep2_prop01", Icon: "Gui/Creeps/Icons/Mnst_Apostate_Creep2",
 		Health: 130, DmgMin: 16, DmgMax: 22, AttackSpeed: 0.8, Speed: 4.0, XP: 14, Coins: 5, AttackRange: 9.0, CollisionRadius: 0.55},
 }
 

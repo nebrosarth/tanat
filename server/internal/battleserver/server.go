@@ -246,6 +246,8 @@ func (s *Server) handlePacket(c *conn, p battleproto.Packet) {
 		s.handleDoAction(c, p)
 	case battleproto.CmdUpgradeSkill:
 		s.handleUpgradeSkill(c, p)
+	case battleproto.CmdBuy:
+		s.handleBuy(c, p)
 	case battleproto.CmdGetDropInfo:
 		s.handleGetDropInfo(c, p)
 	case battleproto.CmdPickUp:
@@ -409,16 +411,23 @@ func (s *Server) sendWorldState(c *conn) {
 			room = -self
 		}
 		inst := s.joinInstance(room, c.hunt.MapID, c)
-		if inst.dota != nil {
-			// «Штурм»: spawn at the player's base near its altar. map_1_0 walkability is
-			// not modeled in v1, so movement is unrestricted (nav stays nil).
+		switch {
+		case inst.dota != nil:
+			// «Штурм»: spawn at the player's base near its altar -- per side, so it comes
+			// from the map's side data and NOT from nav.Spawn() the way Hunt's does.
 			dx, dy := inst.dota.playerSpawn()
 			sx, sy = float32(dx), float32(dy)
-		} else {
+		case inst.arena != nil:
+			// «Арена»: a provisional spawn on walkable ground. sendHuntWorldState assigns
+			// the player a side and moves them to that side's marker once hs exists.
+			if len(inst.arena.m.Spawns) > 0 {
+				sx, sy = float32(inst.arena.m.Spawns[0].X), float32(inst.arena.m.Spawns[0].Y)
+			}
+		default:
 			mx, my := inst.m.Spawn()
 			sx, sy = float32(mx), float32(my)
-			c.nav = inst.nav // enforce this scene's walkability on movement
 		}
+		c.nav = inst.nav // enforce this scene's walkability on movement
 	}
 	c.lock()
 	c.x, c.y, c.vx, c.vy, c.snapT = sx, sy, 0, 0, s.battleTime()
@@ -618,6 +627,10 @@ func (s *Server) handleMove(c *conn, p battleproto.Packet) {
 			s.stopAttackLocked(c, false)
 		}
 		s.cancelOrderLocked(c)
+		// ...and it commands the pets too: they break off and walk to the click. The
+		// avatar's own destination cannot stand in for this -- c.hasDest clears the
+		// moment IT arrives, while the pet is still on its way.
+		s.orderPetsMoveLocked(c, float32(tx), float32(ty))
 	}
 	c.moveToLocked(s, float32(tx), float32(ty))
 }

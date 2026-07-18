@@ -29,7 +29,7 @@ func (s *Server) renderAvatarForLocked(viewer, owner *conn, now float64) {
 		Set("id", proto).Set("desc", avatarProtoDesc(a)))
 	s.push(viewer, battleproto.CmdPlayerReg, amf.NewArray().
 		Set("id", owner.selfPlayerID).Set("name", owner.name).
-		Set("team", int32(1)).Set("avatar", a.ID))
+		Set("team", owner.playerTeam()).Set("avatar", a.ID))
 	s.push(viewer, battleproto.CmdCreateObject, amf.NewArray().
 		Set("id", owner.objID).Set("proto", proto))
 	s.push(viewer, battleproto.CmdSetAvatar, amf.NewArray().
@@ -74,7 +74,7 @@ func (s *Server) renderAvatarForLocked(viewer, owner *conn, now float64) {
 			setFloats(syncDmgMin, idx, float32(a.DmgMin)).
 			setFloats(syncDmgMax, idx, float32(a.DmgMax)).
 			setFloats(syncRadius, idx, float32(a.Radius())).
-			setInt(syncTeam, idx, 1).
+			setInt(syncTeam, idx, owner.playerTeam()).
 			build(vh.tr.count())))
 }
 
@@ -97,13 +97,13 @@ func (s *Server) introduceMemberLocked(c *conn, now float64) {
 		s.renderAvatarForLocked(c, other, now) // existing player -> newcomer's client
 		s.renderAvatarForLocked(other, c, now) // newcomer -> existing player's client
 		// Show that player's live summons to the newcomer (the newcomer has none yet,
-		// so this is one-directional). Match tickSummonsLocked's ACTUAL liveness test
-		// (hp>0 && not expired), not just the lazily-set sm.dead flag: a summon that
-		// took a lethal hit or expired this tick isn't reaped until the owner's next
-		// tick, and revealing it here would pop a 0-HP model onto the newcomer that
-		// vanishes (no death anim, since it never saw the ON_KILL) a tick later.
+		// so this is one-directional). sm.alive is the shared liveness test, and the
+		// lazily-set sm.dead flag alone would not do: a summon that took a lethal hit or
+		// expired this tick isn't reaped until the owner's next tick, and revealing it
+		// here would pop a 0-HP model onto the newcomer that vanishes (no death anim,
+		// since it never saw the ON_KILL) a tick later.
 		for _, sm := range other.huntState.summons {
-			if !sm.dead && sm.hp > 0 && sm.until >= now {
+			if sm.alive(now) {
 				s.revealSummonToMemberLocked(c, sm, now)
 			}
 		}

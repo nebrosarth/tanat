@@ -54,6 +54,9 @@ func TestMobRespawn(t *testing.T) {
 		id: id, mobIdx: idx, mob: mob,
 		x: sx + 3, y: sy, spawnX: sx + 3, spawnY: sy,
 		hp: 10, shown: true, aggro: true,
+		// Homed: only a mob that owns a spawn is respawnable. A homeless «Штурм» creep
+		// takes the opposite branch -- see TestDotaCreepKilledByPlayerIsNotLeaked.
+		homed: true,
 	}
 
 	c.mvMu.Lock()
@@ -118,12 +121,16 @@ func TestRespawnEvictsCampingPack(t *testing.T) {
 		id: 2200, mobIdx: idx, mob: gamedata.Mobs()[idx],
 		x: sx + 2, y: sy, spawnX: sx + 20, spawnY: sy,
 		hp: 30, maxHP: 92, shown: true, aggro: true,
+		// Homed: only a mob that owns a spawn may be evicted to it. A «Штурм» creep is
+		// homeless and must be left alone here -- see TestRespawnLeavesCreepsAlone.
+		homed: true,
 	}
 	// Distant mob genuinely at its far home must not be repositioned.
 	far := &mobState{
 		id: 2201, mobIdx: idx, mob: gamedata.Mobs()[idx],
 		x: sx + 40, y: sy, spawnX: sx + 40, spawnY: sy,
 		hp: 92, maxHP: 92, shown: true, aggro: true,
+		homed: true,
 	}
 
 	c.mvMu.Lock()

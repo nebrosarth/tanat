@@ -34,15 +34,16 @@ func TestHuntMatchmakingFlow(t *testing.T) {
 	}
 
 	// arena|get_maps_info must list every hunt map (type_id 4) AND every «Штурм»
-	// (DOTA, type_id 1) map -- FightHelper.FindMapById needs both so JoinBattle can
-	// route by mType.
+	// (DOTA, type_id 1) AND every «Арена» (DM, type_id 0) map -- FightHelper.FindMapById
+	// needs all of them so JoinBattle can route by mType, and a mode whose maps are
+	// missing here shows an EMPTY tab in the start-battle menu.
 	mi, _ := postEnvelope(t, url, mkReq("arena", "get_maps_info", amf.NewArray(), 2)).
 		GetArray(ctrlproto.CmdKey("arena", "get_maps_info"))
 	if mi == nil {
 		t.Fatal("no arena|get_maps_info response")
 	}
 	maps, ok := mi.GetArray("maps_info")
-	wantMaps := len(gamedata.HuntMaps()) + len(gamedata.DotaMaps())
+	wantMaps := len(gamedata.HuntMaps()) + len(gamedata.DotaMaps()) + len(gamedata.ArenaMaps())
 	if !ok || len(maps.Dense) != wantMaps {
 		t.Fatalf("maps_info: want %d dense entries, got %#v", wantMaps, mi.Assoc)
 	}
@@ -55,6 +56,26 @@ func TestHuntMatchmakingFlow(t *testing.T) {
 	}
 	if sc, _ := first.GetString("scene"); sc != "map_4_0" {
 		t.Errorf("maps_info[0].scene = %q, want map_4_0", sc)
+	}
+	// Every «Арена» map must appear with type_id=DM, or the Arena tab is empty.
+	for _, am := range gamedata.ArenaMaps() {
+		found := false
+		for _, e := range maps.Dense {
+			m, _ := e.(*amf.MixedArray)
+			if m == nil {
+				continue
+			}
+			if id, _ := m.GetInt("id"); id == am.ID {
+				if typ, _ := m.GetInt("type_id"); typ != gamedata.MapTypeDM {
+					t.Errorf("arena map %d listed with type_id %d, want %d (DM)", am.ID, typ, gamedata.MapTypeDM)
+				}
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Errorf("arena map %d (%s) missing from get_maps_info: its tab will be empty", am.ID, am.Scene)
+		}
 	}
 
 	huntMap := gamedata.HuntMaps()[0]
@@ -242,8 +263,11 @@ func TestItemsAmfCarriesCtrlPrototypeFields(t *testing.T) {
 	if !ok {
 		t.Fatalf("items.amf root is %T", v)
 	}
-	if len(root.Dense) != len(gamedata.Items()) {
-		t.Fatalf("items.amf: %d entries, want %d", len(root.Dense), len(gamedata.Items()))
+	// Potions come first, then the avatar battle-tree items, then the hero-gear
+	// wearables -- one shared blob.
+	wantEntries := len(gamedata.Items()) + len(gamedata.AvatarItems()) + len(gamedata.Wearables())
+	if len(root.Dense) != wantEntries {
+		t.Fatalf("items.amf: %d entries, want %d", len(root.Dense), wantEntries)
 	}
 	for i, want := range gamedata.Items() {
 		entry, ok := root.Dense[i].(*amf.MixedArray)
@@ -268,6 +292,94 @@ func TestItemsAmfCarriesCtrlPrototypeFields(t *testing.T) {
 		// this field was missing entirely.
 		if kind, ok := entry.GetInt("kind_id"); !ok || kind == 0 {
 			t.Errorf("items.amf[%d] (article %d) kind_id = %d, ok=%v -- must not be 0 (QUEST_ITEM)", i, want.ArticleID, kind, ok)
+		}
+	}
+}
+
+// TestItemsAmfCarriesAvatarTreeArticles: the 60 battle-tree items must ride in
+// the SAME items.amf blob after the potions, each carrying the fields the item
+// tree reads -- tree_id (the tab), tree_slot (the cell), tree_parents (dense
+// ints), a real price, and params as a dense array of {skill_id, impact, value}.
+// A missing tree_id would drop the item from every tab; a bad params shape would
+// print "-1" in the tooltip.
+func TestItemsAmfCarriesAvatarTreeArticles(t *testing.T) {
+	srv := New()
+	ts := httptest.NewServer(srv.Handler())
+	defer ts.Close()
+
+	resp, err := http.Get(ts.URL + "/xml/items.amf")
+	if err != nil {
+		t.Fatalf("get items.amf: %v", err)
+	}
+	defer resp.Body.Close()
+	v, err := amf.NewDecoder(resp.Body).DecodeMessage()
+	if err != nil {
+		t.Fatalf("decode items.amf: %v", err)
+	}
+	root := v.(*amf.MixedArray)
+
+	// Index the blob by article id.
+	byID := map[int32]*amf.MixedArray{}
+	for _, e := range root.Dense {
+		if m, ok := e.(*amf.MixedArray); ok {
+			if id, ok := m.GetInt("id"); ok {
+				byID[id] = m
+			}
+		}
+	}
+
+	for _, want := range gamedata.AvatarItems() {
+		entry, ok := byID[want.ArticleID]
+		if !ok {
+			t.Fatalf("tree article %d (%s) absent from items.amf", want.ArticleID, want.NameKey)
+		}
+		if tid, _ := entry.GetInt("tree_id"); tid != want.TreeID {
+			t.Errorf("%s tree_id = %d, want %d", want.NameKey, tid, want.TreeID)
+		}
+		if sl, _ := entry.GetInt("tree_slot"); sl != want.TreeSlot {
+			t.Errorf("%s tree_slot = %d, want %d", want.NameKey, sl, want.TreeSlot)
+		}
+		if pr, _ := entry.GetInt("price"); pr != want.Price {
+			t.Errorf("%s price = %d, want %d", want.NameKey, pr, want.Price)
+		}
+		// tree_parents: dense array of ints matching the authored edges.
+		tp, ok := entry.GetArray("tree_parents")
+		if !ok {
+			t.Fatalf("%s has no tree_parents array", want.NameKey)
+		}
+		if len(tp.Dense) != len(want.Parents) {
+			t.Errorf("%s tree_parents len = %d, want %d", want.NameKey, len(tp.Dense), len(want.Parents))
+		}
+		// params: one {skill_id, impact, value} per authored stat.
+		params, ok := entry.GetArray("params")
+		if !ok {
+			t.Fatalf("%s has no params array", want.NameKey)
+		}
+		if len(params.Dense) != len(want.Stats) {
+			t.Fatalf("%s params len = %d, want %d", want.NameKey, len(params.Dense), len(want.Stats))
+		}
+		gotParam := map[string]*amf.MixedArray{}
+		for _, p := range params.Dense {
+			pm := p.(*amf.MixedArray)
+			sk, _ := pm.GetString("skill_id")
+			gotParam[sk] = pm
+		}
+		for _, st := range want.Stats {
+			pm, ok := gotParam[st.Name]
+			if !ok {
+				t.Errorf("%s params missing skill_id %q", want.NameKey, st.Name)
+				continue
+			}
+			wantImpact := int32(0)
+			if st.Mul {
+				wantImpact = 1
+			}
+			if imp, _ := pm.GetInt("impact"); imp != wantImpact {
+				t.Errorf("%s param %s impact = %d, want %d", want.NameKey, st.Name, imp, wantImpact)
+			}
+			if val, _ := pm.GetFloat("value"); val != st.Value {
+				t.Errorf("%s param %s value = %v, want %v", want.NameKey, st.Name, val, st.Value)
+			}
 		}
 	}
 }

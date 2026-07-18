@@ -191,15 +191,16 @@ func TestDotaCreepWaveSpawns(t *testing.T) {
 	c.unlock()
 
 	creeps := len(inst.mobs) - structs
-	generators := 0
+	barracks := 0
 	for _, sc := range inst.dota.m.Structures {
-		if sc.Role == gamedata.DotaGenerator {
-			generators++
+		if sc.Role == gamedata.DotaCreepTower {
+			barracks++
 		}
 	}
-	want := generators * gamedata.CreepsPerWave
+	// One barracks owns one lane and sends CreepsPerWave down it.
+	want := barracks * gamedata.CreepsPerWave
 	if creeps != want {
-		t.Fatalf("spawned %d creeps, want %d (%d generators × %d)", creeps, want, generators, gamedata.CreepsPerWave)
+		t.Fatalf("spawned %d creeps, want %d (%d barracks × %d)", creeps, want, barracks, gamedata.CreepsPerWave)
 	}
 	// A human generator's creeps must be allies (team 1), an elf generator's enemies.
 	var sawAlly, sawEnemy bool
@@ -246,5 +247,52 @@ func TestDotaCreepTargetsEnemyNotAlly(t *testing.T) {
 	}
 	if tgt.mob.id != own.id {
 		t.Errorf("creep targeted obj %d, want the nearby ally altar %d", tgt.mob.id, own.id)
+	}
+}
+
+// TestDotaCreepVsCreepEncodesSwing reproduces the "server crashes when lane creeps meet"
+// bug: two opposing creeps in melee reach swing at each other, which broadcasts a
+// CmdAction. The action args carried a nil targetPos, which the AMF encoder mis-handled
+// as a typed *MixedArray nil and dereferenced -> panic on the ticker goroutine (whole
+// server down). The tick must run and the swing must actually encode (member renders both
+// creeps) without panicking, and the hit must land.
+func TestDotaCreepVsCreepEncodesSwing(t *testing.T) {
+	s, c, inst, cleanup := newDotaConn(t, "Avtr_Tank_Velial")
+	defer cleanup()
+	now := float64(s.battleTime())
+	// Two opposing melee creeps 1m apart, far from any base structure (mid-map), so each
+	// picks the other as its nearest enemy.
+	ally := &mobState{
+		id: 60001, mobIdx: inst.dota.m.HumanCreepMelee,
+		mob: gamedata.Mobs()[inst.dota.m.HumanCreepMelee],
+		x:   0, y: 0, hp: 500, maxHP: 500, dmgMin: 5, dmgMax: 8,
+		team: dotaPlayerTeam, lastSync: now,
+	}
+	enemy := &mobState{
+		id: 60002, mobIdx: inst.dota.m.ElfCreepMelee,
+		mob: gamedata.Mobs()[inst.dota.m.ElfCreepMelee],
+		x:   1, y: 0, hp: 500, maxHP: 500, dmgMin: 5, dmgMax: 8,
+		team: dotaEnemyTeam, lastSync: now,
+	}
+
+	c.lock()
+	inst.mobs[ally.id] = ally
+	inst.mobs[enemy.id] = enemy
+	// Reveal both to the member so the CmdAction broadcast actually reaches the encoder
+	// (broadcastObjLocked only pushes to members that render the object) -- that encode is
+	// where the crash lived.
+	s.revealMobToMemberLocked(c, ally, now)
+	s.revealMobToMemberLocked(c, enemy, now)
+	// World passes: the first makes both creeps acquire each other and swing -- that
+	// CmdAction encode is where the crash lived. The swing only COMMITS its hit though
+	// (a melee blow connects mid-animation, at 0.5/attackSpeed ~= 0.56s), so keep
+	// ticking past the connect point to see the clash actually resolve in damage.
+	for bt := now; bt <= now+1.2; bt += 0.2 {
+		s.dotaTickLocked(c, bt)
+	}
+	c.unlock()
+
+	if enemy.hp >= 500 && ally.hp >= 500 {
+		t.Fatalf("neither creep took damage -- the melee clash never resolved (ally=%g enemy=%g)", ally.hp, enemy.hp)
 	}
 }

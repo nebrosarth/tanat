@@ -4,6 +4,7 @@ import (
 	"log"
 	"math"
 	"sort"
+	"strings"
 
 	"tanatserver/internal/amf"
 	"tanatserver/internal/battleproto"
@@ -158,6 +159,24 @@ func (s *Server) startSkillOrderLocked(c *conn, slot int, target int32, px, py f
 	if target > 0 && target != c.objID {
 		ms = hs.mobs[target]
 		if ms == nil || ms.dead {
+			s.orderDoneLocked(c, parent)
+			return
+		}
+		// «Штурм» friendly fire, single-target arm. The AoE scans filter allies
+		// themselves (mobsWithinLocked), but damageTargetsLocked hands an op with no
+		// radius its ctx.target VERBATIM -- and that target starts here. This is also
+		// where OpPull's victim comes from, which bypasses opTargetsLocked entirely.
+		//
+		// Gate on the skill's own declared mask rather than on hostile() alone: the four
+		// FRIEND skills (Vigilans' «Щит хранителя»/«Касание спасителя», the druid's
+		// «Древесный камуфляж»/«Дубовая кора») are declared castable on an ally.
+		//
+		// Scope, precisely: an ally that reaches here is a «Штурм» creep or building --
+		// hs.mobs holds mobStates only, so an ally PLAYER's objID misses the lookup above
+		// and the cast fizzles before this line (a separate, pre-existing gap: those
+		// skills do not work on party members, and their OpShield/OpHot apply to the
+		// caster regardless of who was targeted).
+		if !ms.hostile() && !skillHasTargetFlag(def, "FRIEND") {
 			s.orderDoneLocked(c, parent)
 			return
 		}
@@ -682,13 +701,15 @@ func (s *Server) centerLocked(c *conn, ctx opCtx) (float32, float32) {
 	return c.posAtLocked(s.battleTime())
 }
 
-// mobsWithinLocked collects living mobs whose body (centre within r + the mob's
+// mobsWithinLocked collects living ENEMIES whose body (centre within r + the mob's
 // own radius) overlaps the circle of radius r at (x,y), so an AoE that reaches a
-// big boss's edge still hits it.
+// big boss's edge still hits it. See mobState.hostile: in «Штурм» this map also
+// holds the player's own creeps and buildings, and every op routed through here
+// (damage, DoT, stun, root, slow, silence, knockback) was landing on them.
 func (c *conn) mobsWithinLocked(x, y float32, r float64) []*mobState {
 	var out []*mobState
 	for _, m := range c.huntState.mobs {
-		if m.dead {
+		if m.dead || !m.hostile() {
 			continue
 		}
 		if math.Hypot(float64(m.x-x), float64(m.y-y)) <= r+m.mob.Radius() {
@@ -712,7 +733,7 @@ func (c *conn) mobsAlongLineLocked(cx, cy, tx, ty float32, halfWidth, maxLen flo
 	ux, uy := dx/dlen, dy/dlen // unit direction toward the aim point
 	var out []*mobState
 	for _, m := range c.huntState.mobs {
-		if m.dead {
+		if m.dead || !m.hostile() { // allies are not in the swath -- see mobState.hostile
 			continue
 		}
 		rx, ry := float64(m.x-cx), float64(m.y-cy)
@@ -724,6 +745,25 @@ func (c *conn) mobsAlongLineLocked(cx, cy, tx, ty float32, halfWidth, maxLen flo
 		}
 	}
 	return out
+}
+
+// skillHasTargetFlag reports whether a skill's declared target mask names `flag`.
+//
+// The mask is the client's own TanatKernel.SkillTarget enum (FRIEND=1, ENEMY=4,
+// BUILDING=0x10, NOT_BUILDING=0x20 ...), stored '+'-joined -- "ENEMY+NOT_BUILDING" --
+// and shipped verbatim to the client in the effector description, where
+// TargetValidator enforces it on the player's click. It is authored game data, so it
+// is the right authority for "may this cast land on that unit" on the server too.
+//
+// Tokens are matched WHOLE: a naive substring test would see FRIEND inside NOT_FRIEND
+// and invert the rule.
+func skillHasTargetFlag(sk gamedata.Skill, flag string) bool {
+	for _, f := range strings.Split(sk.Target, "+") {
+		if strings.TrimSpace(f) == flag {
+			return true
+		}
+	}
+	return false
 }
 
 // skillIsDashCleave reports whether a line skill (AoEWidth>0) is a dash-cleave --
@@ -942,7 +982,16 @@ func (s *Server) applyOpsLocked(c *conn, ops []gamedata.Op, ctx opCtx, now float
 			}
 
 		case gamedata.OpBuffStat:
-			if op.On == "target" {
+			// On:"target" with NO unit target is a self-cast (the client always ships a
+			// targetPos, so hasPos alone does not mean a unit was picked): buff the
+			// caster. It must not fall through to opTargetsLocked -- damageTargetsLocked's
+			// "no target, no radius" arm substitutes a 4-unit circle, which is a heuristic
+			// for DAMAGE ops and hands a friendly buff to whatever stands nearby. That
+			// scan is hostile-only, so a self-cast «Щит хранителя» was handing +30
+			// magic_armor to the enemies around it and nothing to the caster.
+			if op.On == "target" && ctx.target == nil {
+				s.addPlayerModLocked(c, ctx, op, now)
+			} else if op.On == "target" {
 				for _, m := range s.opTargetsLocked(c, ctx, op) {
 					m.st.mods = append(m.st.mods, statMod{
 						stat: op.Stat, value: op.Value.At(ctx.level),
@@ -1088,7 +1137,9 @@ func (hs *huntState) maxHPLocked(now float64) float64 {
 	return hs.av.Health*hs.hpMul() + hs.st.modSum(now, "max_hp")
 }
 
-func (hs *huntState) maxManaLocked(float64) float64 { return hs.av.Mana * hs.hpMul() }
+func (hs *huntState) maxManaLocked(now float64) float64 {
+	return hs.av.Mana*hs.hpMul() + hs.st.modSum(now, "max_mana")
+}
 
 // effAttackRangeLocked is the avatar's live auto-attack reach: its base AttackRange
 // plus any attack_range buff (Teridin's «Прицеливание» passive).
@@ -1190,6 +1241,9 @@ func (s *Server) pushPlayerStatsLocked(c *conn, now float64) {
 	// dmgMul is the buff multiplier; pMul is the per-level power multiplier -- both
 	// apply to the displayed basic-attack damage (matching the real hit calc).
 	dmgMul := st.modMul(now, "dmg_pct") * hs.powerMul()
+	// Flat basic-attack bonuses from avatar tree items (DamageMin/AttackSpeed).
+	dmgFlat := st.modSum(now, "dmg_flat")
+	atkSpeed := a.AttackSpeed + st.modSum(now, "atk_speed_flat")
 	armMul := st.modMul(now, "armor_pct")
 	maxHP := hs.maxHPLocked(now)
 	if hs.hp > maxHP {
@@ -1200,9 +1254,9 @@ func (s *Server) pushPlayerStatsLocked(c *conn, now float64) {
 		hs.mana = maxMana
 	}
 	b := newSyncBlob(float32(now)).
-		setFloats(syncDmgMin, idx, float32(float64(a.DmgMin)*dmgMul)).
-		setFloats(syncDmgMax, idx, float32(float64(a.DmgMax)*dmgMul)).
-		setFloats(syncAttackSpeed, idx, float32(a.AttackSpeed*st.attackFactor(now))).
+		setFloats(syncDmgMin, idx, float32((float64(a.DmgMin)+dmgFlat)*dmgMul)).
+		setFloats(syncDmgMax, idx, float32((float64(a.DmgMax)+dmgFlat)*dmgMul)).
+		setFloats(syncAttackSpeed, idx, float32(atkSpeed*st.attackFactor(now))).
 		setFloats(syncMaxHealth, idx, float32(maxHP)).
 		setFloats(syncHealth, idx, float32(hs.hp/maxHP)).
 		setFloats(syncMaxMana, idx, float32(maxMana)).
@@ -1294,9 +1348,9 @@ func (s *Server) dashLocked(c *conn, ctx opCtx, speed float64, now float64, noCl
 }
 
 // knockbackMobLocked shoves a mob directly away from the caster by dist units (the
-// inverse of pullMobLocked), clipped to walkable ground -- Dutnik's «Взрыв» blast.
+// inverse of pullMobLocked), clipped to walkable ground -- Dutnik's «Взрыв» blast and
+// Miriam's «Выстрел бури».
 func (s *Server) knockbackMobLocked(c *conn, m *mobState, dist float64, now float64) {
-	hs := c.huntState
 	if dist <= 0 {
 		dist = 3
 	}
@@ -1312,14 +1366,7 @@ func (s *Server) knockbackMobLocked(c *conn, m *mobState, dist float64, now floa
 		nx, ny := c.nav.Clip(float64(m.x), float64(m.y), float64(tx), float64(ty))
 		tx, ty = float32(nx), float32(ny)
 	}
-	m.x, m.y = tx, ty
-	idx := hs.tr.index(m.id)
-	if idx >= 0 {
-		s.push(c, battleproto.CmdSync, amf.NewArray().Set("data",
-			newSyncBlob(float32(now)).position(idx, m.x, m.y, 0, 0, float32(now)).
-				build(hs.tr.count())))
-	}
-	s.stopMobLocked(c, m, now)
+	s.teleportMobLocked(c, m, tx, ty, now)
 }
 
 // resetCooldownsLocked clears every skill cooldown for the caster, server-side AND on
@@ -1340,7 +1387,6 @@ func (s *Server) resetCooldownsLocked(c *conn, now float64) {
 }
 
 func (s *Server) pullMobLocked(c *conn, m *mobState, now float64) {
-	hs := c.huntState
 	cx, cy := c.posAtLocked(float32(now))
 	d := math.Hypot(float64(m.x-cx), float64(m.y-cy))
 	if d < 1.5 {
@@ -1348,12 +1394,27 @@ func (s *Server) pullMobLocked(c *conn, m *mobState, now float64) {
 	}
 	nx := cx + float32(float64(m.x-cx)*1.5/d)
 	ny := cy + float32(float64(m.y-cy)*1.5/d)
-	m.x, m.y = nx, ny
-	idx := hs.tr.index(m.id)
-	if idx >= 0 {
-		s.push(c, battleproto.CmdSync, amf.NewArray().Set("data",
-			newSyncBlob(float32(now)).position(idx, m.x, m.y, 0, 0, float32(now)).
-				build(hs.tr.count())))
+	s.teleportMobLocked(c, m, nx, ny, now)
+}
+
+// teleportMobLocked drops a mob at (x,y) and tells EVERY viewer, not just the caster:
+// a displaced mob is halted there, so its clients must be snapped to the new spot
+// rather than left dead-reckoning from the old one. Shared by the pull and knockback
+// paths, which both used to push the new position to the caster alone and then lean on
+// stopMobLocked to inform the rest -- but that call bails out early on an already-
+// stationary mob, so yanking or shoving a standing mob simply did not move it on a
+// teammate's screen.
+//
+// Immovable units are refused outright. Mob.Stationary is honoured by the two AI
+// movement drivers (they never integrate a stationary mob), so before this guard the
+// effects engine was the ONE place in the server that could move something bolted to
+// the ground: a «Штурм» cannon could be shoved out of its emplacement by a knockback
+// and dragged around by a pull, and the illegal position went out to every client.
+func (s *Server) teleportMobLocked(c *conn, m *mobState, x, y float32, now float64) {
+	if m.structure || m.mob.Stationary {
+		return
 	}
-	s.stopMobLocked(c, m, now)
+	m.x, m.y = x, y
+	m.vx, m.vy = 0, 0
+	s.broadcastPosLocked(c, m.id, m.x, m.y, 0, 0, float32(now))
 }

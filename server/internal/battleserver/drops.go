@@ -43,7 +43,16 @@ func dropChestProtoDesc() string {
 
 // rollDropLocked reports whether ms should drop loot: bosses (any Skills)
 // always do; trash rolls a flat 1-in-trashDropChance chance.
-func (s *Server) rollDropLocked(ms *mobState) bool {
+//
+// «Штурм» drops NOTHING. It is a match, not a farm -- there is no dungeon to stock up
+// for and no run to carry loot out of. Lane creeps, cannons, towers, generators and the
+// enemy Fortress Crystal are all ordinary mobStates on the shared death path, so without
+// this gate the mode rolled a 1-in-15 chest off every one of them and dropped a
+// consumable on the ground at the exact moment the match was won.
+func (s *Server) rollDropLocked(c *conn, ms *mobState) bool {
+	if c.inst != nil && c.inst.dota != nil {
+		return false
+	}
 	if len(ms.mob.Skills) > 0 {
 		return true
 	}

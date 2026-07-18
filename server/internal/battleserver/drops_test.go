@@ -13,12 +13,12 @@ import (
 // Skills) always drops, and a trash mob rolls a flat 1-in-trashDropChance
 // chance (currently 15).
 func TestRollDropChances(t *testing.T) {
-	s, _, _, cleanup := newHuntConnWithHero(t, "Avtr_Tank_Zamaran")
+	s, c, _, cleanup := newHuntConnWithHero(t, "Avtr_Tank_Zamaran")
 	defer cleanup()
 
 	boss := &mobState{mob: gamedata.Mob{Skills: []gamedata.BossSkill{{}}}}
 	for i := 0; i < 50; i++ {
-		if !s.rollDropLocked(boss) {
+		if !s.rollDropLocked(c, boss) {
 			t.Fatal("boss should always drop")
 		}
 	}
@@ -27,7 +27,7 @@ func TestRollDropChances(t *testing.T) {
 	const trials = 30000
 	hits := 0
 	for i := 0; i < trials; i++ {
-		if s.rollDropLocked(trash) {
+		if s.rollDropLocked(c, trash) {
 			hits++
 		}
 	}

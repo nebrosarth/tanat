@@ -21,7 +21,7 @@ func newNavConn(t *testing.T) (*Server, *conn, gamedata.Nav, float32, float32) {
 // tests: toggles, summons, passives).
 func newNavConnAvatar(t *testing.T, avatarID int32) (*Server, *conn, gamedata.Nav, float32, float32) {
 	t.Helper()
-	m, ok := gamedata.HuntMapByID(40) // map_4_0 crypt: the only nav-backed scene
+	m, ok := gamedata.HuntMapByID(40) // map_4_0 crypt: the nav-backed Hunt scene
 	if !ok || m.Nav == nil {
 		t.Fatal("map_4_0 (id 40) has no nav grid")
 	}

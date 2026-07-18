@@ -43,6 +43,13 @@ func (s *Server) handleUserBag(req ctrlproto.Request, resp *ctrlproto.Response) 
 				Set("cnt", bi.Count).
 				Set("used", int32(0)))
 		}
+		// Unequipped wearable gear shares the one owned inventory with potions, but as
+		// discrete instances with stable ids (>= heroItemInstanceBase, so they never
+		// collide with the 1-based potion rows above). These are what user|dress and
+		// store|sell address by id.
+		for _, ow := range h.Owned {
+			bag.Add(bagRow(ow.ID, ow.ArticleID, 1))
+		}
 	}
 	resp.Add("user", "bag", amf.NewArray().
 		Set("user_money", money).
@@ -229,10 +236,7 @@ func dressedItemsArray(h *session.Hero) *amf.MixedArray {
 
 // ---- Phase 3: lobby services (empty-but-valid so the menus don't error) ----
 
-// handleStoreList answers store|list -> {store:{}} (empty shop for now).
-func (s *Server) handleStoreList(req ctrlproto.Request, resp *ctrlproto.Response) {
-	resp.Add("store", "list", amf.NewArray().Set("store", amf.NewArray()))
-}
+// handleStoreList lives in hero_items.go (the city gear shop).
 
 // handleCastleList answers castle|list. CastleListArgParser requires "castles".
 func (s *Server) handleCastleList(req ctrlproto.Request, resp *ctrlproto.Response) {

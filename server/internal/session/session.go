@@ -51,6 +51,18 @@ type Hero struct {
 	// article id (one stack per distinct item). Survives logout/restart, unlike
 	// the ephemeral hunt-instance battle state.
 	Bag []BagItem
+	// Owned is the hero's unequipped WEARABLE gear (bought in the city shop, not
+	// yet dressed). Unlike Bag potions these are DISCRETE instances (one row each,
+	// never merged) with a STABLE per-hero instance ID, because user|dress and
+	// store|sell address a specific owned instance by that id. Dressing moves an
+	// instance from Owned into Dressed (keeping its id); undressing moves it back.
+	Owned []OwnedItem
+	// NextItemID mints the stable wearable instance ids (starts at
+	// heroItemInstanceBase, only ever increments, never reused).
+	NextItemID int32
+	// Quests is the hero's persistent PvE quest state (accepted/in-progress/done/closed +
+	// kill progress + REPLAY cooldowns). See session/quests.go for the state machine.
+	Quests []QuestState
 }
 
 // BagItem is one persisted consumable stack. ArticleID is the gamedata item
@@ -68,6 +80,14 @@ type DressedItem struct {
 	ArticleID int32
 	Count     int32
 	Slot      int32
+}
+
+// OwnedItem is one unequipped wearable the hero owns (a discrete instance with a
+// stable id). It has no slot until dressed; on the user|bag wire it appears as
+// {id, artikul_id, cnt:1, used:0} alongside the potion stacks.
+type OwnedItem struct {
+	ID        int32
+	ArticleID int32
 }
 
 type Session struct {
@@ -166,6 +186,41 @@ func (s *Store) AddHeroMoney(userID, delta int32) (money, diamonds int32, ok boo
 	if u.Hero.Money < 0 {
 		u.Hero.Money = 0
 	}
+	s.saveLocked()
+	return u.Hero.Money, u.Hero.DiamondMoney, true
+}
+
+// HeroMoney returns a user's current persistent money/diamond totals WITHOUT
+// changing them. Used by the Battle server to seed the in-battle balance (the
+// initial SET_MONEY the item tree's affordability check reads). ok=false if the
+// user or hero is missing.
+func (s *Store) HeroMoney(userID int32) (money, diamonds int32, ok bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	u, found := s.usersByID[userID]
+	if !found || u.Hero == nil {
+		return 0, 0, false
+	}
+	return u.Hero.Money, u.Hero.DiamondMoney, true
+}
+
+// SpendHeroMoney atomically debits amount from a user's persistent hero money IF
+// they can afford it, returning the new totals. ok=false with no change when the
+// user/hero is missing, amount is negative, or the balance is insufficient --
+// the caller (Battle BUY) uses this single call as the affordability check so a
+// concurrent debit can't slip a purchase past a stale balance. Used to buy the
+// in-battle avatar item tree.
+func (s *Store) SpendHeroMoney(userID, amount int32) (money, diamonds int32, ok bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	u, found := s.usersByID[userID]
+	if !found || u.Hero == nil {
+		return 0, 0, false
+	}
+	if amount < 0 || u.Hero.Money < amount {
+		return u.Hero.Money, u.Hero.DiamondMoney, false
+	}
+	u.Hero.Money -= amount
 	s.saveLocked()
 	return u.Hero.Money, u.Hero.DiamondMoney, true
 }
