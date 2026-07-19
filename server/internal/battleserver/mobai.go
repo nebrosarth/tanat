@@ -957,7 +957,7 @@ func (s *Server) revealSummonToMemberLocked(mem *conn, sm *summonState, now floa
 			setFloats(syncRadius, idx, float32(summonRadius)).
 			// Vision -- a pet is always FRIEND, so unlike a mob's this always spawns a
 			// reveal zone on a map that renders fog. See creepViewRadius.
-			setFloats(syncViewRadius, idx, summonViewRadius).
+			setFloats(syncViewRadius, idx, effectiveViewRadius(summonViewRadius)).
 			setInt(syncTeam, idx, summonTeam).
 			build(hs.tr.count())))
 	// ATTACK effector so the model swings when we push its ACTIONs.
@@ -1999,6 +1999,22 @@ func nearestMemberDistLocked(members []*conn, m *mobState, now float64) float64 
 // the shown/active comment on mobState. «Штурм» keeps every unit active and rendered
 // instead, which is why creeps go on breaking towers in fog.
 func (s *Server) mobInterestLocked(c *conn, m *mobState, now float64) bool {
+	// Admin fog-off for «Охота»: reveal and simulate every mob from the start, with
+	// no reveal-on-approach gate and no shade overlay -- the whole map is visible.
+	// (This pass runs only for Hunt/Arena worlds; «Штурм» has its own dotaTick.) A
+	// late joiner still gets every shown mob via the join-time sync (see avatars.go).
+	if !gamedata.HuntFog() {
+		if !m.shown {
+			s.revealMobLocked(c, m, now)
+		}
+		if m.shaded {
+			s.worldFxEndLocked(c, m.shadeFxUID)
+			m.shadeFxUID = 0
+			m.shaded = false
+		}
+		m.active = m.shown
+		return m.active
+	}
 	d := nearestMemberDistLocked(c.members(), m, now)
 	if m.shown {
 		if d >= mobHideRadius {
@@ -2086,7 +2102,7 @@ func (s *Server) revealMobToMemberLocked(mem *conn, m *mobState, now float64) {
 			// enemy creep, and lights the lane for the player's own creeps. Omitting it
 			// is what left a «Штурм» lane black -- mViewRadius > 0f is the other half of
 			// that gate, and the escorting creeps failed it.
-			setFloats(syncViewRadius, idx, creepViewRadius).
+			setFloats(syncViewRadius, idx, effectiveViewRadius(creepViewRadius)).
 			setInt(syncTeam, idx, m.teamVal()).
 			build(hs.tr.count())))
 	s.addAttackEffectorLocked(mem, m.id, mobAttackProtoID(m.mobIdx), now)

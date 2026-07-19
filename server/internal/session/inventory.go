@@ -86,7 +86,7 @@ func (s *Store) BuyWearables(userID, totalPrice int32, articles []int32) (money,
 		h.Owned = append(h.Owned, it)
 		added = append(added, it)
 	}
-	s.saveLocked()
+	s.saveUserLocked(u)
 	return h.Money, h.DiamondMoney, added, true
 }
 
@@ -108,7 +108,7 @@ func (s *Store) SellWearable(userID, instanceID, refund int32) (money, diamonds,
 			if refund > 0 {
 				h.Money += refund
 			}
-			s.saveLocked()
+			s.saveUserLocked(u)
 			return h.Money, h.DiamondMoney, articleID, true
 		}
 	}
@@ -163,7 +163,7 @@ func (s *Store) DressWearable(userID, instanceID, slot int32) (res DressResult, 
 	}
 	h.Dressed = append(h.Dressed, DressedItem{ID: instanceID, ArticleID: article, Count: 1, Slot: slot})
 	res.DressedArticle = article
-	s.saveLocked()
+	s.saveUserLocked(u)
 	return res, true
 }
 
@@ -183,7 +183,7 @@ func (s *Store) UndressWearable(userID, slot int32) (freedID, freedArticle int32
 			freedArticle = h.Dressed[i].ArticleID
 			h.Owned = append(h.Owned, OwnedItem{ID: freedID, ArticleID: freedArticle})
 			h.Dressed = append(h.Dressed[:i], h.Dressed[i+1:]...)
-			s.saveLocked()
+			s.saveUserLocked(u)
 			return freedID, freedArticle, true
 		}
 	}

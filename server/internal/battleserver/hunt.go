@@ -151,6 +151,23 @@ const (
 	summonViewRadius float32 = 18
 )
 
+// fogRevealAllRadius is a vision radius large enough to clear an entire war-fog
+// plane at once. Used when the admin has turned fog-of-war OFF (gamedata.FogOfWar
+// false): every friendly unit still reveals through the same path, but its zone
+// now covers the whole map, so nothing stays fogged.
+const fogRevealAllRadius float32 = 100000
+
+// effectiveViewRadius maps an authored vision radius to what is actually sent:
+// the value itself while fog-of-war is enabled (the default), or the reveal-all
+// radius when the admin panel has disabled fog. Read live so the toggle takes
+// effect on the next unit that reveals, without a restart.
+func effectiveViewRadius(base float32) float32 {
+	if gamedata.FogOfWar() {
+		return base
+	}
+	return fogRevealAllRadius
+}
+
 // ---- battle prototype ids ----
 //
 // One id space per battle connection: the avatar object prototype (100+),
@@ -1169,7 +1186,7 @@ func (s *Server) sendHuntWorldState(c *conn, name string) {
 				setFloats(syncManaRegen, avatarIdx, float32(a.ManaRegen)).
 				setFloats(syncSpeed, avatarIdx, lobbyMoveSpeed).
 				setFloats(syncRadius, avatarIdx, float32(a.Radius())).
-				setFloats(syncViewRadius, avatarIdx, avatarViewRadius).
+				setFloats(syncViewRadius, avatarIdx, effectiveViewRadius(avatarViewRadius)).
 				setInt(syncTeam, avatarIdx, c.playerTeam()).
 				setFloats(syncSpellPower, avatarIdx, float32(a.SpellPower)).
 				setFloats(syncCastCost, avatarIdx, 1.0).

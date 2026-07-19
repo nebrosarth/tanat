@@ -265,7 +265,11 @@ func TestMobLevelGradient(t *testing.T) {
 			ghoulMax = sp.Level
 		}
 	}
-	if ghoulMax > 2 {
+	// Ghouls populate the two entrance regions (both authored level 1). Under the
+	// path-based IDW leveling the last of them, deep in the first corridor, ramp
+	// toward the level-3 Elgorm approach instead of snapping at the region border --
+	// so <=3 (still the trivial starter, ~104 HP) rather than the old hard <=2.
+	if ghoulMax > 3 {
 		t.Errorf("starter ghouls should stay low level, got max %d", ghoulMax)
 	}
 	if maxLvl < 18 {

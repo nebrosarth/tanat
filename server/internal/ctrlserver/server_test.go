@@ -120,6 +120,128 @@ func TestLoginThenHeroCreateEndToEnd(t *testing.T) {
 	}
 }
 
+// TestLoginWrongPasswordRejected checks that, once an account exists, a login
+// with the wrong password replies with the WRONG_PASS (6014) error the client's
+// CtrlPacketValidator routes to LoginPerformer.OnLoginFailed -- and does NOT
+// bundle hero_conf/area_conf (which would look like a successful login).
+func TestLoginWrongPasswordRejected(t *testing.T) {
+	srv := New()
+	ts := httptest.NewServer(srv.Handler())
+	defer ts.Close()
+	url := ts.URL + "/entry_point.php"
+
+	// Register the account with its real password.
+	first := postEnvelope(t, url, loginEnvelope("wp@example.com", "right", "3.4.1.27345", "0", "", 1))
+	if lr, ok := first.GetArray(ctrlproto.CmdKey("user", "login")); !ok {
+		t.Fatal("missing user|login on first login")
+	} else if st, _ := lr.GetInt("status"); st != ctrlproto.StatusOK {
+		t.Fatalf("first login status = %d, want 100", st)
+	}
+
+	// A wrong password must be rejected with 6014 and no hero bundle.
+	bad := postEnvelope(t, url, loginEnvelope("wp@example.com", "WRONG", "3.4.1.27345", "0", "", 2))
+	lr, ok := bad.GetArray(ctrlproto.CmdKey("user", "login"))
+	if !ok {
+		t.Fatalf("missing user|login on rejected login: %#v", bad.Assoc)
+	}
+	if st, _ := lr.GetInt("status"); st != loginWrongPass {
+		t.Errorf("rejected login status = %d, want %d (WRONG_PASS)", st, loginWrongPass)
+	}
+	if errCode, _ := lr.GetInt("error"); errCode != loginWrongPass {
+		t.Errorf("rejected login error = %d, want %d", errCode, loginWrongPass)
+	}
+	if _, ok := bad.GetArray(ctrlproto.CmdKey("common", "hero_conf")); ok {
+		t.Error("a rejected login must not bundle hero_conf")
+	}
+
+	// The correct password still works afterward.
+	good := postEnvelope(t, url, loginEnvelope("wp@example.com", "right", "3.4.1.27345", "0", "", 3))
+	if lr, ok := good.GetArray(ctrlproto.CmdKey("user", "login")); !ok {
+		t.Fatal("missing user|login on retry")
+	} else if st, _ := lr.GetInt("status"); st != ctrlproto.StatusOK {
+		t.Errorf("correct-password login status = %d, want 100", st)
+	}
+}
+
+// TestLoginBannedRejected: a banned account authenticates but is refused with the
+// BANNED (6011) code and no hero bundle, even with the correct password.
+func TestLoginBannedRejected(t *testing.T) {
+	srv := New()
+	ts := httptest.NewServer(srv.Handler())
+	defer ts.Close()
+	url := ts.URL + "/entry_point.php"
+
+	// Register, then ban via the admin store path.
+	first := postEnvelope(t, url, loginEnvelope("ban@example.com", "pw", "3.4.1.27345", "0", "", 1))
+	lr, _ := first.GetArray(ctrlproto.CmdKey("user", "login"))
+	userID, _ := lr.GetInt("id")
+	if !srv.Store.SetBanned(int32(userID), true) {
+		t.Fatal("SetBanned failed")
+	}
+
+	banned := postEnvelope(t, url, loginEnvelope("ban@example.com", "pw", "3.4.1.27345", "0", "", 2))
+	br, ok := banned.GetArray(ctrlproto.CmdKey("user", "login"))
+	if !ok {
+		t.Fatalf("missing user|login on banned login: %#v", banned.Assoc)
+	}
+	if st, _ := br.GetInt("status"); st != loginBanned {
+		t.Errorf("banned login status = %d, want %d (BANNED)", st, loginBanned)
+	}
+	if _, ok := banned.GetArray(ctrlproto.CmdKey("common", "hero_conf")); ok {
+		t.Error("a banned login must not bundle hero_conf")
+	}
+
+	// Unbanning lets them back in.
+	srv.Store.SetBanned(int32(userID), false)
+	good := postEnvelope(t, url, loginEnvelope("ban@example.com", "pw", "3.4.1.27345", "0", "", 3))
+	if gr, ok := good.GetArray(ctrlproto.CmdKey("user", "login")); !ok {
+		t.Fatal("missing user|login after unban")
+	} else if st, _ := gr.GetInt("status"); st != ctrlproto.StatusOK {
+		t.Errorf("post-unban login status = %d, want 100", st)
+	}
+}
+
+// TestHeroCreateDoesNotOverwriteExisting: a second hero|create for an account
+// that already has a hero must NOT wipe its progress (money/level/gear/quests).
+func TestHeroCreateDoesNotOverwriteExisting(t *testing.T) {
+	srv := New()
+	ts := httptest.NewServer(srv.Handler())
+	defer ts.Close()
+	url := ts.URL + "/entry_point.php"
+
+	login := postEnvelope(t, url, loginEnvelope("keep@example.com", "pw", "3.4.1.27345", "0", "", 1))
+	lr, _ := login.GetArray(ctrlproto.CmdKey("user", "login"))
+	sessKey, _ := lr.GetString("sess_key")
+	userID, _ := lr.GetInt("id")
+
+	createReq := func(counter int32) *amf.MixedArray {
+		return amf.NewArray().
+			Set("object", "hero").Set("action", "create").
+			Set("params", amf.NewArray().
+				Set("race", int32(1)).Set("gender", int32(1)).
+				Set("face", int32(0)).Set("hair", int32(0)).
+				Set("dist_mark", int32(0)).Set("skin_color", int32(0)).Set("hair_color", int32(0))).
+			Set("sess_uid", int32(userID)).Set("sess_key", sessKey).Set("counter", counter)
+	}
+	postEnvelope(t, url, createReq(2)) // create the hero
+
+	// Simulate earned progress.
+	u, ok := srv.Store.ByID(int32(userID))
+	if !ok || u.Hero == nil {
+		t.Fatal("hero not created")
+	}
+	u.Hero.Money = 99999
+	u.Hero.Level = 12
+	srv.Store.Save()
+
+	// A second (spurious) hero|create must be a no-op, not a wipe.
+	postEnvelope(t, url, createReq(3))
+	u2, _ := srv.Store.ByID(int32(userID))
+	if u2.Hero.Money != 99999 || u2.Hero.Level != 12 {
+		t.Errorf("second hero|create overwrote progress: money=%d level=%d, want 99999/12", u2.Hero.Money, u2.Hero.Level)
+	}
+}
+
 // TestAreaConfReturnsBattleCoordinates checks the common|area_conf reply has
 // the exact shape ServerDataArgParser reads ({area_conf:{ip,port,scene,passwd,
 // area_id}, log}) and that the scene tracks the hero's race (elf -> cs_elf).

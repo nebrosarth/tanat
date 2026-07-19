@@ -30,7 +30,7 @@ func questStatus(s *Server, uid, questID int32) int32 {
 // bound to a different map are left untouched.
 func TestQuestKillAdvancesProgress(t *testing.T) {
 	s, c, _, sx, sy := newNavConn(t) // killer is on map_4_0 (id 40)
-	u, _ := s.Store.LoginOrRegister("qhunter@test.io", "pw")
+	u, _, _ := s.Store.LoginOrRegister("qhunter@test.io", "pw")
 	s.Store.CreateHero(u, 1, false, 0, 0, 0, 0, 0)
 	c.selfPlayerID = u.ID
 

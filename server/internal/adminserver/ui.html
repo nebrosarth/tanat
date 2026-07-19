@@ -1,0 +1,722 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Tanat • Админ-панель</title>
+<style>
+  :root{
+    --bg:#0e1319; --panel:#161d27; --panel2:#1c2530; --line:#2a3644;
+    --text:#e7edf3; --muted:#8a97a6; --accent:#d9a441; --accent-dim:#3a2f18;
+    --good:#5ec26a; --warn:#e0a44c; --danger:#e5534b; --danger-dim:#3a1f1d;
+    --radius:9px;
+  }
+  *{box-sizing:border-box}
+  html,body{margin:0;padding:0}
+  body{
+    background:var(--bg); color:var(--text); min-height:100vh;
+    font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+    font-size:14px; line-height:1.45;
+  }
+  .mono{font-family:ui-monospace,"SF Mono",Menlo,Consolas,monospace}
+  .num{font-variant-numeric:tabular-nums}
+  a{color:var(--accent)}
+  button{font:inherit;cursor:pointer}
+  input[type=text],input[type=password],input[type=number],select{
+    font:inherit; background:var(--panel2); color:var(--text);
+    border:1px solid var(--line); border-radius:6px; padding:6px 8px; width:100%;
+  }
+  select{cursor:pointer}
+  input:focus,select:focus{outline:2px solid var(--accent); outline-offset:-1px; border-color:var(--accent)}
+  h3{color:var(--text)}
+  .btn{
+    background:var(--panel2); color:var(--text); border:1px solid var(--line);
+    border-radius:7px; padding:7px 13px; transition:.12s;
+  }
+  .btn:hover{border-color:var(--accent); color:#fff}
+  .btn.primary{background:var(--accent); color:#1a1206; border-color:var(--accent); font-weight:600}
+  .btn.primary:hover{filter:brightness(1.08)}
+  .btn.danger{border-color:var(--danger); color:#f0a49e}
+  .btn.danger:hover{background:var(--danger-dim); color:#fff}
+  .btn.small{padding:4px 9px; font-size:12.5px; border-radius:6px}
+  .btn:disabled{opacity:.5; cursor:default}
+
+  /* ---- login ---- */
+  #login{min-height:100vh; display:grid; place-items:center; padding:20px}
+  .card{
+    background:var(--panel); border:1px solid var(--line); border-radius:var(--radius);
+    padding:30px; width:100%; max-width:360px; box-shadow:0 12px 40px rgba(0,0,0,.4);
+  }
+  .card h1{margin:0 0 4px; font-size:20px}
+  .card .sub{color:var(--muted); margin:0 0 22px; font-size:13px}
+  .card label{display:block; font-size:12px; color:var(--muted); margin:0 0 6px; letter-spacing:.03em; text-transform:uppercase}
+  .card .row{display:flex; gap:9px; margin-top:16px}
+  .err{color:var(--danger); font-size:13px; min-height:18px; margin-top:10px}
+
+  /* ---- app shell ---- */
+  #app{display:none}
+  header{
+    display:flex; align-items:center; gap:18px; flex-wrap:wrap;
+    padding:14px 20px; border-bottom:1px solid var(--line); background:var(--panel);
+    position:sticky; top:0; z-index:5;
+  }
+  header .brand{font-weight:700; font-size:16px; letter-spacing:.02em}
+  header .brand b{color:var(--accent)}
+  .chips{display:flex; gap:10px; flex-wrap:wrap; margin-left:auto; align-items:center}
+  .chip{
+    display:inline-flex; align-items:center; gap:6px; background:var(--panel2);
+    border:1px solid var(--line); border-radius:20px; padding:4px 11px; font-size:12.5px; color:var(--muted);
+  }
+  .chip b{color:var(--text)}
+  .dot{width:7px; height:7px; border-radius:50%; background:var(--good)}
+
+  nav.tabs{display:flex; gap:4px; padding:12px 20px 0; border-bottom:1px solid var(--line); background:var(--panel); flex-wrap:wrap}
+  nav.tabs button{
+    background:none; border:none; color:var(--muted); padding:9px 15px; border-radius:7px 7px 0 0;
+    border-bottom:2px solid transparent; font-size:14px;
+  }
+  nav.tabs button:hover{color:var(--text)}
+  nav.tabs button.active{color:var(--accent); border-bottom-color:var(--accent)}
+
+  main{padding:22px 20px 60px; max-width:1240px; margin:0 auto}
+  .tab{display:none}
+  .tab.active{display:block}
+  .tab h2{margin:0 0 4px; font-size:17px}
+  .tab .hint{color:var(--muted); font-size:13px; margin:0 0 18px; max-width:70ch}
+
+  .toolbar{display:flex; gap:10px; align-items:center; margin-bottom:14px; flex-wrap:wrap}
+  .toolbar input[type=text]{max-width:280px}
+  .spacer{flex:1}
+
+  .scroll{overflow-x:auto; border:1px solid var(--line); border-radius:var(--radius); background:var(--panel)}
+  table{border-collapse:collapse; width:100%; font-size:13px}
+  th,td{padding:9px 11px; text-align:left; border-bottom:1px solid var(--line); white-space:nowrap}
+  th{color:var(--muted); font-weight:600; font-size:11.5px; text-transform:uppercase; letter-spacing:.04em; background:var(--panel2); position:sticky; top:0}
+  tbody tr:hover{background:var(--panel2)}
+  tr.modified{background:rgba(217,164,65,.06)}
+  td .cell-in{width:78px}
+  td.name b{color:var(--text)}
+  td.name small{color:var(--muted); display:block; font-size:11px}
+
+  .pill{display:inline-block; padding:2px 9px; border-radius:12px; font-size:11.5px; font-weight:600}
+  .pill.on{background:rgba(94,194,106,.14); color:var(--good)}
+  .pill.off{background:var(--panel2); color:var(--muted)}
+  .pill.ban{background:var(--danger-dim); color:#f0a49e}
+
+  .grid{display:grid; grid-template-columns:repeat(auto-fill,minmax(230px,1fr)); gap:16px}
+  .field{background:var(--panel); border:1px solid var(--line); border-radius:var(--radius); padding:14px}
+  .field label{display:block; font-size:12px; color:var(--muted); margin-bottom:7px}
+  .field .desc{font-size:11.5px; color:var(--muted); margin-top:6px; line-height:1.35}
+  .toggle{display:flex; align-items:center; gap:10px}
+  .toggle input{width:auto}
+
+  .actions{display:flex; gap:7px}
+  .save-row{display:flex; gap:10px; align-items:center; margin-top:20px; position:sticky; bottom:0;
+    background:linear-gradient(transparent,var(--bg) 40%); padding:14px 0}
+
+  #toast{
+    position:fixed; bottom:22px; left:50%; transform:translateX(-50%) translateY(30px);
+    background:var(--panel2); border:1px solid var(--line); border-radius:9px; padding:11px 18px;
+    box-shadow:0 8px 30px rgba(0,0,0,.5); opacity:0; transition:.25s; pointer-events:none; z-index:50; font-size:13.5px;
+  }
+  #toast.show{opacity:1; transform:translateX(-50%) translateY(0)}
+  #toast.ok{border-color:var(--good)} #toast.bad{border-color:var(--danger)}
+  .muted{color:var(--muted)}
+</style>
+</head>
+<body>
+
+<div id="login">
+  <form class="card" id="loginForm" autocomplete="off">
+    <h1>Tanat <span style="color:var(--accent)">Админка</span></h1>
+    <p class="sub">Управление сервером Tanat Online</p>
+    <label for="pw">Пароль администратора</label>
+    <input type="password" id="pw" autocomplete="current-password" autofocus>
+    <div class="err" id="loginErr"></div>
+    <div class="row"><button class="btn primary" type="submit" style="flex:1">Войти</button></div>
+  </form>
+</div>
+
+<div id="app">
+  <header>
+    <div class="brand">Tanat <b>Админка</b></div>
+    <div class="chips">
+      <span class="chip"><span class="dot"></span> онлайн: <b id="stOnline">–</b></span>
+      <span class="chip">аккаунтов: <b id="stAccounts">–</b></span>
+      <span class="chip">аптайм: <b id="stUptime">–</b></span>
+      <button class="btn small" id="btnRefresh">Обновить</button>
+      <button class="btn small" id="btnLogout">Выход</button>
+    </div>
+  </header>
+
+  <nav class="tabs">
+    <button data-tab="players" class="active">Игроки</button>
+    <button data-tab="manage">Квесты и предметы</button>
+    <button data-tab="config">Конфиг</button>
+    <button data-tab="avatars">Статы аватаров</button>
+    <button data-tab="mobs">Статы мобов</button>
+  </nav>
+
+  <main>
+    <!-- PLAYERS -->
+    <section class="tab active" id="tab-players">
+      <h2>Игроки</h2>
+      <p class="hint">Список аккаунтов. Деньги/уровень применяются сразу и сохраняются в БД. Бан отклоняет вход в игру; удаление необратимо.</p>
+      <div class="toolbar">
+        <input type="text" id="playerSearch" placeholder="Поиск по e-mail / нику / id…">
+        <div class="spacer"></div>
+        <span class="muted" id="playerCount"></span>
+      </div>
+      <div class="scroll">
+        <table id="playersTable">
+          <thead><tr>
+            <th>id</th><th>Аккаунт</th><th>Ур.</th><th>Опыт</th><th>Монеты</th><th>Кристаллы</th>
+            <th>Статус</th><th>Действия</th>
+          </tr></thead>
+          <tbody></tbody>
+        </table>
+      </div>
+    </section>
+
+    <!-- MANAGE: quests + item grants -->
+    <section class="tab" id="tab-manage">
+      <h2>Квесты и предметы</h2>
+      <p class="hint">Выберите игрока, чтобы посмотреть и изменить прогресс его квестов и выдать предметы. Изменения сохраняются в БД и видны игроку при следующем открытии журнала / инвентаря (перезаход в город обновит гарантированно).</p>
+      <div class="toolbar">
+        <select id="mgPlayer" style="max-width:340px"></select>
+        <button class="btn" id="mgLoad">Загрузить</button>
+        <div class="spacer"></div>
+        <span class="muted" id="mgWho"></span>
+      </div>
+
+      <div id="mgBody" style="display:none">
+        <!-- Quests -->
+        <h3 style="margin:22px 0 4px; font-size:15px">Квесты игрока</h3>
+        <p class="hint" style="margin-bottom:10px">Статус и прогресс. «Выполнен» = готов к сдаче у NPC; «Закрыт» = одноразовый пройден; «Кулдаун» = повторяемый на перезарядке.</p>
+        <div class="scroll">
+          <table id="mgQuestTable">
+            <thead><tr><th>id</th><th>Квест</th><th>Карта</th><th>Статус</th><th>Прогресс</th><th>Действия</th></tr></thead>
+            <tbody></tbody>
+          </table>
+        </div>
+        <div class="field" style="margin-top:14px; max-width:none">
+          <label>Добавить / переопределить квест</label>
+          <div style="display:flex; gap:10px; flex-wrap:wrap; align-items:flex-end">
+            <div style="flex:2; min-width:220px"><small class="muted">Квест</small><select id="mgQuestAdd"></select></div>
+            <div style="flex:1; min-width:130px"><small class="muted">Статус</small><select id="mgQuestAddStatus"></select></div>
+            <div style="width:100px"><small class="muted">Прогресс</small><input type="number" id="mgQuestAddProg" class="num" value="0" min="0"></div>
+            <button class="btn primary" id="mgQuestAddBtn">Применить</button>
+          </div>
+        </div>
+
+        <!-- Item grant -->
+        <h3 style="margin:26px 0 4px; font-size:15px">Выдать предмет</h3>
+        <p class="hint" style="margin-bottom:10px">Расходники складываются в сумку стопкой; экипировка выдаётся отдельными экземплярами в инвентарь (не надета). Бесплатно.</p>
+        <div class="field" style="max-width:none">
+          <div style="display:flex; gap:10px; flex-wrap:wrap; align-items:flex-end">
+            <div style="width:150px"><small class="muted">Тип</small>
+              <select id="mgGrantKind">
+                <option value="potion">Расходник</option>
+                <option value="wearable">Экипировка</option>
+              </select>
+            </div>
+            <div style="flex:1; min-width:140px"><small class="muted">Раса (для экип.)</small>
+              <select id="mgGrantRace"><option value="">Все</option><option value="Human">Human</option><option value="Elf">Elf</option></select>
+            </div>
+            <div style="flex:3; min-width:260px"><small class="muted">Предмет</small><select id="mgGrantItem"></select></div>
+            <div style="width:90px"><small class="muted">Кол-во</small><input type="number" id="mgGrantCount" class="num" value="1" min="1"></div>
+            <button class="btn primary" id="mgGrantBtn">Выдать</button>
+          </div>
+        </div>
+
+        <!-- Current inventory -->
+        <h3 style="margin:26px 0 4px; font-size:15px">Текущий инвентарь</h3>
+        <div class="grid" style="grid-template-columns:1fr 1fr">
+          <div>
+            <div class="muted" style="margin-bottom:6px; font-size:12px">Сумка (расходники)</div>
+            <div class="scroll"><table id="mgBagTable"><thead><tr><th>Артикул</th><th>Предмет</th><th>Кол-во</th></tr></thead><tbody></tbody></table></div>
+          </div>
+          <div>
+            <div class="muted" style="margin-bottom:6px; font-size:12px">Экипировка (в инвентаре / надето)</div>
+            <div class="scroll"><table id="mgGearTable"><thead><tr><th>id</th><th>Артикул</th><th>Предмет</th><th>Где</th></tr></thead><tbody></tbody></table></div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- CONFIG -->
+    <section class="tab" id="tab-config">
+      <h2>Игровые параметры</h2>
+      <p class="hint">Глобальные настройки, применяются «на горячую» — для новых спавнов и начислений сразу, без перезапуска. Сохраняются в БД.</p>
+      <div class="grid" id="configGrid"></div>
+      <div class="save-row">
+        <button class="btn primary" id="btnSaveConfig">Сохранить конфиг</button>
+        <button class="btn" id="btnResetConfig">Отменить изменения</button>
+      </div>
+    </section>
+
+    <!-- AVATARS -->
+    <section class="tab" id="tab-avatars">
+      <h2>Статы аватаров</h2>
+      <p class="hint">Переопределение базовых статов героев. Применяется при следующем входе в бой. Пустая/совпадающая ячейка = авторское значение. Изменённые строки подсвечены.</p>
+      <div class="toolbar">
+        <input type="text" id="avatarSearch" placeholder="Поиск по имени / префабу…">
+        <div class="spacer"></div>
+        <span class="muted">СкАтк = атак/сек · Дальн/Бр = усл. ед.</span>
+      </div>
+      <div class="scroll"><table id="avatarsTable"><thead></thead><tbody></tbody></table></div>
+    </section>
+
+    <!-- MOBS -->
+    <section class="tab" id="tab-mobs">
+      <h2>Статы мобов</h2>
+      <p class="hint">Переопределение базовых статов мобов (уровень 1; в бою домножается на уровень места). Применяется к новым спавнам. Боссы помечены ★.</p>
+      <div class="toolbar">
+        <input type="text" id="mobSearch" placeholder="Поиск по префабу / ключу…">
+        <div class="spacer"></div>
+      </div>
+      <div class="scroll"><table id="mobsTable"><thead></thead><tbody></tbody></table></div>
+    </section>
+  </main>
+</div>
+
+<div id="toast"></div>
+
+<script>
+"use strict";
+let CSRF = null, STATE = null, CATALOG = null;
+
+const QUEST_STATUS = {0:"Кулдаун", 1:"В процессе", 2:"Выполнен", 3:"Закрыт"};
+const QUEST_KIND   = {1:"Убить", 2:"Собрать"};
+const QUEST_PVE    = {1:"Одиночный", 2:"Групповой", 3:"Повторяемый"};
+const ITEM_KIND = ["Зелье HP","Зелье маны","Фляга HP","Фляга маны","Скорость","Невидимость",
+  "Откровение","Уворот","Крит","Против физброни","Против магброни"];
+
+const AV_TYPE = {1:"Воин",2:"Убийца",3:"Маг",4:"Саппорт"};
+const STAT_RU = {
+  Health:"HP", Mana:"Мана", HealthRegen:"HP/с", ManaRegen:"Мана/с",
+  AttackSpeed:"СкАтк", AttackRange:"Дальн", DmgMin:"УронМин", DmgMax:"УронМакс",
+  PhysArmor:"ФизБр", MagicArmor:"МагБр", SpellPower:"СилаМаг",
+  Speed:"Скор", XP:"Опыт", Coins:"Монеты"
+};
+const CONFIG_FIELDS = [
+  {key:"mob_hp_per_level",     label:"HP мобов за уровень",     desc:"Доля прибавки HP за каждый уровень места (0.15 = +15%/ур)."},
+  {key:"mob_dmg_per_level",    label:"Урон мобов за уровень",   desc:"Доля прибавки урона за уровень (0.10 = +10%/ур)."},
+  {key:"mob_xp_per_level",     label:"Опыт мобов за уровень",   desc:"Прибавка опыта за уровень (0.40 = +40%/ур)."},
+  {key:"mob_coin_per_level",   label:"Монеты мобов за уровень", desc:"Прибавка монет за уровень (0.15 = +15%/ур)."},
+  {key:"hero_power_per_level", label:"Сила героя за уровень",   desc:"Рост урона/лечения/силы магии героя за уровень (0.06)."},
+  {key:"hero_health_per_level",label:"HP героя за уровень",     desc:"Рост макс. HP/маны героя за уровень (0.06)."},
+  {key:"xp_multiplier",        label:"Множитель опыта (ивент)", desc:"Общий множитель всего опыта. 1 = обычный, 2 = ×2."},
+  {key:"coin_multiplier",      label:"Множитель монет (ивент)", desc:"Общий множитель всех монет. 1 = обычный, 2 = ×2."},
+  {key:"new_hero_money",       label:"Стартовые монеты",        desc:"Кошелёк нового героя (бронза).", int:true},
+  {key:"new_hero_diamond",     label:"Стартовые кристаллы",     desc:"Кошелёк нового героя (кристаллы).", int:true},
+];
+
+/* ---------- networking ---------- */
+async function api(path, opts={}){
+  const method = opts.method || "GET";
+  const h = {};
+  const init = {method, headers:h, credentials:"same-origin"};
+  if(opts.body!=null){ h["Content-Type"]="application/json"; init.body=JSON.stringify(opts.body); }
+  if(method!=="GET" && CSRF) h["X-CSRF-Token"]=CSRF;
+  const res = await fetch(path, init);
+  if(res.status===401){ showLogin(); throw new Error("нужен вход"); }
+  const data = await res.json().catch(()=>({}));
+  if(!res.ok) throw new Error(data.error || ("HTTP "+res.status));
+  return data;
+}
+
+/* ---------- toast ---------- */
+let toastT=null;
+function toast(msg, kind="ok"){
+  const t=document.getElementById("toast");
+  t.textContent=msg; t.className="show "+kind;
+  clearTimeout(toastT); toastT=setTimeout(()=>{t.className="";}, 2600);
+}
+
+/* ---------- login ---------- */
+function showLogin(){ document.getElementById("app").style.display="none"; document.getElementById("login").style.display="grid";
+  document.getElementById("pw").focus(); }
+function showApp(){ document.getElementById("login").style.display="none"; document.getElementById("app").style.display="block"; }
+
+document.getElementById("loginForm").addEventListener("submit", async e=>{
+  e.preventDefault();
+  const pw=document.getElementById("pw").value;
+  const errEl=document.getElementById("loginErr"); errEl.textContent="";
+  try{
+    const res=await fetch("/api/login",{method:"POST",headers:{"Content-Type":"application/json"},
+      body:JSON.stringify({password:pw}),credentials:"same-origin"});
+    const data=await res.json().catch(()=>({}));
+    if(!res.ok) throw new Error(data.error||"ошибка входа");
+    CSRF=data.csrf; document.getElementById("pw").value="";
+    await boot();
+  }catch(err){ errEl.textContent=err.message; }
+});
+
+document.getElementById("btnLogout").addEventListener("click", async ()=>{
+  try{ await api("/api/logout",{method:"POST"}); }catch(e){}
+  CSRF=null; showLogin();
+});
+document.getElementById("btnRefresh").addEventListener("click", ()=>boot().catch(e=>toast(e.message,"bad")));
+
+/* ---------- tabs ---------- */
+document.querySelectorAll("nav.tabs button").forEach(b=>{
+  b.addEventListener("click", ()=>{
+    document.querySelectorAll("nav.tabs button").forEach(x=>x.classList.remove("active"));
+    document.querySelectorAll(".tab").forEach(x=>x.classList.remove("active"));
+    b.classList.add("active");
+    document.getElementById("tab-"+b.dataset.tab).classList.add("active");
+  });
+});
+
+/* ---------- boot ---------- */
+async function boot(){
+  STATE = await api("/api/state");
+  if(STATE.csrf) CSRF=STATE.csrf;
+  showApp();
+  renderStatus();
+  renderConfig();
+  renderAvatars();
+  renderMobs();
+  await loadPlayers();
+  CATALOG = await api("/api/catalog");
+  initManage();
+}
+
+function fmtUptime(s){
+  s=Math.floor(s); const d=Math.floor(s/86400); s%=86400;
+  const h=Math.floor(s/3600); s%=3600; const m=Math.floor(s/60);
+  if(d>0) return d+"д "+h+"ч"; if(h>0) return h+"ч "+m+"м"; return m+"м";
+}
+function renderStatus(){
+  const st=STATE.status;
+  document.getElementById("stOnline").textContent=st.online;
+  document.getElementById("stAccounts").textContent=st.accounts;
+  document.getElementById("stUptime").textContent=fmtUptime(st.uptime_seconds);
+}
+
+/* ---------- players ---------- */
+let PLAYERS=[];
+async function loadPlayers(){
+  const data=await api("/api/players");
+  PLAYERS=data.players||[];
+  renderPlayers();
+  renderManagePlayers();
+}
+function renderPlayers(){
+  const q=(document.getElementById("playerSearch").value||"").toLowerCase();
+  const tb=document.querySelector("#playersTable tbody"); tb.innerHTML="";
+  const rows=PLAYERS.filter(p=>!q || (p.email+" "+p.username+" "+p.id).toLowerCase().includes(q));
+  document.getElementById("playerCount").textContent=rows.length+" / "+PLAYERS.length;
+  for(const p of rows){
+    const tr=document.createElement("tr");
+    const status = p.banned
+      ? '<span class="pill ban">бан</span>'
+      : (p.online?'<span class="pill on">онлайн</span>':'<span class="pill off">оффлайн</span>');
+    const heroCells = p.has_hero
+      ? `<td class="num"><input type="number" class="cell-in num" value="${p.level}" data-k="level"></td>
+         <td class="num"><input type="number" class="cell-in num" value="${p.exp}" data-k="exp"></td>
+         <td class="num"><input type="number" class="cell-in num" value="${p.money}" data-k="money"></td>
+         <td class="num"><input type="number" class="cell-in num" value="${p.diamonds}" data-k="diamonds"></td>`
+      : `<td colspan="4" class="muted">нет героя</td>`;
+    tr.innerHTML=`
+      <td class="num mono">${p.id}</td>
+      <td class="name"><b>${esc(p.email)}</b><small>${esc(p.username)}</small></td>
+      ${heroCells}
+      <td>${status}</td>
+      <td><div class="actions">
+        ${p.has_hero?`<button class="btn small primary" data-act="save">Сохранить</button>`:""}
+        <button class="btn small" data-act="ban">${p.banned?"Разбан":"Бан"}</button>
+        <button class="btn small danger" data-act="del">Удалить</button>
+      </div></td>`;
+    tr.querySelectorAll("button").forEach(btn=>btn.addEventListener("click",()=>playerAction(p, btn.dataset.act, tr)));
+    tb.appendChild(tr);
+  }
+}
+document.getElementById("playerSearch").addEventListener("input", renderPlayers);
+
+async function playerAction(p, act, tr){
+  try{
+    if(act==="save"){
+      const g=k=>parseInt(tr.querySelector(`[data-k="${k}"]`).value||"0",10);
+      await api("/api/player/money",{method:"POST",body:{id:p.id,money:g("money"),diamonds:g("diamonds")}});
+      await api("/api/player/progress",{method:"POST",body:{id:p.id,level:g("level"),exp:g("exp"),next_exp:0}});
+      toast("Игрок #"+p.id+" сохранён");
+    } else if(act==="ban"){
+      await api("/api/player/ban",{method:"POST",body:{id:p.id,banned:!p.banned}});
+      toast(p.banned?"Разбанен #"+p.id:"Забанен #"+p.id);
+    } else if(act==="del"){
+      if(!confirm(`Удалить аккаунт #${p.id} (${p.email}) навсегда?`)) return;
+      await api("/api/player/delete",{method:"POST",body:{id:p.id}});
+      toast("Аккаунт #"+p.id+" удалён");
+    }
+    await loadPlayers();
+  }catch(err){ toast(err.message,"bad"); }
+}
+
+/* ---------- config ---------- */
+function renderConfig(){
+  const g=document.getElementById("configGrid"); g.innerHTML="";
+  const s=STATE.settings;
+  // fog toggles first (two separate mechanisms: Штурм war-fog plane vs Охота concealment)
+  const fog=document.createElement("div"); fog.className="field";
+  fog.innerHTML=`<label>Туман войны (Штурм)</label>
+    <div class="toggle"><input type="checkbox" id="cfg_fog" ${s.fog_of_war?"checked":""}>
+    <span>Включён (выкл = карта открыта)</span></div>
+    <div class="desc">Боевой туман на карте «Штурм» (map_1_0). На «Охоте» не действует.</div>`;
+  g.appendChild(fog);
+  const hfog=document.createElement("div"); hfog.className="field";
+  hfog.innerHTML=`<label>Туман войны (Охота)</label>
+    <div class="toggle"><input type="checkbox" id="cfg_hunt_fog" ${s.hunt_fog?"checked":""}>
+    <span>Включён (выкл = все мобы видны сразу)</span></div>
+    <div class="desc">Мобы «Охоты» проявляются при приближении и полупрозрачны на краю обзора. Выкл — вся карта открыта.</div>`;
+  g.appendChild(hfog);
+  for(const f of CONFIG_FIELDS){
+    const d=document.createElement("div"); d.className="field";
+    const step=f.int?"1":"0.01";
+    d.innerHTML=`<label>${f.label}</label>
+      <input type="number" step="${step}" id="cfg_${f.key}" class="num" value="${s[f.key]}">
+      <div class="desc">${f.desc}</div>`;
+    g.appendChild(d);
+  }
+}
+document.getElementById("btnResetConfig").addEventListener("click", renderConfig);
+document.getElementById("btnSaveConfig").addEventListener("click", async ()=>{
+  try{
+    const body={
+      fog_of_war:document.getElementById("cfg_fog").checked,
+      hunt_fog:document.getElementById("cfg_hunt_fog").checked,
+    };
+    for(const f of CONFIG_FIELDS){
+      const v=document.getElementById("cfg_"+f.key).value;
+      body[f.key]=f.int?parseInt(v||"0",10):parseFloat(v||"0");
+    }
+    const res=await api("/api/settings",{method:"POST",body});
+    STATE.settings=res.settings; renderConfig();
+    toast("Конфиг сохранён");
+  }catch(err){ toast(err.message,"bad"); }
+});
+
+/* ---------- stat tables (avatars + mobs) ---------- */
+function statTable(tableId, fields, rows, meta, saveFn){
+  const table=document.getElementById(tableId);
+  const thead=table.querySelector("thead"), tbody=table.querySelector("tbody");
+  thead.innerHTML="<tr>"+meta.head+fields.map(f=>`<th class="num">${STAT_RU[f]||f}</th>`).join("")+"<th>Действия</th></tr>";
+  tbody.innerHTML="";
+  for(const r of rows){
+    const tr=document.createElement("tr");
+    const ov=r.override||{};
+    if(Object.keys(ov).length) tr.classList.add("modified");
+    let cells=meta.cells(r);
+    for(const f of fields){
+      const authored=r.stats[f]!=null?r.stats[f]:0;
+      const val = (ov[f]!=null)?ov[f]:authored;
+      cells+=`<td><input type="number" step="0.01" class="cell-in num" data-f="${f}" data-auth="${authored}" value="${round4(val)}"></td>`;
+    }
+    cells+=`<td><div class="actions">
+      <button class="btn small primary" data-act="save">Сохранить</button>
+      <button class="btn small" data-act="reset">Сброс</button></div></td>`;
+    tr.innerHTML=cells;
+    tr.querySelector('[data-act="save"]').addEventListener("click",()=>{
+      const override={};
+      tr.querySelectorAll("input[data-f]").forEach(inp=>{
+        const f=inp.dataset.f, auth=parseFloat(inp.dataset.auth), v=parseFloat(inp.value);
+        if(!isNaN(v) && Math.abs(v-auth)>1e-9) override[f]=v;
+      });
+      saveFn(r, override, tr);
+    });
+    tr.querySelector('[data-act="reset"]').addEventListener("click",()=>saveFn(r, {}, tr));
+    tbody.appendChild(tr);
+  }
+}
+function renderAvatars(){
+  const q=(document.getElementById("avatarSearch").value||"").toLowerCase();
+  const rows=STATE.avatars.filter(a=>!q||(a.short_name+" "+a.prefab+" "+a.id).toLowerCase().includes(q));
+  statTable("avatarsTable", STATE.avatar_stat_fields, rows, {
+    head:'<th>id</th><th>Аватар</th><th>Класс</th>',
+    cells:a=>`<td class="num mono">${a.id}</td>
+      <td class="name"><b>${esc(a.short_name)}</b><small>${esc(a.prefab)}</small></td>
+      <td class="muted">${AV_TYPE[a.type]||a.type}</td>`
+  }, async (a, override, tr)=>{
+    try{
+      await api("/api/avatar",{method:"POST",body:{id:a.id,override}});
+      a.override=Object.keys(override).length?override:null;
+      tr.classList.toggle("modified", !!a.override);
+      toast(a.short_name+": статы сохранены");
+    }catch(err){ toast(err.message,"bad"); }
+  });
+}
+function renderMobs(){
+  const q=(document.getElementById("mobSearch").value||"").toLowerCase();
+  const rows=STATE.mobs.filter(m=>!q||(m.prefab+" "+m.name_key+" "+m.index).toLowerCase().includes(q));
+  statTable("mobsTable", STATE.mob_stat_fields, rows, {
+    head:'<th>#</th><th>Моб</th>',
+    cells:m=>`<td class="num mono">${m.index}</td>
+      <td class="name"><b>${m.is_boss?"★ ":""}${esc(m.prefab)}</b><small>${esc(m.name_key)}</small></td>`
+  }, async (m, override, tr)=>{
+    try{
+      await api("/api/mob",{method:"POST",body:{index:m.index,override}});
+      m.override=Object.keys(override).length?override:null;
+      tr.classList.toggle("modified", !!m.override);
+      toast("Моб #"+m.index+": статы сохранены");
+    }catch(err){ toast(err.message,"bad"); }
+  });
+}
+document.getElementById("avatarSearch").addEventListener("input", renderAvatars);
+document.getElementById("mobSearch").addEventListener("input", renderMobs);
+
+/* ---------- manage: quests + item grants ---------- */
+let MG_ID = null, MG_INV = null;
+
+// prettyKey turns a locale id ("IDS_Quest_Ghoul_Hunt_Name") into a readable label.
+function prettyKey(s){
+  if(!s) return "";
+  return String(s).replace(/^IDS_/,"").replace(/_(Name|Desc|LongDesc|Task|Start|Progress|Win)$/,"").replace(/_/g," ");
+}
+function questLabel(q){
+  const nm = prettyKey(q.name_key) || q.key || ("Квест "+q.id);
+  return `#${q.id} · ${nm} — ${QUEST_KIND[q.kind]||"?"} ×${q.count} (карта ${q.map_id})`;
+}
+function questById(id){ return (CATALOG.quests||[]).find(q=>q.id===id); }
+
+function renderManagePlayers(){
+  const sel=document.getElementById("mgPlayer"); if(!sel) return;
+  const prev=sel.value;
+  sel.innerHTML = PLAYERS.filter(p=>p.has_hero)
+    .map(p=>`<option value="${p.id}">#${p.id} · ${esc(p.email)}${p.online?" (онлайн)":""}</option>`).join("");
+  if(prev) sel.value=prev;
+}
+
+function initManage(){
+  // quest-add pickers
+  const qa=document.getElementById("mgQuestAdd");
+  qa.innerHTML=(CATALOG.quests||[]).map(q=>`<option value="${q.id}">${esc(questLabel(q))}</option>`).join("");
+  const qs=document.getElementById("mgQuestAddStatus");
+  qs.innerHTML=Object.entries(QUEST_STATUS).map(([v,l])=>`<option value="${v}">${l}</option>`).join("");
+  qs.value="1";
+  fillGrantItems();
+
+  document.getElementById("mgLoad").addEventListener("click", loadManage);
+  document.getElementById("mgPlayer").addEventListener("change", loadManage);
+  document.getElementById("mgGrantKind").addEventListener("change", fillGrantItems);
+  document.getElementById("mgGrantRace").addEventListener("change", fillGrantItems);
+  document.getElementById("mgQuestAddBtn").addEventListener("click", ()=>{
+    const qid=parseInt(document.getElementById("mgQuestAdd").value,10);
+    const status=parseInt(document.getElementById("mgQuestAddStatus").value,10);
+    const progress=parseInt(document.getElementById("mgQuestAddProg").value||"0",10);
+    saveQuest(qid,{status,progress});
+  });
+  document.getElementById("mgGrantBtn").addEventListener("click", grantItem);
+}
+
+function fillGrantItems(){
+  const kind=document.getElementById("mgGrantKind").value;
+  const race=document.getElementById("mgGrantRace").value;
+  const sel=document.getElementById("mgGrantItem");
+  document.getElementById("mgGrantRace").disabled = (kind!=="wearable");
+  if(kind==="potion"){
+    sel.innerHTML=(CATALOG.potions||[]).map(p=>
+      `<option value="${p.article}">${(ITEM_KIND[p.kind]||"?")} · ${esc(prettyKey(p.name_key))} (арт. ${p.article})</option>`).join("");
+  } else {
+    sel.innerHTML=(CATALOG.wearables||[]).filter(w=>!race||w.race===race).map(w=>
+      `<option value="${w.article}">${w.race} S${w.tier} ${w.color} · ${w.slot} — ${esc(prettyKey(w.name_key))} [ур.${w.min_level}] (арт. ${w.article})</option>`).join("");
+  }
+}
+
+async function loadManage(){
+  const sel=document.getElementById("mgPlayer");
+  if(!sel.value){ document.getElementById("mgBody").style.display="none"; return; }
+  MG_ID=parseInt(sel.value,10);
+  try{
+    MG_INV=await api("/api/player/inventory?id="+MG_ID);
+    const p=PLAYERS.find(x=>x.id===MG_ID);
+    document.getElementById("mgWho").textContent=p?("Игрок #"+p.id+" · ур. "+p.level):"";
+    document.getElementById("mgBody").style.display="block";
+    renderQuests(); renderInv();
+  }catch(err){ toast(err.message,"bad"); }
+}
+
+function renderQuests(){
+  const tb=document.querySelector("#mgQuestTable tbody"); tb.innerHTML="";
+  const list=MG_INV.quests||[];
+  if(!list.length){ tb.innerHTML=`<tr><td colspan="6" class="muted">Нет активных квестов</td></tr>`; return; }
+  for(const st of list){
+    const q=questById(st.QuestID);
+    const nm=q?(prettyKey(q.name_key)||q.key):("квест "+st.QuestID);
+    const cnt=q?q.count:"?";
+    const tr=document.createElement("tr");
+    const statusSel=Object.entries(QUEST_STATUS).map(([v,l])=>`<option value="${v}" ${(+v===st.Status)?"selected":""}>${l}</option>`).join("");
+    tr.innerHTML=`
+      <td class="num mono">${st.QuestID}</td>
+      <td class="name"><b>${esc(nm)}</b><small>${q?(QUEST_KIND[q.kind]||"")+" · "+(QUEST_PVE[q.pve_type]||""):""}</small></td>
+      <td class="num">${q?q.map_id:"?"}</td>
+      <td><select data-k="status">${statusSel}</select></td>
+      <td class="num"><input type="number" class="cell-in num" data-k="progress" value="${st.Progress}" min="0"> / ${cnt}</td>
+      <td><div class="actions">
+        <button class="btn small primary" data-act="save">Сохранить</button>
+        <button class="btn small danger" data-act="del">Удалить</button>
+      </div></td>`;
+    tr.querySelector('[data-act="save"]').addEventListener("click",()=>saveQuest(st.QuestID,{
+      status:parseInt(tr.querySelector('[data-k="status"]').value,10),
+      progress:parseInt(tr.querySelector('[data-k="progress"]').value||"0",10),
+    }));
+    tr.querySelector('[data-act="del"]').addEventListener("click",()=>saveQuest(st.QuestID,{remove:true}));
+    tb.appendChild(tr);
+  }
+}
+
+async function saveQuest(questID, opts){
+  if(MG_ID==null) return;
+  const body={id:MG_ID, quest_id:questID, status:opts.status||0, progress:opts.progress||0, remove:!!opts.remove};
+  try{
+    await api("/api/player/quest",{method:"POST",body});
+    toast(opts.remove?("Квест #"+questID+" удалён"):("Квест #"+questID+" обновлён"));
+    await loadManage();
+  }catch(err){ toast(err.message,"bad"); }
+}
+
+async function grantItem(){
+  if(MG_ID==null){ toast("Выберите игрока","bad"); return; }
+  const article=parseInt(document.getElementById("mgGrantItem").value,10);
+  const count=parseInt(document.getElementById("mgGrantCount").value||"1",10);
+  if(!article){ toast("Выберите предмет","bad"); return; }
+  try{
+    await api("/api/player/grant",{method:"POST",body:{id:MG_ID, article_id:article, count}});
+    toast("Выдано ×"+count+" (арт. "+article+")");
+    await loadManage();
+  }catch(err){ toast(err.message,"bad"); }
+}
+
+function itemName(article){
+  const p=(CATALOG.potions||[]).find(x=>x.article===article);
+  if(p) return (ITEM_KIND[p.kind]||"")+" · "+prettyKey(p.name_key);
+  const w=(CATALOG.wearables||[]).find(x=>x.article===article);
+  if(w) return w.race+" S"+w.tier+" "+w.color+" "+w.slot+" · "+prettyKey(w.name_key);
+  return "";
+}
+function renderInv(){
+  const bt=document.querySelector("#mgBagTable tbody"); bt.innerHTML="";
+  const bag=MG_INV.bag||[];
+  if(!bag.length) bt.innerHTML=`<tr><td colspan="3" class="muted">пусто</td></tr>`;
+  for(const b of bag){
+    bt.innerHTML+=`<tr><td class="num mono">${b.ArticleID}</td><td>${esc(itemName(b.ArticleID))}</td><td class="num">${b.Count}</td></tr>`;
+  }
+  const gt=document.querySelector("#mgGearTable tbody"); gt.innerHTML="";
+  const owned=(MG_INV.owned||[]).map(o=>({id:o.ID,art:o.ArticleID,where:"инвентарь"}));
+  const dressed=(MG_INV.dressed||[]).map(d=>({id:d.ID,art:d.ArticleID,where:"надето"}));
+  const gear=owned.concat(dressed);
+  if(!gear.length) gt.innerHTML=`<tr><td colspan="4" class="muted">пусто</td></tr>`;
+  for(const g of gear){
+    gt.innerHTML+=`<tr><td class="num mono">${g.id}</td><td class="num mono">${g.art}</td><td>${esc(itemName(g.art))}</td><td class="muted">${g.where}</td></tr>`;
+  }
+}
+
+/* ---------- utils ---------- */
+function esc(s){ return String(s==null?"":s).replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c])); }
+function round4(n){ return Math.round(n*10000)/10000; }
+
+/* try to resume an existing session (cookie) on load */
+boot().catch(()=>showLogin());
+</script>
+</body>
+</html>

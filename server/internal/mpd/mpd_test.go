@@ -50,7 +50,7 @@ func readOneFrame(t *testing.T, br *bufio.Reader) interface{} {
 // {"chat|message": {"arguments": {...}}}.
 func TestMPDHandshakeAndPush(t *testing.T) {
 	store := session.NewStore()
-	u, sid := store.LoginOrRegister("a@example.com", "pw")
+	u, sid, _ := store.LoginOrRegister("a@example.com", "pw")
 
 	h, addr := startHub(t, store)
 
@@ -114,7 +114,7 @@ func TestMPDHandshakeAndPush(t *testing.T) {
 // and the socket is closed (the client then treats it as AUTHORIZATION_FAILED).
 func TestMPDAuthFailDropsSocket(t *testing.T) {
 	store := session.NewStore()
-	u, _ := store.LoginOrRegister("a@example.com", "pw")
+	u, _, _ := store.LoginOrRegister("a@example.com", "pw")
 	_, addr := startHub(t, store)
 
 	c, err := net.Dial("tcp", addr)
@@ -138,7 +138,7 @@ func TestMPDAuthFailDropsSocket(t *testing.T) {
 // appearance keyed by id under {data:{...}}, carrying status:100 so it isn't dropped.
 func TestPushHeroData(t *testing.T) {
 	store := session.NewStore()
-	u, sid := store.LoginOrRegister("a@example.com", "pw")
+	u, sid, _ := store.LoginOrRegister("a@example.com", "pw")
 	store.CreateHero(u, 2, false, 3, 4, 5, 6, 7)
 
 	h, addr := startHub(t, store)

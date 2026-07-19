@@ -50,6 +50,56 @@ func TestMobFogOfWar(t *testing.T) {
 	}
 }
 
+// TestHuntFogDisabledRevealsAll: with the admin «Охота» fog toggle off, every mob
+// is revealed and simulated regardless of distance, and carries no shade -- the
+// whole map is visible. Turning it back on restores the reveal-on-approach gate.
+func TestHuntFogDisabledRevealsAll(t *testing.T) {
+	orig := gamedata.Snapshot()
+	defer gamedata.Apply(orig)
+
+	s, c, _, sx, sy := newNavConn(t)
+	hs := c.huntState
+	now := float64(s.battleTime())
+	mob := gamedata.Mobs()[2] // skeleton
+
+	// A mob well past the hide radius, plus one in the shade ring so we can watch
+	// the shade get cleared when fog is disabled.
+	far := &mobState{id: 5000, mobIdx: 2, mob: mob, x: sx + float32(mobHideRadius) + 40, y: sy, hp: mob.Health, homed: true}
+	ring := &mobState{id: 5001, mobIdx: 2, mob: mob, x: sx + 26, y: sy, hp: mob.Health, homed: true} // reveal(28) but shaded(>24)
+	hs.mobs[far.id] = far
+	hs.mobs[ring.id] = ring
+
+	c.mvMu.Lock()
+	defer c.mvMu.Unlock()
+
+	// Fog ON: the far mob is hidden, the ring mob is shown-but-shaded.
+	gamedata.Update(func(st *gamedata.Settings) { st.HuntFogEnabled = true })
+	s.mobInterestLocked(c, far, now)
+	s.mobInterestLocked(c, ring, now)
+	if far.shown {
+		t.Fatal("with hunt fog on, a distant mob must stay hidden")
+	}
+	if !ring.shown || !ring.shaded {
+		t.Fatal("with hunt fog on, the ring mob should be shown and shaded")
+	}
+
+	// Fog OFF: the far mob reveals and is active; the ring mob loses its shade.
+	gamedata.Update(func(st *gamedata.Settings) { st.HuntFogEnabled = false })
+	if !s.mobInterestLocked(c, far, now) {
+		t.Fatal("with hunt fog off, a distant mob must be active")
+	}
+	if !far.shown {
+		t.Fatal("with hunt fog off, every mob must be revealed")
+	}
+	if far.shaded {
+		t.Fatal("with hunt fog off, mobs must not be shaded")
+	}
+	s.mobInterestLocked(c, ring, now)
+	if ring.shaded || ring.shadeFxUID != 0 {
+		t.Fatal("with hunt fog off, the previously-shaded mob must clear its shade")
+	}
+}
+
 // TestMobShadeFogRing: a revealed mob is rendered translucent (shade fx) while it
 // sits in the outer reveal ring, snaps to full opacity as the player closes in,
 // re-shades on retreat, and drops the shade when it hides entirely.

@@ -14,7 +14,7 @@ import (
 
 func newQuestHero(t *testing.T, srv *Server, race int32) (int32, string) {
 	t.Helper()
-	u, key := srv.Store.LoginOrRegister("quest@example.com", "pw")
+	u, key, _ := srv.Store.LoginOrRegister("quest@example.com", "pw")
 	srv.Store.CreateHero(u, race, false, 0, 0, 0, 0, 0)
 	return u.ID, key
 }

@@ -1,9 +1,20 @@
 package session
 
+import "log"
+
 // Friends/ignore lists. A friendship is mutual (both accounts carry each other) and
 // persists with the account; ignore is one-directional. Friend REQUESTS are transient
 // (in-memory), like party invites: `from` asks `to`, and the pair only becomes friends
 // when `to` accepts (or when the two have requested each other -- a mutual add).
+
+// persistPairLocked persists both sides of a mutual friendship change in ONE
+// transaction, so a crash/IO-failure can't leave the friendship asymmetric
+// (one account listing the other but not vice-versa). Nil users are skipped.
+func (s *Store) persistPairLocked(a, b *User) {
+	if err := s.persistUsersLocked(a, b); err != nil {
+		log.Printf("session: persist friend pair failed: %v", err)
+	}
+}
 
 // AddFriendRequest records that `from` wants to befriend `to`. If `to` had already
 // requested `from`, the pending pair is completed immediately (mutual add) and it
@@ -22,7 +33,7 @@ func (s *Store) AddFriendRequest(from, to int32) (nowFriends, ok bool) {
 	if s.friendReqs[from][to] { // `to` already asked `from` -> mutual
 		s.clearReqLocked(from, to)
 		s.addFriendPairLocked(fu, tu)
-		s.saveLocked()
+		s.persistPairLocked(fu, tu)
 		return true, true
 	}
 	if s.friendReqs[to] == nil {
@@ -44,7 +55,7 @@ func (s *Store) AcceptFriendRequest(answerer, requester int32) bool {
 	}
 	s.clearReqLocked(answerer, requester)
 	s.addFriendPairLocked(au, ru)
-	s.saveLocked()
+	s.persistPairLocked(au, ru)
 	return true
 }
 
@@ -59,13 +70,15 @@ func (s *Store) DeclineFriendRequest(answerer, requester int32) {
 func (s *Store) RemoveFriend(uid, target int32) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if u := s.usersByID[uid]; u != nil {
+	u := s.usersByID[uid]
+	t := s.usersByID[target]
+	if u != nil {
 		u.Friends = removeID(u.Friends, target)
 	}
-	if t := s.usersByID[target]; t != nil {
+	if t != nil {
 		t.Friends = removeID(t.Friends, uid)
 	}
-	s.saveLocked()
+	s.persistPairLocked(u, t) // both nil-safe, one transaction
 }
 
 // AddIgnore adds target to uid's ignore list (one-directional).
@@ -77,7 +90,7 @@ func (s *Store) AddIgnore(uid, target int32) {
 		return
 	}
 	u.Ignores = append(u.Ignores, target)
-	s.saveLocked()
+	s.saveUserLocked(u)
 }
 
 // RemoveIgnore drops target from uid's ignore list.
@@ -86,7 +99,7 @@ func (s *Store) RemoveIgnore(uid, target int32) {
 	defer s.mu.Unlock()
 	if u := s.usersByID[uid]; u != nil {
 		u.Ignores = removeID(u.Ignores, target)
-		s.saveLocked()
+		s.saveUserLocked(u)
 	}
 }
 

@@ -9,7 +9,7 @@ import (
 func questHero(t *testing.T) (*Store, *User) {
 	t.Helper()
 	s := NewStore()
-	u, _ := s.LoginOrRegister("quester@test.io", "pw")
+	u, _, _ := s.LoginOrRegister("quester@test.io", "pw")
 	s.CreateHero(u, 1, false, 0, 0, 0, 0, 0)
 	return s, u
 }

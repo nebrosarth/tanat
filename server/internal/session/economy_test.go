@@ -9,9 +9,10 @@ import (
 // coin bounties (AddHeroMoney, called from the Battle server's
 // awardCoinsLocked) must survive a process restart, not just live in memory.
 func TestMoneyPersistsAcrossRestart(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "accounts.json")
+	path := filepath.Join(t.TempDir(), "store.db")
 	s1 := NewPersistentStore(path)
-	u, _ := s1.LoginOrRegister("a@b.c", "pw")
+	defer s1.Close()
+	u, _, _ := s1.LoginOrRegister("a@b.c", "pw")
 	s1.CreateHero(u, 1, true, 0, 0, 0, 0, 0)
 
 	money, _, ok := s1.AddHeroMoney(u.ID, 250)
@@ -20,6 +21,7 @@ func TestMoneyPersistsAcrossRestart(t *testing.T) {
 	}
 
 	s2 := NewPersistentStore(path)
+	defer s2.Close()
 	got, ok := s2.usersByEmail["a@b.c"]
 	if !ok || got.Hero == nil {
 		t.Fatal("account/hero not reloaded")
@@ -32,9 +34,10 @@ func TestMoneyPersistsAcrossRestart(t *testing.T) {
 // TestAddHeroExpLevelsUp checks the persistent character-XP curve
 // (heroExpNextLevel = 100*level) advances Level/Exp/NextExp and persists.
 func TestAddHeroExpLevelsUp(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "accounts.json")
+	path := filepath.Join(t.TempDir(), "store.db")
 	s1 := NewPersistentStore(path)
-	u, _ := s1.LoginOrRegister("a@b.c", "pw")
+	defer s1.Close()
+	u, _, _ := s1.LoginOrRegister("a@b.c", "pw")
 	s1.CreateHero(u, 1, true, 0, 0, 0, 0, 0) // starts Level 1, Exp 0, NextExp 100
 
 	// Start: Level 1, Exp 0, NextExp 100. +250 exp: consumes the 100 for level 2
@@ -48,6 +51,7 @@ func TestAddHeroExpLevelsUp(t *testing.T) {
 	}
 
 	s2 := NewPersistentStore(path)
+	defer s2.Close()
 	got := s2.usersByEmail["a@b.c"].Hero
 	if got.Level != 2 || got.Exp != 150 || got.NextExp != 200 {
 		t.Errorf("reloaded hero = level %d exp %d next %d, want 2 150 200 (exp did not persist)",
@@ -58,9 +62,10 @@ func TestAddHeroExpLevelsUp(t *testing.T) {
 // TestBagPersistsAndMerges checks AddBagItem merges same-article stacks,
 // RemoveBagItem drops an emptied stack, and the bag survives a reload.
 func TestBagPersistsAndMerges(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "accounts.json")
+	path := filepath.Join(t.TempDir(), "store.db")
 	s1 := NewPersistentStore(path)
-	u, _ := s1.LoginOrRegister("a@b.c", "pw")
+	defer s1.Close()
+	u, _, _ := s1.LoginOrRegister("a@b.c", "pw")
 	s1.CreateHero(u, 1, true, 0, 0, 0, 0, 0)
 
 	if !s1.AddBagItem(u.ID, 5000, 2) {
@@ -94,6 +99,7 @@ func TestBagPersistsAndMerges(t *testing.T) {
 	}
 
 	s2 := NewPersistentStore(path)
+	defer s2.Close()
 	bag2 := s2.HeroBag(u.ID)
 	if len(bag2) != 1 || bag2[0].ArticleID != 5008 || bag2[0].Count != 1 {
 		t.Errorf("reloaded bag = %+v, want [{5008 1}] (bag did not persist)", bag2)

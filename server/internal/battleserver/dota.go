@@ -341,7 +341,7 @@ func (s *Server) dotaRevealStructureLocked(mem *conn, m *mobState, now float64) 
 		setFloats(syncHealth, idx, frac).
 		setFloats(syncMaxHealth, idx, float32(m.maxHP)).
 		setFloats(syncRadius, idx, float32(m.mob.Radius())).
-		setFloats(syncViewRadius, idx, structViewRadius).
+		setFloats(syncViewRadius, idx, effectiveViewRadius(structViewRadius)).
 		setInt(syncTeam, idx, m.teamVal())
 	if m.dmgMax > 0 { // a cannon/tower: give the client its attack stats
 		blob = blob.setFloats(syncDmgMin, idx, float32(m.dmgMin)).
@@ -638,7 +638,7 @@ func (s *Server) dotaSpawnCreepWaveLocked(rep *conn, bar gamedata.DotaStructure,
 		if (i+li+d.waveParity)%archerEveryNth == archerEveryNth-1 {
 			idx = ranged
 		}
-		mob := gamedata.Mobs()[idx]
+		mob := gamedata.MobByIndex(idx) // authored stats + any live admin override
 		d.nextCreep++
 		// Fan the spawn a touch so they don't stack on one point.
 		off := float32(i) * 0.8

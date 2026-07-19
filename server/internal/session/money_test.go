@@ -6,7 +6,7 @@ import "testing"
 // hero money and reports the new totals, and fails safe for unknown users.
 func TestAddHeroMoney(t *testing.T) {
 	s := NewStore()
-	u, _ := s.LoginOrRegister("hunter@test.io", "pw")
+	u, _, _ := s.LoginOrRegister("hunter@test.io", "pw")
 	s.CreateHero(u, 0, false, 0, 0, 0, 0, 0)
 	start := u.Hero.Money
 

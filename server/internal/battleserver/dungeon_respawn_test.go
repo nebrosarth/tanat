@@ -12,7 +12,7 @@ import (
 func TestMobKillAwardsCoinsAndXP(t *testing.T) {
 	s, c, _, sx, sy := newNavConn(t)
 	// Bind a real hero to the battle connection so coins have somewhere to land.
-	u, _ := s.Store.LoginOrRegister("hunter@test.io", "pw")
+	u, _, _ := s.Store.LoginOrRegister("hunter@test.io", "pw")
 	s.Store.CreateHero(u, 0, false, 0, 0, 0, 0, 0)
 	c.selfPlayerID = u.ID
 	startMoney := u.Hero.Money

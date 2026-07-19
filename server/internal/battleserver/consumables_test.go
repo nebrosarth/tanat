@@ -141,7 +141,7 @@ func TestPerItemBuffProtoIsDistinctPerTier(t *testing.T) {
 func newHuntConnWithHero(t *testing.T, prefab string) (*Server, *conn, *session.User, func()) {
 	t.Helper()
 	s, c, cleanup := newHuntConn(t, prefab)
-	u, _ := s.Store.LoginOrRegister("potiontest@test.test", "pw")
+	u, _, _ := s.Store.LoginOrRegister("potiontest@test.test", "pw")
 	s.Store.CreateHero(u, 1, true, 0, 0, 0, 0, 0)
 	c.selfPlayerID = u.ID
 	return s, c, u, cleanup

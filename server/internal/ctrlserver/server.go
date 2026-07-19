@@ -455,15 +455,40 @@ func (s *Server) dispatch(req ctrlproto.Request, resp *ctrlproto.Response) {
 	}
 }
 
-// PLACEHOLDER AUTH: see internal/session doc comment. Any email/password
-// logs in and auto-registers on first use.
+// loginWrongPass / loginBanned mirror LoginPerformer.LoginFailReason: WRONG_PASS
+// surfaces as an invalid-password failure, BANNED as an account-blocked failure
+// (the admin panel sets the ban flag).
+const (
+	loginWrongPass int32 = 6014
+	loginBanned    int32 = 6011
+)
+
+// handleLogin authenticates the account (auto-registering on first use, setting
+// the password) and, on success, bundles hero_conf/area_conf so the client's
+// LoginPerformer completes in one round trip. A wrong password for an existing
+// account replies with the WRONG_PASS (6014) error the client's
+// CtrlPacketValidator routes to LoginPerformer.OnLoginFailed.
 func (s *Server) handleLogin(req ctrlproto.Request, resp *ctrlproto.Response) {
 	email := req.Params.StringOr("email", "")
 	passwd := req.Params.StringOr("passwd", "")
 	version := req.Params.StringOr("version", "")
 	log.Printf("ctrl: login email=%s version=%s", email, version)
 
-	u, sessKey := s.Store.LoginOrRegister(email, passwd)
+	u, sessKey, ok := s.Store.LoginOrRegister(email, passwd)
+	if !ok {
+		log.Printf("ctrl: login REJECTED (wrong password) email=%s", email)
+		resp.Fail("user", "login", int32(loginWrongPass))
+		return
+	}
+	// A banned account authenticates (so a wrong password still reads as WRONG_PASS,
+	// not revealing the ban) but is then refused: revoke the just-issued session and
+	// reply BANNED.
+	if s.Store.IsBanned(u.ID) {
+		log.Printf("ctrl: login REJECTED (banned) email=%s id=%d", email, u.ID)
+		s.Store.InvalidateSession(sessKey)
+		resp.Fail("user", "login", int32(loginBanned))
+		return
+	}
 
 	resp.Add("user", "login", amf.NewArray().
 		Set("id", u.ID).
@@ -537,8 +562,16 @@ func (s *Server) handleHeroCreate(req ctrlproto.Request, resp *ctrlproto.Respons
 	skinColor := req.Params.IntOr("skin_color", 0)
 	hairColor := req.Params.IntOr("hair_color", 0)
 
-	h := s.Store.CreateHero(u, race, gender, face, hair, distMark, skinColor, hairColor)
-	log.Printf("ctrl: hero %d created for user %d (race=%d)", h.ID, u.ID, race)
+	// Guard against a stray/replayed hero|create overwriting an existing hero:
+	// CreateHero would reset money/level/gear/quests and (now) persist that wipe.
+	// The client only shows the create screen when it has no hero, so an arriving
+	// create for a hero that exists is spurious -- keep the existing hero.
+	if u.HasHero && u.Hero != nil {
+		log.Printf("ctrl: hero|create IGNORED for user %d (hero already exists; not overwriting)", u.ID)
+	} else {
+		h := s.Store.CreateHero(u, race, gender, face, hair, distMark, skinColor, hairColor)
+		log.Printf("ctrl: hero %d created for user %d (race=%d)", h.ID, u.ID, race)
+	}
 	resp.Ack("hero", "create")
 
 	// After creating the hero, send the client into the central square. The

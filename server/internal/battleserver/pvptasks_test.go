@@ -50,7 +50,7 @@ func heroMoney(t *testing.T, s *Server, uid int32) int32 {
 // bindHero attaches a fresh hero to a battle conn so rewards can be credited.
 func bindHero(t *testing.T, s *Server, c *conn, email string) int32 {
 	t.Helper()
-	u, _ := s.Store.LoginOrRegister(email, "pw")
+	u, _, _ := s.Store.LoginOrRegister(email, "pw")
 	s.Store.CreateHero(u, 1, false, 0, 0, 0, 0, 0)
 	c.selfPlayerID = u.ID
 	return u.ID

@@ -153,8 +153,8 @@ func TestGroupPresenceOnConnect(t *testing.T) {
 	go hub.Serve(ln)
 
 	// Two logged-in users forming a party.
-	u1, s1 := srv.Store.LoginOrRegister("m1@example.com", "pw")
-	u2, s2 := srv.Store.LoginOrRegister("m2@example.com", "pw")
+	u1, s1, _ := srv.Store.LoginOrRegister("m1@example.com", "pw")
+	u2, s2, _ := srv.Store.LoginOrRegister("m2@example.com", "pw")
 	if _, ok := srv.Store.JoinGroup(u1.ID, u2.ID); !ok {
 		t.Fatal("failed to form the test party")
 	}

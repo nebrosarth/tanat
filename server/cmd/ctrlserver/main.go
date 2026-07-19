@@ -12,6 +12,8 @@
 package main
 
 import (
+	"crypto/rand"
+	"encoding/hex"
 	"flag"
 	"io"
 	"log"
@@ -20,6 +22,7 @@ import (
 	"path/filepath"
 	"strconv"
 
+	"tanatserver/internal/adminserver"
 	"tanatserver/internal/battleserver"
 	"tanatserver/internal/ctrlserver"
 	"tanatserver/internal/mpd"
@@ -32,8 +35,10 @@ func main() {
 	battleHost := flag.String("battle-host", "127.0.0.1", "host advertised to the client for the Battle server (in area_conf)")
 	mpdAddr := flag.String("mpd-addr", ":9340", "listen address for the MPD push server (chat/party/presence)")
 	logPath := flag.String("log", defaultLogPath(), "also write logs to this file (blank = stdout only)")
-	accountsPath := flag.String("accounts", defaultAccountsPath(), "JSON file to persist accounts/heroes (blank = in-memory only)")
+	dbPath := flag.String("db", defaultDBPath(), "SQLite database file for accounts/heroes (blank = in-memory only; a sibling accounts.json is imported once on a fresh DB)")
 	dotaPlayers := flag.Int("dota-players", 1, "«Штурм» (DOTA) match size: players a match waits for before it starts (1-10; 1 = solo instant-match)")
+	adminAddr := flag.String("admin-addr", ":8090", "listen address for the web admin panel (blank = disabled)")
+	adminPass := flag.String("admin-pass", "", "admin panel password (blank = generate a random one and print it to the log)")
 	flag.Parse()
 
 	if *logPath != "" {
@@ -47,9 +52,12 @@ func main() {
 	}
 
 	srv := ctrlserver.New()
-	if *accountsPath != "" {
-		srv.Store = session.NewPersistentStore(*accountsPath)
+	if *dbPath != "" {
+		srv.Store = session.NewPersistentStore(*dbPath)
 	}
+	// Apply any admin-panel gameplay settings persisted from a previous run, on top
+	// of gamedata's authored defaults, before anything serves.
+	adminserver.LoadSettings(srv.Store)
 	if applied := srv.SetDotaMatchSize(int32(*dotaPlayers)); applied != int32(*dotaPlayers) {
 		log.Printf("«Штурм» match size %d out of range, clamped to %d", *dotaPlayers, applied)
 	}
@@ -98,6 +106,24 @@ func main() {
 		}
 	}()
 
+	// The web admin panel is a fourth listener in this process, sharing the session
+	// store. It is disabled with a blank -admin-addr; with no -admin-pass a random
+	// password is generated and printed so it is never left unprotected.
+	if *adminAddr != "" {
+		pass := *adminPass
+		if pass == "" {
+			pass = randomAdminPassword()
+			log.Printf("admin panel: no -admin-pass set, generated password: %s", pass)
+		}
+		admin := adminserver.New(srv.Store, pass)
+		go func() {
+			log.Printf("admin panel on %s (open http://<this-host>%s/ in a browser)", *adminAddr, *adminAddr)
+			if err := admin.ListenAndServe(*adminAddr); err != nil {
+				log.Fatalf("admin server: %v", err)
+			}
+		}()
+	}
+
 	log.Printf("ctrlserver listening on %s (POST /entry_point.php); battle on %s advertised as %s:%v; mpd on %s; «Штурм» match size %d",
 		*addr, *battleAddr, srv.BattleHost, srv.BattlePorts, *mpdAddr, srv.DotaMatchSize)
 	if err := http.ListenAndServe(*addr, srv.Handler()); err != nil {
@@ -111,9 +137,19 @@ func defaultLogPath() string {
 	return besideExe("ctrlserver.log")
 }
 
-// defaultAccountsPath persists accounts next to the executable.
-func defaultAccountsPath() string {
-	return besideExe("accounts.json")
+// defaultDBPath keeps the SQLite database next to the executable.
+func defaultDBPath() string {
+	return besideExe("tanat.db")
+}
+
+// randomAdminPassword mints a short, URL-safe hex password used when the operator
+// starts the admin panel without -admin-pass, so it is never left open.
+func randomAdminPassword() string {
+	b := make([]byte, 6)
+	if _, err := rand.Read(b); err != nil {
+		return "changeme"
+	}
+	return hex.EncodeToString(b)
 }
 
 func besideExe(name string) string {

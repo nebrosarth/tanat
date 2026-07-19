@@ -16,7 +16,7 @@ import (
 // session key so the Ctrl handlers (which resolve the caller via SessKey) can be driven.
 func newShopHero(t *testing.T, srv *Server, race, level, money int32) (int32, string) {
 	t.Helper()
-	u, key := srv.Store.LoginOrRegister("shop@example.com", "pw")
+	u, key, _ := srv.Store.LoginOrRegister("shop@example.com", "pw")
 	h := srv.Store.CreateHero(u, race, false, 0, 0, 0, 0, 0)
 	h.Level = level
 	h.Money = money

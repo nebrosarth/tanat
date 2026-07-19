@@ -9,18 +9,32 @@ package session
 
 import (
 	"crypto/rand"
+	"database/sql"
 	"encoding/hex"
+	"log"
 	"strings"
 	"sync"
+
+	"golang.org/x/crypto/bcrypt"
+
+	"tanatserver/internal/gamedata"
 )
 
 type User struct {
-	ID       int32
-	Email    string
-	Password string
-	Username string
-	HasHero  bool
-	Hero     *Hero
+	ID    int32
+	Email string
+	// PassHash is the bcrypt hash of the account password (never the plaintext,
+	// never sent to the client). Empty only for a malformed row; see checkPassword.
+	PassHash string
+	// CreatedAt is the unix time the account first registered (0 = unknown, e.g.
+	// migrated from the pre-SQLite JSON store). Not sent to the client.
+	CreatedAt int64
+	Username  string
+	HasHero   bool
+	Hero      *Hero
+	// Banned, when true, refuses the account at login (the Ctrl handler replies with
+	// the client's BANNED code). Set/cleared from the admin panel; persisted.
+	Banned bool
 	// Friends/Ignores are the account's persistent social lists (white/black list in
 	// the client's get_bw_list). Friendship is mutual (both carry each other); ignore
 	// is one-directional.
@@ -121,7 +135,8 @@ type Store struct {
 	groups       map[int32]*Group         // userID -> the party it belongs to (shared pointer)
 	friendReqs   map[int32]map[int32]bool // target userID -> set of users with a pending friend request to them
 	nextUserID   int32
-	path         string // JSON persistence file; "" = in-memory only
+	path         string  // SQLite database file; "" = in-memory only
+	db           *sql.DB // nil for an in-memory store (NewStore)
 }
 
 func NewStore() *Store {
@@ -137,28 +152,71 @@ func NewStore() *Store {
 	}
 }
 
-// LoginOrRegister finds the account for email, creating it if this is the
-// first time we've seen it, and issues a fresh session key.
-func (s *Store) LoginOrRegister(email, password string) (*User, string) {
+// LoginOrRegister authenticates email/password, auto-registering the account on
+// first use, and issues a fresh session key. ok is false (with a nil user, no
+// session issued) when the email already exists but the password does not match
+// its bcrypt hash -- the Ctrl login handler turns that into a WRONG_PASS reply.
+// The first login for an email sets its password.
+func (s *Store) LoginOrRegister(email, password string) (u *User, key string, ok bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	u, ok := s.usersByEmail[email]
-	if !ok {
+	u, exists := s.usersByEmail[email]
+	if !exists {
 		u = &User{
-			ID:       s.nextUserID,
-			Email:    email,
-			Password: password,
-			Username: email,
+			ID:        s.nextUserID,
+			Email:     email,
+			PassHash:  hashPassword(password),
+			Username:  email,
+			CreatedAt: nowUnix(),
 		}
 		s.nextUserID++
 		s.usersByEmail[email] = u
 		s.usersByID[u.ID] = u
-		s.saveLocked()
+		s.saveUserLocked(u)
+		s.persistNextUserIDLocked()
+	} else if !u.checkPassword(password) {
+		return nil, "", false
 	}
-	key := newToken()
+	key = newToken()
 	s.sessions[key] = &Session{Key: key, UserID: u.ID}
-	return u, key
+	return u, key, true
+}
+
+// hashPassword returns the bcrypt hash of a plaintext password. Any bcrypt error
+// (which, thanks to bcryptInput's cap, no longer includes the >72-byte case) is
+// logged and yields an empty hash; checkPassword then FAILS CLOSED on that empty
+// hash so a hashing failure can never produce a passwordless account.
+func hashPassword(password string) string {
+	h, err := bcrypt.GenerateFromPassword(bcryptInput(password), bcrypt.DefaultCost)
+	if err != nil {
+		log.Printf("session: bcrypt hash failed: %v", err)
+		return ""
+	}
+	return string(h)
+}
+
+// checkPassword reports whether password matches the account's stored hash. An
+// empty stored hash (a malformed/never-hashed row) fails closed -- it must never
+// authenticate an arbitrary password.
+func (u *User) checkPassword(password string) bool {
+	if u.PassHash == "" {
+		return false
+	}
+	return bcrypt.CompareHashAndPassword([]byte(u.PassHash), bcryptInput(password)) == nil
+}
+
+// bcryptInput caps the password at bcrypt's hard 72-byte limit. Without this a
+// long password -- e.g. a ~37-character Cyrillic one, 2 bytes/char in UTF-8 --
+// makes GenerateFromPassword return ErrPasswordTooLong. Capping (bcrypt's own
+// historical behavior) makes hashing deterministic; the same cap on verify keeps
+// hash and check consistent.
+func bcryptInput(password string) []byte {
+	b := []byte(password)
+	if len(b) > 72 {
+		b = b[:72]
+	}
+	return b
 }
 
 // ByID looks a user up by id. The Battle channel authenticates with the numeric
@@ -186,7 +244,7 @@ func (s *Store) AddHeroMoney(userID, delta int32) (money, diamonds int32, ok boo
 	if u.Hero.Money < 0 {
 		u.Hero.Money = 0
 	}
-	s.saveLocked()
+	s.saveUserLocked(u)
 	return u.Hero.Money, u.Hero.DiamondMoney, true
 }
 
@@ -221,7 +279,7 @@ func (s *Store) SpendHeroMoney(userID, amount int32) (money, diamonds int32, ok 
 		return u.Hero.Money, u.Hero.DiamondMoney, false
 	}
 	u.Hero.Money -= amount
-	s.saveLocked()
+	s.saveUserLocked(u)
 	return u.Hero.Money, u.Hero.DiamondMoney, true
 }
 
@@ -254,7 +312,7 @@ func (s *Store) AddHeroExp(userID, delta int32) (level, exp, nextExp int32, ok b
 		h.Level++
 		h.NextExp = heroExpNextLevel(h.Level)
 	}
-	s.saveLocked()
+	s.saveUserLocked(u)
 	return h.Level, h.Exp, h.NextExp, true
 }
 
@@ -271,12 +329,12 @@ func (s *Store) AddBagItem(userID, articleID, count int32) bool {
 	for i := range h.Bag {
 		if h.Bag[i].ArticleID == articleID {
 			h.Bag[i].Count += count
-			s.saveLocked()
+			s.saveUserLocked(u)
 			return true
 		}
 	}
 	h.Bag = append(h.Bag, BagItem{ArticleID: articleID, Count: count})
-	s.saveLocked()
+	s.saveUserLocked(u)
 	return true
 }
 
@@ -297,7 +355,7 @@ func (s *Store) RemoveBagItem(userID, articleID, count int32) bool {
 			if h.Bag[i].Count <= 0 {
 				h.Bag = append(h.Bag[:i], h.Bag[i+1:]...)
 			}
-			s.saveLocked()
+			s.saveUserLocked(u)
 			return true
 		}
 	}
@@ -370,16 +428,15 @@ func (s *Store) CreateHero(u *User, race int32, gender bool, face, hair, distMar
 		DistMark:  clampIdx(distMark),
 		SkinColor: clampIdx(skinColor),
 		HairColor: clampIdx(hairColor),
-		// Starter lobby defaults so the client's UI populates sensibly.
-		Money:        1000,
-		DiamondMoney: 100,
-		Level:        1,
-		Exp:          0,
-		NextExp:      100,
+		Level:     1,
+		Exp:       0,
+		NextExp:   100,
 	}
+	// Starter wallet is admin-tunable (defaults 1000 bronze / 100 diamond).
+	h.Money, h.DiamondMoney = gamedata.NewHeroWallet()
 	u.Hero = h
 	u.HasHero = true
-	s.saveLocked()
+	s.saveUserLocked(u)
 	return h
 }
 
@@ -422,12 +479,13 @@ func (s *Store) TakePendingBattle(userID int32) (PendingBattle, bool) {
 	return pb, ok
 }
 
-// Save persists the store to disk (no-op when in-memory). Callers that mutate a
-// User/Hero outside the Store's own methods (e.g. spending money) should call it.
+// Save persists every account to the database (no-op when in-memory). Callers
+// that mutate a User/Hero outside the Store's own methods (e.g. tests poking
+// Hero.Money directly) should call it.
 func (s *Store) Save() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.saveLocked()
+	s.saveAllLocked()
 }
 
 // clampIdx normalizes a hero customization index ("-1" = untouched slider).

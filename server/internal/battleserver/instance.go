@@ -91,7 +91,7 @@ func newHuntInstance(s *Server, id, mapID int32) *huntInstance {
 	}
 	baseX, baseY := m.Spawn()
 	for i, sp := range m.Spawns {
-		mobT := gamedata.Mobs()[sp.Mob]
+		mobT := gamedata.MobByIndex(sp.Mob) // authored stats + any live admin override
 		mid := int32(2000 + i)
 		// Abs spawns (bosses) carry absolute world coords; the rest are offsets from
 		// the player spawn.

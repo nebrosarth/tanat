@@ -364,10 +364,14 @@ func buildAvatars() []Avatar {
 // Avatars returns the full roster in a stable order.
 func Avatars() []Avatar { return avatars }
 
-// AvatarByID finds a roster avatar by its Ctrl-side id.
+// AvatarByID finds a roster avatar by its Ctrl-side id, with any live admin-panel
+// stat override applied on top of the authored template. Returns a copy, so the
+// override never mutates the shared roster. With no override (the default) the
+// authored stats are returned verbatim.
 func AvatarByID(id int32) (Avatar, bool) {
 	for _, a := range avatars {
 		if a.ID == id {
+			applyAvatarMods(&a, settings().AvatarOverrides[id])
 			return a, true
 		}
 	}
@@ -787,8 +791,23 @@ func IsBoss(mobIdx int) bool {
 	return false
 }
 
-// Mobs returns the mob roster; index is the per-map spawn reference.
+// Mobs returns the mob roster; index is the per-map spawn reference. The stats
+// are the AUTHORED templates -- battle spawns should use MobByIndex so live admin
+// overrides apply.
 func Mobs() []Mob { return mobs }
+
+// MobByIndex returns the roster mob at index i with any live admin-panel stat
+// override applied on top of the authored template (a copy, so the shared roster
+// is never mutated). An out-of-range index returns a zero Mob. With no override
+// (the default) it is exactly Mobs()[i].
+func MobByIndex(i int) Mob {
+	if i < 0 || i >= len(mobs) {
+		return Mob{}
+	}
+	m := mobs[i]
+	applyMobMods(&m, settings().MobOverrides[int32(i)])
+	return m
+}
 
 // MobSpawn places one mob (by roster index) at an offset from the map's spawn
 // point, so the layout follows wherever the measured spawn lands.
@@ -895,53 +914,10 @@ func nearestRegion(regions []dungeonRegion, wx, wy float64) (dungeonRegion, int)
 	return r, ri
 }
 
-// regionLevelAt returns a SMOOTHLY interpolated mob level for a pack at (wx,wy): the
-// nearest region's band, distance-blended toward whichever of its two ROUTE-adjacent
-// anchors (prev/next in the region list) is geographically closer. A pack sitting between
-// two zones on the same trail takes an intermediate level instead of snapping to the
-// nearer anchor's whole band -- so the level rises ~1 at a time along a trail rather than
-// jumping by the full band gap when nearestRegion flips (the "+5 сразу" the player saw).
-//
-// Blending with the ROUTE neighbour (not the geometric second-nearest) is what keeps the
-// ramp well-behaved: the region lists run start->deep, so a route neighbour is a same-trail
-// band one step away, never a distant high-level zone whose Voronoi cell happens to abut
-// the entrance (which is how the geometric blend pulled starter ghouls up to level 5). It
-// also keeps the entrance low (its only neighbour is another low band) and works for the
-// branching jungle (the CLOSER of the two list neighbours is the same-trail one).
-//
-// The CREATURE POOL still comes from nearestRegion; only the level number is smoothed.
-// Bounded between the nearest band and its closer route-neighbour's band (never below 1).
-func regionLevelAt(regions []dungeonRegion, wx, wy float64) int {
-	if len(regions) == 1 {
-		return regions[0].level
-	}
-	r, ri := nearestRegion(regions, wx, wy)
-	d0 := math.Hypot(wx-r.x, wy-r.y)
-	if d0 < 1e-6 { // sitting on an anchor: take its band exactly
-		return r.level
-	}
-	// The closer of the two route-adjacent anchors (list index +-1).
-	nb, nbD := -1, math.Inf(1)
-	for _, j := range []int{ri - 1, ri + 1} {
-		if j < 0 || j >= len(regions) {
-			continue
-		}
-		if d := math.Hypot(wx-regions[j].x, wy-regions[j].y); d < nbD {
-			nbD, nb = d, j
-		}
-	}
-	if nb < 0 {
-		return r.level
-	}
-	// Inverse-distance blend of the nearest band and the closer route-neighbour's band:
-	// (Lr*nbD + Lnb*d0)/(d0+nbD) -- the nearer anchor dominates, equal at the midpoint.
-	lvl := (float64(r.level)*nbD + float64(regions[nb].level)*d0) / (d0 + nbD)
-	n := int(math.Round(lvl))
-	if n < 1 {
-		n = 1
-	}
-	return n
-}
+// Smooth level interpolation moved to regionMap.levelAt (regionmap.go): it blends
+// along NAVMESH (path) distance and an explicit trail topology instead of the old
+// straight-line + list-adjacency heuristic, which leaked across the gaps between the
+// jungle's forking trails. nearestRegion (above) remains the Euclidean fallback.
 
 func dungeonRegions() []dungeonRegion {
 	return []dungeonRegion{
@@ -955,17 +931,17 @@ func dungeonRegions() []dungeonRegion {
 		// Зомби губитель/ратоборец, Демон захватчик/надзиратель) belong to the GROUP invasion
 		// (map_4_1, invasionRegions41). Difficulty here comes from level scaling, not eliteness.
 		// Guarded by TestNoElitesInNormalDungeon.
-		{493, 64, 1, []int{mobGhoul}},                                                                       // spawn mouth (ghouls)
-		{455, 117, 1, []int{mobGhoul, mobSkeleton, mobSkeletonArcher}},                                      // first corridor (ghoul+skel)
+		{493, 64, 1, []int{mobGhoul}},                                  // spawn mouth (ghouls)
+		{455, 117, 1, []int{mobGhoul, mobSkeleton, mobSkeletonArcher}}, // first corridor (ghoul+skel)
 		{384, 140, 3, []int{mobSkeleton, mobSkeletonHewer, mobZombieSoldier, mobSkeletonArcher, mobSkeletonBurning}}, // toward Elgorm
-		{304, 121, 5, []int{mobSkeleton, mobSkeletonHewer, mobZombie, mobSkeletonArcher, mobZombieSoldier}}, // Elgorm's hall
-		{389, 328, 8, []int{mobZombie, mobSkeleton, mobSkeletonArcher, mobZombieSoldier}},                   // mid (CP3)
-		{486, 306, 10, []int{mobDemon, mobZombieSoldier, mobDemonRange, mobZombie}},                         // Velial's lair (demons)
-		{306, 444, 12, []int{mobZombie, mobDemon, mobSkeletonHewer, mobZombieSoldier}},                      // toward Cerber (CP4)
-		{239, 434, 14, []int{mobDemon, mobDemonRange, mobZombie}},                                           // Cerber's gate (demons)
-		{170, 300, 16, []int{mobDemon, mobDemonRange, mobZombieSoldier}},                                    // Cerber->Hekata connector (demons)
-		{124, 346, 18, []int{mobDemon, mobSkeletonArcher, mobSkeleton, mobDemonRange}},                      // CP5
-		{120, 212, 20, []int{mobDemon, mobDemonRange, mobSkeleton, mobZombie}},                              // Hekata's chamber
+		{304, 121, 5, []int{mobSkeleton, mobSkeletonHewer, mobZombie, mobSkeletonArcher, mobZombieSoldier}},          // Elgorm's hall
+		{389, 328, 8, []int{mobZombie, mobSkeleton, mobSkeletonArcher, mobZombieSoldier}},                            // mid (CP3)
+		{486, 306, 10, []int{mobDemon, mobZombieSoldier, mobDemonRange, mobZombie}},                                  // Velial's lair (demons)
+		{306, 444, 12, []int{mobZombie, mobDemon, mobSkeletonHewer, mobZombieSoldier}},                               // toward Cerber (CP4)
+		{239, 434, 14, []int{mobDemon, mobDemonRange, mobZombie}},                                                    // Cerber's gate (demons)
+		{170, 300, 16, []int{mobDemon, mobDemonRange, mobZombieSoldier}},                                             // Cerber->Hekata connector (demons)
+		{124, 346, 18, []int{mobDemon, mobSkeletonArcher, mobSkeleton, mobDemonRange}},                               // CP5
+		{120, 212, 20, []int{mobDemon, mobDemonRange, mobSkeleton, mobZombie}},                                       // Hekata's chamber
 	}
 }
 
@@ -1128,6 +1104,10 @@ func buildDungeonPack40() []MobSpawn {
 // the per-map mob-walkability tests pass. Deterministic (fixed scan + stable sort).
 func buildPacks(ng *NavGrid, regions []dungeonRegion, reborns []Vec2, bosses []bossPlacement) []MobSpawn {
 	sx, sy := ng.Spawn()
+	// Level by WALK distance from the spawn (radial ramp over the whole map) and pool
+	// by nearest anchor along the real corridors -- so difficulty rises with the walk a
+	// player actually takes rather than leaking across walls (see regionmap.go).
+	rm := newRegionMap(ng, regions, sx, sy, huntLevelCeiling)
 
 	// clearOf reports whether a point is far enough from the start, every respawn
 	// checkpoint, and every boss to host a pack.
@@ -1206,8 +1186,7 @@ func buildPacks(ng *NavGrid, regions []dungeonRegion, reborns []Vec2, bosses []b
 		if effRad < 1.0 {
 			effRad = 1.0
 		}
-		rg, ri := nearestRegion(regions, cx, cy)
-		lvl := regionLevelAt(regions, cx, cy) // smooth level; POOL still from the nearest region
+		rg, ri := rm.nearest(cx, cy) // POOL + pack-size band from the nearest region (by path)
 		size := dungeonPackSize(rg.level, pi)
 		// Cap the count to what the local clearance can hold at ~1.8m spacing (the
 		// battle server's mobSepRange): otherwise a big pack in a tight corridor would
@@ -1239,11 +1218,13 @@ func buildPacks(ng *NavGrid, regions []dungeonRegion, reborns []Vec2, bosses []b
 				continue
 			}
 			out = append(out, MobSpawn{
-				Mob:   rg.pool[regionCounter[ri]%len(rg.pool)],
-				DX:    mx,
-				DY:    my,
-				Abs:   true,
-				Level: lvl,
+				Mob: rg.pool[regionCounter[ri]%len(rg.pool)],
+				DX:  mx,
+				DY:  my,
+				Abs: true,
+				// Level PER MEMBER (continuous IDW field): packmates read the same
+				// level, adjacent packs differ by at most one -- no zone-border cliff.
+				Level: rm.levelAt(mx, my),
 			})
 			regionCounter[ri]++
 		}
@@ -1400,19 +1381,21 @@ const (
 )
 
 // LevelPowerMul is the damage/heal/spell-power multiplier at a 0-based level.
+// The slope is the admin-tunable HeroPowerPerLevel (default levelCombatGrowth).
 func LevelPowerMul(level int32) float64 {
 	if level < 0 {
 		level = 0
 	}
-	return 1 + levelCombatGrowth*float64(level)
+	return 1 + settings().HeroPowerPerLevel*float64(level)
 }
 
 // LevelHealthMul is the max-health/max-mana multiplier at a 0-based level.
+// The slope is the admin-tunable HeroHealthPerLevel (default levelHealthGrowth).
 func LevelHealthMul(level int32) float64 {
 	if level < 0 {
 		level = 0
 	}
-	return 1 + levelHealthGrowth*float64(level)
+	return 1 + settings().HeroHealthPerLevel*float64(level)
 }
 
 // Mob per-level scaling. Regular (non-boss) creatures are authored at level 1 and
@@ -1420,19 +1403,21 @@ func LevelHealthMul(level int32) float64 {
 // tougher and more rewarding the deeper into the map it sits -- "по мере
 // продвижения по карте уровень мобов растёт". Level 1 is identity, so the authored
 // values ARE the level-1 stats. Bosses are exempt (hand-tuned, see mobs slice).
-func MobHPMul(level int) float64  { return 1 + 0.15*float64(mobLvl(level)-1) } // +15%/level
-func MobDmgMul(level int) float64 { return 1 + 0.10*float64(mobLvl(level)-1) } // +10%/level
+// The per-level slopes are admin-tunable (defaults +15%/+10% HP/damage per level).
+func MobHPMul(level int) float64  { return 1 + settings().MobHPPerLevel*float64(mobLvl(level)-1) }
+func MobDmgMul(level int) float64 { return 1 + settings().MobDmgPerLevel*float64(mobLvl(level)-1) }
 
 // MobXPMul scales XP bounty. It used to be a steep N x (a level-N mob = N x base
 // XP), which made mid-map trash absurdly rich -- a base-16 skeleton at level 5 gave
-// 80 XP. Now it grows GENTLY at +40%/level: ~2.6x at level 5 (that skeleton -> ~42),
-// still ~8.6x at level 20 so deep grinding keeps the climb to 20 feasible.
-func MobXPMul(level int) float64 { return 1 + 0.40*float64(mobLvl(level)-1) }
+// 80 XP. Now it grows GENTLY at +40%/level (the admin-tunable MobXPPerLevel): ~2.6x
+// at level 5 (that skeleton -> ~42), still ~8.6x at level 20 so deep grinding keeps
+// the climb to 20 feasible.
+func MobXPMul(level int) float64 { return 1 + settings().MobXPPerLevel*float64(mobLvl(level)-1) }
 
 // MobCoinMul scales COIN bounty GENTLY -- deeper mobs drop a little more bronze,
-// tracking toughness (+15%/level, same as HP): a level-2 (reinforced, 92 HP) ghoul
-// yields 7 bronze, not 12. Rounded to whole coins in ScaledStats.
-func MobCoinMul(level int) float64 { return 1 + 0.15*float64(mobLvl(level)-1) }
+// tracking toughness (default +15%/level, same as HP): a level-2 (reinforced, 92 HP)
+// ghoul yields 7 bronze, not 12. Rounded to whole coins in ScaledStats.
+func MobCoinMul(level int) float64 { return 1 + settings().MobCoinPerLevel*float64(mobLvl(level)-1) }
 
 func mobLvl(level int) int {
 	if level < 1 {
@@ -1442,15 +1427,20 @@ func mobLvl(level int) int {
 }
 
 // ScaledStats returns a mob's effective combat stats and rewards at a placement
-// level. Bosses (which carry Skills) are hand-tuned and returned UNSCALED; every
-// other creature scales its level-1 base by the mob multipliers.
+// level. Bosses (which carry Skills) are hand-tuned and returned with their HP/
+// damage UNSCALED; every other creature scales its level-1 base by the mob
+// multipliers. The global XP/coin event multipliers (default 1.0) apply to BOTH
+// tiers -- a "2x coin weekend" should boost boss bounty too.
 func (m Mob) ScaledStats(level int) (maxHP, dmgMin, dmgMax, xp float64, coins int32) {
+	st := settings()
 	if len(m.Skills) > 0 {
-		return m.Health, float64(m.DmgMin), float64(m.DmgMax), m.XP, m.Coins
+		return m.Health, float64(m.DmgMin), float64(m.DmgMax),
+			m.XP * st.XPMultiplier,
+			int32(math.Round(float64(m.Coins) * st.CoinMultiplier))
 	}
 	return m.Health * MobHPMul(level),
 		float64(m.DmgMin) * MobDmgMul(level),
 		float64(m.DmgMax) * MobDmgMul(level),
-		m.XP * MobXPMul(level),
-		int32(math.Round(float64(m.Coins) * MobCoinMul(level)))
+		m.XP * MobXPMul(level) * st.XPMultiplier,
+		int32(math.Round(float64(m.Coins) * MobCoinMul(level) * st.CoinMultiplier))
 }

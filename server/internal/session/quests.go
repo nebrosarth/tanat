@@ -88,14 +88,14 @@ func (s *Store) AcceptQuest(userID, questID int32) (QuestState, bool) {
 			cur.Status = gamedata.QuestStatusInProgress
 			cur.Progress = 0
 			cur.CooldownUntil = 0
-			s.saveLocked()
+			s.saveUserLocked(u)
 			return *cur, true
 		}
 	}
 	qs := QuestState{QuestID: questID, Status: gamedata.QuestStatusInProgress}
 	_ = q
 	h.Quests = append(h.Quests, qs)
-	s.saveLocked()
+	s.saveUserLocked(u)
 	return qs, true
 }
 
@@ -125,7 +125,7 @@ func (s *Store) CancelQuest(userID, questID int32) bool {
 			return false // a completed/cooling quest is not abandonable (would re-arm its reward)
 		}
 		h.Quests = append(h.Quests[:i], h.Quests[i+1:]...)
-		s.saveLocked()
+		s.saveUserLocked(u)
 		return true
 	}
 	return false
@@ -187,7 +187,7 @@ func (s *Store) CompleteQuest(userID, questID int32) (QuestReward, bool) {
 			h.NextExp = heroExpNextLevel(h.Level)
 		}
 	}
-	s.saveLocked()
+	s.saveUserLocked(u)
 	return QuestReward{Quest: q, Money: h.Money, Diamonds: h.DiamondMoney, Level: h.Level, Exp: h.Exp, NextExp: h.NextExp}, true
 }
 
@@ -230,7 +230,7 @@ func (s *Store) AddQuestKill(userID, mapID int32, mobIdx int) []QuestState {
 		dirty = true
 	}
 	if dirty {
-		s.saveLocked()
+		s.saveUserLocked(u)
 	}
 	return changed
 }

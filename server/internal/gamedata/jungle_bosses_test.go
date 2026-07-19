@@ -105,11 +105,12 @@ func TestJungleTrashGenerated(t *testing.T) {
 		if d := math.Hypot(sp.DX-sx, sp.DY-sy); d < dungeonSpawnClear {
 			t.Errorf("trash Mob %d is %.1fm from spawn -- inside the safe ring (%.0f)", sp.Mob, d, dungeonSpawnClear)
 		}
-		// The jungle roster is mobSpider..mobGolemElite, PLUS the deliberate cross-roster
-		// «Деревенский пожар» burning-skeleton pin (jungleBurntVillage) -- still walkable and
-		// spawn-clear (checked above), just not a native jungle creature.
-		if sp.Mob != mobSkeletonBurning && (sp.Mob < mobSpider || sp.Mob > mobGolemElite) {
-			t.Errorf("spawn Mob %d is not a jungle-roster creature (or the burnt-village pin)", sp.Mob)
+		// The jungle roster is mobSpider..mobGolemElite, PLUS two deliberate cross-roster
+		// pins: the «Деревенский пожар» burning skeleton (jungleBurntVillage) and the
+		// hunter-flower forced into the user-marked western corridor (jungleFlowerPool) --
+		// still walkable and spawn-clear (checked above), just not native jungle creatures.
+		if sp.Mob != mobSkeletonBurning && sp.Mob != mobFlowerHunter && (sp.Mob < mobSpider || sp.Mob > mobGolemElite) {
+			t.Errorf("spawn Mob %d is not a jungle-roster creature (or a deliberate pin)", sp.Mob)
 		}
 	}
 	if trash < 20 {
@@ -155,12 +156,14 @@ func TestBossArenasClearOnAllMaps(t *testing.T) {
 }
 
 // TestBurntVillageInJungle: the «Деревенский пожар» quest (Map_4_2 Stage2_2) is now completable --
-// burning skeletons really spawn in the jungle CENTRE, on walkable floor, clear of the spawn/boss
-// rings. Pins the user's request that this creature exist on map_4_2.
+// the standard pack generator fills the burnt village with burning-skeleton packs (no hand-placed
+// pins), every one on walkable floor, reachable, clear of the spawn/boss rings, and within the
+// burned-house cluster. Pins the user's request that this creature populate map_4_2's village.
 func TestBurntVillageInJungle(t *testing.T) {
 	m, _ := HuntMapByID(42)
 	sx, sy := m.Spawn()
-	fx, fy := -32.56, 5.96 // Fairy = the central hill
+	// The ACTUAL burnt village -- the baked House_*_Burned / Skeleton_burned prop cluster
+	// centred at jungleBurntVillageCenter (extracted from map_4_2.unity3d).
 	n := 0
 	for _, sp := range m.Spawns {
 		if sp.Mob != mobSkeletonBurning {
@@ -170,6 +173,9 @@ func TestBurntVillageInJungle(t *testing.T) {
 		if !navGrid42.Walkable(sp.DX, sp.DY) {
 			t.Errorf("burnt-village skeleton at (%.1f,%.1f) is not walkable", sp.DX, sp.DY)
 		}
+		if p := navGrid42.Path(sx, sy, sp.DX, sp.DY); len(p) == 0 {
+			t.Errorf("burnt-village skeleton at (%.1f,%.1f) is not reachable from spawn", sp.DX, sp.DY)
+		}
 		if d := math.Hypot(sp.DX-sx, sp.DY-sy); d < dungeonSpawnClear {
 			t.Errorf("burnt-village skeleton is %.1fm from spawn -- inside the safe ring", d)
 		}
@@ -178,12 +184,33 @@ func TestBurntVillageInJungle(t *testing.T) {
 				t.Errorf("burnt-village skeleton at (%.1f,%.1f) is %.1fm from a boss -- inside its arena", sp.DX, sp.DY, d)
 			}
 		}
-		if d := math.Hypot(sp.DX-fx, sp.DY-fy); d > 90 {
-			t.Errorf("burnt-village skeleton at (%.1f,%.1f) is %.1fm from the central hill -- not central", sp.DX, sp.DY, d)
+		if d := math.Hypot(sp.DX-jungleBurntVillageCenter.X, sp.DY-jungleBurntVillageCenter.Y); d > jungleBurntVillageRadius {
+			t.Errorf("burnt-village skeleton at (%.1f,%.1f) is %.1fm from the burned-house cluster -- outside the village", sp.DX, sp.DY, d)
 		}
 	}
 	if n < 3 {
-		t.Errorf("expected a burnt-village cluster of burning skeletons in the jungle, got %d", n)
+		t.Errorf("expected the burnt village populated with burning-skeleton packs, got %d", n)
+	}
+}
+
+// TestBurntVillageOnlySkeletons: the burnt village is a skeletons-only zone -- the standard
+// generator fills it, but every mob inside its radius is a burning skeleton; no regular jungle
+// pack (spider/tribe/dino/...) draws there, so the ruins read as a burned-out village.
+func TestBurntVillageOnlySkeletons(t *testing.T) {
+	vc := jungleBurntVillageCenter
+	inside := 0
+	for _, sp := range junglePack {
+		if math.Hypot(sp.DX-vc.X, sp.DY-vc.Y) > jungleBurntVillageRadius {
+			continue
+		}
+		inside++
+		if sp.Mob != mobSkeletonBurning {
+			t.Errorf("mob %d at (%.1f,%.1f) is inside the burnt village but not a burning skeleton",
+				sp.Mob, sp.DX, sp.DY)
+		}
+	}
+	if inside < 3 {
+		t.Fatalf("burnt village holds too few mobs (%d) -- the generator should fill it with skeleton packs", inside)
 	}
 }
 
