@@ -61,6 +61,14 @@ func wearableArticleEntry(w gamedata.Wearable) *amf.MixedArray {
 		Set("short", "").
 		Set("long", w.DescKey).
 		Set("icon", w.Icon).
+		// A "prefab" key MUST be present even if empty: the client's PPrefab.Load does a
+		// bare _data["prefab"], and a missing key throws KeyNotFoundException that
+		// PropertyHolder swallows -- leaving Prefab UNREGISTERED (null). HeroInfo's dressed-item
+		// loop then dereferences ctrlPrototype.Prefab.mValue and NREs, so the "Информация о
+		// герое" window never opens for any hero wearing gear. Empty is safe: HeroWear.SetItems
+		// resolves the name via GetItemById and skips anything it can't find (we have no real
+		// gear-mesh mapping, so the preview just shows no worn mesh -- same as the square).
+		Set("prefab", "").
 		Set("price", w.Price).
 		Set("sell_price", w.SellPrice).
 		Set("type_id", int32(0)). // ItemType.WEARABLE

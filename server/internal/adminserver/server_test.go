@@ -159,6 +159,38 @@ func TestSettingsUpdateAffectsGamedata(t *testing.T) {
 	}
 }
 
+func TestSettingsWtfModeAndStartLevel(t *testing.T) {
+	restoreGamedata(t)
+	ts, _, _ := newTestServer(t)
+	c, csrf := login(t, ts, "secret")
+
+	if gamedata.WTFMode() || gamedata.HuntStartLevel() != 0 {
+		t.Fatalf("baseline: wtf=%v startlvl=%d, want off/0", gamedata.WTFMode(), gamedata.HuntStartLevel())
+	}
+	res := post(t, c, ts.URL+"/api/settings", csrf,
+		`{"xp_multiplier":1,"coin_multiplier":1,"new_hero_money":1000,"new_hero_diamond":100,"wtf_mode":true,"hunt_start_level":5}`)
+	res.Body.Close()
+	if res.StatusCode != 200 {
+		t.Fatalf("settings status = %d", res.StatusCode)
+	}
+	if !gamedata.WTFMode() {
+		t.Error("wtf mode not applied")
+	}
+	if gamedata.HuntStartLevel() != 5 {
+		t.Errorf("start level not applied: %d", gamedata.HuntStartLevel())
+	}
+	// A negative start level is clamped to 0 (no override).
+	res = post(t, c, ts.URL+"/api/settings", csrf,
+		`{"xp_multiplier":1,"coin_multiplier":1,"wtf_mode":false,"hunt_start_level":-3}`)
+	res.Body.Close()
+	if gamedata.WTFMode() {
+		t.Error("wtf mode should be off")
+	}
+	if gamedata.HuntStartLevel() != 0 {
+		t.Errorf("negative start level not clamped: %d", gamedata.HuntStartLevel())
+	}
+}
+
 func TestAvatarOverrideEndpoint(t *testing.T) {
 	restoreGamedata(t)
 	ts, _, _ := newTestServer(t)
@@ -289,6 +321,62 @@ func TestQuestAndGrantEndpoints(t *testing.T) {
 	if len(inv.Bag) != 1 || len(inv.Owned) != 2 {
 		t.Errorf("inventory read wrong: bag=%d owned=%d", len(inv.Bag), len(inv.Owned))
 	}
+}
+
+func TestItemRemoveEndpoint(t *testing.T) {
+	ts, store, id := newTestServer(t)
+	c, csrf := login(t, ts, "secret")
+
+	// A bag stack (first potion) and two discrete wearable instances.
+	pArt := gamedata.Items()[0].ArticleID
+	wArt := gamedata.Wearables()[0].ArticleID
+	store.AddBagItem(id, pArt, 5)
+	owned, _ := store.AdminGrantWearable(id, wArt, 2)
+
+	// Remove part of the bag stack.
+	res := post(t, c, ts.URL+"/api/player/item/remove", csrf,
+		`{"id":`+itoa(id)+`,"kind":"bag","article_id":`+itoa(pArt)+`,"count":2}`)
+	res.Body.Close()
+	if res.StatusCode != 200 {
+		t.Fatalf("remove bag(part) status = %d", res.StatusCode)
+	}
+	if bag := store.HeroBag(id); len(bag) != 1 || bag[0].Count != 3 {
+		t.Fatalf("bag not decremented: %+v", bag)
+	}
+
+	// Remove the whole remaining stack (count 0).
+	res = post(t, c, ts.URL+"/api/player/item/remove", csrf,
+		`{"id":`+itoa(id)+`,"kind":"bag","article_id":`+itoa(pArt)+`,"count":0}`)
+	res.Body.Close()
+	if bag := store.HeroBag(id); len(bag) != 0 {
+		t.Fatalf("bag stack not removed: %+v", bag)
+	}
+
+	// Remove one owned wearable instance by id.
+	res = post(t, c, ts.URL+"/api/player/item/remove", csrf,
+		`{"id":`+itoa(id)+`,"kind":"owned","instance_id":`+itoa(owned[0].ID)+`}`)
+	res.Body.Close()
+	if res.StatusCode != 200 {
+		t.Fatalf("remove owned status = %d", res.StatusCode)
+	}
+	if o := store.HeroOwned(id); len(o) != 1 || o[0].ID != owned[1].ID {
+		t.Fatalf("wrong owned instance removed: %+v", o)
+	}
+
+	// Removing an absent instance / stack is a 400.
+	res = post(t, c, ts.URL+"/api/player/item/remove", csrf,
+		`{"id":`+itoa(id)+`,"kind":"owned","instance_id":999999}`)
+	if res.StatusCode != 400 {
+		t.Errorf("absent owned: want 400, got %d", res.StatusCode)
+	}
+	res.Body.Close()
+
+	// Unknown kind rejected.
+	res = post(t, c, ts.URL+"/api/player/item/remove", csrf, `{"id":`+itoa(id)+`,"kind":"nope"}`)
+	if res.StatusCode != 400 {
+		t.Errorf("unknown kind: want 400, got %d", res.StatusCode)
+	}
+	res.Body.Close()
 }
 
 func itoa(i int32) string {

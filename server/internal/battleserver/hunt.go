@@ -24,10 +24,14 @@ import (
 var debugStartLevelOverride int32
 
 // huntStartLevel returns the character level (1-based) a hunt avatar should spawn
-// at: the test override if set, else TANAT_HUNT_START_LEVEL, else 1.
+// at: the test override if set, else the admin-panel setting (gamedata), else the
+// legacy TANAT_HUNT_START_LEVEL env var, else 1.
 func huntStartLevel() int32 {
 	if debugStartLevelOverride > 0 {
 		return debugStartLevelOverride
+	}
+	if lvl := gamedata.HuntStartLevel(); lvl > 0 {
+		return lvl
 	}
 	if v := os.Getenv("TANAT_HUNT_START_LEVEL"); v != "" {
 		if n, err := strconv.Atoi(v); err == nil && n > 0 {
@@ -43,10 +47,14 @@ func huntStartLevel() int32 {
 // separate path. A pure testing aid for exercising skills without resource limits.
 var debugWTFMode bool
 
-// wtfMode reports whether WTF MODE is on (test override or TANAT_WTF_MODE set to a
-// truthy value; any non-empty value except "0"/"false" counts as on).
+// wtfMode reports whether WTF MODE is on: the test override, else the admin-panel
+// setting (gamedata), else the legacy TANAT_WTF_MODE env var set to a truthy value
+// (any non-empty value except "0"/"false" counts as on).
 func wtfMode() bool {
 	if debugWTFMode {
+		return true
+	}
+	if gamedata.WTFMode() {
 		return true
 	}
 	v := os.Getenv("TANAT_WTF_MODE")
@@ -479,6 +487,16 @@ func activeChildDesc(a gamedata.Avatar, sk gamedata.Skill) string {
 		target = ""
 		aoeRadius, aoeWidth = 0, 0
 	}
+	// A friend-or-foe DUAL cast authors both ENEMY and FRIEND. The client's TargetValidator
+	// AND-combines every set flag, so "ENEMY+…+FRIEND" is unsatisfiable (no unit is both) and
+	// EVERY click is rejected -- the "can't cast on enemy OR self" report (Frost s3, Kiona s4,
+	// Hekata s3). Emit a satisfiable mask: NOT_BUILDING validates any non-building unit --
+	// enemy, ally, and (since it isn't a POINT mask, IsValidTarget only bars self for POINT)
+	// the caster itself. The SERVER keeps reading the authored sk.Target for its friend/foe
+	// split, so the runtime effect is unchanged; only the client's click-gate is satisfiable.
+	if !selfCast && strings.Contains(target, "ENEMY") && strings.Contains(target, "FRIEND") {
+		target = "NOT_BUILDING"
+	}
 	attribs := attrEnum("target", target) +
 		attrEnum("targeting", targeting) +
 		attrItem("distance", itoa(sk.Distance)) +
@@ -565,6 +583,15 @@ type huntState struct {
 	hasProjectile bool
 	procs         []procState // rolled when the avatar HITS (basic attack)
 	defenseProcs  []procState // rolled when the avatar is STRUCK (Titanid «Каменная кожа»)
+	killProcs     []procState // rolled whenever the avatar's side KILLS an enemy (Gayal «Аура погибших»)
+	anyDamageProcs []procState // ALSO rolled once per cast when the avatar's own skill damage lands (Anhel «Зов фантомов»)
+	// lastDamageWasSkill flags the hit ABOUT to run runDefenseProcsLocked as mob/boss SKILL
+	// damage (Op.SkillOnly, Neirofim's «Обращение энергии») rather than a basic attack
+	// (Op.BasicAttackOnly, Gektor's «Реванш»). Set by the caller just before the hit lands
+	// (resolveMobHitLocked=false, landBossSkillLocked=true) and consumed-then-reset at the
+	// top of runDefenseProcsLocked so it never leaks into an unrelated later hit (a thorns
+	// bounce, a PvP swing, ...) that never sets it.
+	lastDamageWasSkill bool
 
 	// reviveSlot / ccImmuneSlot are the 1-based slots of a learned PASSIVE carrying an
 	// OpRevive / OpImmune op (0 = none). Set at world-build. reviveReadyAt /
@@ -574,9 +601,19 @@ type huntState struct {
 	reviveReadyAt   float64
 	ccImmuneSlot    int
 	ccImmuneReadyAt float64
+	// tempCCImmuneUntil is a battle-time deadline for a CAST-GRANTED (not passive) window of
+	// full CC immunity -- Arianna's «Щит хранителя»: «щит дает полную неуязвимость к
+	// магическому урону, оглушению и замедлению». Unlike ccImmuneSlot's consume-then-cooldown
+	// passive, this just blocks every CC attempt until the deadline (the shield's own
+	// duration), with nothing to consume or reset.
+	tempCCImmuneUntil float64
 	// healOnKillSlot is the 1-based slot of a learned PASSIVE carrying an OpHealOnKill
 	// (Cerber's «Кровавый пир»), 0 = none. Honored in hitMobLocked's death branch.
 	healOnKillSlot int
+	// manaOnKillSlot is the 1-based slot of a learned PASSIVE carrying an OpManaOnKill
+	// (Kiona's «Вдохновение»), 0 = none. Honored in the same mob-death branch: each kill
+	// restores current mana.
+	manaOnKillSlot int
 	// consecutiveHitSlot is the 1-based slot of a learned PASSIVE carrying an
 	// OpConsecutiveHit (Mihalych's «Трепка»), 0 = none. hitStreakTarget/hitStreak track the
 	// current same-target basic-attack streak that feeds its escalating bonus damage. The
@@ -588,6 +625,36 @@ type huntState struct {
 	// OpAttackSpeedStreak (Lirvein's «Неумолимость»), 0 = none. When set, the swing interval
 	// is recomputed each swing so the same-target hitStreak speeds attacks up (capped).
 	attackSpeedStreakSlot int
+	// manaSpeedSlot is the 1-based slot of a learned PASSIVE carrying an
+	// OpManaScaledAttackSpeed (Sharli's «Жар души»), 0 = none. Read live in
+	// attackPeriodLocked -- no counter to track, the bonus is a pure function of current
+	// mana each time it is (re)computed.
+	manaSpeedSlot int
+	// moveChargeSlot is the 1-based slot of a learned PASSIVE carrying an
+	// OpMoveChargeAttack (Sandariel's «Острие странника»), 0 = none. moveChargeLast{X,Y}/
+	// HasLast track the avatar's own last-sampled position (per-tick dead-reckoning
+	// delta), moveChargeDist the unconverted distance banked toward the next charge, and
+	// moveChargeCount the currently-held charge stack (consumed on the next basic attack).
+	moveChargeSlot    int
+	moveChargeLastX   float32
+	moveChargeLastY   float32
+	moveChargeHasLast bool
+	moveChargeDist    float64
+	moveChargeCount   int
+	// zoneArmorSlot is the toggle slot (0 = none) carrying an OpZoneArmor (Inshari's
+	// «Угнетение»): its armor bonus only mitigates a hit from an attacker standing
+	// outside the op's own Radius of the caster.
+	zoneArmorSlot int
+	// meleeFormSlot is the toggle slot (0 = none) carrying an OpMeleeForm (Grimlok's
+	// «Темная сторона»): forces meleeReach + no projectile while on. meleeFormWasProjectile
+	// remembers hasProjectile's pre-toggle value so toggle-off restores it exactly.
+	meleeFormSlot          int
+	meleeFormWasProjectile bool
+	// toggleStealthSlot is the toggle slot (0 = none) carrying an OpStealth (Astarot's
+	// «Слуга тьмы»): tickTogglesLocked keeps re-arming hs.invisibleUntil every tick while
+	// it stays on, and toggle-off immediately breaks the stealth rather than waiting for
+	// the last refresh to lapse.
+	toggleStealthSlot int
 	// soulSlot is the 1-based slot of a learned PERSISTENT OpOnKillStack passive (Gellar's
 	// «Порабощение» souls), 0 = none. soulStacks is how many enemies it has banked (each
 	// worth +Value flat attack); halved when the avatar dies.
@@ -611,6 +678,39 @@ type huntState struct {
 	// nextHitBonus is bonus magic damage stored onto the caster's NEXT basic attack by
 	// Rognar's «Окропление кровью» (spend HP now, empower the next swing), consumed on use.
 	nextHitBonus float64
+	// recoilFrac/recoilUntil implement Op.SelfRecoil (Sigilion's «Мощь берсерка»): while
+	// now < recoilUntil, every basic-attack swing costs the caster recoilFrac × the
+	// swing's dmg_pct-attributable bonus as self-damage.
+	recoilFrac  float64
+	recoilUntil float64
+	// manaShot* implement Op.AttackManaBonus (Miriam's «Зачарованные стрелы»): while
+	// now < manaShotUntil, a swing that can afford manaShotCost mana instead deals
+	// manaShotDmg extra flat damage, consuming that mana.
+	manaShotUntil float64
+	manaShotCost  float64
+	manaShotDmg   float64
+	// hitStack* implement Op.HitStack (Gayal's «Меч жажды»): while now < hitStackUntil,
+	// each landing basic attack adds a stack (+hitStackLSPer lifesteal_pct, +hitStackSpdPer
+	// attack_speed_pct, both reflected live via a refreshed statMod), up to hitStackCap; on
+	// reaching the cap the swing also adds hitStackBurstDmg(+hitStackBurstSP×SP) bonus magic
+	// damage and hitStackCount resets to 0.
+	hitStackUntil    float64
+	hitStackCount    int
+	hitStackCap      int
+	hitStackLSPer    float64
+	hitStackSpdPer   float64
+	hitStackBurstDmg float64
+	hitStackBurstSP  float64
+	// cleaveUntil/cleaveRadius implement Op.AttackCleave (BlackDragon's «Неистовство»):
+	// while now < cleaveUntil, a landing basic attack also strikes every other enemy
+	// within cleaveRadius of the primary target for the same damage.
+	cleaveUntil  float64
+	cleaveRadius float64
+	// cleanseSlot is the 1-based slot of a learned PASSIVE carrying an OpCleanseOnHit
+	// (Abominator's «Окоченение»), 0 = none. Honored by the (currently unreached, no
+	// avatar-vs-avatar CC path exists yet) player-facing-debuff-apply gate, mirroring
+	// ccImmuneSlot's documented latency.
+	cleanseSlot int
 	// deathLink* is Rognar's «Канал смерти»: while deathLinkUntil is in the future, a share
 	// of every blow the caster takes is forwarded to deathLinkObj (a mob id) as magic damage,
 	// or heals it when deathLinkAlly.
@@ -643,6 +743,7 @@ type huntState struct {
 	actionDones  []actionDone
 	fxEnds       []fxEnd
 	traps        []trapState
+	wards        []wardState
 	channels     []channelState
 	bounces      []bounceState
 	summons      map[int32]*summonState
@@ -690,6 +791,28 @@ type huntState struct {
 	invisibleUntil float64
 	invisFxUID     int32
 	invisBuffEffID int32
+	// stealthBreaksOnMove: this avatar's active stealth was granted by a BreakOnMove OpStealth
+	// (Wilfang's «Засада»), so issuing a MOVE order reveals it -- not only the next attack/cast.
+	// Set at grant (applySkillStealthLocked); cleared when stealth ends (breakInvisibilityLocked).
+	stealthBreaksOnMove bool
+
+	// Urg's «Древесный камуфляж» (tree camouflage): an armed tree form on THIS avatar.
+	// treeFormObj is the standing disguise prop; treeFormBurst is the reveal burst (magic
+	// damage + silence) that detonates around the avatar when it leaves the form (move/
+	// attack/cast via breakInvisibilityLocked, or treeFormUntil expiry). Nil burst = no
+	// tree form armed. See urg.go.
+	treeFormObj   int32
+	treeFormBurst []gamedata.Op
+	treeFormSlot  int
+	treeFormLevel int
+	treeFormUntil float64
+
+	// stealthBurst arms a reveal burst on an OpStealth carrying nested Ops (Wilfang's
+	// «Засада»): detonated around the avatar the instant invisibility breaks (move/
+	// attack/cast via breakInvisibilityLocked), not at cast. Nil = no burst armed.
+	stealthBurst      []gamedata.Op
+	stealthBurstSlot  int
+	stealthBurstLevel int
 
 	// revealInvisibleUntil / revealBuffEffID: an active Revelation potion.
 	// Currently a no-op beyond its own buff icon/timer -- Hunt is a co-op PvE
@@ -744,9 +867,10 @@ func (c *conn) playerTeam() int32 {
 	return dotaPlayerTeam
 }
 
-// arenaEnemies reports whether two players are on opposing «Арена» sides -- i.e. legal
-// targets for each other. False outside «Арена» (both teams are the co-op side), which
-// keeps friendly fire off in Hunt and «Штурм».
+// arenaEnemies reports whether two players are on opposing PvP sides -- i.e. legal
+// targets for each other. Serves both «Арена» and «Штурм» (their two sides carry
+// distinct teams). In Hunt every player is the default co-op side, so this is false and
+// player-vs-player fire stays off.
 func arenaEnemies(a, b *conn) bool {
 	if a == nil || b == nil || a == b {
 		return false
@@ -801,6 +925,10 @@ type mobState struct {
 	// starving a caster/archer of its ranged output. Set at spawn (newHuntInstance).
 	mana    float64
 	maxMana float64
+	// manaSyncFrac is the mana fraction last broadcast to clients. Live mob-mana syncs
+	// (syncMobManaLocked) fire only when the current fraction drifts past a threshold from
+	// this, so a drained/regenerating mana bar moves without a per-tick packet. Starts full.
+	manaSyncFrac float32
 
 	st        unitStatus
 	aggro     bool
@@ -933,19 +1061,21 @@ func (c *conn) altarShieldedLocked(ms *mobState) bool {
 	return ms.altar && c.inst != nil && c.inst.dota != nil && !c.inst.dota.altarVulnerableLocked(ms)
 }
 
-// hostile reports whether m is a legal target for the PLAYER's side: anything that
-// is not one of the player's own «Штурм» units.
+// enemyOf reports whether m is a legal target for a unit on `team`: its TEAM differs.
 //
-// Every scan that picks a mob to harm must consult it. mobState is one type serving
-// two roles, and in «Штурм» inst.mobs holds the player's own creeps and buildings
-// right beside the enemy's -- so an unfiltered "nearest living mob" scan is a scan
-// for allies too. That is not hypothetical: it is why a skill, an AoE, a DoT and the
-// auto-attack all happily killed the creeps they were escorting.
+// Every combat scan that picks a mob to harm must consult it. mobState is one type
+// serving two roles, and in «Штурм» inst.mobs holds a side's OWN creeps and buildings
+// right beside the enemy's -- so an unfiltered "nearest living mob" scan is a scan for
+// allies too. That is not hypothetical: it is why a skill, an AoE, a DoT and the
+// auto-attack all once happily killed the creeps they were escorting.
 //
-// Hunt is unaffected by construction, twice over: its mobs never set team, so
-// teamVal() is dotaEnemyTeam; and summons are not in inst.mobs at all (they live in
-// huntState.summons), so this can never filter out a pet.
-func (m *mobState) hostile() bool { return m.teamVal() != dotaPlayerTeam }
+// It is team-RELATIVE because «Штурм» is true PvP: a player fighting for the Elf side
+// (team 2) must be able to strike team-1 Human units, so every player/summon-driven scan
+// passes the ACTING side's team (c.playerTeam() / sm.team) rather than a fixed value.
+// Hunt is unchanged: its mobs never set a team, so teamVal() is dotaEnemyTeam (-1), an
+// enemy of the default team-1 player; and summons live in huntState.summons, never in
+// inst.mobs, so this can never filter out a pet.
+func (m *mobState) enemyOf(team int32) bool { return m.teamVal() != team }
 
 // maxHealth / rollDamage / xpReward / coinReward return the mob's effective
 // (level-scaled) stats, falling back to the raw Mob fields when maxHP is unset --
@@ -1081,6 +1211,20 @@ func (s *Server) sendHuntWorldState(c *conn, name string) {
 		hs.team = c.inst.arena.assignTeam()
 		ax, ay := arenaInitialSpawn(c.inst.arena, hs.team)
 		c.x, c.y = float32(ax), float32(ay)
+	} else if c.inst != nil && c.inst.dota != nil {
+		// «Штурм» PvP: take the side the matchmaker assigned (PendingBattle.Team), or, for
+		// a solo/direct launch that carries none, alternate joiners across the two bases.
+		// hs.team drives playerTeam(), so set it -- and move to that side's own base -- here,
+		// before any self world-state or teammate reveal reads the team/position.
+		var side gamedata.DotaSide
+		if pb.Team == dotaTeamHuman || pb.Team == dotaTeamElf {
+			side = sideForTeam(pb.Team)
+		} else {
+			side = c.inst.dota.assignSide()
+		}
+		hs.team = teamForSide(side)
+		dx, dy := c.inst.dota.sideSpawn(side)
+		c.x, c.y = float32(dx), float32(dy)
 	}
 	sx, sy := c.x, c.y
 	// Start checkpoint = the battle-start Reborn_point (the spawn). The first tick
@@ -1092,6 +1236,9 @@ func (s *Server) sendHuntWorldState(c *conn, name string) {
 	// mods NOW, before the world-state stat packets read modSum, so the sim and the initial
 	// pools already include gear. Shared by all modes (Hunt/Arena/Штурм).
 	s.applyDressedItemStatsLocked(c, now)
+	// Fold the hero's active rune stat-buffs the same way, and snapshot the active elixir
+	// xp/money multipliers onto the conn for the reward paths.
+	s.applyGlobalBuffsLocked(c, now)
 	c.unlock()
 
 	// 1. Static data + prototypes.
@@ -1136,6 +1283,12 @@ func (s *Server) sendHuntWorldState(c *conn, name string) {
 	// Invisible trap-fx anchor prototype: a stationary object a SELF-mode ground fx
 	// parents to so it holds the cast point (see trap_anchor.go). One fixed proto.
 	pkts = append(pkts, protoInfoPkt(trapAnchorProtoID, trapAnchorProtoDesc()))
+	// Vision-ward prototypes: one per distinct scout prop any avatar's kit plants
+	// (Urg's «Росток» acorn tree). A stationary friendly prop that reveals fog +
+	// exposes stealthed enemies (see ward.go). Registered up front like the anchor.
+	for _, wp := range wardProtos() {
+		pkts = append(pkts, protoInfoPkt(wp.id, wp.desc))
+	}
 	// Ground-loot chest prototype (see drops.go). One fixed proto, spawned wherever
 	// a mob happens to drop loot.
 	pkts = append(pkts, protoInfoPkt(dropChestProtoID, dropChestProtoDesc()))
@@ -1238,26 +1391,42 @@ func (s *Server) sendHuntWorldState(c *conn, name string) {
 		for _, op := range sk.Ops {
 			switch op.Kind {
 			case gamedata.OpProc:
-				pr := procState{slot: i + 1, chance: op.Chance, ops: op.Ops}
+				pr := procState{slot: i + 1, chance: op.Chance, ops: op.Ops, cd: sk.TipArgs["cooldown"], meleeOnly: op.MeleeOnly, basicAttackOnly: op.BasicAttackOnly, skillOnly: op.SkillOnly}
 				// Most procs fire when the avatar HITS (runProcsLocked, basic-attack path).
 				// A proc flagged OnDamaged instead fires when the avatar is STRUCK, so it is
 				// rolled from the incoming-damage path (Titanid «Каменная кожа», Gektor
-				// «Реванш», Dutnik «Детонация», Nerlag «Прилив крови»).
-				if op.OnDamaged {
+				// «Реванш», Dutnik «Детонация», Nerlag «Прилив крови»). OnKill fires once per
+				// KILL, not per hit (Gayal's «Аура погибших»: zombies rise from the dead, not
+				// from every landing swing).
+				switch {
+				case op.OnKill:
+					hs.killProcs = append(hs.killProcs, pr)
+				case op.OnDamaged:
 					hs.defenseProcs = append(hs.defenseProcs, pr)
-				} else {
+				default:
 					hs.procs = append(hs.procs, pr)
+					if op.OnAnyDamage {
+						hs.anyDamageProcs = append(hs.anyDamageProcs, pr)
+					}
 				}
 			case gamedata.OpRevive:
 				hs.reviveSlot = i + 1
 			case gamedata.OpImmune:
 				hs.ccImmuneSlot = i + 1
+			case gamedata.OpCleanseOnHit:
+				hs.cleanseSlot = i + 1
 			case gamedata.OpHealOnKill:
 				hs.healOnKillSlot = i + 1
+			case gamedata.OpManaOnKill:
+				hs.manaOnKillSlot = i + 1
 			case gamedata.OpConsecutiveHit:
 				hs.consecutiveHitSlot = i + 1
 			case gamedata.OpAttackSpeedStreak:
 				hs.attackSpeedStreakSlot = i + 1
+			case gamedata.OpManaScaledAttackSpeed:
+				hs.manaSpeedSlot = i + 1
+			case gamedata.OpMoveChargeAttack:
+				hs.moveChargeSlot = i + 1
 			case gamedata.OpOnKillStack:
 				// Only the PERSISTENT soul flavour (Dur 0) is a passive: it is banked in the
 				// mob-death branch. The ACTIVE window flavour (Dur > 0) is opened by its cast
@@ -1416,6 +1585,15 @@ func (hs *huntState) passiveBuffArgs(slot, level int, now float64) *amf.MixedArr
 // CasterMissingHP proc): the current bonus damage = coeff × Velial's missing-HP
 // fraction, matching the value it actually adds on the next hit.
 func (hs *huntState) passiveBuffCounterLocked(slot, level int, now float64) (int32, bool) {
+	// Gellar's «Порабощение»: the number beside the icon is the current banked soul count
+	// («Убивая врагов, Геллар собирает их души») -- refreshed live as souls are gained/lost.
+	if hs.soulSlot != 0 && slot == hs.soulSlot {
+		return int32(hs.soulStacks), true
+	}
+	// Sandariel's «Острие странника»: show the currently-banked move-charge count.
+	if hs.moveChargeSlot != 0 && slot == hs.moveChargeSlot {
+		return int32(hs.moveChargeCount), true
+	}
 	coeff := passiveCasterMissingHP(hs.kit.Skills[slot-1], level)
 	if coeff <= 0 {
 		return 0, false
@@ -1457,6 +1635,36 @@ func passiveCasterMissingHP(sk gamedata.Skill, level int) float64 {
 		return 0
 	}
 	return scan(sk.Ops)
+}
+
+// casterMissingHPBonusLocked is the flat basic-attack bonus the caster's learned
+// CasterMissingHP passives add right now (Velial's «Воля к победе»: coeff × own missing-HP
+// fraction). Added AFTER the attack multipliers, exactly as the real hit calc does
+// (damageValueLocked), so the avatar card's displayed attack damage matches what a swing
+// actually deals. 0 when at full HP or no such passive is learned.
+func (hs *huntState) casterMissingHPBonusLocked(now float64) float64 {
+	maxHP := hs.maxHPLocked(now)
+	if maxHP <= 0 {
+		return 0
+	}
+	missing := 1 - hs.hp/maxHP
+	if missing <= 0 {
+		return 0
+	}
+	var bonus float64
+	for i := range hs.kit.Skills {
+		if hs.kit.Skills[i].Type != "PASSIVE" {
+			continue
+		}
+		level := int(hs.skillLevel[i])
+		if level < 1 {
+			continue
+		}
+		if coeff := passiveCasterMissingHP(hs.kit.Skills[i], level); coeff > 0 {
+			bonus += coeff * missing
+		}
+	}
+	return bonus
 }
 
 // sendEffectorsLocked re-sends the whole effector set (used on respawn, since
@@ -1602,9 +1810,10 @@ func (s *Server) doActionLocked(c *conn, itemID, action, target int32, px, py fl
 			if ms.dead {
 				return
 			}
-			// «Штурм» friendly fire: never attack an ally (own-team creep/structure). Hunt
-			// mobs are team -1 (teamVal), so this never blocks a PvE target.
-			if !ms.hostile() {
+			// «Штурм» friendly fire: never attack an ally (a unit on the player's OWN side).
+			// Team-relative so it turns the right targets away from either side; Hunt mobs are
+			// team -1, so this never blocks a PvE target.
+			if !ms.enemyOf(c.playerTeam()) {
 				return
 			}
 			// A guarded altar refuses the order. The client's own auto-acquire already skips
@@ -1622,7 +1831,7 @@ func (s *Server) doActionLocked(c *conn, itemID, action, target int32, px, py fl
 		// «Арена»: the target isn't a mob -- it may be an enemy player's avatar. Only an
 		// opposing, living arena member is a legal victim; anyone else falls through and
 		// the order is dropped (a click on an ally, or a stale id).
-		if victim := c.arenaMember(target); victim != nil && arenaEnemies(c, victim) && victim.huntState.deadUntil == 0 {
+		if victim := c.pvpMember(target); victim != nil && arenaEnemies(c, victim) && victim.huntState.deadUntil == 0 {
 			s.startPvpAttackLocked(c, victim)
 		}
 	case skillSlotByProto(a, action) != 0:
@@ -1639,6 +1848,10 @@ func (s *Server) startAttackLocked(c *conn, ms *mobState) {
 	if hs.deadUntil > 0 {
 		return
 	}
+	// Issuing an attack is "acting again": it cancels a caster-sustained interruptible
+	// channel (Morlokai's «Кабала» hold breaks if he starts attacking). Move/stun breaks
+	// are handled in the channel tick; a fresh CAST is handled at cast start.
+	s.breakInterruptibleChannelsLocked(c)
 	s.cancelOrderLocked(c)
 	hs.attackTarget = ms.id
 	// Pets fight on the player's orders: the same click that sends the avatar at this
@@ -1679,7 +1892,7 @@ func (s *Server) resumeAutoAttackLocked(c *conn, now float64, preferred int32) {
 // nearestAttackableMobLocked returns the closest living ENEMY whose body is within r
 // of the avatar (nil if none) -- the target it auto-acquires when it goes idle.
 //
-// The hostile() filter is load-bearing here, not defensive. The client-issued attack
+// The enemyOf() filter is load-bearing here, not defensive. The client-issued attack
 // path checks allies itself (DO_ACTION, above), but this scan is the SERVER-driven
 // resume: after any ability finishes, resumeAutoAttackLocked re-acquires through here
 // with no client involved. Without the filter the avatar turned on the nearest own
@@ -1690,7 +1903,7 @@ func (s *Server) nearestAttackableMobLocked(c *conn, now float64, r float64) *mo
 	var best *mobState
 	bestD := r
 	for _, m := range hs.mobs {
-		if m.dead || !m.hostile() || c.altarShieldedLocked(m) {
+		if m.dead || !m.enemyOf(c.playerTeam()) || c.altarShieldedLocked(m) {
 			continue
 		}
 		d := math.Hypot(float64(m.x-cx), float64(m.y-cy)) - m.mob.Radius()
@@ -1707,10 +1920,105 @@ func (s *Server) attackPeriodLocked(hs *huntState) float64 {
 	// atk_speed_flat is a flat bonus from avatar tree items (a "+0.3 attack
 	// speed" reads as-is); attackFactor stays the multiplicative buff/slow axis.
 	sp := (hs.av.AttackSpeed + hs.st.modSum(now, "atk_speed_flat")) * hs.st.attackFactor(now)
+	sp *= s.manaScaledAttackSpeedMulLocked(hs, now)
 	if sp < 0.1 {
 		sp = 0.1
 	}
 	return sp
+}
+
+// manaScaledAttackSpeedMulLocked returns the live attack-speed multiplier from
+// Op.ManaScaledAttackSpeed (Sharli's «Жар души»): 1 (no bonus) unless the passive is
+// learned, in which case it grows continuously as CURRENT mana drains -- +Value% per
+// 10% of the caster's max mana currently missing, full at 0 mana.
+func (s *Server) manaScaledAttackSpeedMulLocked(hs *huntState, now float64) float64 {
+	slot := hs.manaSpeedSlot
+	if slot < 1 {
+		return 1
+	}
+	level := int(hs.skillLevel[slot-1])
+	if level < 1 {
+		return 1
+	}
+	var per float64
+	for _, op := range hs.kit.Skills[slot-1].Ops {
+		if op.Kind == gamedata.OpManaScaledAttackSpeed {
+			per = op.Value.At(level)
+			break
+		}
+	}
+	if per <= 0 {
+		return 1
+	}
+	maxMana := hs.maxManaLocked(now)
+	if maxMana <= 0 {
+		return 1
+	}
+	missingFrac := 1 - hs.mana/maxMana
+	if missingFrac < 0 {
+		missingFrac = 0
+	}
+	return 1 + (per/100)*(missingFrac*10)
+}
+
+// tickMoveChargeLocked accumulates Sandariel's «Острие странника» distance-traveled
+// stack: samples the avatar's own dead-reckoned position each upkeep tick, banks the
+// delta, and converts every full chargeDist (Op.Value2) walked into one more charge, up
+// to the rank's cap (Op.Count). A no-op for every avatar without the passive learned.
+func (s *Server) tickMoveChargeLocked(c *conn, now float64) {
+	hs := c.huntState
+	slot := hs.moveChargeSlot
+	if slot < 1 {
+		return
+	}
+	x, y := c.posAtLocked(float32(now))
+	if hs.moveChargeHasLast {
+		hs.moveChargeDist += math.Hypot(float64(x-hs.moveChargeLastX), float64(y-hs.moveChargeLastY))
+	}
+	hs.moveChargeLastX, hs.moveChargeLastY, hs.moveChargeHasLast = x, y, true
+	level := int(hs.skillLevel[slot-1])
+	if level < 1 {
+		return
+	}
+	var perDist, maxCharges float64
+	for _, op := range hs.kit.Skills[slot-1].Ops {
+		if op.Kind == gamedata.OpMoveChargeAttack {
+			perDist = op.Value2.At(level)
+			maxCharges = op.Count.At(level)
+			break
+		}
+	}
+	if perDist <= 0 {
+		return
+	}
+	for hs.moveChargeDist >= perDist && (maxCharges <= 0 || float64(hs.moveChargeCount) < maxCharges) {
+		hs.moveChargeDist -= perDist
+		hs.moveChargeCount++
+	}
+}
+
+// consumeMoveChargeLocked returns the flat bonus damage banked move-charge stacks add to
+// a landing basic attack, resetting the stack to 0 -- «После использования базовой атаки
+// количество зарядов сбрасывается». 0 outside the passive/with no banked charges.
+func (s *Server) consumeMoveChargeLocked(hs *huntState, now float64) float64 {
+	slot := hs.moveChargeSlot
+	if slot < 1 || hs.moveChargeCount == 0 {
+		return 0
+	}
+	level := int(hs.skillLevel[slot-1])
+	count := hs.moveChargeCount
+	hs.moveChargeCount = 0
+	if level < 1 {
+		return 0
+	}
+	var perCharge float64
+	for _, op := range hs.kit.Skills[slot-1].Ops {
+		if op.Kind == gamedata.OpMoveChargeAttack {
+			perCharge = op.Value.At(level)
+			break
+		}
+	}
+	return perCharge * float64(count)
 }
 
 // swingIntervalLocked is the delay between basic-attack swings: the base attack period
@@ -1928,7 +2236,17 @@ func (s *Server) scheduleHitAfterLocked(c *conn, seq int, targetID int32, windup
 		// +attack from avatar tree items, plus any banked on-kill attack (Gellar's souls /
 		// Hekata's kill-window), which grow the base attack floor exactly like gear does.
 		flat := hs.st.modSum(float64(now), "dmg_flat") + s.killAttackBonusLocked(hs, float64(now))
-		dmg := (float64(av.DmgMin) + flat + rand.Float64()*float64(av.DmgMax-av.DmgMin)) * hs.st.modMul(float64(now), "dmg_pct") * hs.powerMul()
+		dmgPctMul := hs.st.modMul(float64(now), "dmg_pct")
+		dmg := (float64(av.DmgMin) + flat + rand.Float64()*float64(av.DmgMax-av.DmgMin)) * dmgPctMul * hs.powerMul()
+		// Sigilion's «Мощь берсерка»: while armed, every swing costs recoilFrac × the
+		// portion of this hit attributable to the LIVE dmg_pct bonus ("ранит себя на 50%
+		// от увеличенного урона"). dmg/dmgPctMul backs out the pre-bonus damage.
+		if float64(now) < hs.recoilUntil && hs.recoilFrac > 0 && dmgPctMul > 1 {
+			if recoil := (dmg - dmg/dmgPctMul) * hs.recoilFrac; recoil > 0 {
+				hs.hp = math.Max(1, hs.hp-recoil)
+				s.syncSelfLocked(c, syncHealth)
+			}
+		}
 		// «Трепка» (Mihalych): each basic attack that lands on the SAME target as the last
 		// deals escalating bonus damage; switching targets resets the streak.
 		dmg += s.consecutiveHitBonusLocked(hs, ms.id)
@@ -1937,6 +2255,20 @@ func (s *Server) scheduleHitAfterLocked(c *conn, seq int, targetID int32, windup
 			dmg += hs.nextHitBonus
 			hs.nextHitBonus = 0
 		}
+		// Miriam's «Зачарованные стрелы»: a swing that can afford the mana cost deals extra
+		// flat damage, consuming that mana; insufficient mana just skips the bonus.
+		if float64(now) < hs.manaShotUntil && hs.mana >= hs.manaShotCost && hs.manaShotCost > 0 {
+			hs.mana -= hs.manaShotCost
+			dmg += hs.manaShotDmg
+			s.syncSelfLocked(c, syncMana)
+		}
+		// Gayal's «Меч жажды»: while the stacking window holds, this landing hit banks one
+		// more stack of lifesteal/attack-speed; at the cap it also bursts bonus damage and
+		// resets the stacks.
+		dmg += s.applyHitStackLocked(c, float64(now))
+		// Sandariel's «Острие странника»: banked distance-walked charges add flat damage to
+		// this swing, then reset to 0.
+		dmg += s.consumeMoveChargeLocked(hs, float64(now))
 		// Crit: crit_pct chance to strike for 1.5× base (+ crit_dmg_pct bonus magnitude),
 		// flagged 2 on the RECEIVE_HIT so the client plays its CritStrikeEffect. (Skill
 		// damage does not crit -- only the basic attack.)
@@ -1946,6 +2278,15 @@ func (s *Server) scheduleHitAfterLocked(c *conn, seq int, targetID int32, windup
 			hitFlags = 2
 		}
 		s.hitMobFlagsLocked(c, ms, dmg, c.objID, hitFlags)
+		// BlackDragon's «Неистовство»: while armed, this swing also cleaves every OTHER
+		// enemy within cleaveRadius of the primary target for the same damage.
+		if float64(now) < hs.cleaveUntil && hs.cleaveRadius > 0 {
+			for _, m2 := range c.mobsWithinLocked(ms.x, ms.y, hs.cleaveRadius) {
+				if m2.id != ms.id {
+					s.hitMobLocked(c, m2, dmg, c.objID)
+				}
+			}
+		}
 		// Lifesteal on basic attacks.
 		if ls := hs.st.modSum(float64(now), "lifesteal_pct"); ls > 0 {
 			s.healPlayerLocked(c, dmg*ls)
@@ -1978,10 +2319,48 @@ func (s *Server) consecutiveHitBonusLocked(hs *huntState, targetID int32) float6
 	for _, op := range hs.kit.Skills[slot-1].Ops {
 		if op.Kind == gamedata.OpConsecutiveHit {
 			per = op.Value.At(level)
+			if op.PerSP > 0 {
+				per += hs.spellPowerLocked(float64(s.battleTime())) * op.PerSP
+			}
 			break
 		}
 	}
 	return float64(hs.hitStreak) * per * hs.powerMul()
+}
+
+// applyHitStackLocked advances Gayal's «Меч жажды» stacking window on a landing basic
+// attack: banks one more stack (refreshing the live lifesteal_pct/attack_speed_pct
+// mods), and returns bonus burst damage (0 normally) the instant the stack count reaches
+// its cap, resetting the count. A no-op outside the window (hitStackCap == 0).
+func (s *Server) applyHitStackLocked(c *conn, now float64) float64 {
+	hs := c.huntState
+	if hs.hitStackCap <= 0 || now >= hs.hitStackUntil {
+		return 0
+	}
+	hs.hitStackCount++
+	var burst float64
+	if hs.hitStackCount >= hs.hitStackCap {
+		burst = hs.hitStackBurstDmg
+		if hs.hitStackBurstSP > 0 {
+			burst += hs.spellPowerLocked(now) * hs.hitStackBurstSP
+		}
+		hs.hitStackCount = 0
+	}
+	// Replace the stacking buff's mods with fresh values reflecting the new count.
+	kept := hs.st.mods[:0]
+	for _, m := range hs.st.mods {
+		if m.src != "hitstack" {
+			kept = append(kept, m)
+		}
+	}
+	hs.st.mods = kept
+	if hs.hitStackCount > 0 {
+		hs.st.mods = append(hs.st.mods,
+			statMod{stat: "lifesteal_pct", value: hs.hitStackLSPer * float64(hs.hitStackCount), until: hs.hitStackUntil, src: "hitstack"},
+			statMod{stat: "attack_speed_pct", value: 1 + hs.hitStackSpdPer*float64(hs.hitStackCount), until: hs.hitStackUntil, src: "hitstack"},
+		)
+	}
+	return burst
 }
 
 // onKillStackOp returns the OpOnKillStack op (and its learned level) in a slot, if any.
@@ -2045,17 +2424,89 @@ func (s *Server) applyOnKillStacksLocked(c *conn, now float64) {
 // runProcsLocked rolls each registered on-hit passive against a struck mob.
 func (s *Server) runProcsLocked(c *conn, ms *mobState, now float64) {
 	hs := c.huntState
-	for _, pr := range hs.procs {
+	for i := range hs.procs {
+		pr := &hs.procs[i] // by pointer: readyAt must persist across ticks
 		level := int(hs.skillLevel[pr.slot-1])
 		if level < 1 { // an unlearned passive (rank-0 ult slot) does not proc
 			continue
+		}
+		if pr.cd.At(level) > 0 && now < pr.readyAt {
+			continue // on its internal cooldown (client button is greyed)
 		}
 		if rand.Float64() >= pr.chance.At(level) {
 			continue
 		}
 		ctx := opCtx{slot: pr.slot, level: level, target: ms, px: ms.x, py: ms.y, hasPos: true}
 		s.applyOpsLocked(c, pr.ops, ctx, now)
+		if cd := pr.cd.At(level); cd > 0 {
+			pr.readyAt = now + cd
+			s.pushPassiveProcCooldownLocked(c, pr.slot, pr.readyAt)
+		}
 	}
+}
+
+// runKillProcsLocked rolls each registered on-KILL passive against a just-slain mob
+// (Gayal's «Аура погибших»: zombies rise from the dead with a per-kill chance). Mirrors
+// runProcsLocked, but is called once from the mob-death branch instead of every landed hit.
+func (s *Server) runKillProcsLocked(c *conn, ms *mobState, now float64) {
+	hs := c.huntState
+	for i := range hs.killProcs {
+		pr := &hs.killProcs[i] // by pointer: readyAt must persist across ticks
+		level := int(hs.skillLevel[pr.slot-1])
+		if level < 1 { // an unlearned passive (rank-0 ult slot) does not proc
+			continue
+		}
+		if pr.cd.At(level) > 0 && now < pr.readyAt {
+			continue // on its internal cooldown (client button is greyed)
+		}
+		if rand.Float64() >= pr.chance.At(level) {
+			continue
+		}
+		ctx := opCtx{slot: pr.slot, level: level, px: ms.x, py: ms.y, hasPos: true}
+		s.applyOpsLocked(c, pr.ops, ctx, now)
+		if cd := pr.cd.At(level); cd > 0 {
+			pr.readyAt = now + cd
+			s.pushPassiveProcCooldownLocked(c, pr.slot, pr.readyAt)
+		}
+	}
+}
+
+// runAnyDamageProcsLocked rolls each registered Op.OnAnyDamage passive once per cast, when
+// the caster's own ACTIVE skill damage lands (Anhel's «Зов фантомов»: a clone can rise from
+// her nuke, not only her basic attack). Centred on the caster's own position -- there is no
+// single struck mob to anchor an AoE-summon proc like this on.
+func (s *Server) runAnyDamageProcsLocked(c *conn, now float64) {
+	hs := c.huntState
+	for i := range hs.anyDamageProcs {
+		pr := &hs.anyDamageProcs[i] // by pointer: readyAt must persist across ticks
+		level := int(hs.skillLevel[pr.slot-1])
+		if level < 1 {
+			continue
+		}
+		if pr.cd.At(level) > 0 && now < pr.readyAt {
+			continue
+		}
+		if rand.Float64() >= pr.chance.At(level) {
+			continue
+		}
+		s.applyOpsLocked(c, pr.ops, opCtx{slot: pr.slot, level: level}, now)
+		if cd := pr.cd.At(level); cd > 0 {
+			pr.readyAt = now + cd
+			s.pushPassiveProcCooldownLocked(c, pr.slot, pr.readyAt)
+		}
+	}
+}
+
+// pushPassiveProcCooldownLocked greys a passive's skill button until readyAt, giving the
+// «уходит на перезарядку» feedback a passive proc otherwise lacks (Edilia's «Пыльца
+// забвения», Morlokai's «Всполох магии»). Mirrors resetCooldownsLocked's per-slot push.
+func (s *Server) pushPassiveProcCooldownLocked(c *conn, slot int, readyAt float64) {
+	hs := c.huntState
+	s.pushAvatarAllLocked(c, battleproto.CmdActionDone, amf.NewArray().
+		Set("id", c.objID).
+		Set("action", skillProtoID(hs.av, slot)).
+		Set("item", false).
+		Set("cooldown", readyAt))
 }
 
 // runDefenseProcsLocked rolls each ON-DAMAGED passive after the avatar takes a hit --
@@ -2067,11 +2518,28 @@ func (s *Server) runDefenseProcsLocked(c *conn, attacker *mobState, dmg float64,
 	if len(hs.defenseProcs) == 0 {
 		return
 	}
+	// Consume-then-reset: this hit's skill-vs-basic-attack flag applies only to THIS roll,
+	// never to a later unrelated hit that never sets it (see the field's doc comment).
+	wasSkill := hs.lastDamageWasSkill
+	hs.lastDamageWasSkill = false
 	px, py := c.posAtLocked(float32(now))
-	for _, pr := range hs.defenseProcs {
+	for i := range hs.defenseProcs {
+		pr := &hs.defenseProcs[i] // by pointer: readyAt must persist across ticks
 		level := int(hs.skillLevel[pr.slot-1])
 		if level < 1 {
 			continue
+		}
+		if pr.cd.At(level) > 0 && now < pr.readyAt {
+			continue // on its internal cooldown (client button is greyed)
+		}
+		if pr.meleeOnly && (attacker == nil || attacker.mob.AttackRange > 0) {
+			continue // BlackDragon's «Кровь дракона»: only a MELEE attacker triggers it
+		}
+		if pr.basicAttackOnly && wasSkill {
+			continue // Gektor's «Реванш»: mob SKILL damage doesn't trigger it
+		}
+		if pr.skillOnly && !wasSkill {
+			continue // Neirofim's «Обращение энергии»: a basic attack doesn't trigger it
 		}
 		if rand.Float64() >= pr.chance.At(level) {
 			continue
@@ -2080,6 +2548,10 @@ func (s *Server) runDefenseProcsLocked(c *conn, attacker *mobState, dmg float64,
 		// for the damage just taken (Nerlag's «Прилив крови»: OpHeal with Value2>0).
 		ctx := opCtx{slot: pr.slot, level: level, target: attacker, px: px, py: py, hasPos: true, dmgIn: dmg}
 		s.applyOpsLocked(c, pr.ops, ctx, now)
+		if cd := pr.cd.At(level); cd > 0 {
+			pr.readyAt = now + cd
+			s.pushPassiveProcCooldownLocked(c, pr.slot, pr.readyAt)
+		}
 	}
 }
 
@@ -2183,6 +2655,23 @@ func (s *Server) hitMobFlagsLocked(c *conn, ms *mobState, dmg float64, damager i
 		ms.aggro = true
 	}
 	ms.hp -= dmg
+	// Op.DamageShare (Kiona's «Лесной покров»): a share of THIS damage heals every living
+	// ally near the marked target instead of just being dealt.
+	if ms.st.cloakHealCoeff > 0 && now < ms.st.cloakUntil {
+		if owner := s.creditConnLocked(c, ms.st.cloakOwner); owner != nil {
+			share := dmg * ms.st.cloakHealCoeff
+			for _, mem := range owner.members() {
+				mh := mem.huntState
+				if mh == nil || mh.deadUntil > 0 {
+					continue
+				}
+				mx, my := mem.posAtLocked(float32(now))
+				if math.Hypot(float64(mx-ms.x), float64(my-ms.y)) <= ms.st.cloakRadius {
+					s.healPlayerLocked(mem, share)
+				}
+			}
+		}
+	}
 	s.broadcastObjLocked(c, ms.id, battleproto.CmdReceiveHit, amf.NewArray().
 		Set("object", ms.id).
 		Set("damager", damager).
@@ -2196,6 +2685,15 @@ func (s *Server) hitMobFlagsLocked(c *conn, ms *mobState, dmg float64, damager i
 	killer := s.creditConnLocked(c, damager)
 	ms.hp = 0
 	ms.dead = true
+	// Op.OnKill's Dur-marked kill window (Lirvein's «Изощренный бросок»): a late kill by
+	// ANY source still pays off the ORIGINAL caster, not just an instant kill by their
+	// cast. Read before ms.st is wiped below.
+	killMarkUntil, killMarkOwner, killMarkOps, killMarkLevel, killMarkSlot :=
+		ms.st.killMarkUntil, ms.st.killMarkOwner, ms.st.killMarkOps, ms.st.killMarkLevel, ms.st.killMarkSlot
+	// Op.ExplodeOnDeath (Wilfang's «Ядовитый укус»): read the poison-explosion state
+	// before ms.st is wiped below.
+	poisonExplodeUntil, poisonExplodeOwner, poisonExplodeDmg, poisonExplodeRadius :=
+		ms.st.poisonExplodeUntil, ms.st.poisonExplodeOwner, ms.st.poisonExplodeDmg, ms.st.poisonExplodeRadius
 	s.broadcastObjLocked(c, ms.id, battleproto.CmdOnKill, amf.NewArray().
 		Set("killer", killer.objID).Set("id", ms.id))
 	s.syncMobHealthLocked(c, ms)
@@ -2207,6 +2705,20 @@ func (s *Server) hitMobFlagsLocked(c *conn, ms *mobState, dmg float64, damager i
 	// corpse until the barrier expires (read before st is wiped).
 	anchorUntil := ms.st.anchorFxUntil
 	ms.st = unitStatus{}
+	if killMarkOps != nil && float64(s.battleTime()) < killMarkUntil {
+		if owner := s.creditConnLocked(c, killMarkOwner); owner != nil && owner.huntState != nil {
+			s.applyOpsLocked(owner, killMarkOps, opCtx{slot: killMarkSlot, level: killMarkLevel}, float64(s.battleTime()))
+		}
+	}
+	// Wilfang's «Ядовитый укус»: a death while still poisoned detonates an AoE burst
+	// around the corpse, credited to whoever applied the poison.
+	if poisonExplodeDmg > 0 && float64(s.battleTime()) < poisonExplodeUntil {
+		if owner := s.creditConnLocked(c, poisonExplodeOwner); owner != nil {
+			for _, m2 := range c.mobsWithinLocked(ms.x, ms.y, poisonExplodeRadius) {
+				s.hitMobLocked(c, m2, poisonExplodeDmg, owner.objID)
+			}
+		}
+	}
 	// End the killer's auto-attack session onto this mob (their client stops
 	// swinging), and resume onto the next enemy if the attack was server-driven.
 	if kh := killer.huntState; kh != nil && kh.attackTarget == ms.id {
@@ -2226,9 +2738,16 @@ func (s *Server) hitMobFlagsLocked(c *conn, ms *mobState, dmg float64, damager i
 	// On-kill heal (Cerber's «Кровавый пир»): the killer restores a fraction of the
 	// slain enemy's max HP, capped.
 	s.applyHealOnKillLocked(killer, ms, float64(s.battleTime()))
+	// On-kill mana (Kiona's «Вдохновение»): each kill restores current mana.
+	s.applyManaOnKillLocked(killer, float64(s.battleTime()))
 	// On-kill attack stacks (Gellar's souls / Hekata's kill-window): bank the kill so the
 	// killer's base attack grows.
 	s.applyOnKillStacksLocked(killer, float64(s.battleTime()))
+	// On-kill procs (Gayal's «Аура погибших»): chance-gated effects that fire once per
+	// kill, distinct from the on-hit/on-struck proc lists.
+	if killer.huntState != nil {
+		s.runKillProcsLocked(killer, ms, float64(s.battleTime()))
+	}
 	// Loot: a ground chest with a single random consumable, shared party-wide
 	// loot rights. Bosses always drop; trash rolls a flat 1-in-N chance.
 	if s.rollDropLocked(c, ms) {
@@ -2312,10 +2831,45 @@ func (s *Server) applyHealOnKillLocked(c *conn, victim *mobState, now float64) {
 			continue
 		}
 		heal := op.Value.At(level) * victim.maxHealth()
-		if cap := op.Value2.At(level); cap > 0 && heal > cap {
-			heal = cap
+		if cap := op.Value2.At(level); cap > 0 {
+			if op.PerSP > 0 {
+				cap += hs.spellPowerLocked(now) * op.PerSP
+			}
+			if heal > cap {
+				heal = cap
+			}
 		}
 		s.healPlayerLocked(c, heal)
+		return
+	}
+}
+
+// applyManaOnKillLocked restores current mana to the killer when it has a learned
+// OpManaOnKill passive (Kiona's «Вдохновение»). Value = flat mana per kill (+ PerSP × SP),
+// scaled by powerMul, clamped to max mana.
+func (s *Server) applyManaOnKillLocked(c *conn, now float64) {
+	hs := c.huntState
+	if hs == nil || hs.manaOnKillSlot == 0 {
+		return
+	}
+	slot := hs.manaOnKillSlot
+	level := int(hs.skillLevel[slot-1])
+	if level < 1 {
+		return
+	}
+	for _, op := range hs.skillDef(slot).Ops {
+		if op.Kind != gamedata.OpManaOnKill {
+			continue
+		}
+		amt := op.Value.At(level) * hs.powerMul()
+		if op.PerSP > 0 {
+			amt += hs.spellPowerLocked(now) * op.PerSP
+		}
+		if amt <= 0 {
+			return
+		}
+		hs.mana = math.Min(hs.maxManaLocked(now), hs.mana+amt)
+		s.syncSelfLocked(c, syncMana)
 		return
 	}
 }
@@ -2328,6 +2882,7 @@ func (s *Server) awardCoinsLocked(c *conn, fromObj, coins int32) {
 	if coins <= 0 {
 		return
 	}
+	coins = buffCoinScale(c, coins) // active money-elixir multiplier (1x if none)
 	money, diamonds, ok := s.Store.AddHeroMoney(c.selfPlayerID, coins)
 	if !ok {
 		return // no hero bound to this battle connection
@@ -2352,6 +2907,9 @@ const heroExpShare = 0.10
 // every level-scaled stat is re-synced so the HUD and the damage/HP math track.
 func (s *Server) grantXPLocked(c *conn, xp float64) {
 	hs := c.huntState
+	if c.buffXPMult > 0 {
+		xp *= c.buffXPMult // active xp-elixir multiplier
+	}
 	hs.xp += xp
 	s.syncSelfLocked(c, syncExperience)
 	if charXP := int32(xp * heroExpShare); charXP > 0 {
@@ -2454,12 +3012,19 @@ func (s *Server) reapplyPassiveLocked(c *conn, slot int, now float64) {
 	// Refresh the permanent buff-bar icon so its hover tip tracks the new rank; this
 	// also lights it up the first time a rank-0 (ult-slot) passive is learned.
 	if sk.BuffIcon && level >= 1 {
-		if hs.passiveBuffEff[slot-1] != 0 {
-			s.push(c, battleproto.CmdRemEffector, amf.NewArray().Set("id", hs.passiveBuffEff[slot-1]))
+		// Keep the icon's effector id stable across a rank-up so it holds its slot in the
+		// client's buff bar (a fresh id would re-append it past its neighbours -- see
+		// refreshPassiveBuffCountersLocked). Only allocate one when first learning the
+		// passive (no live icon yet).
+		id := hs.passiveBuffEff[slot-1]
+		if id != 0 {
+			s.push(c, battleproto.CmdRemEffector, amf.NewArray().Set("id", id))
+		} else {
+			id = hs.newEffID()
+			hs.passiveBuffEff[slot-1] = id
 		}
-		hs.passiveBuffEff[slot-1] = hs.newEffID()
 		hs.passiveBuffCount[slot-1] = passiveBuffCountOrNone(hs, slot, level, now)
-		s.push(c, battleproto.CmdAddEffector, addEffectorArgs(hs.passiveBuffEff[slot-1],
+		s.push(c, battleproto.CmdAddEffector, addEffectorArgs(id,
 			buffProtoID(hs.av, slot), c.objID, -1, now, hs.passiveBuffArgs(slot, level, now)))
 	}
 	s.pushPlayerStatsLocked(c, now)
@@ -2475,6 +3040,7 @@ func (s *Server) refreshPassiveBuffCountersLocked(c *conn, now float64) {
 	if hs.deadUntil > 0 {
 		return // icon is dropped while dead; sendEffectorsLocked re-adds it on respawn
 	}
+	pushStats := false
 	for i := range hs.kit.Skills {
 		if hs.passiveBuffEff[i] == 0 { // no live buff icon in this slot
 			continue
@@ -2485,11 +3051,25 @@ func (s *Server) refreshPassiveBuffCountersLocked(c *conn, now float64) {
 		if !ok || cnt == hs.passiveBuffCount[i] {
 			continue // static passive, or the displayed integer hasn't changed
 		}
-		s.push(c, battleproto.CmdRemEffector, amf.NewArray().Set("id", hs.passiveBuffEff[i]))
-		hs.passiveBuffEff[i] = hs.newEffID()
+		// Reuse the SAME effector id on refresh. The client's battle buff bar keeps a
+		// persistent dict keyed by effector id (BuffRenderer.mBuffs): an id it already
+		// knows is updated in place, but a NEW id is appended to the END of the bar. If we
+		// allocated a fresh id here, every missing-HP tick would drop the icon and re-append
+		// it past its neighbours -- the reported «Воля к победе»/руна swap on taking damage.
+		// REM+ADD with the same id refreshes the counter while holding its slot.
+		id := hs.passiveBuffEff[i]
+		s.push(c, battleproto.CmdRemEffector, amf.NewArray().Set("id", id))
 		hs.passiveBuffCount[i] = cnt
-		s.push(c, battleproto.CmdAddEffector, addEffectorArgs(hs.passiveBuffEff[i],
+		s.push(c, battleproto.CmdAddEffector, addEffectorArgs(id,
 			buffProtoID(hs.av, slot), c.objID, -1, now, hs.passiveBuffArgs(slot, level, now)))
+		// A CasterMissingHP passive (Velial's «Воля к победе») also feeds the displayed
+		// attack damage, so re-sync the avatar card when its bonus changes.
+		if passiveCasterMissingHP(hs.kit.Skills[i], level) > 0 {
+			pushStats = true
+		}
+	}
+	if pushStats {
+		s.pushPlayerStatsLocked(c, now)
 	}
 }
 

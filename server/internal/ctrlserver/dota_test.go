@@ -125,6 +125,60 @@ func TestDotaMatchSizeGating(t *testing.T) {
 	}
 }
 
+// TestDotaMatchSplitsTeams: a «Штурм» match of two players is true PvP -- the matchmaker
+// puts them on OPPOSITE sides (teams 1 and 2), and the assigned side rides through to the
+// launch (PendingBattle.Team), so the pre-battle roster and the battle agree.
+func TestDotaMatchSplitsTeams(t *testing.T) {
+	srv := New()
+	srv.BattleHost = "127.0.0.1"
+	srv.BattlePorts = []int32{9339}
+	srv.SetDotaMatchSize(2)
+	ts := httptest.NewServer(srv.Handler())
+	defer ts.Close()
+	url := ts.URL + "/entry_point.php"
+	dm := gamedata.DotaMaps()[0]
+
+	// Log in and queue one player; return (uid, sessKey).
+	joinAs := func(email string, counter int32) (int32, string) {
+		login := postEnvelope(t, url, loginEnvelope(email, "pw", "1.11", "0", "", counter))
+		lr, _ := login.GetArray(ctrlproto.CmdKey("user", "login"))
+		sessKey, _ := lr.GetString("sess_key")
+		uid, _ := lr.GetInt("id")
+		req := amf.NewArray().Set("object", "fight").Set("action", "join").
+			Set("params", amf.NewArray().Set("map_id", dm.ID)).
+			Set("sess_uid", uid).Set("sess_key", sessKey).Set("counter", counter+1)
+		postEnvelope(t, url, req)
+		return uid, sessKey
+	}
+
+	a, keyA := joinAs("splitA@example.com", 1)
+	b, _ := joinAs("splitB@example.com", 10)
+
+	selA, okA := srv.getFightSel(a)
+	selB, okB := srv.getFightSel(b)
+	if !okA || !okB {
+		t.Fatalf("match did not form for both players: A=%v B=%v", okA, okB)
+	}
+	// The two must be on OPPOSING sides: {1,2}, not both the same team.
+	teams := map[int32]bool{selA.team: true, selB.team: true}
+	if !teams[1] || !teams[2] || selA.team == selB.team {
+		t.Fatalf("match not split into two sides: A.team=%d B.team=%d (want one 1 and one 2)", selA.team, selB.team)
+	}
+
+	// The assigned side survives to the launch handoff.
+	ready := amf.NewArray().Set("object", "fight").Set("action", "ready").
+		Set("params", amf.NewArray()).
+		Set("sess_uid", a).Set("sess_key", keyA).Set("counter", 3)
+	postEnvelope(t, url, ready)
+	pb, ok := srv.Store.TakePendingBattle(a)
+	if !ok {
+		t.Fatal("fight|ready recorded no PendingBattle")
+	}
+	if pb.Team != selA.team {
+		t.Fatalf("PendingBattle.Team = %d, want the matchmaker-assigned side %d", pb.Team, selA.team)
+	}
+}
+
 // TestArenaTabListAndMatchmaking exercises the «Арена» (DM) path the client's Arena tab
 // drives: arena|get_maps {type:DM} must return the arena map (an empty response is the
 // "empty tab" bug), get_map_type_descs must carry a DM blurb, and the map must join and

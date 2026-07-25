@@ -24,7 +24,7 @@ func pvpTaskOf(c *conn, id int32) *pvpTaskState {
 func enemyStructsByLane(inst *huntInstance, role gamedata.DotaRole) map[int][]*mobState {
 	out := map[int][]*mobState{}
 	for _, m := range inst.mobs {
-		if !m.structure || m.team != dotaEnemyTeam || m.dotaRole != role {
+		if !m.structure || m.team != dotaTeamElf || m.dotaRole != role {
 			continue
 		}
 		sc, ok := inst.dota.m.StructByID(m.id - dotaStructIDBase)
@@ -221,7 +221,7 @@ func TestPvpTaskIgnoresNonObjectives(t *testing.T) {
 	}
 
 	// A plain creep (non-structure) must not credit any structure task.
-	creep := &mobState{id: 9001, team: dotaEnemyTeam, structure: false}
+	creep := &mobState{id: 9001, team: dotaTeamElf, structure: false}
 	credit(creep)
 	if s6 := pvpTaskOf(c, 91006); s6 == nil || s6.count != 0 {
 		t.Errorf("creep advanced 91006: %+v", s6)
@@ -338,7 +338,7 @@ func TestPvpTaskShturmOnly(t *testing.T) {
 	}
 
 	// The kill hook must no-op with no dota instance.
-	ms := &mobState{id: dotaStructIDBase + 5, team: dotaEnemyTeam, structure: true, dotaRole: gamedata.DotaGun}
+	ms := &mobState{id: dotaStructIDBase + 5, team: dotaTeamElf, structure: true, dotaRole: gamedata.DotaGun}
 	c.mvMu.Lock()
 	s.creditPvpStructureKillLocked(c.inst, ms)
 	c.mvMu.Unlock()

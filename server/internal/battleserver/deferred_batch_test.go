@@ -248,14 +248,20 @@ func TestKillWindowStacksAttack(t *testing.T) {
 	if hs.killWindowUntil <= now {
 		t.Fatalf("window not opened: killWindowUntil=%g now=%g", hs.killWindowUntil, now)
 	}
-	// Two kills during the window → +4 attack each (rank-1 damagePerKill).
+	// Two kills during the window -> 2x the per-kill increment (rank-1 damagePerKill,
+	// now folding in Hekata's own spell power too - PerSP:1, pass-11 audit - so this reads
+	// the live value rather than hardcoding the old SP-less "4").
+	perKill := hs.killWindowPerKill
+	if perKill <= 0 {
+		t.Fatal("killWindowPerKill must be positive once the window is open")
+	}
 	s.applyOnKillStacksLocked(c, now)
 	s.applyOnKillStacksLocked(c, now)
 	if hs.killWindowStacks != 2 {
 		t.Fatalf("killWindowStacks = %d want 2", hs.killWindowStacks)
 	}
-	if b := s.killAttackBonusLocked(hs, now); b != 8 { // 2 × +4
-		t.Fatalf("window attack bonus = %.0f want 8", b)
+	if b, want := s.killAttackBonusLocked(hs, now), 2*perKill; b != want {
+		t.Fatalf("window attack bonus = %.1f want %.1f", b, want)
 	}
 	// Once the window closes the bonus is gone.
 	if b := s.killAttackBonusLocked(hs, hs.killWindowUntil+1); b != 0 {
@@ -393,6 +399,29 @@ func TestMobManaHelpers(t *testing.T) {
 	}
 	if got := ranged.drainManaLocked(1000); got != 70 || ranged.mana != 0 {
 		t.Errorf("over-drain must clamp at 0: took %.0f, mana %.0f", got, ranged.mana)
+	}
+}
+
+// TestMobManaShouldSync: the live mob-mana bar re-syncs on a threshold-sized move or on
+// hitting an exact empty/full rail, but stays quiet on unchanged / sub-threshold drift.
+func TestMobManaShouldSync(t *testing.T) {
+	cases := []struct {
+		name       string
+		prev, frac float32
+		want       bool
+	}{
+		{"unchanged", 0.5, 0.5, false},
+		{"tiny drift held", 0.50, 0.51, false},
+		{"threshold drop broadcasts", 1.0, 0.9, true},
+		{"big mana-burn broadcasts", 0.8, 0.2, true},
+		{"reaches empty rail", 0.02, 0, true},
+		{"reaches full rail", 0.99, 1, true},
+		{"sub-threshold climb held", 0.90, 0.91, false},
+	}
+	for _, c := range cases {
+		if got := mobManaShouldSync(c.prev, c.frac); got != c.want {
+			t.Errorf("%s: mobManaShouldSync(%.2f, %.2f) = %v, want %v", c.name, c.prev, c.frac, got, c.want)
+		}
 	}
 }
 

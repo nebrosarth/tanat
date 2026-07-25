@@ -462,6 +462,9 @@ type BossSkill struct {
 var summonUnits = map[string]struct{ NameKey, Icon string }{
 	"Avtr_Dsb_Frost_Elemental":        {"IDS_Mob_FrostElemental_Name", "Gui/Mobs/Icons/summon_elemental_frost"},
 	"Avtr_Dsb_Morlokay_Skill4_prop01": {"IDS_MorlokaySkill4_Name", "Gui/Mobs/Icons/neitral_creep_tree"},
+	// Lirvein's «Вендетта» dagger swarm: no dedicated summon-card strings ship for this
+	// VFX prop, so it borrows his own skill-4 name key and avatar portrait icon.
+	"VFX_Avtr_DPS_Lirvein_Skill4_Prop01": {"IDS_LirveinSkill4_Name", "Gui/Avatars/Icons/Avtr_DPS_Lirvein"},
 }
 
 // UnitDesc returns the name key and object-card icon for a summonable unit prefab: the

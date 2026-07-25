@@ -23,6 +23,51 @@ func mintItemIDLocked(h *Hero) int32 {
 	return id
 }
 
+// BagArticleAtIndex resolves the 1-based synthesized bag-row id (the id the user|bag reply
+// assigns each Hero.Bag stack, = index+1) back to its article id. Owned wearable instances
+// (row id >= heroItemInstanceBase) are discrete, not bag stacks, and return ok=false. Used to
+// map a common|action artifact_id to the article the player is opening/using.
+func (s *Store) BagArticleAtIndex(userID, rowID int32) (int32, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	u, ok := s.usersByID[userID]
+	if !ok || u.Hero == nil {
+		return 0, false
+	}
+	idx := int(rowID) - 1
+	if idx < 0 || idx >= len(u.Hero.Bag) {
+		return 0, false
+	}
+	return u.Hero.Bag[idx].ArticleID, true
+}
+
+// ConsumeOneBagArticle removes exactly one unit of articleID from the hero's bag and returns
+// the new stack count (0 once the stack is emptied and dropped). ok=false if the hero holds
+// none. Atomic under the store lock, so an openable item (a chest) can't be consumed twice by
+// concurrent requests.
+func (s *Store) ConsumeOneBagArticle(userID, articleID int32) (newCount int32, ok bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	u, found := s.usersByID[userID]
+	if !found || u.Hero == nil {
+		return 0, false
+	}
+	h := u.Hero
+	for i := range h.Bag {
+		if h.Bag[i].ArticleID == articleID {
+			h.Bag[i].Count--
+			newCount = h.Bag[i].Count
+			if newCount <= 0 {
+				h.Bag = append(h.Bag[:i], h.Bag[i+1:]...)
+				newCount = 0
+			}
+			s.saveUserLocked(u)
+			return newCount, true
+		}
+	}
+	return 0, false
+}
+
 // HeroOwned returns a copy of the hero's unequipped wearables (nil if no account/hero).
 func (s *Store) HeroOwned(userID int32) []OwnedItem {
 	s.mu.Lock()

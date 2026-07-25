@@ -111,6 +111,104 @@ func TestAdminQuestStateAndGrant(t *testing.T) {
 	}
 }
 
+func TestGlobalBuffAddRefreshPersist(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "store.db")
+	s := NewPersistentStore(path)
+	defer s.Close()
+
+	id := withHero(t, s, "buff@x")
+	// Add a buff, then refresh the SAME article -> one entry, later expiry (no stacking).
+	e1, ok := s.AddGlobalBuff(id, 70000, 3600)
+	if !ok {
+		t.Fatal("AddGlobalBuff failed")
+	}
+	e2, _ := s.AddGlobalBuff(id, 70000, 7200)
+	if e2 <= e1 {
+		t.Errorf("refresh did not extend expiry: %d -> %d", e1, e2)
+	}
+	if b := s.HeroActiveBuffs(id); len(b) != 1 {
+		t.Fatalf("want 1 buff after refresh, got %d", len(b))
+	}
+	// A second distinct article -> two active buffs.
+	s.AddGlobalBuff(id, 71000, 3600)
+	if b := s.HeroActiveBuffs(id); len(b) != 2 {
+		t.Fatalf("want 2 buffs, got %d", len(b))
+	}
+	// Non-positive duration is rejected.
+	if _, ok := s.AddGlobalBuff(id, 72000, 0); ok {
+		t.Error("zero-duration buff should be rejected")
+	}
+
+	// Persist across reopen.
+	s.Close()
+	s2 := NewPersistentStore(path)
+	defer s2.Close()
+	if b := s2.HeroActiveBuffs(id); len(b) != 2 {
+		t.Errorf("buffs not persisted: %d", len(b))
+	}
+}
+
+func TestAdminRemoveItems(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "store.db")
+	s := NewPersistentStore(path)
+	defer s.Close()
+
+	id := withHero(t, s, "rm@x")
+
+	// --- bag stack: partial then full removal ---
+	s.AddBagItem(id, 70000, 5)
+	if rem, ok := s.AdminRemoveBagArticle(id, 70000, 2); !ok || rem != 3 {
+		t.Fatalf("partial bag remove: rem=%d ok=%v", rem, ok)
+	}
+	if rem, ok := s.AdminRemoveBagArticle(id, 70000, 0); !ok || rem != 0 {
+		t.Fatalf("full bag remove (count 0): rem=%d ok=%v", rem, ok)
+	}
+	if len(s.HeroBag(id)) != 0 {
+		t.Fatalf("bag not empty after removal: %+v", s.HeroBag(id))
+	}
+	if _, ok := s.AdminRemoveBagArticle(id, 70000, 1); ok {
+		t.Error("removing an absent bag stack should be ok=false")
+	}
+
+	// --- owned wearable instance ---
+	owned, _ := s.AdminGrantWearable(id, 80001, 2)
+	if !s.AdminRemoveOwned(id, owned[0].ID) {
+		t.Fatal("AdminRemoveOwned failed")
+	}
+	if o := s.HeroOwned(id); len(o) != 1 || o[0].ID != owned[1].ID {
+		t.Fatalf("wrong owned removed: %+v", o)
+	}
+	if s.AdminRemoveOwned(id, 999999) {
+		t.Error("removing an absent instance should be false")
+	}
+
+	// --- dressed item: dress the survivor, then destroy it (not undress-to-owned) ---
+	if _, ok := s.DressWearable(id, owned[1].ID, 1); !ok {
+		t.Fatal("DressWearable failed")
+	}
+	if !s.AdminRemoveDressed(id, 1) {
+		t.Fatal("AdminRemoveDressed failed")
+	}
+	if len(s.HeroDressed(id)) != 0 {
+		t.Fatalf("dressed not removed: %+v", s.HeroDressed(id))
+	}
+	if len(s.HeroOwned(id)) != 0 {
+		t.Errorf("destroyed dressed item leaked back into owned: %+v", s.HeroOwned(id))
+	}
+	if s.AdminRemoveDressed(id, 1) {
+		t.Error("removing from an empty slot should be false")
+	}
+
+	// --- persistence: all gone after reopen ---
+	s.Close()
+	s2 := NewPersistentStore(path)
+	defer s2.Close()
+	if len(s2.HeroBag(id)) != 0 || len(s2.HeroOwned(id)) != 0 || len(s2.HeroDressed(id)) != 0 {
+		t.Errorf("removals not persisted: bag=%d owned=%d dressed=%d",
+			len(s2.HeroBag(id)), len(s2.HeroOwned(id)), len(s2.HeroDressed(id)))
+	}
+}
+
 func TestAdminBanPersists(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "store.db")
 	s := NewPersistentStore(path)

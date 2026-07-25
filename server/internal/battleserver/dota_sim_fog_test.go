@@ -44,7 +44,7 @@ func TestDotaCreepFightsWithNoPlayerAnywhere(t *testing.T) {
 		id: 62001, mobIdx: idx, mob: gamedata.Mobs()[idx],
 		x: tower.x + 1, y: tower.y, hp: 5000, maxHP: 5000,
 		dmgMin: 40, dmgMax: 40,
-		team: dotaEnemyTeam, lastSync: now,
+		team: dotaTeamElf, lastSync: now,
 	}
 	inst.mobs[creep.id] = creep
 	hp0 := tower.hp
@@ -162,7 +162,7 @@ func TestSlowActuallySlowsDotaCreep(t *testing.T) {
 	idx := inst.dota.m.ElfCreepMelee
 	creep := &mobState{
 		id: 62002, mobIdx: idx, mob: gamedata.Mobs()[idx],
-		x: 0, y: 0, hp: 5000, maxHP: 5000, team: dotaEnemyTeam, lastSync: now,
+		x: 0, y: 0, hp: 5000, maxHP: 5000, team: dotaTeamElf, lastSync: now,
 	}
 	inst.mobs[creep.id] = creep
 
@@ -274,7 +274,7 @@ func TestDotaCreepCanHitSummon(t *testing.T) {
 	creep := &mobState{
 		id: 62003, mobIdx: idx, mob: gamedata.Mobs()[idx],
 		x: sm.x + 1, y: sm.y, hp: 5000, maxHP: 5000,
-		dmgMin: 30, dmgMax: 30, team: dotaEnemyTeam, lastSync: now,
+		dmgMin: 30, dmgMax: 30, team: dotaTeamElf, lastSync: now,
 	}
 	inst.mobs[creep.id] = creep
 
@@ -308,7 +308,7 @@ func TestDotaCreepKilledByPlayerIsNotLeaked(t *testing.T) {
 	creep := &mobState{
 		id: 62004, mobIdx: idx, mob: gamedata.Mobs()[idx],
 		x: c.x + 1, y: c.y, hp: 10, maxHP: 5000,
-		team: dotaEnemyTeam, lastSync: now, homed: false,
+		team: dotaTeamElf, lastSync: now, homed: false,
 	}
 	inst.mobs[creep.id] = creep
 
@@ -405,7 +405,7 @@ func TestSecondHitOnDyingSummonIsDropped(t *testing.T) {
 	idx := inst.dota.m.ElfCreepMelee
 	mk := func(id int32) *mobState {
 		m := &mobState{id: id, mobIdx: idx, mob: gamedata.Mobs()[idx], x: sm.x + 1, y: sm.y,
-			hp: 5000, maxHP: 5000, team: dotaEnemyTeam, lastSync: now}
+			hp: 5000, maxHP: 5000, team: dotaTeamElf, lastSync: now}
 		inst.mobs[id] = m
 		return m
 	}
@@ -453,7 +453,7 @@ func TestSelfCastFriendBuffLandsOnCaster(t *testing.T) {
 	c.mvMu.Lock()
 	defer c.mvMu.Unlock()
 
-	enemy := dotaAlly(t, inst, 62012, dotaEnemyTeam, c.x+2, c.y, now)
+	enemy := dotaAlly(t, inst, 62012, dotaTeamElf, c.x+2, c.y, now)
 	op := gamedata.Op{Kind: gamedata.OpBuffStat, Value: gamedata.PerLevel{30, 30, 30, 30},
 		Dur: gamedata.PerLevel{5, 5, 5, 5}, Stat: "magic_armor", On: "target"}
 

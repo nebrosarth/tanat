@@ -167,6 +167,18 @@ func (s *Server) pushLeft(remaining []int32, leaverID int32, disbanded bool) {
 	}
 }
 
+// OnMPDConnect fires when a hero's MPD socket registers (fresh login OR relog). Wired as the
+// Hub's OnConnect. Beyond the party-presence push (NotifyOnline), it RE-SENDS the hero's own
+// active global buffs (pushGlobalBuffs): the client's HeroStore.mGlobalBuffs is populated
+// ONLY by the update_global_buffs_mpd push and starts empty on every connect, so without this
+// a rune/elixir buff activated in a previous session shows NO icon on the buff bar after relog
+// (its combat effect still applies -- that re-folds from the persisted hero_buffs at match
+// entry). The re-push repopulates mGlobalBuffs so the buff bar resolves the item icon again.
+func (s *Server) OnMPDConnect(uid int32) {
+	s.NotifyOnline(uid)
+	s.pushGlobalBuffs(uid)
+}
+
 // NotifyOnline / NotifyOffline push a user's presence to their party co-members when
 // their MPD socket connects / disconnects. Wired as the Hub's OnConnect/OnDisconnect.
 func (s *Server) NotifyOnline(uid int32)  { s.notifyPresence(uid, "user|online") }

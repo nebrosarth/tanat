@@ -209,13 +209,16 @@ func TestHuntWorldState(t *testing.T) {
 			continue
 		}
 		mask := binary.LittleEndian.Uint64(data[10:18])
-		if mask&syncTeam != 0 && mask&syncPosition != 0 && mask&syncMaxHealth != 0 {
+		// MAX_MANA must be in the registration blob too, else the client target-card mana bar
+		// defaults to 0 (the «Скелет лучник shows 0 mana» bug). Sent for every mob; melee just
+		// carry a 0 pool.
+		if mask&syncTeam != 0 && mask&syncPosition != 0 && mask&syncMaxHealth != 0 && mask&syncMaxMana != 0 {
 			found = true
 			break
 		}
 	}
 	if !found {
-		t.Errorf("no mob registration sync with TEAM+POSITION+MAX_HEALTH found")
+		t.Errorf("no mob registration sync with TEAM+POSITION+MAX_HEALTH+MAX_MANA found")
 	}
 }
 

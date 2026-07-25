@@ -31,21 +31,27 @@ func TestSandarielSkill3ShowsBuffIcon(t *testing.T) {
 	}
 }
 
-// TestSandarielSkill2IsAOE: «Прыжок» must land an AoE (Radius>0 damage op + an AoERadius
+// TestSandarielSkill2IsAOE: «Прыжок» must land an AoE (Radius>0 buff op + an AoERadius
 // cursor), not a single-target/no-target leap ("2 скилл должен быть не таргетным, а AOE").
+// The AoE is the ally attack/move-speed buff landing on everyone around the destination --
+// NOT damage: the client's Name/LobbyDesc/CommonDesc/ShortDesc/LongDesc never mention any
+// damage token for this skill (pass-6 audit 2026-07-20 removed an invented OpDamage).
 func TestSandarielSkill2IsAOE(t *testing.T) {
 	sk := SkillsFor(avatarByPrefabT(t, "Avtr_DPS_Sandariel")).Skills[1]
 	if sk.AoERadius <= 0 {
 		t.Errorf("Sandariel skill 2 AoERadius = %d, want > 0 (AOE cursor)", sk.AoERadius)
 	}
-	aoeDmg := false
+	aoeBuff := false
 	for _, op := range sk.Ops {
-		if op.Kind == OpDamage && op.Radius > 0 {
-			aoeDmg = true
+		if op.Kind == OpBuffStat && (op.On == "allies" || op.On == "ally") && op.Radius > 0 {
+			aoeBuff = true
+		}
+		if op.Kind == OpDamage {
+			t.Error("Sandariel skill 2 must not deal damage -- the client text never mentions any")
 		}
 	}
-	if !aoeDmg {
-		t.Error("Sandariel skill 2 must have an AoE damage op (OpDamage with Radius > 0)")
+	if !aoeBuff {
+		t.Error("Sandariel skill 2 must have an AoE ally buff op (OpBuffStat On:allies with Radius > 0)")
 	}
 }
 

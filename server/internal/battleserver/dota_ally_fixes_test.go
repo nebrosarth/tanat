@@ -18,7 +18,7 @@ import (
 func dotaAlly(t *testing.T, inst *huntInstance, id int32, team int32, x, y float32, now float64) *mobState {
 	t.Helper()
 	idx := inst.dota.m.HumanCreepMelee
-	if team == dotaEnemyTeam {
+	if team == dotaTeamElf {
 		idx = inst.dota.m.ElfCreepMelee
 	}
 	m := &mobState{
@@ -40,7 +40,7 @@ func TestSkillAoESkipsAlliesHitsEnemies(t *testing.T) {
 	defer c.mvMu.Unlock()
 
 	ally := dotaAlly(t, inst, 61001, dotaPlayerTeam, c.x+2, c.y, now)
-	enemy := dotaAlly(t, inst, 61002, dotaEnemyTeam, c.x+2, c.y+1, now)
+	enemy := dotaAlly(t, inst, 61002, dotaTeamElf, c.x+2, c.y+1, now)
 
 	got := c.mobsWithinLocked(c.x, c.y, 6)
 	var sawAlly, sawEnemy bool
@@ -79,7 +79,7 @@ func TestSkillLineSwathSkipsAllies(t *testing.T) {
 	defer c.mvMu.Unlock()
 
 	ally := dotaAlly(t, inst, 61003, dotaPlayerTeam, c.x+4, c.y, now)
-	enemy := dotaAlly(t, inst, 61004, dotaEnemyTeam, c.x+6, c.y, now)
+	enemy := dotaAlly(t, inst, 61004, dotaTeamElf, c.x+6, c.y, now)
 
 	got := c.mobsAlongLineLocked(c.x, c.y, c.x+10, c.y, 2, 12)
 	for _, m := range got {
@@ -109,7 +109,7 @@ func TestAutoAttackDoesNotAcquireAlly(t *testing.T) {
 	defer c.mvMu.Unlock()
 
 	ally := dotaAlly(t, inst, 61005, dotaPlayerTeam, c.x+1, c.y, now)
-	enemy := dotaAlly(t, inst, 61006, dotaEnemyTeam, c.x+5, c.y, now)
+	enemy := dotaAlly(t, inst, 61006, dotaTeamElf, c.x+5, c.y, now)
 
 	got := s.nearestAttackableMobLocked(c, now, mobAggroRange)
 	if got == nil {
@@ -132,7 +132,7 @@ func TestBounceScansSkipAllies(t *testing.T) {
 	defer c.mvMu.Unlock()
 
 	ally := dotaAlly(t, inst, 61007, dotaPlayerTeam, c.x+1, c.y, now)
-	enemy := dotaAlly(t, inst, 61008, dotaEnemyTeam, c.x+3, c.y, now)
+	enemy := dotaAlly(t, inst, 61008, dotaTeamElf, c.x+3, c.y, now)
 
 	if got := s.nearestMobLocked(c, c.x, c.y, 8, 0); got == nil || got.id == ally.id {
 		t.Fatalf("nearestMobLocked = %v, want the enemy %d", got, enemy.id)
@@ -254,7 +254,7 @@ func TestStructureResistsDisplacement(t *testing.T) {
 	}
 
 	// A creep in the same spot must still move, or the guard is just "never displace".
-	creep := dotaAlly(t, inst, 61010, dotaEnemyTeam, c.x+3, c.y, now)
+	creep := dotaAlly(t, inst, 61010, dotaTeamElf, c.x+3, c.y, now)
 	px := creep.x
 	s.knockbackMobLocked(c, creep, 5, now)
 	if creep.x <= px {

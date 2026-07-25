@@ -81,10 +81,10 @@ func (s *Server) handleUserGameInfo(req ctrlproto.Request, resp *ctrlproto.Respo
 func (s *Server) handleHeroGetDataList(req ctrlproto.Request, resp *ctrlproto.Response) {
 	data := amf.NewArray()
 	for _, h := range s.requestedHeroes(req) {
-		addHeroData(data, h)
+		s.addHeroData(data, h)
 	}
 	if len(data.Assoc) == 0 {
-		addHeroData(data, s.heroFromSession(req))
+		s.addHeroData(data, s.heroFromSession(req))
 	}
 	resp.Add("hero", "get_data_list", amf.NewArray().Set("data", data))
 }
@@ -153,7 +153,7 @@ func (s *Server) handleFullHeroInfo(req ctrlproto.Request, resp *ctrlproto.Respo
 		nick = u.Username
 	}
 	resp.Add("user", "full_hero_info", amf.NewArray().
-		Set("visual_data", heroDataMapOf(h)).
+		Set("visual_data", s.heroDataMapOf(h)).
 		Set("hero_data", s.gameInfoFields(h)).
 		Set("nick", nick).
 		Set("last_visit", int32(0)))
@@ -172,35 +172,39 @@ func (s *Server) gameInfoFields(h *session.Hero) *amf.MixedArray {
 		Set("DEATHS", int32(0)).Set("FIGHTS", int32(0)).
 		Set("WINS", int32(0)).Set("LOSE", int32(0)).
 		Set("FIGHTS_LEAVING", int32(0)).Set("HONOR", int32(0))
+	clanInfo := amf.NewArray().Set("id", int32(-1)).Set("tag", "")
+	if h != nil {
+		clanInfo = s.clanInfoArray(h.ID)
+	}
 	return amf.NewArray().
 		Set("user_id", id).
 		Set("level", level).
 		Set("exp", exp).
 		Set("next_exp", next).
 		Set("stats", stats).
-		Set("clan_info", amf.NewArray().Set("id", int32(-1)).Set("tag", "")).
+		Set("clan_info", clanInfo).
 		Set("buffs", amf.NewArray())
 }
 
 // heroDataMapOf builds the {"<heroId>": {load, dressed_items, clan_info,
 // user_info}} map the client parses in HeroDataListArgParser.ParseData.
-func heroDataMapOf(h *session.Hero) *amf.MixedArray {
+func (s *Server) heroDataMapOf(h *session.Hero) *amf.MixedArray {
 	m := amf.NewArray()
-	addHeroData(m, h)
+	s.addHeroData(m, h)
 	return m
 }
 
 // addHeroData adds h's {load, dressed_items, clan_info, user_info} entry to m, keyed
 // by the hero id (a no-op for a nil hero). Shared by hero|get_data_list (which may
 // carry several occupants) and user|full_hero_info (a single hero).
-func addHeroData(m *amf.MixedArray, h *session.Hero) {
+func (s *Server) addHeroData(m *amf.MixedArray, h *session.Hero) {
 	if h == nil {
 		return
 	}
 	entry := amf.NewArray().
 		Set("load", heroViewArray(h)).
 		Set("dressed_items", dressedItemsArray(h)).
-		Set("clan_info", amf.NewArray().Set("id", int32(-1)).Set("tag", "")).
+		Set("clan_info", s.clanInfoArray(h.ID)).
 		Set("user_info", amf.NewArray().
 			Set("level", h.Level).
 			Set("exp", h.Exp).
@@ -237,11 +241,7 @@ func dressedItemsArray(h *session.Hero) *amf.MixedArray {
 // ---- Phase 3: lobby services (empty-but-valid so the menus don't error) ----
 
 // handleStoreList lives in hero_items.go (the city gear shop).
-
-// handleCastleList answers castle|list. CastleListArgParser requires "castles".
-func (s *Server) handleCastleList(req ctrlproto.Request, resp *ctrlproto.Response) {
-	resp.Add("castle", "list", amf.NewArray().Set("castles", amf.NewArray()))
-}
+// handleCastleList and the other castle|* handlers live in castle.go.
 
 // handleGroupList answers user|group_list -> {users:[...], leader}. It returns the
 // party of the requester (or of the user_id queried), each member row carrying the
@@ -299,7 +299,7 @@ func (s *Server) groupMemberRow(uid int32) *amf.MixedArray {
 		Set("level", level).
 		Set("race", race).
 		Set("gender", gender).
-		Set("clan_info", amf.NewArray().Set("id", int32(-1)).Set("tag", ""))
+		Set("clan_info", s.clanInfoArray(uid))
 }
 
 // handleCanReconnect answers common|can_reconnect with {answer:false} so the

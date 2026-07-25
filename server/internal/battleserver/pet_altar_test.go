@@ -205,7 +205,7 @@ func TestGuardedAltarIsNotAttackable(t *testing.T) {
 
 	var altar *mobState
 	for _, m := range inst.mobs {
-		if m.altar && m.team == dotaEnemyTeam {
+		if m.altar && m.team == dotaTeamElf {
 			altar = m
 			break
 		}
@@ -342,10 +342,10 @@ func TestDoActionOnGuardedAltarIsRefused(t *testing.T) {
 
 	var altar, gun *mobState
 	for _, m := range inst.mobs {
-		if m.altar && m.team == dotaEnemyTeam {
+		if m.altar && m.team == dotaTeamElf {
 			altar = m
 		}
-		if m.structure && m.dotaRole == gamedata.DotaGun && m.team == dotaEnemyTeam && !m.dead {
+		if m.structure && m.dotaRole == gamedata.DotaGun && m.team == dotaTeamElf && !m.dead {
 			gun = m
 		}
 	}

@@ -288,6 +288,75 @@ func (s *Store) AdminGrantWearable(userID, articleID, count int32) ([]OwnedItem,
 	return added, true
 }
 
+// AdminRemoveBagArticle removes count units of a stacking bag item (potion/rune/elixir/chest/
+// totem) from a hero, dropping the stack once it empties. A non-positive count, or a count at
+// or above the stack size, removes the WHOLE stack (the operator "delete this item" case).
+// Returns the remaining count (0 once dropped); ok=false if the hero holds none of it.
+func (s *Store) AdminRemoveBagArticle(userID, articleID, count int32) (remaining int32, ok bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	u, found := s.usersByID[userID]
+	if !found || u.Hero == nil {
+		return 0, false
+	}
+	h := u.Hero
+	for i := range h.Bag {
+		if h.Bag[i].ArticleID == articleID {
+			if count <= 0 || count >= h.Bag[i].Count {
+				h.Bag = append(h.Bag[:i], h.Bag[i+1:]...)
+				s.saveUserLocked(u)
+				return 0, true
+			}
+			h.Bag[i].Count -= count
+			remaining = h.Bag[i].Count
+			s.saveUserLocked(u)
+			return remaining, true
+		}
+	}
+	return 0, false
+}
+
+// AdminRemoveOwned destroys one unequipped wearable instance (by its stable id) without a
+// refund. ok=false if the hero owns no such instance (already dressed, sold, or never owned).
+func (s *Store) AdminRemoveOwned(userID, instanceID int32) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	u, found := s.usersByID[userID]
+	if !found || u.Hero == nil {
+		return false
+	}
+	h := u.Hero
+	for i := range h.Owned {
+		if h.Owned[i].ID == instanceID {
+			h.Owned = append(h.Owned[:i], h.Owned[i+1:]...)
+			s.saveUserLocked(u)
+			return true
+		}
+	}
+	return false
+}
+
+// AdminRemoveDressed destroys the wearable worn in slot outright -- unlike UndressWearable,
+// which moves it back into Owned. This is an operator deletion, so the item is gone, not
+// returned. ok=false if no item occupies that slot.
+func (s *Store) AdminRemoveDressed(userID, slot int32) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	u, found := s.usersByID[userID]
+	if !found || u.Hero == nil {
+		return false
+	}
+	h := u.Hero
+	for i := range h.Dressed {
+		if h.Dressed[i].Slot == slot {
+			h.Dressed = append(h.Dressed[:i], h.Dressed[i+1:]...)
+			s.saveUserLocked(u)
+			return true
+		}
+	}
+	return false
+}
+
 // GetMeta reads a value from the persistent meta key/value table. ok is false for
 // a missing key or an in-memory (no-DB) store.
 func (s *Store) GetMeta(key string) (value string, ok bool) {

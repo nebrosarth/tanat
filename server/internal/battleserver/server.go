@@ -128,6 +128,13 @@ type conn struct {
 	huntState *huntState
 	nav       gamedata.Nav // walkability for the current scene (nil = free)
 
+	// buffXPMult / buffCoinMult are this hero's active ELIXIR xp/money multipliers,
+	// snapshotted at match entry (elixirs are used in the city, not mid-battle, so they don't
+	// change during a hunt). 0 means "unset" -> treated as 1x by buffMult. Applied in
+	// grantXPLocked / awardCoinsLocked; rune stat-buffs fold in as statMods at entry instead.
+	buffXPMult   float64
+	buffCoinMult float64
+
 	// Movement state for the self avatar. The client dead-reckons from the last
 	// POSITION sync, so we keep the last snapshot (x,y at snapT with velocity
 	// vx,vy) and, while moving, an arrival timer that fires the stop sync.
@@ -413,9 +420,10 @@ func (s *Server) sendWorldState(c *conn) {
 		inst := s.joinInstance(room, c.hunt.MapID, c)
 		switch {
 		case inst.dota != nil:
-			// «Штурм»: spawn at the player's base near its altar -- per side, so it comes
-			// from the map's side data and NOT from nav.Spawn() the way Hunt's does.
-			dx, dy := inst.dota.playerSpawn()
+			// «Штурм»: a provisional base spawn on walkable ground. sendHuntWorldState
+			// assigns the player their side (from the matchmaker, else alternating) and
+			// moves them to THAT side's base once hs exists, exactly as «Арена» does.
+			dx, dy := inst.dota.sideSpawn(gamedata.DotaSideHuman)
 			sx, sy = float32(dx), float32(dy)
 		case inst.arena != nil:
 			// «Арена»: a provisional spawn on walkable ground. sendHuntWorldState assigns
@@ -623,6 +631,11 @@ func (s *Server) handleMove(c *conn, p battleproto.Packet) {
 	}
 	// A manual move order breaks the auto-attack session and any pending cast.
 	if hs := c.huntState; hs != nil {
+		// A "breaks on move" stealth (Wilfang's «Засада») reveals the avatar the instant it
+		// steps out of the ambush -- same reveal path attacking/casting uses. No-op otherwise.
+		if hs.stealthBreaksOnMove {
+			s.breakInvisibilityLocked(c, float64(now))
+		}
 		if hs.attackTarget != 0 {
 			s.stopAttackLocked(c, false)
 		}

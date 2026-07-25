@@ -183,7 +183,7 @@ func (s *Server) armPvpAttackTimer(c *conn, seq int, targetID int32, delay, inte
 		if hs == nil || hs.closed || hs.attackSeq != seq || hs.deadUntil > 0 {
 			return
 		}
-		victim := c.arenaMember(targetID)
+		victim := c.pvpMember(targetID)
 		if victim == nil || !arenaEnemies(c, victim) || victim.huntState.deadUntil > 0 {
 			s.stopAttackLocked(c, false)
 			return
@@ -227,7 +227,7 @@ func (s *Server) schedulePvpProjectileLocked(c *conn, seq int, targetID int32, r
 		if hs == nil || hs.closed || hs.attackSeq != seq || hs.deadUntil > 0 {
 			return
 		}
-		victim := c.arenaMember(targetID)
+		victim := c.pvpMember(targetID)
 		if victim == nil || victim.huntState.deadUntil > 0 {
 			return
 		}
@@ -263,7 +263,7 @@ func (s *Server) schedulePvpHitAfterLocked(c *conn, seq int, targetID int32, win
 		if !committed && hs.attackSeq != seq {
 			return
 		}
-		victim := c.arenaMember(targetID)
+		victim := c.pvpMember(targetID)
 		if victim == nil || victim.huntState.deadUntil > 0 {
 			return
 		}
@@ -282,10 +282,12 @@ func (s *Server) schedulePvpHitAfterLocked(c *conn, seq int, targetID int32, win
 	})
 }
 
-// arenaMember returns the enemy avatar this player is targeting if it is still a live
-// member of the same arena, else nil (left, or not an arena at all).
-func (c *conn) arenaMember(objID int32) *conn {
-	if c.inst == nil || c.inst.arena == nil {
+// pvpMember returns the avatar this player is targeting if it is still a live member of
+// the same PvP-capable world, else nil (left, or not a PvP mode). Serves BOTH «Арена»
+// (deathmatch) and «Штурм» (DOTA), which share the whole avatar-vs-avatar attack engine
+// -- the only mode where a hero has enemy heroes to shoot is one that fields two sides.
+func (c *conn) pvpMember(objID int32) *conn {
+	if c.inst == nil || (c.inst.arena == nil && c.inst.dota == nil) {
 		return nil
 	}
 	m := c.inst.members[objID]

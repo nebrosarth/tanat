@@ -41,6 +41,14 @@ const (
 	// OpConsumeDots deals Value bonus damage per DoT stack currently on the
 	// target, then clears them (ShinDalar's "Вскрытие ран").
 	OpConsumeDots OpKind = "consume_dots"
+	// OpDrainMaxHP permanently reduces the target mob's max HP by Value(+PerSP), clamping
+	// current HP down to match (Abominator's «Пожирание»: «уменьшается количество текущего
+	// и максимального здоровья... каждую секунду», nested in the same channel tick as the
+	// OpLifestealHit that heals the caster for the same amount). No auto-revert: mobState's
+	// maxHealth() has no live/mod-aware lookup (unlike the player's maxHPLocked), so unlike
+	// the caster's own temporary max_hp gain this drain lasts the rest of the mob's life --
+	// an acceptable simplification since Hunt mobs are typically killed within one encounter.
+	OpDrainMaxHP OpKind = "drain_max_hp"
 	// OpRevive is a PASSIVE auto-resurrection (Zamaran's «Возрождение»): when the
 	// caster would die, if this passive is learned and off its internal cooldown, it
 	// resurrects in place instead of dying. Value = HP restored (scaled by powerMul,
@@ -59,8 +67,17 @@ const (
 	// Value2. Registered at world-build (healOnKillSlot) and honored in the mob-death
 	// branch (hitMobLocked). Not run through applyOpsLocked.
 	OpHealOnKill OpKind = "heal_on_kill"
+	// OpManaOnKill is a PASSIVE mana-on-kill siphon (Kiona's «Вдохновение»): whenever the
+	// caster kills an enemy, restore Value (+ PerSP × SP) CURRENT mana, scaled by powerMul,
+	// clamped to max. Registered at world-build (manaOnKillSlot) and honored in the mob-death
+	// branch, mirroring OpHealOnKill. Not run through applyOpsLocked.
+	OpManaOnKill OpKind = "mana_on_kill"
 	// OpOnKill is a cast-time wrapper (Lirvein's «Изощренный бросок»): its nested Ops
-	// run only if the cast's primary target died from this cast (ctx.target.dead).
+	// run immediately if the cast's primary target died from this cast (ctx.target.dead).
+	// If Dur > 0 and the target survived the cast, it instead MARKS the target for Dur
+	// seconds («накладывая на цель эффект на N секунд»): if that target later dies from
+	// ANY source before the mark expires, the mob-death branch still fires the nested
+	// Ops for the original caster, mirroring a delayed kill credit.
 	OpOnKill OpKind = "on_kill"
 	// OpCooldownReset clears all of the caster's skill cooldowns (Lirvein's on-kill
 	// reset). Typically nested under OpOnKill.
@@ -119,7 +136,8 @@ const (
 	// mana it is MISSING (Neirofim's «Паралич воли»: «чем меньше маны, тем больше урон»):
 	// Value base + Value2 × (target.maxMana - target.mana), plus a slow whose strength scales
 	// with the target's REMAINING mana (strong when full, none when dry). Manaless (melee)
-	// mobs take only the base and no slow.
+	// mobs still take the flat base (+PerSP) -- only the mana-dependent bonus and the slow,
+	// which have nothing to scale from, are skipped for them.
 	OpManaScaledDamage OpKind = "mana_scaled_damage"
 	// OpManaBurnHit drains mana from the struck target on a basic attack (sit it inside a
 	// Chance-1 on-hit OpProc). Value = amount; Apply "own_mana" makes it Value × the caster's
@@ -146,6 +164,139 @@ const (
 	// holds, Value2 fraction of every blow the caster takes is forwarded to the linked enemy
 	// as magic damage (or heals a linked ally). The link's objID/until live on huntState.
 	OpDeathLink OpKind = "death_link"
+	// OpVisionWard plants a stationary friendly SCOUT object (Urg's «Росток» acorn) at the
+	// cast point for Lifetime seconds — a pure vision utility, no damage or CC. The visible
+	// prop is Unit (a loadable prefab); it carries a fog-of-war VIEW_RADIUS (Radius) so the
+	// whole friendly team sees the patch of terrain around it («открывает небольшой участок
+	// местности для всей дружественной команды»), and each world tick it REVEALS any
+	// stealthed enemy within Radius — breaking their invisibility (balance patch 1.08's
+	// «теперь способность даёт возможность видеть невидимых врагов»). TrapFx is an optional
+	// persistent ground fx. Handled by the ward tick, spawned through applyOpsLocked.
+	OpVisionWard OpKind = "vision_ward"
+
+	// OpTreeForm turns a friendly avatar (self in solo) into a TREE — Urg's «Древесный
+	// камуфляж». It cloaks the target as break-on-move stealth, plants the disguise prop
+	// (Unit) at their feet, and ARMS the reveal burst (nested Ops — magic damage + silence)
+	// that detonates on the surrounding enemies the moment they leave tree form: by moving
+	// («При движении… выходит из формы дерева»), acting, or the stealth expiring. Dur is the
+	// camouflage lifetime; the nested Ops carry their own Radius.
+	OpTreeForm OpKind = "tree_form"
+
+	// OpGrove grows a ring of trees around the caster — Urg's «Непроглядные дебри». Count
+	// props (Unit) are planted on a circle of Radius and stand for Dur seconds; while they
+	// stand the sibling OpSilence on the skill keeps enemies inside from casting («враги не
+	// могут применять способности»). When the trees FALL (Dur elapses) the nested Ops (a
+	// magic-damage burst) hit every enemy still inside («Когда деревья исчезнут, все враги
+	// внутри получат магический урон»). Handled through applyOpsLocked; the fall-damage rides
+	// the deferred-payload queue and the props expire via the anchor-end queue.
+	OpGrove OpKind = "grove"
+
+	// OpSelfRecoil arms a per-attack self-punish window (Sigilion's «Мощь берсерка»):
+	// while it holds (Dur seconds), every basic-attack swing costs the caster
+	// Value×(the attack's live dmg_pct-attributable bonus) as self-damage («ранит себя
+	// на 50% от увеличенного урона от атак»). Value2/Chance unused. Consumed at hit-time
+	// in scheduleHitAfterLocked (hs.recoilFrac/recoilUntil), not run through applyOpsLocked.
+	OpSelfRecoil OpKind = "self_recoil"
+
+	// OpAttackManaBonus arms a mana-fueled attack window (Miriam's «Зачарованные
+	// стрелы»): while it holds (Dur), each basic-attack swing that can afford Value2
+	// mana instead deals Value(+PerSP×SP) extra FLAT damage, consuming that mana — a
+	// swing with insufficient mana lands with no bonus, no failure. Consumed at
+	// hit-time in scheduleHitAfterLocked (hs.manaShot*), not run through applyOpsLocked.
+	OpAttackManaBonus OpKind = "attack_mana_bonus"
+
+	// OpCastMark tags every enemy caught in the op's area (Einzenhaim's «Изгнание
+	// колдовства»): if the marked unit casts a skill within Dur seconds, it takes an
+	// extra Value(+PerSP×SP) damage from the caster who marked it («и при применении
+	// любого навыка в течение {duration} секунд получают {*castDamage} урона»). Only
+	// bosses actually cast skills today, so the mark is honored in tryBossSkillLocked.
+	OpCastMark OpKind = "cast_mark"
+
+	// OpAttackCleave arms a Dur-second window (BlackDragon's «Неистовство»: «нанесение
+	// урона нескольким целям») during which every basic-attack swing ALSO strikes every
+	// other enemy within Radius of the primary target for the same damage, instead of
+	// hitting only the one target. Consumed at hit-time in scheduleHitAfterLocked
+	// (hs.cleaveUntil/cleaveRadius), not run through applyOpsLocked for the per-hit part.
+	OpAttackCleave OpKind = "attack_cleave"
+
+	// OpManaBurnArea drains Value mana from every enemy within Radius of the cast
+	// (PlusMinus's «Шаровая молния»: «сжигая {manaDamage} единиц маны всем врагам» in the
+	// blast). Unlike OpManaBurnHit (a single struck target on a basic attack), this is a
+	// one-shot AoE burn with no damage-back component -- mirrors the radius-drain half of
+	// OpSilenceAll without the silence.
+	OpManaBurnArea OpKind = "mana_burn_area"
+
+	// OpManaScaledAttackSpeed is a PASSIVE marker (Sharli's «Жар души»): attack speed
+	// rises by Value PERCENT for every 10% of the caster's CURRENT mana pool that is
+	// missing («увеличение базовой скорости атаки на {additionalSpeed} за каждые 10%
+	// отсутствующей маны») -- a live, continuously-reevaluated bonus (full mana = none,
+	// empty mana = 10× Value%), not a fixed buff. Not run through applyOpsLocked;
+	// registered at world-build (manaSpeedSlot) and read each time the swing interval is
+	// (re)computed (attackPeriodLocked).
+	OpManaScaledAttackSpeed OpKind = "mana_scaled_attack_speed"
+
+	// OpCleanseOnHit is a PASSIVE that sheds every hostile effect on the caster the
+	// instant a negative ability lands on them (Abominator's «Окоченение»: «При
+	// применении негативной способности на Абоминатора, он скидывает все враждебные
+	// воздействия»). Registered at world-build (cleanseSlot) and honored by the
+	// player-facing-debuff-apply gate (cleansePlayerDebuffsLocked) — LATENT today like
+	// OpImmune, since no mob or avatar currently applies CC to a player avatar. Not run
+	// through applyOpsLocked.
+	OpCleanseOnHit OpKind = "cleanse_on_hit"
+
+	// OpHitStack arms a Dur-second stacking window on cast (Gayal's «Меч жажды»: «каждый
+	// удар увеличивает похищение жизни на 5% и скорость атаки... до 5 ударов»): every basic
+	// attack that lands while it holds adds one stack, each worth +Value lifesteal_pct and
+	// +Value2 attack_speed_pct, up to Count stacks; on reaching Count the landing swing also
+	// deals StackBurstDamage(+PerSP×SP) bonus magic damage and the stacks reset to 0 (the
+	// window itself keeps running, so a fresh climb to Count can burst again before it
+	// expires). Consumed at hit-time in scheduleHitAfterLocked (hs.hitStack*), not run
+	// through applyOpsLocked for the per-hit part -- only the initial arming is.
+	OpHitStack OpKind = "hit_stack"
+
+	// OpMoveChargeAttack is a PASSIVE marker (Sandariel's «Острие странника»): banks a
+	// charge every Value2 units the avatar walks (up to Count charges), each charge
+	// adding Value flat damage to the caster's NEXT basic attack; the stack resets to 0
+	// the instant that attack lands. Registered at world-build (huntState.moveChargeSlot);
+	// distance is accumulated in the per-tick upkeep, consumed in scheduleHitAfterLocked.
+	OpMoveChargeAttack OpKind = "move_charge_attack"
+
+	// OpChainHeal is Kiona's «Лечебная волна»: hops between up to Count living allies
+	// (self first), healing each for Value(+PerSP×SP) and dealing Value2 magic damage to
+	// enemies within Radius of whichever ally is currently being healed -- "восстанавливающую
+	// здоровья каждой цели... враги, находящиеся вблизи исцеляемой цели, получают урона
+	// при каждом скачке".
+	OpChainHeal OpKind = "chain_heal"
+
+	// OpDamageShare arms Kiona's «Лесной покров» damage-redirect: while live, Value
+	// fraction of any damage the marked unit (enemy mob OR ally player -- whichever this
+	// cast resolved) takes is ALSO dealt as healing to every living ally within Radius of
+	// it, credited to this op's caster. Honored in hitMobFlagsLocked/hitPlayerFromLocked
+	// via the shared unitStatus.cloak* fields.
+	OpDamageShare OpKind = "damage_share"
+
+	// OpRevealTarget arms Velial's «Трибунал»: the marked target stays fully revealed to
+	// the caster's whole team for the duration, bypassing the normal distance-based fog/
+	// hide radius (mobViewDistLocked) -- "цель становится видна в невидимости для всех
+	// членов союзной команды". Mobs have no self-stealth today, so this is currently only
+	// observable as an always-visible/un-shaded mark; the primitive is real and tested
+	// independent of that (mirrors OpImmune/OpCleanseOnHit's "latent but genuine" pattern).
+	OpRevealTarget OpKind = "reveal_target"
+
+	// OpZoneArmor is a TOGGLE-only marker (Inshari's «Угнетение»): while the toggle is on,
+	// Value is an armor multiplier that applies ONLY against an attacker standing OUTSIDE
+	// Radius of the caster -- "враги, находящиеся вне зоны действия, наносят пониженный
+	// урон" (an attacker fighting her INSIDE the aura hits at her normal, unbuffed armor).
+	// Armed via huntState.zoneArmorSlot in toggleSkillLocked/toggleOffLocked, read live in
+	// hitPlayerFromLocked (replaces the generic, unconditional "armor_pct" stat for this
+	// specific skill).
+	OpZoneArmor OpKind = "zone_armor"
+
+	// OpMeleeForm is a TOGGLE-only marker (Grimlok's «Темная сторона»): while the toggle is
+	// on, the avatar's effective auto-attack range drops to meleeReach and its projectile
+	// pool is suppressed ("изменяя атаку с дальней на ближнюю"), restored the instant the
+	// toggle turns off. Armed via huntState.meleeFormSlot.
+	OpMeleeForm OpKind = "melee_form"
 )
 
 // PerLevel holds one value per skill RANK. Slots 1-3 carry 5 ranks, the ult
@@ -180,10 +331,35 @@ type Op struct {
 	Scale          string // "phys" | "magic" | "pure" | ""
 	Radius         float64
 	PerSP          float64 // damage/heal added per point of spell power (from bonus_per_sp/per_sp)
+	// PctOfAttack multiplies the caster's LIVE base attack power (hs.baseAttackLocked) by a
+	// per-rank coefficient onto an OpDamage, so the hit tracks gear/buffs instead of a flat
+	// per-rank number baked in at authoring time (Nerlag's «Мясорубка»: client's
+	// «{aoeDamageCoef}% от базовой атаки»). Additive with Value, not a replacement for it.
+	// Empty/zero = no attack-power term (back-compat default).
+	PctOfAttack    PerLevel
+	// PushAside, on an OpDash, shoves every enemy along the charge's straight-line path
+	// this distance away from that line at the moment the dash starts (Zamaran's «Таран»:
+	// client's «отпихивая всех врагов в стороны» -- distinct from the arrival-point
+	// slow+damage AoE, which already exists as separate ops). 0 = no push (back-compat
+	// default). No numeric value is given in the locale text, so this reuses knockbackMobLocked's
+	// own modest default distance.
+	PushAside      float64
 	Apply          string  // "self" targets the caster instead of enemies (health-cost damage)
 	Stat           string  // buffstat: dmg_pct, phys_armor, ... (see statMod)
 	On             string  // buffstat: "self" | "target"
 	BonusMissingHP PerLevel
+	// RefundIfHit, on an OpDamage with Apply=="self", skips the self-inflicted cost entirely
+	// when the cast's paired enemy-facing hit actually connected (ctx.target alive at
+	// application time) -- Abominator's «Бросок плоти»: «теряет здоровье, которое он может
+	// восстановить, ударив цель». false = the self-cost always applies (back-compat default).
+	RefundIfHit bool
+	// GrantsCCImmune, on an OpShield, makes the shielded unit (self or the ally On:"ally"
+	// targets) fully immune to stun/root/silence/slow for as long as the shield lasts
+	// (Arianna's «Щит хранителя»: «щит дает полную неуязвимость... к оглушению и
+	// замедлению»). Reuses the shield's own Dur as the immunity window (huntState.
+	// tempCCImmuneUntil, checked in ccImmuneBlockLocked alongside the permanent passive).
+	// false = an ordinary shield with no CC immunity (back-compat default).
+	GrantsCCImmune bool
 	// CasterMissingHP adds flat bonus damage = value × the CASTER's missing-HP fraction
 	// (Velial's «Воля к победе»: fights harder the closer to death). Added after all
 	// multipliers, so it is NOT scaled by power/attack buffs -- it matches the observed
@@ -192,6 +368,25 @@ type Op struct {
 	// MaxTargets, when >0, caps a damaging/CC op to the N nearest enemies in its area
 	// (Rognar's «Могильный холод» hits only two). 0 = no cap (hit everything in range).
 	MaxTargets int
+	// Randomize shuffles the in-radius candidate list before a MaxTargets cap truncates it,
+	// so the N hit are a random subset instead of the N nearest (Rognar's «Могильный холод»:
+	// «волны холода на двух СЛУЧАЙНЫХ целях» -- explicitly random, not nearest-first).
+	// Ignored when MaxTargets==0. false = nearest-first (back-compat default).
+	Randomize bool
+	// ExcludeCenterTarget drops the AoE's own center target (ctx.target, when the center is
+	// a struck/aimed unit rather than a point) from this op's candidate list before
+	// MaxTargets/PerTargetDecay apply (Titanid's «Ударная волна»: «все ДРУГИЕ враги вокруг
+	// него» explicitly excludes the primary target from the splash/slow; PlusMinus's
+	// «Сверхпроводимость»: the chain's «четырем СОСЕДНИМ целям» excludes the already-struck
+	// mob it centers on). false = the center target may be re-selected as one of its own
+	// splash targets (back-compat default).
+	ExcludeCenterTarget bool
+	// PerTargetDecay reduces an OpDamage's magnitude by this fraction for each successive
+	// target in MaxTargets' nearest-first order (PlusMinus's «Сверхпроводимость»: a
+	// 4-target chain, «каждый следующий удар на 20% слабее предыдущего»). Requires
+	// MaxTargets > 0 (the ordering it decays along). 0 = flat damage to every target
+	// (back-compat default).
+	PerTargetDecay float64
 	// HalveOnDeath drops half of a persistent OpOnKillStack's accumulated stacks when the
 	// caster dies (Gellar's souls — «При смерти теряет половину из накопленных душ»).
 	HalveOnDeath bool
@@ -203,6 +398,127 @@ type Op struct {
 	// PerSoul adds Value×soulStacks bonus damage to a damage op (Gellar's «Армия душ» scales
 	// with banked souls). 0 = no soul scaling.
 	PerSoul PerLevel
+	// PerSoulSP adds PerSoulSP×spellPower×soulStacks on top of PerSoul (Gellar's «Армия
+	// душ»: client's «{*damagePerSoul}+{*@damageSoulSP}» -- the per-soul term is ALSO
+	// SP-scaled, on top of the flat op's own PerSP). 0 = no SP scaling on the soul term.
+	PerSoulSP float64
+
+	// SelfMaxHPPct makes an OpDamage or OpHeal's magnitude a fraction of the CASTER's own
+	// live max HP instead of a flat per-rank table (Gayal's «Поглощение жизни»: «5% от
+	// своего максимального здоровья» dealt and healed each channel tick). 0 = use Value as
+	// authored (back-compat default).
+	SelfMaxHPPct PerLevel
+
+	// StackBurstDamage is the bonus magic damage OpHitStack's swing deals when its stacks
+	// reach Count (Gayal's «Меч жажды»: «наносит {damage}+{@damageSP} урона» on the 5th
+	// hit). PerSP scales it with spell power, matching every other magic burst.
+	StackBurstDamage PerLevel
+
+	// StackCap caps the TOTAL live value an OpBuffStat can accumulate on the same target
+	// from repeated procs of the SAME skill (Titanid's «Каменная кожа»: armor keeps
+	// hardening on every hit, «но не более чем на {armourMax}»). Empty/0 = uncapped
+	// (back-compat default). Checked in addPlayerModLocked against the sum of currently
+	// live mods sharing this op's stat and cast source; a new stack is clamped to the
+	// remaining headroom (0 headroom = the stack is dropped, not appended).
+	StackCap PerLevel
+
+	// DecayTo makes a DoT/Slow's magnitude decay LINEARLY from Value at application down to
+	// this value by the time its Dur expires (Rognar's «Могильный холод»: «замедление и
+	// урон постепенно спадает за время действия»). Empty = flat, no decay (back-compat
+	// default). On OpDot it is the terminal per-second damage; on OpSlow the terminal move
+	// factor (1 = no slow left). Read once at application into overTime/unitStatus, then
+	// interpolated at tick/read time -- see overTime.currentPerSec and moveFactor.
+	DecayTo PerLevel
+
+	// Growth adds Value×(pulse index, 0-based) to an OpChannel's nested op on every tick:
+	// on a nested OpDamage it ramps damage (Miriam's «Убийственный залп»: «каждую секунду
+	// урон... дополнительно увеличивается»); on a nested OpStun it ramps the stun duration
+	// (Titanid's «Землетрясение»: each of the 3 waves stuns 0.2s longer than the last). 0 =
+	// flat, no ramp (back-compat default). Read once into channelState.growth/stunGrowth at
+	// OpChannel creation, applied per-pulse in tickChannelsLocked.
+	Growth PerLevel
+	// RadiusGrowth widens an OpChannel's nested op's AoE by this many units per pulse
+	// (Titanid's «Землетрясение»: «каждая следующая волна шире, чем предыдущая»). 0 = flat
+	// radius (back-compat default). Flat, not per-rank, since the client text gives no
+	// per-rank figure, only "wider each wave". Read once into channelState.radiusGrowth,
+	// applied per-pulse as opCtx.radiusBonus.
+	RadiusGrowth float64
+	// GrowthPerSP adds GrowthPerSP×(pulse index, 0-based)×spellPower on top of Growth's
+	// flat per-pulse ramp (Titanid's «Землетрясение»: client's «{aoeDamageInc}+{damageIncSP}
+	// больше урона» -- the wave-to-wave INCREMENT itself is also SP-scaled, not just the
+	// base hit). 0 = the ramp has no SP term (back-compat default).
+	GrowthPerSP float64
+
+	// GrowthPerEnemy adds Value×(live enemy count within this op's own Radius) bonus
+	// damage to an OpChannel's nested OpDamage every pulse (Avrora's «Освященное место»:
+	// «чем больше союзников вокруг, тем сильнее эффект» -- the solo engine has no allies
+	// to count, so this counts enemies caught in the same zone instead, the nearest
+	// available analog). 0 = flat damage regardless of occupancy (back-compat default).
+	GrowthPerEnemy PerLevel
+
+	// MissingHPLinear/DamageCap implement a true execute (Inshari's «Возмездие»): damage =
+	// MissingHPLinear × (victim's missing HP), clamped to DamageCap(+PerSP×spellPower).
+	// MissingHPLinear==0 leaves OpDamage using Value as authored (back-compat default) --
+	// this REPLACES the base Value formula rather than modifying it, same as SelfMaxHPPct.
+	MissingHPLinear PerLevel
+	DamageCap       PerLevel
+
+	// DmgPctOfAttack, on an OpSummon, makes each spawned unit's Dmg a fraction of the
+	// OWNER's live base attack at spawn time (Lirvein's «Вендетта» daggers: «30% от
+	// базовой атаки») instead of a static per-rank Dmg table. 0 = use Dmg as authored.
+	DmgPctOfAttack float64
+	// LastDouble doubles the FINAL spawned unit's Dmg (Lirvein's «Вендетта»: «последний
+	// кинжал нанесёт удвоенный урон»).
+	LastDouble bool
+	// HpPctOfOwner, on an OpSummon, makes each spawned unit's HP a fraction of the OWNER's
+	// live max HP at spawn time (Anhel's clones: «треть жизни и силы атаки самого Анхеля»)
+	// instead of a static per-rank HP table. 0 = use HP as authored.
+	HpPctOfOwner float64
+	// HpPerSP/DmgPerSP add the caster's live spellPower×value on top of an OpSummon's HP/Dmg
+	// tables (Gayal's raised zombies: client's «{healthMod}+{damageHealthSP}» /
+	// «{dmgMod}+{damageSP}» -- both stats carry their own SP-scaled additive term, mirroring
+	// how OpDamage/OpHeal already read PerSP). 0 = no SP scaling on that stat (back-compat
+	// default).
+	HpPerSP, DmgPerSP float64
+
+	// TargetIsolated gates an op so it fires ONLY when the aimed enemy is ALONE — no other
+	// living enemy of its own side within TriggerRadius of it (Vigilans's «Свидание со
+	// смертью»: «Если цель атаки не находится рядом с союзниками, то каждый удар наносит
+	// увеличенный урон»). Sat inside a Chance-1 on-hit OpProc so the bonus rides every basic
+	// attack, but only against a target caught away from its pack. TriggerRadius = the
+	// "рядом" distance (a sensible default is used when 0).
+	TargetIsolated bool
+
+	// ExplodeOnDeath arms an OpDot's target to detonate if it dies while still poisoned
+	// (Wilfang's «Ядовитый укус»: «если цель умрёт, находясь под этим эффектом,
+	// произойдёт взрыв, наносящий магический урон по области»): an AoE magic burst of
+	// ExplodeDamage(+PerSP×SP) centred on the corpse, radius ExplodeRadius, credited to
+	// this op's caster. false = a plain DoT with no death detonation (back-compat default).
+	ExplodeOnDeath bool
+	ExplodeDamage  PerLevel
+	ExplodeRadius  float64
+	// ExplodeSP scales ONLY the death explosion's damage by spellPower, decoupled from this
+	// op's own PerSP (which, on an ExplodeOnDeath OpDot, instead scales the periodic TICK
+	// damage). Wilfang's «Ядовитый укус» needs the two to differ: the tick itself deals no
+	// damage the client ever describes (Value=0, PerSP=0), while the death burst is the
+	// skill's one real, SP-scaled number. 0 = the explosion has no SP term of its own
+	// (back-compat default).
+	ExplodeSP float64
+
+	// MeleeOnly restricts an OnDamaged OpProc to fire only when the STRIKING mob is a
+	// MELEE attacker (AttackRange <= 0) -- BlackDragon's «Кровь дракона»: «При ближней
+	// атаке по дракону...». A ranged mob's hit does not trigger it. Ignored when false
+	// (fires on any attacker, the back-compat default).
+	MeleeOnly bool
+	// BasicAttackOnly restricts an OnDamaged OpProc to fire only when the incoming hit was
+	// a plain basic attack, NOT a mob/boss SKILL cast (Gektor's «Реванш»: «При получении
+	// урона от базовой атаки...» -- an explicit scope, unlike Titanid/Nerlag's unscoped
+	// OnDamaged procs). Ignored when false (fires regardless of source, back-compat default).
+	BasicAttackOnly bool
+	// SkillOnly is the opposite restriction: the proc fires only when the incoming hit came
+	// from a mob/boss SKILL cast, not a basic attack (Neirofim's «Обращение энергии»:
+	// «Каждое направленное на Нейрофима заклинание...» -- only spells trigger it).
+	SkillOnly bool
 
 	// OnDamaged marks a PASSIVE OpProc that fires when the avatar is STRUCK rather than
 	// when it hits (Titanid's «Каменная кожа» hardens on being hit; Gektor's «Реванш»
@@ -211,10 +527,32 @@ type Op struct {
 	// Value>0, the nested heal/damage ops may also read the size of the hit that triggered
 	// them (Nerlag's «Прилив крови» heals for the damage just taken).
 	OnDamaged bool
+	// OnKill marks a PASSIVE OpProc that fires whenever the avatar's side KILLS an enemy
+	// (Gayal's «Аура погибших»: «При смерти врагов... 15% шанс, что из них восстанут
+	// упыри» -- gated on the victim's DEATH, not on landing a hit). Registered into
+	// hs.killProcs and rolled once per kill from the mob-death branch, centred on the
+	// slain mob's position, distinct from the on-hit (hs.procs) and on-struck
+	// (hs.defenseProcs) proc lists.
+	OnKill bool
+	// OnAnyDamage widens a normal on-hit OpProc (still rolled from basic-attack landings
+	// via hs.procs) so it ALSO rolls once per cast when the caster's own ACTIVE skill
+	// damage lands (Anhel's «Зов фантомов»: client's generic «При нанесении урона» --
+	// "upon DEALING damage" -- unlike every other proc's attack/strike-specific wording,
+	// implying any damage she deals, not just her basic attack). Registered into a second
+	// list, hs.anyDamageProcs, alongside the normal hs.procs entry.
+	OnAnyDamage bool
 
 	// summon
 	Unit                     string // loadable character prefab
 	Count, Lifetime, HP, Dmg PerLevel
+	// Stationary marks a summon that HOLDS its spawn point instead of seeking/escorting
+	// (Morlokai's «Грозовой тотем»): it never moves, and attacks nearby enemies with a
+	// ranged zap rather than walking into melee. A killable stationary turret.
+	Stationary bool
+	// SummonFx is a persistent VFX attached to (owned by) the spawned summon for its
+	// lifetime (Frost's «Исчадие мерзлоты» ice aura belongs to the elemental, not the
+	// caster). Started once on spawn parented to the unit, so it dies with the body.
+	SummonFx string
 	// Pet marks a persistent COMMANDED companion rather than a fire-and-forget swarm.
 	// Grimlok's dinosaur is the one: it lives 180s (the others are 15-30s swarms of
 	// 1-3), so it is a unit the player keeps and directs, not a burst of temporary
@@ -244,6 +582,40 @@ type Op struct {
 	//                      dash lands, so damage/root/etc. hit on impact, not on cast.
 	NoClip          bool
 	StrikeOnArrival bool
+
+	// BreakOnMove marks an OpStealth whose invisibility drops the moment the player issues a
+	// MOVE order, not only on the next attack/cast (Wilfang's «Засада»: an ambush you must
+	// hold in place -- stepping out of position reveals you). Left false on stealth that
+	// persists through movement (Lirvein's «Единение с ветром»). Read at grant time into
+	// huntState.stealthBreaksOnMove.
+	BreakOnMove bool
+
+	// PerTargetGrowth adds Value×(target index, 0-based, nearest-to-caster-first) flat bonus
+	// damage to an OpDamage hitting multiple targets in one cast (Nerlag's «Метание топоров»:
+	// «дополнительного урона каждому последующему врагу, которого они заденут» -- the
+	// OPPOSITE of PerTargetDecay, growth instead of falloff). PerTargetGrowthSP adds the same
+	// index×spellPower term on top (the client's «{*aoeDamageInc}+{*@damageIncSP}»). Both 0 =
+	// flat damage to every target (back-compat default). Forces opTargetsLocked to sort
+	// nearest-to-CASTER first (a beam/line hit's natural "first, second, third..." order).
+	PerTargetGrowth   PerLevel
+	PerTargetGrowthSP float64
+
+	// VictimMaxHPPct makes an OpDot's per-second magnitude a fraction of the TARGET's own
+	// live max HP instead of a flat per-rank table (Elgorm's «Оскверненная почва»: «получают
+	// магический урон равный {damage%}% от своего максимального здоровья»). 0 = use Value as
+	// authored (back-compat default). Sibling of SelfMaxHPPct, which instead reads the
+	// CASTER's own max HP on OpDamage/OpHeal.
+	VictimMaxHPPct PerLevel
+
+	// ScalePerHit rescales an OpBuffStat's authored Value by however many enemies the SAME
+	// cast's preceding OpDamage actually hit (Nerlag's «Поголовная бойня»: «...за каждого
+	// врага, попавшего в область действия» -- the buff grows or shrinks with the landing
+	// hit count, not a flat per-rank number). Value is read as the PER-HIT unit: for a "_pct"
+	// stat it is the multiplier ONE hit would grant (e.g. 1.05 = +5%), combined as
+	// 1+(Value-1)×N; for any other stat it is a flat per-hit amount, combined as Value×N.
+	// N is ctx.hitCount, set by the OpDamage op earlier in the same ops list; 0 hits = no
+	// buff at all. False (default) leaves Value untouched (back-compat).
+	ScalePerHit bool
 
 	Ops []Op // nested ops for trap/channel/proc/aura
 }
@@ -498,6 +870,17 @@ func normalizeOp(op *Op, n int) {
 	op.HP = extendSeq(op.HP, n)
 	op.Dmg = extendSeq(op.Dmg, n)
 	op.TickCost = extendSeq(op.TickCost, n)
+	op.DecayTo = extendSeq(op.DecayTo, n)
+	op.Growth = extendSeq(op.Growth, n)
+	op.StackCap = extendSeq(op.StackCap, n)
+	op.StackBurstDamage = extendSeq(op.StackBurstDamage, n)
+	op.SelfMaxHPPct = extendSeq(op.SelfMaxHPPct, n)
+	op.ExplodeDamage = extendSeq(op.ExplodeDamage, n)
+	op.PerTargetGrowth = extendSeq(op.PerTargetGrowth, n)
+	op.VictimMaxHPPct = extendSeq(op.VictimMaxHPPct, n)
+	op.GrowthPerEnemy = extendSeq(op.GrowthPerEnemy, n)
+	op.MissingHPLinear = extendSeq(op.MissingHPLinear, n)
+	op.DamageCap = extendSeq(op.DamageCap, n)
 	for i := range op.Ops {
 		normalizeOp(&op.Ops[i], n)
 	}

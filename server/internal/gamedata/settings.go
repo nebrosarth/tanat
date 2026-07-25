@@ -48,6 +48,15 @@ type Settings struct {
 	HeroPowerPerLevel  float64 `json:"hero_power_per_level"`
 	HeroHealthPerLevel float64 `json:"hero_health_per_level"`
 
+	// Mob regen rates, each a FRACTION of the mob's max pool restored per second.
+	// MobManaRegenFrac is the IN-COMBAT mana regen that lets ranged mobs and bosses
+	// keep shooting/casting (default 0.06 = 6%/s; set 0 to make mana-drain stick, so a
+	// drained archer can't shoot again until it walks home). MobHPRegenFrac is the HP a
+	// mob heals while LEASHING back to its spawn after a player flees (default 0.4 =
+	// 40%/s) -- it is NOT in-combat healing; a mob never regens HP while fighting.
+	MobManaRegenFrac float64 `json:"mob_mana_regen_frac"`
+	MobHPRegenFrac   float64 `json:"mob_hp_regen_frac"`
+
 	// Global reward multipliers applied on TOP of per-level scaling -- the "2x coin
 	// weekend" event knob. 1.0 = no change.
 	XPMultiplier   float64 `json:"xp_multiplier"`
@@ -56,6 +65,18 @@ type Settings struct {
 	// New-hero starting wallet (was hard-coded 1000/100 in CreateHero).
 	NewHeroMoney   int32 `json:"new_hero_money"`
 	NewHeroDiamond int32 `json:"new_hero_diamond"`
+
+	// WtfMode is "WTF MODE": while on, an avatar's skills cost no mana and never go
+	// on cooldown -- a testing aid for exercising abilities without resource limits.
+	// Was the TANAT_WTF_MODE env var; the admin toggle now drives it live.
+	WtfMode bool `json:"wtf_mode"`
+
+	// HuntStartLevel forces every hunt avatar to spawn at this character level (and
+	// hand out the skill points that leveling would have granted) instead of level 1,
+	// so a tester reaches the level-gated skill ranks (the ult unlocks at level 5)
+	// without grinding XP. 0 (the default) means "no override" -- spawn at level 1.
+	// Was the TANAT_HUNT_START_LEVEL env var.
+	HuntStartLevel int32 `json:"hunt_start_level"`
 
 	// Per-entity base-stat overrides, applied when a unit is instantiated into a
 	// battle (so a change takes effect for newly-spawned units without a restart).
@@ -67,6 +88,13 @@ type Settings struct {
 	AvatarOverrides map[int32]map[string]float64 `json:"avatar_overrides,omitempty"`
 	MobOverrides    map[int32]map[string]float64 `json:"mob_overrides,omitempty"`
 }
+
+// Default mob regen fractions -- kept here (not in battleserver) so gamedata, which
+// cannot import battleserver, owns the authored baseline the runtime reads back.
+const (
+	defaultMobManaRegenFrac = 0.06 // 6% of the pool per second (was mobManaRegenFrac)
+	defaultMobHPRegenFrac   = 0.4  // 40% per second while leashing home (was mobReturnRegenPerSec)
+)
 
 // settingsBox holds the live Settings pointer. Readers Load() it lock-free.
 var settingsBox atomic.Pointer[Settings]
@@ -85,10 +113,14 @@ func defaultSettings() *Settings {
 		MobCoinPerLevel:    0.15,
 		HeroPowerPerLevel:  levelCombatGrowth,
 		HeroHealthPerLevel: levelHealthGrowth,
+		MobManaRegenFrac:   defaultMobManaRegenFrac,
+		MobHPRegenFrac:     defaultMobHPRegenFrac,
 		XPMultiplier:       1.0,
 		CoinMultiplier:     1.0,
 		NewHeroMoney:       1000,
 		NewHeroDiamond:     100,
+		WtfMode:            false,
+		HuntStartLevel:     0,
 		AvatarOverrides:    map[int32]map[string]float64{},
 		MobOverrides:       map[int32]map[string]float64{},
 	}
@@ -165,6 +197,16 @@ func normalize(s *Settings) {
 	if s.NewHeroDiamond < 0 {
 		s.NewHeroDiamond = 0
 	}
+	if s.HuntStartLevel < 0 {
+		s.HuntStartLevel = 0
+	}
+	// Regen fractions: a negative would heal-drain a mob; 0 disables the regen entirely.
+	if s.MobManaRegenFrac < 0 {
+		s.MobManaRegenFrac = 0
+	}
+	if s.MobHPRegenFrac < 0 {
+		s.MobHPRegenFrac = 0
+	}
 }
 
 func cloneOverrides(m map[int32]map[string]float64) map[int32]map[string]float64 {
@@ -192,6 +234,20 @@ func NewHeroWallet() (money, diamond int32) {
 	s := settings()
 	return s.NewHeroMoney, s.NewHeroDiamond
 }
+
+// WTFMode reports whether "WTF MODE" is on: avatar skills cost no mana and never
+// go on cooldown.
+func WTFMode() bool { return settings().WtfMode }
+
+// HuntStartLevel returns the forced hunt-avatar spawn level, or 0 for "no
+// override" (spawn at level 1).
+func HuntStartLevel() int32 { return settings().HuntStartLevel }
+
+// MobManaRegenFrac returns the in-combat mob mana regen (fraction of max pool per
+// second) and MobHPRegenFrac the leash-home HP regen (fraction per second). Both are
+// live admin knobs; 0 disables the respective regen.
+func MobManaRegenFrac() float64 { return settings().MobManaRegenFrac }
+func MobHPRegenFrac() float64    { return settings().MobHPRegenFrac }
 
 // ---- per-entity stat overrides ----
 

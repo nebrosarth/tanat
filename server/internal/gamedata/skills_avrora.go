@@ -48,6 +48,10 @@ func init() {
 			{
 				// 2 — Освященное место: a consecrated spot that burns enemies over
 				// time (channel) while mending the caster (the "allies heal" half).
+				// Screenshot's signature clause -- "чем больше союзников вокруг, тем
+				// сильнее эффект" -- is a real scaling mechanic, not flavor text; the
+				// solo engine has no allies to count, so GrowthPerEnemy counts enemies
+				// caught in the same zone instead (pass-6 audit 2026-07-20).
 				Slot: 2, NameRu: "Освященное место", Type: "ACTIVE",
 				Target: "POINT", Targeting: "", Distance: 10, AoERadius: 4, AoEWidth: 0,
 				ManaCost: []int{45, 50, 55, 60}, Cooldown: []int{14, 13, 12, 11},
@@ -55,7 +59,7 @@ func init() {
 				Ops: []Op{
 					{Kind: OpHot, Value: PerLevel{14, 18, 22, 26}, Dur: PerLevel{5, 5, 5, 5}},
 					{Kind: OpChannel, Dur: PerLevel{5, 5, 5, 5}, Interval: 1, Ops: []Op{
-						{Kind: OpDamage, Value: PerLevel{22, 30, 38, 46}, Scale: "magic", Radius: 4},
+						{Kind: OpDamage, Value: PerLevel{22, 30, 38, 46}, Scale: "magic", Radius: 4, GrowthPerEnemy: PerLevel{4, 6, 8, 10}},
 					}},
 				},
 				TipArgs: map[string]PerLevel{
@@ -65,7 +69,10 @@ func init() {
 			},
 			{
 				// 3 — Воссоединение: the ally-reunite pull. With no allies to grab it
-				// yanks the targeted foe to the caster and restores her health.
+				// yanks the targeted foe to the caster and restores her health. Screenshot
+				// text is pull+heal ONLY -- no damage clause anywhere -- unlike skills 1/2,
+				// which both explicitly describe damage; the stray OpDamage here (pass-6
+				// audit 2026-07-20) was an invented extra effect, removed.
 				Slot: 3, NameRu: "Воссоединение", Type: "ACTIVE",
 				Target: "ENEMY+NOT_BUILDING", Targeting: "TARGET", Distance: 10, AoERadius: 0, AoEWidth: 0,
 				ManaCost: []int{40, 45, 50, 55}, Cooldown: []int{14, 13, 12, 11},
@@ -73,7 +80,6 @@ func init() {
 				Ops: []Op{
 					{Kind: OpPull},
 					{Kind: OpHeal, Value: PerLevel{50, 70, 90, 110}, PerSP: 1},
-					{Kind: OpDamage, Value: PerLevel{30, 40, 50, 60}, Scale: "magic"},
 				},
 				TipArgs: map[string]PerLevel{
 					"hpRestore": PerLevel{50, 70, 90, 110},

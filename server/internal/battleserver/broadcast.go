@@ -1,6 +1,8 @@
 package battleserver
 
 import (
+	"math"
+
 	"tanatserver/internal/amf"
 	"tanatserver/internal/battleproto"
 )
@@ -54,6 +56,42 @@ func (s *Server) broadcastStatLocked(c *conn, objID int32, typ uint64, val, t fl
 		s.push(mem, battleproto.CmdSync, amf.NewArray().Set("data",
 			newSyncBlob(t).setFloats(typ, idx, val).build(count)))
 	})
+}
+
+// mobManaSyncThreshold gates live mob-mana broadcasts: resync only once the fraction has
+// drifted this much since the last push, so per-tick regen and single shots don't flood the
+// wire (regen is ~mobManaRegenFrac/sec, so this lands a sync roughly twice a second while a
+// pool refills, and immediately on a big mana-burn).
+const mobManaSyncThreshold = 0.03
+
+// syncMobManaLocked broadcasts the mob's mana fraction to every viewer when it has moved past
+// mobManaSyncThreshold since the last push, or reached an exact empty/full rail (so the final
+// state always lands). No-op for melee (no pool) and when nothing changed. Keeps the target-
+// card mana bar live as a mob spends mana on shots/casts and as a player drains it.
+func (s *Server) syncMobManaLocked(c *conn, m *mobState, now float64) {
+	if m.maxMana <= 0 {
+		return
+	}
+	frac := float32(math.Max(0, math.Min(1, m.mana/m.maxMana)))
+	if !mobManaShouldSync(m.manaSyncFrac, frac) {
+		return
+	}
+	m.manaSyncFrac = frac
+	s.broadcastStatLocked(c, m.id, syncMana, frac, float32(now))
+}
+
+// mobManaShouldSync reports whether a mana bar at fraction `frac` should be re-broadcast given
+// the last-pushed `prev`: on any move past mobManaSyncThreshold, or when it reaches an exact
+// empty/full rail (so a small final step still commits the rail), but never when unchanged.
+func mobManaShouldSync(prev, frac float32) bool {
+	if frac == prev {
+		return false
+	}
+	d := frac - prev
+	if d < 0 {
+		d = -d
+	}
+	return d >= mobManaSyncThreshold || frac == 0 || frac == 1
 }
 
 // addAttackEffectorLocked pushes the ATTACK effector bound to objID on mem's client

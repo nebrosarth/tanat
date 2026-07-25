@@ -143,6 +143,7 @@ func newHuntInstance(s *Server, id, mapID int32) *huntInstance {
 				}
 			}
 			ms.mana = ms.maxMana
+			ms.manaSyncFrac = 1 // spawns full; the reveal sends this, live syncs track from here
 		}
 		if len(mobT.Skills) > 0 {
 			ms.skillReady = make([]float64, len(mobT.Skills))
@@ -244,6 +245,11 @@ func (inst *huntInstance) leaveInstanceLocked(c *conn) {
 			}
 			for _, a := range c.huntState.anchorEnds {
 				inst.s.untrackObjForMemberLocked(other, a.id, float32(now))
+			}
+			// The leaver's planted vision-ward props must be pulled from the remaining
+			// members too, else they leak (the leaver's tick that would expire them is gone).
+			for _, w := range c.huntState.wards {
+				inst.s.untrackObjForMemberLocked(other, w.obj, float32(now))
 			}
 		}
 	}

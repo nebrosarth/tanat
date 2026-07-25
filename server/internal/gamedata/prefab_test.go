@@ -57,6 +57,23 @@ func TestSummonPrefabsResolvable(t *testing.T) {
 	}
 }
 
+// TestWardPropsResolvable guards the same invisible-object failure for the scout props
+// vision wards plant (Urg's «Росток» tree). These are inert props, NOT summoned combat
+// units, so they are checked here rather than folded into the summon-unit walk (which
+// also feeds the info-card requirement — a prop has no card).
+func TestWardPropsResolvable(t *testing.T) {
+	valid := validPrefabs(t)
+	for _, ks := range skillsByPrefab {
+		for _, sk := range ks.Skills {
+			for _, op := range sk.Ops {
+				if op.Kind == OpVisionWard && op.Unit != "" && !valid[op.Unit] {
+					t.Errorf("ward prop prefab %q is not a loadable prefab name (would spawn invisible)", op.Unit)
+				}
+			}
+		}
+	}
+}
+
 func collectSummonUnits(op Op, seen map[string]bool) {
 	if op.Kind == OpSummon && op.Unit != "" {
 		seen[op.Unit] = true

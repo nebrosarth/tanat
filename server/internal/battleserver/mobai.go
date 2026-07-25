@@ -37,11 +37,12 @@ const (
 	bossSpawnLeash = 2.0
 	mobSpawnLeash  = 12.0
 
-	// mobReturnRegenPerSec is how fast a leashed mob heals while walking home, as a
-	// fraction of its max HP per second. At ~40%/s a full reset takes ~2.5s, which
-	// comfortably tops it off over the walk back from leash range so it arrives (and
-	// re-reveals to a returning player) at full health.
-	mobReturnRegenPerSec = 0.4
+	// The leash-home HP-regen rate (fraction of max HP per second while walking home) is
+	// the admin knob gamedata.MobHPRegenFrac(); its default 0.4 (~40%/s) tops a mob off
+	// over the walk back from leash range so it arrives (and re-reveals to a returning
+	// player) at full health. This is NOT in-combat regen -- a mob never heals while it
+	// is still fighting.
+	//
 	// mobHomeEpsilon: a returning mob within this of its spawn is considered home.
 	mobHomeEpsilon = 0.3
 
@@ -59,12 +60,8 @@ const (
 	// mob's own AttackRange replaces this base.
 	meleeReach = 0.6
 
-	// summonTeam is the sync TEAM a summon is rendered with: it fights for its owner,
-	// so it shares the player's side (the client's self team = FRIEND). It is also the
-	// team a summon must NOT attack.
-	summonTeam int32 = 1
-
 	summonSeek        = 12.0 // summons pick fights inside this radius
+	stationaryTurretRange = 8.0 // a stationary summon (Morlokai's totem) zaps enemies inside this
 	summonRing        = 2.8  // escort radius: summons hold a ring slot AROUND the follow point
 	summonSpawnRadius = 1.2  // tighter ring the burst spawns on, around its cast point
 	summonSlotTol     = 0.6  // deadband: don't re-issue a follow until this far off the slot
@@ -175,6 +172,28 @@ type channelState struct {
 	// effect (Titanid's quake): it breaks the moment the caster acts again -- moves,
 	// is stunned, or casts another skill. See channelInterruptible.
 	interruptible bool
+	// breakDist > 0 makes a UNIT channel a LEASH (Inshari's «Изъятие сущности» siphon):
+	// if the target ever gets further than breakDist from the caster the contact snaps and
+	// the target is stunned for stunOnBreak seconds. Running to full duration ends it with
+	// NO stun. 0 = no leash.
+	breakDist   float64
+	stunOnBreak float64
+	// growth/stunGrowth/radiusGrowth/pulseCount implement Op.Growth/Op.RadiusGrowth
+	// (Miriam's «Убийственный залп» ramps damage; Titanid's «Землетрясение» ramps stun
+	// duration and widens the AoE): each pulse adds growth×pulseCount bonus damage,
+	// stunGrowth×pulseCount bonus stun seconds, and radiusGrowth×pulseCount extra AoE
+	// radius before firing, then increments pulseCount. All-zero is the flat (no ramp)
+	// back-compat default.
+	growth       float64
+	growthSP     float64 // Op.GrowthPerSP: growth×pulseCount also gets a growthSP×pulseCount×spellPower term
+	stunGrowth   float64
+	radiusGrowth float64
+	pulseCount   int
+	// growthPerEnemy/growthRadius implement Op.GrowthPerEnemy (Avrora's «Освященное
+	// место»): each pulse adds growthPerEnemy × the live enemy count within growthRadius
+	// of the pulse's centre. 0 = no occupancy scaling (back-compat default).
+	growthPerEnemy float64
+	growthRadius   float64
 }
 
 // summonState is one allied summoned unit. In a shared world it is rendered by
@@ -191,8 +210,14 @@ func (sm *summonState) alive(now float64) bool {
 }
 
 type summonState struct {
-	id          int32
-	proto       int32
+	id    int32
+	proto int32
+	// team is the ABSOLUTE side this summon fights for: its owner's side, fixed at
+	// creation (c.playerTeam()). It is what the summon renders with (syncTeam) so every
+	// client resolves friend/foe from the owner's side -- an Elf-side («Штурм» team 2)
+	// player's summon must show as team 2, ENEMY to the Human side, FRIEND to its owner --
+	// and the side it must NOT attack. Hunt/solo/Human owners are team 1, unchanged.
+	team        int32
 	hp, maxHP   float64
 	dmg         float64
 	until       float64
@@ -220,6 +245,26 @@ type summonState struct {
 	ordTarget  int32 // enemy the owner ordered it onto (0 = none)
 	ordX, ordY float32
 	ordMove    bool // walking to an ordered ground point
+
+	// stationary (Morlokai's «Грозовой тотем»): a turret that never moves. It holds its
+	// spawn point and zaps the nearest enemy within stationaryRange instead of walking into
+	// melee, so tickSummonsLocked skips all of its seek/escort/separation movement.
+	stationary bool
+
+	// atkSpeedMul/atkSpeedMulUntil implement an OpBuffStat On:"own_summons" attack-speed
+	// buff on this summon (Anhel's «Гнев океана»: «себе, и всем своим клонам»). 0/expired
+	// = the normal 1-swing/sec cadence.
+	atkSpeedMul      float64
+	atkSpeedMulUntil float64
+	// moveSpeedMul/moveSpeedMulUntil is the same idea for MOVE speed (Grimlok's «Дикость»:
+	// the same buff also speeds up his live dinosaur). 0/expired = summonSpeed unmodified.
+	moveSpeedMul      float64
+	moveSpeedMulUntil float64
+
+	// onHitOps fire on every landing basic attack this summon lands (Frost's ice elemental:
+	// «Каждая атака элементаля замедляет врага... стан, если атакует врага под ознобом»).
+	// Copied from the spawning Op.Ops at cast time; nil = a plain damage-only summon.
+	onHitOps []gamedata.Op
 
 	pf pathState // routed chase waypoints when the straight line is wall-blocked
 }
@@ -301,6 +346,20 @@ type procState struct {
 	slot   int
 	chance gamedata.PerLevel
 	ops    []gamedata.Op
+	// cd (from the skill's TipArgs["cooldown"]) is the passive's INTERNAL cooldown: after a
+	// successful proc it cannot fire again for cd seconds, and the client greys the skill
+	// button until readyAt (the missing «уходит на перезарядку» feedback). nil/0 = no cd.
+	cd      gamedata.PerLevel
+	readyAt float64
+	// meleeOnly implements Op.MeleeOnly on a defense (OnDamaged) proc: it rolls only when
+	// the striking mob is melee (BlackDragon's «Кровь дракона»).
+	meleeOnly bool
+	// basicAttackOnly/skillOnly implement Op.BasicAttackOnly/Op.SkillOnly on a defense
+	// (OnDamaged) proc: they roll only for a basic-attack hit (Gektor's «Реванш») or only
+	// for a mob/boss SKILL hit (Neirofim's «Обращение энергии»), read from
+	// huntState.lastDamageWasSkill at roll time.
+	basicAttackOnly bool
+	skillOnly       bool
 }
 
 // memberTickLocked runs one 200ms step of a single player's own upkeep: timed
@@ -356,6 +415,9 @@ func (s *Server) memberTickLocked(c *conn, now float64) {
 
 	// 3. Player statuses.
 	s.tickPlayerStatusLocked(c, now)
+	// 3a. Move-charge stack (Sandariel's «Острие странника»): bank a charge every
+	// chargeDist units walked, up to the rank's cap; consumed on the next basic attack.
+	s.tickMoveChargeLocked(c, now)
 
 	// 3b. Respawn checkpoints: activate the Reborn_point the player walks onto.
 	s.tickRebornLocked(c, now)
@@ -371,6 +433,9 @@ func (s *Server) memberTickLocked(c *conn, now float64) {
 	// 5. Traps (+ deferred trap-anchor cleanup).
 	s.tickTrapsLocked(c, now)
 	s.tickAnchorEndsLocked(c, now)
+	// 5b. Vision wards (Urg's «Росток»): expire past-lifetime props + reveal stealthed
+	// enemies within range.
+	s.tickWardsLocked(c, now)
 
 	// 6. Channels.
 	s.tickChannelsLocked(c, now)
@@ -501,6 +566,16 @@ func (s *Server) tickPlayerStatusLocked(c *conn, now float64) {
 			hs.invisBuffEffID = 0
 		}
 	}
+	// Urg's tree camouflage that ran its full duration without the avatar moving/acting still
+	// leaves tree form (and detonates its reveal burst) on expiry.
+	if hs.treeFormBurst != nil && hs.treeFormUntil > 0 && now >= hs.treeFormUntil {
+		s.fireTreeFormBurstLocked(c, now)
+	}
+	// Wilfang's «Засада» that ran its full duration unbroken still detonates its reveal
+	// burst on expiry, mirroring Urg's tree form above.
+	if hs.stealthBurst != nil && now >= hs.invisibleUntil {
+		s.fireStealthBurstLocked(c, now)
+	}
 	// Revelation potion expiry: end the buff icon (no fx to end, see the doc
 	// on huntState.revealInvisibleUntil for why this potion has no other
 	// visible effect yet).
@@ -540,6 +615,11 @@ func (s *Server) tickTogglesLocked(c *conn, now float64) {
 		}
 		def := hs.skillDef(slot)
 		level := int(hs.skillLevel[slot-1])
+		if hs.toggleStealthSlot == slot {
+			// Astarot's «Слуга тьмы»: keep re-arming stealth every tick so it never lapses
+			// while the toggle (and its mana) hold out; toggle-off breaks it immediately.
+			hs.invisibleUntil = now + 1.0
+		}
 		for _, op := range def.Ops {
 			if op.Kind != gamedata.OpAura {
 				continue
@@ -591,6 +671,13 @@ func (s *Server) tickPassiveAurasLocked(c *conn, now float64) {
 				continue
 			}
 			hs.toggleNextPulse[slot-1] = now + math.Max(op.Interval, 0.5)
+			// An ally-oriented aura (Arianna's «Аура стойкости»: nested On=="allies") buffs
+			// every nearby friendly avatar via allyTargetsLocked instead of scanning mobs.
+			if len(op.Ops) > 0 && (op.Ops[0].On == "ally" || op.Ops[0].On == "allies") {
+				ctx := opCtx{slot: slot, level: level}
+				s.applyOpsLocked(c, op.Ops, ctx, now)
+				continue
+			}
 			cx, cy := c.posAtLocked(float32(now))
 			for _, m := range c.mobsWithinLocked(cx, cy, op.Radius) {
 				ctx := opCtx{slot: slot, level: level, target: m}
@@ -663,6 +750,20 @@ func (s *Server) tickChannelsLocked(c *conn, now float64) {
 		if !groundAnchored || ch.interruptible {
 			broken = broken || hs.st.stunned(now) || c.hasDest
 		}
+		// Leash break (Inshari's siphon): if the tethered target strays past breakDist the
+		// contact snaps, stunning it -- «при сильном отдалении контакт разорвётся, оглушая
+		// цель». Only fires on a distance break, never on the natural full-duration end.
+		if !broken && ch.breakDist > 0 && ch.target > 0 {
+			if ms := hs.mobs[ch.target]; ms != nil && !ms.dead {
+				cx, cy := c.posAtLocked(float32(now))
+				if math.Hypot(float64(ms.x-cx), float64(ms.y-cy)) > ch.breakDist {
+					if ch.stunOnBreak > 0 {
+						s.stunMobLocked(c, ms, now, ch.stunOnBreak)
+					}
+					continue // drop the channel: contact broken
+				}
+			}
+		}
 		if broken || now > ch.until {
 			continue
 		}
@@ -681,9 +782,24 @@ func (s *Server) tickChannelsLocked(c *conn, now float64) {
 					ms = nil
 				}
 			}
+			dmgBonus := ch.growth * float64(ch.pulseCount)
+			if ch.growthSP > 0 {
+				dmgBonus += ch.growthSP * float64(ch.pulseCount) * hs.spellPowerLocked(now)
+			}
+			if ch.growthPerEnemy > 0 {
+				cx, cy := ch.px, ch.py
+				if !ch.hasPos {
+					cx, cy = c.posAtLocked(float32(now))
+				}
+				dmgBonus += ch.growthPerEnemy * float64(len(c.mobsWithinLocked(cx, cy, ch.growthRadius)))
+			}
 			ctx := opCtx{slot: ch.slot, level: ch.level, target: ms,
-				px: ch.px, py: ch.py, hasPos: ch.hasPos}
+				px: ch.px, py: ch.py, hasPos: ch.hasPos,
+				dmgBonus:    dmgBonus,
+				durBonus:    ch.stunGrowth * float64(ch.pulseCount),
+				radiusBonus: ch.radiusGrowth * float64(ch.pulseCount)}
 			s.applyOpsLocked(c, ch.ops, ctx, now)
+			ch.pulseCount++
 		}
 		keep = append(keep, ch)
 	}
@@ -771,7 +887,7 @@ func (s *Server) nearestMobLocked(c *conn, x, y float32, r float64, exclude int3
 	var best *mobState
 	bestD := r
 	for _, m := range c.huntState.mobs {
-		if m.dead || m.id == exclude || !m.hostile() {
+		if m.dead || m.id == exclude || !m.enemyOf(c.playerTeam()) {
 			continue
 		}
 		if d := math.Hypot(float64(m.x-x), float64(m.y-y)); d <= bestD {
@@ -790,7 +906,7 @@ func (s *Server) nearestMobLocked(c *conn, x, y float32, r float64, exclude int3
 func (s *Server) randomMobInRangeLocked(c *conn, x, y float32, r float64, exclude int32) *mobState {
 	var cands []*mobState
 	for _, m := range c.huntState.mobs {
-		if m.dead || m.id == exclude || !m.hostile() {
+		if m.dead || m.id == exclude || !m.enemyOf(c.playerTeam()) {
 			continue
 		}
 		if math.Hypot(float64(m.x-x), float64(m.y-y)) <= r {
@@ -867,6 +983,42 @@ func (c *conn) allocSummonID() int32 {
 	return c.huntState.nextSummonID
 }
 
+// summonAttackSpeedMulLocked returns a summon's current attack-speed multiplier: 1 (the
+// normal 1-swing/sec cadence) unless an OpBuffStat On:"own_summons" buff (Anhel's «Гнев
+// океана») is live on it.
+func summonAttackSpeedMulLocked(sm *summonState, now float64) float64 {
+	if sm.atkSpeedMul > 0 && now < sm.atkSpeedMulUntil {
+		return sm.atkSpeedMul
+	}
+	return 1
+}
+
+// summonMoveSpeedMulLocked mirrors summonAttackSpeedMulLocked for MOVE speed (Grimlok's
+// «Дикость» buffing his live dinosaur's run speed alongside its attack speed).
+func summonMoveSpeedMulLocked(sm *summonState, now float64) float64 {
+	if sm.moveSpeedMul > 0 && now < sm.moveSpeedMulUntil {
+		return sm.moveSpeedMul
+	}
+	return 1
+}
+
+// applySummonOnHitOpsLocked runs a summon's own on-hit ops (Frost's ice elemental: slow +
+// chill-interaction stun on every landing attack) against the mob it just struck. A no-op
+// for any summon without onHitOps (every OTHER summon kind).
+func (s *Server) applySummonOnHitOpsLocked(c *conn, sm *summonState, target *mobState, now float64) {
+	if len(sm.onHitOps) == 0 {
+		return
+	}
+	level := 1
+	if hs := c.huntState; sm.slot >= 1 && sm.slot <= len(hs.skillLevel) {
+		if lv := int(hs.skillLevel[sm.slot-1]); lv >= 1 {
+			level = lv
+		}
+	}
+	ctx := opCtx{slot: sm.slot, level: level, target: target, px: target.x, py: target.y, hasPos: true}
+	s.applyOpsLocked(c, sm.onHitOps, ctx, now)
+}
+
 func (s *Server) summonLocked(c *conn, op gamedata.Op, ctx opCtx, now float64) {
 	hs := c.huntState
 	protoID, ok := hs.summonProtos[op.Unit]
@@ -898,6 +1050,24 @@ func (s *Server) summonLocked(c *conn, op gamedata.Op, ctx opCtx, now float64) {
 	if ctx.hasPos {
 		cx, cy = ctx.px, ctx.py
 	}
+	// DmgPctOfAttack (Lirvein's «Вендетта» daggers) ties each unit's damage to the
+	// OWNER's live base attack at cast time instead of a static per-rank Dmg table.
+	dmg := op.Dmg.At(ctx.level)
+	if op.DmgPctOfAttack > 0 {
+		dmg = op.DmgPctOfAttack * hs.baseAttackLocked(now)
+	}
+	if op.DmgPerSP > 0 {
+		dmg += op.DmgPerSP * hs.spellPowerLocked(now)
+	}
+	// HpPctOfOwner (Anhel's clones) ties each unit's HP to the OWNER's live max HP at
+	// cast time instead of a static per-rank HP table.
+	hp := op.HP.At(ctx.level)
+	if op.HpPctOfOwner > 0 {
+		hp = op.HpPctOfOwner * hs.maxHPLocked(now)
+	}
+	if op.HpPerSP > 0 {
+		hp += op.HpPerSP * hs.spellPowerLocked(now)
+	}
 	for i := 0; i < n; i++ {
 		id := c.allocSummonID()
 		// Give each summon a fixed slot angle on the ring so the group spawns
@@ -906,16 +1076,25 @@ func (s *Server) summonLocked(c *conn, op gamedata.Op, ctx opCtx, now float64) {
 		ang := float64(i) * 2 * math.Pi / float64(n)
 		sx := cx + float32(summonSpawnRadius*math.Cos(ang))
 		sy := cy + float32(summonSpawnRadius*math.Sin(ang))
+		unitDmg := dmg
+		// LastDouble (Lirvein's «Вендетта»): "последний кинжал нанесёт удвоенный урон".
+		if op.LastDouble && i == n-1 {
+			unitDmg *= 2
+		}
 		sm := &summonState{
 			id: id, proto: protoID, x: sx, y: sy, fang: ang,
-			hp: op.HP.At(ctx.level), maxHP: op.HP.At(ctx.level),
-			dmg:   op.Dmg.At(ctx.level),
+			team: c.playerTeam(), // fights for its owner's absolute side (1 Human / 2 Elf)
+			hp:   hp, maxHP: hp,
+			dmg:   unitDmg,
 			until: now + op.Lifetime.At(ctx.level),
 			pet:   op.Pet, slot: ctx.slot,
+			stationary: op.Stationary,
+			// Frost's «Исчадие мерзлоты»: the elemental's own on-hit slow/chill-stun combo.
+			onHitOps: op.Ops,
 		}
 		// A pet summoned onto a target inherits that as its first order -- casting the
 		// summon at an enemy means "go get it", not "stand there".
-		if op.Pet && ctx.target != nil && !ctx.target.dead && ctx.target.hostile() {
+		if op.Pet && ctx.target != nil && !ctx.target.dead && ctx.target.enemyOf(c.playerTeam()) {
 			sm.ordTarget = ctx.target.id
 		}
 		hs.summons[id] = sm
@@ -923,6 +1102,12 @@ func (s *Server) summonLocked(c *conn, op gamedata.Op, ctx opCtx, now float64) {
 		// Outside an instance c.members() is [c], so this is the owner-only path.
 		for _, mem := range c.members() {
 			s.revealSummonToMemberLocked(mem, sm, now)
+		}
+		// A persistent aura attached to the unit (Frost's ice elemental) -- started once,
+		// world-scoped, parented to the summon so it dies with the body. Fired after the
+		// reveal loop so the object exists on every client before the fx attaches.
+		if op.SummonFx != "" {
+			s.fxStartLocked(c, op.SummonFx, sm.id, 0, false, 0, 0)
 		}
 	}
 }
@@ -955,10 +1140,10 @@ func (s *Server) revealSummonToMemberLocked(mem *conn, sm *summonState, now floa
 			// actually animates (same latent bug the ally avatar had).
 			setFloats(syncAttackSpeed, idx, 1.0).
 			setFloats(syncRadius, idx, float32(summonRadius)).
-			// Vision -- a pet is always FRIEND, so unlike a mob's this always spawns a
-			// reveal zone on a map that renders fog. See creepViewRadius.
+			// Vision -- a summon is FRIEND to its own side, so on a fog map it spawns a
+			// reveal zone for that side. See creepViewRadius.
 			setFloats(syncViewRadius, idx, effectiveViewRadius(summonViewRadius)).
-			setInt(syncTeam, idx, summonTeam).
+			setInt(syncTeam, idx, sm.team).
 			build(hs.tr.count())))
 	// ATTACK effector so the model swings when we push its ACTIONs.
 	s.addAttackEffectorLocked(mem, sm.id, summonAttackProtoID, now)
@@ -991,14 +1176,14 @@ func (s *Server) petTargetLocked(c *conn, sm *summonState, now float64) *mobStat
 	if sm.ordTarget == 0 {
 		return nil
 	}
-	if m := hs.mobs[sm.ordTarget]; m != nil && !m.dead && m.hostile() {
+	if m := hs.mobs[sm.ordTarget]; m != nil && !m.dead && m.enemyOf(c.playerTeam()) {
 		return m
 	}
 	sm.ordTarget = 0
 	var best *mobState
 	bestD := summonSeek
 	for _, m := range hs.mobs {
-		if m.dead || !m.hostile() {
+		if m.dead || !m.enemyOf(c.playerTeam()) {
 			continue
 		}
 		if d := math.Hypot(float64(m.x-sm.x), float64(m.y-sm.y)); d < bestD {
@@ -1070,6 +1255,36 @@ func (s *Server) tickSummonsLocked(c *conn, now float64) {
 				Set("item", false).
 				Set("cooldown", now))
 		}
+		// A STATIONARY turret (Morlokai's «Грозовой тотем») never moves: it holds its spawn
+		// point and zaps a RANDOM enemy within range each second ("...случайным врагам
+		// вокруг" -- not the nearest one, so a single unit parked next to it can't tank
+		// every bolt while the rest of a pack takes none). Handled before the seek/escort
+		// movement logic and always `continue`s so no move order is ever issued for it.
+		if sm.stationary {
+			var candidates []*mobState
+			for _, m := range hs.mobs {
+				if m.dead || !m.enemyOf(c.playerTeam()) {
+					continue
+				}
+				if math.Hypot(float64(m.x-sm.x), float64(m.y-sm.y)) < stationaryTurretRange {
+					candidates = append(candidates, m)
+				}
+			}
+			var tgt *mobState
+			if len(candidates) > 0 {
+				tgt = candidates[rand.Intn(len(candidates))]
+			}
+			if tgt != nil && now >= sm.nextSwing {
+				sm.nextSwing = now + 1.0/summonAttackSpeedMulLocked(sm, now)
+				s.broadcastObjLocked(c, sm.id, battleproto.CmdAction,
+					newActionArgs(sm.id, summonAttackProtoID, tgt.id, now,
+						amf.NewArray().Set("x", 0.0).Set("y", 0.0)))
+				sm.swingDoneAt = now + 0.9
+				s.hitMobLocked(c, tgt, sm.dmg, sm.id)
+				s.applySummonOnHitOpsLocked(c, sm, tgt, now)
+			}
+			continue
+		}
 		// Find something to fight. Only ENEMIES: a summon fights for its owner, so it
 		// is team 1 (see revealSummonToMemberLocked) and must skip the player's own
 		// side. In Hunt every mob is team 0 -> teamVal() -1, so all of them stay
@@ -1099,7 +1314,9 @@ func (s *Server) tickSummonsLocked(c *conn, now float64) {
 			best = math.Hypot(float64(target.x-sm.x), float64(target.y-sm.y))
 		} else {
 			for _, m := range hs.mobs {
-				if m.dead || m.teamVal() == summonTeam {
+				// Judge the target against the OWNER's side (c is the summon's owner here),
+				// the same authority the pet path uses -- a summon fights for whoever cast it.
+				if m.dead || !m.enemyOf(c.playerTeam()) {
 					continue
 				}
 				d := math.Hypot(float64(m.x-sm.x), float64(m.y-sm.y))
@@ -1146,7 +1363,7 @@ func (s *Server) tickSummonsLocked(c *conn, now float64) {
 		// it begins its strike, the exact «двигается во время замаха» regression the creep
 		// path was already fixed for (and which the Hunt mob arm still has as a wart).
 		if now >= sm.nextSwing {
-			sm.nextSwing = now + 1.0
+			sm.nextSwing = now + 1.0/summonAttackSpeedMulLocked(sm, now)
 			s.broadcastObjLocked(c, sm.id, battleproto.CmdAction,
 				newActionArgs(sm.id, summonAttackProtoID, target.id, now,
 					amf.NewArray().Set("x", 0.0).Set("y", 0.0)))
@@ -1154,6 +1371,7 @@ func (s *Server) tickSummonsLocked(c *conn, now float64) {
 			// re-triggers cleanly (mirrors the mob path).
 			sm.swingDoneAt = now + 0.9
 			s.hitMobLocked(c, target, sm.dmg, sm.id)
+			s.applySummonOnHitOpsLocked(c, sm, target, now)
 		}
 		s.moveSummonLocked(c, sm, 0, 0, false, now)
 	}
@@ -1171,6 +1389,8 @@ func (sm *summonState) ringPoint(cx, cy float32, radius float64) (float32, float
 // clamped to walkable ground and routes around walls (same nav treatment as
 // mobs) so a summon can't chase its target through geometry.
 func (s *Server) moveSummonLocked(c *conn, sm *summonState, tx, ty float32, chase bool, now float64) {
+	// Grimlok's «Дикость» also speeds up his live dinosaur's run, not just its swing.
+	speed := float32(float64(summonSpeed) * summonMoveSpeedMulLocked(sm, now))
 	dt := tickInterval.Seconds()
 	px0, py0 := sm.x, sm.y
 	sm.x += sm.vx * float32(dt)
@@ -1212,7 +1432,7 @@ func (s *Server) moveSummonLocked(c *conn, sm *summonState, tx, ty float32, chas
 			if sn < 1e-3 {
 				stx, sty, sn = ux, uy, 1
 			}
-			nvx, nvy = stx/sn*summonSpeed, sty/sn*summonSpeed
+			nvx, nvy = stx/sn*speed, sty/sn*speed
 		}
 	default:
 		sm.pf.pts = nil
@@ -1223,7 +1443,7 @@ func (s *Server) moveSummonLocked(c *conn, sm *summonState, tx, ty float32, chas
 		// just outside the body it was standing in and holds there. Reduced speed so
 		// getting unstuck reads as a shuffle, not a charge (mirrors the Hunt mob arm).
 		if sepN > mobSepStep {
-			nvx, nvy = sepx/sepN*summonSpeed*mobSidestepFrac, sepy/sepN*summonSpeed*mobSidestepFrac
+			nvx, nvy = sepx/sepN*speed*mobSidestepFrac, sepy/sepN*speed*mobSidestepFrac
 		}
 	}
 	// A push is lateral, so it can aim at ground the straight heading never touched. Keep
@@ -1236,7 +1456,7 @@ func (s *Server) moveSummonLocked(c *conn, sm *summonState, tx, ty float32, chas
 			if chase {
 				if dx, dy := tx-sm.x, ty-sm.y; math.Hypot(float64(dx), float64(dy)) > 0.3 {
 					d := float32(math.Hypot(float64(dx), float64(dy)))
-					nvx, nvy = dx/d*summonSpeed, dy/d*summonSpeed
+					nvx, nvy = dx/d*speed, dy/d*speed
 				}
 			}
 		}
@@ -1250,7 +1470,7 @@ func (s *Server) moveSummonLocked(c *conn, sm *summonState, tx, ty float32, chas
 	// is worth a packet. Mirrors the mob chase guard.
 	stopping := nvx == 0 && nvy == 0
 	if !stopping && now-sm.posSyncAt <= 0.7 &&
-		math.Hypot(float64(nvx-sm.vx), float64(nvy-sm.vy)) <= summonSpeed*0.3 {
+		math.Hypot(float64(nvx-sm.vx), float64(nvy-sm.vy)) <= float64(speed)*0.3 {
 		return
 	}
 	sm.vx, sm.vy = nvx, nvy
@@ -1383,6 +1603,7 @@ func (s *Server) resolveMobHitLocked(m *mobState, members []*conn, now float64) 
 			continue
 		}
 		if mem.objID == m.hitTarget {
+			hs.lastDamageWasSkill = false
 			s.hitPlayerLocked(mem, m, m.hitDmg, now)
 			return
 		}
@@ -1473,13 +1694,12 @@ func (s *Server) closeMobSwingLocked(c *conn, m *mobState, now float64) {
 const (
 	// Ranged mobs and bosses carry a mana pool (mobState.maxMana); melee trash has none.
 	// mobRangedManaCost is spent per ranged basic-attack shot, bossSkillManaCost per boss
-	// skill cast. Regen (mobManaRegenFrac of the pool per second) comfortably outpaces a
-	// mob's own steady spend, so a mob never self-starves -- only a player's active
-	// mana-drain / mana-burn skill can, which is exactly the tactical window those skills
-	// promise. defaultRangedMana/defaultBossMana back-fill unauthored pools.
+	// skill cast. Regen (gamedata.MobManaRegenFrac() of the pool per second, an admin knob)
+	// by default comfortably outpaces a mob's own steady spend, so a mob never self-starves
+	// -- only a player's active mana-drain / mana-burn skill can. Lowering the knob (or 0)
+	// makes a drained mob stay drained. defaultRangedMana/defaultBossMana back-fill pools.
 	mobRangedManaCost = 6.0
 	bossSkillManaCost = 25.0
-	mobManaRegenFrac  = 0.06
 	defaultRangedMana = 120.0
 	defaultBossMana   = 320.0
 )
@@ -1487,10 +1707,14 @@ const (
 func (s *Server) mobUpkeepLocked(c *conn, m *mobState, now float64) bool {
 	st := &m.st
 
-	// Mana regen for the ranged/boss pool (private server-side resource; no client bar).
+	// Mana regen for the ranged/boss pool, then push the mana bar to viewers if it moved
+	// enough since the last sync -- so a bar drained by a shot/boss-cast/mana-burn visibly
+	// drops and climbs back live (throttled; a no-op for melee). Runs every mob tick, but
+	// only broadcasts on a meaningful change (syncMobManaLocked's threshold).
 	if m.maxMana > 0 && m.mana < m.maxMana {
-		m.mana = math.Min(m.maxMana, m.mana+m.maxMana*mobManaRegenFrac*tickInterval.Seconds())
+		m.mana = math.Min(m.maxMana, m.mana+m.maxMana*gamedata.MobManaRegenFrac()*tickInterval.Seconds())
 	}
+	s.syncMobManaLocked(c, m, now)
 
 	// Status fx expiry (world-scoped: ended on every viewer).
 	if st.stunFx != 0 && now >= st.stunUntil {
@@ -1545,7 +1769,7 @@ func (s *Server) mobUpkeepLocked(c *conn, m *mobState, now float64) bool {
 		}
 		d := dots[i]
 		for d.nextTick <= now && d.nextTick <= d.until && !m.dead {
-			slice := d.perSec * dotTickInterval
+			slice := d.currentPerSec(d.nextTick) * dotTickInterval
 			if m.hp-slice <= 0 {
 				s.hitMobLocked(c, m, slice, d.srcObj) // finishing tick: full death path
 			} else {
@@ -1969,14 +2193,62 @@ func (c *conn) instMembers() map[int32]*conn {
 // nearestMemberDistLocked is the distance from a mob to the closest party member
 // (avatars only; +Inf if none). Drives the unified fog: a mob is shown to the
 // whole party while ANY member is near, hidden once EVERY member is far.
+// mobViewDistLocked is the interest-management distance for m: the nearest party member,
+// but ALSO counting any live vision ward (Urg's «Росток») as an eye. A mob inside a
+// ward's radius counts as fully in view (distance 0), so it is revealed AND unshaded even
+// with no player nearby -- «Росток» «открывает участок местности», i.e. shows the mobs
+// standing on it (on a Hunt map the only "fog" is that distant mobs aren't created on the
+// client at all, so this is what makes them appear). A mob just past the ward edge counts
+// the ward as a distant viewer, so it fades in through the shade ring rather than popping.
+func (s *Server) mobViewDistLocked(c *conn, m *mobState, now float64) float64 {
+	// Op.RevealTarget (Velial's «Трибунал»): the marked target stays fully revealed to the
+	// whole team regardless of distance, bypassing the fog entirely.
+	if now < m.st.revealUntil {
+		return 0
+	}
+	members := c.members()
+	d := nearestMemberDistLocked(members, m, now)
+	if d <= mobUnshadeRadius {
+		return d // a player is already close enough; the ward scan can't lower it further
+	}
+	for _, mem := range members {
+		hs := mem.huntState
+		if hs == nil {
+			continue
+		}
+		for _, w := range hs.wards {
+			if now > w.until {
+				continue
+			}
+			wd := math.Hypot(float64(w.x-m.x), float64(w.y-m.y))
+			if wd <= w.radius {
+				return 0 // inside the acorn's radius -> fully revealed
+			}
+			if wd < d {
+				d = wd
+			}
+		}
+	}
+	return d
+}
+
 func nearestMemberDistLocked(members []*conn, m *mobState, now float64) float64 {
 	best := math.Inf(1)
 	for _, mem := range members {
-		if mem.huntState == nil {
+		hs := mem.huntState
+		if hs == nil {
 			continue
 		}
 		px, py := mem.posAtLocked(float32(now))
-		if d := math.Hypot(float64(px-m.x), float64(py-m.y)); d < best {
+		d := math.Hypot(float64(px-m.x), float64(py-m.y))
+		// Op.Stat=="view_radius_pct" (Veritas «Метаморфоза»): a bigger view radius reveals
+		// mobs from farther away, i.e. shrinks the EFFECTIVE distance used for the
+		// reveal/hide comparison below -- Hunt has no fog plane, so this is the only real
+		// vision-radius hook (mobRevealRadius/mobHideRadius are otherwise flat constants).
+		if mul := hs.st.modMul(now, "view_radius_pct"); mul > 1 {
+			d /= mul
+		}
+		if d < best {
 			best = d
 		}
 	}
@@ -2015,7 +2287,7 @@ func (s *Server) mobInterestLocked(c *conn, m *mobState, now float64) bool {
 		m.active = m.shown
 		return m.active
 	}
-	d := nearestMemberDistLocked(c.members(), m, now)
+	d := s.mobViewDistLocked(c, m, now)
 	if m.shown {
 		if d >= mobHideRadius {
 			s.hideMobLocked(c, m, now)
@@ -2071,6 +2343,15 @@ func (s *Server) revealMobToMemberLocked(mem *conn, m *mobState, now float64) {
 	if maxHP > 0 {
 		hpFrac = float32(m.hp / maxHP)
 	}
+	// Ranged mobs and bosses carry a mana pool (m.maxMana); melee trash has 0. Send it so the
+	// target-card mana bar reads the real value -- without a syncMana/syncMaxMana the client
+	// defaults it to 0 (why «Скелет лучник» showed 0 mana). Same wire shape as the avatar:
+	// syncMana is a FRACTION (mana/maxMana), syncMaxMana the absolute pool. Melee (maxMana 0)
+	// sends 0/0, which is exactly its "no mana" state -- no regression.
+	manaFrac := float32(0)
+	if m.maxMana > 0 {
+		manaFrac = float32(m.mana / m.maxMana)
+	}
 	dmgLo, dmgHi := m.dmgRange()
 	s.push(mem, battleproto.CmdCreateObject, amf.NewArray().
 		Set("id", m.id).Set("proto", mobProtoID(m.mobIdx)))
@@ -2091,6 +2372,8 @@ func (s *Server) revealMobToMemberLocked(mem *conn, m *mobState, now float64) {
 			position(idx, m.x, m.y, m.vx, m.vy, bt).
 			setFloats(syncHealth, idx, hpFrac).
 			setFloats(syncMaxHealth, idx, float32(maxHP)).
+			setFloats(syncMana, idx, manaFrac).
+			setFloats(syncMaxMana, idx, float32(m.maxMana)).
 			setFloats(syncDmgMin, idx, float32(dmgLo)).
 			setFloats(syncDmgMax, idx, float32(dmgHi)).
 			setFloats(syncAttackSpeed, idx, float32(m.mob.AttackSpeed)).
@@ -2141,6 +2424,7 @@ func (m *mobState) resetToSpawn() {
 	m.vx, m.vy = 0, 0
 	m.hp = m.maxHealth()
 	m.mana = m.maxMana // ranged/boss mana tops off with HP at home
+	m.manaSyncFrac = 1 // full again; keeps the next live sync from re-announcing the refill
 	m.aggro = false
 	m.returning = false
 	m.st = unitStatus{}
@@ -2157,6 +2441,7 @@ func (s *Server) respawnMobLocked(c *conn, m *mobState, now float64) {
 	m.respawnAt = 0
 	m.hp = m.maxHealth()
 	m.mana = m.maxMana // full mana on respawn
+	m.manaSyncFrac = 1
 	m.x, m.y = m.spawnX, m.spawnY
 	m.vx, m.vy = 0, 0
 	m.aggro = false
@@ -2204,7 +2489,7 @@ func (s *Server) returnHomeStepLocked(c *conn, m *mobState, now float64) {
 	maxHP := m.maxHealth()
 	// Regenerate toward full while walking back.
 	if m.hp < maxHP {
-		m.hp = math.Min(maxHP, m.hp+maxHP*mobReturnRegenPerSec*tickInterval.Seconds())
+		m.hp = math.Min(maxHP, m.hp+maxHP*gamedata.MobHPRegenFrac()*tickInterval.Seconds())
 		s.syncMobHealthLocked(c, m)
 	}
 	sp := m.mob.Speed // reset ignores slows -- it heads home at full pace
@@ -2324,6 +2609,14 @@ func (s *Server) tryBossSkillLocked(c *conn, m *mobState, members []*conn, now f
 			m.mana -= bossSkillManaCost
 		}
 		m.skillReady[i] = now + sk.Cooldown
+		// Op.CastMark (Einzenhaim's «Изгнание колдовства»): this boss was marked by an
+		// earlier spray -- casting now triggers the extra punish damage.
+		if now < m.st.castMarkUntil {
+			if dmg := m.st.castMarkDmg; dmg > 0 {
+				s.hitMobLocked(c, m, dmg, m.st.castMarkOwner)
+			}
+			m.st.castMarkUntil = 0
+		}
 		// Play an attack animation (reuse the boss's attack action) turned to the
 		// target, broadcast to every viewer, and close it after the wind-up.
 		s.broadcastObjLocked(c, m.id, battleproto.CmdAction,
@@ -2366,6 +2659,7 @@ func (s *Server) landBossSkillLocked(c *conn, m *mobState, members []*conn, now 
 			}
 			px, py := mem.posAtLocked(float32(now))
 			if math.Hypot(float64(px-m.skillCX), float64(py-m.skillCY)) <= m.skillRadius {
+				hs.lastDamageWasSkill = true
 				s.hitPlayerLocked(mem, m, m.skillDmg, now)
 			}
 		}
@@ -2374,6 +2668,7 @@ func (s *Server) landBossSkillLocked(c *conn, m *mobState, members []*conn, now 
 	for _, mem := range members {
 		if mem.objID == m.skillTargetObj {
 			if hs := mem.huntState; hs != nil && hs.deadUntil == 0 {
+				hs.lastDamageWasSkill = true
 				s.hitPlayerLocked(mem, m, m.skillDmg, now)
 			}
 			return
@@ -2429,17 +2724,60 @@ func (s *Server) hitPlayerFromLocked(c *conn, damagerID int32, dmg float64, now 
 			Set("damage", 0.0))
 		return
 	}
-	armor := (hs.av.PhysArmor + hs.st.modSum(now, "phys_armor")) * hs.st.modMul(now, "armor_pct")
+	armorMul := hs.st.modMul(now, "armor_pct")
+	// Op.ZoneArmor (Inshari's «Угнетение»): her armor bonus only helps against an attacker
+	// standing OUTSIDE the aura -- one fighting her INSIDE it (already taking the periodic
+	// damage) hits at her normal, unbuffed armor.
+	if hs.zoneArmorSlot > 0 {
+		if level := int(hs.skillLevel[hs.zoneArmorSlot-1]); level >= 1 {
+			for _, op := range hs.kit.Skills[hs.zoneArmorSlot-1].Ops {
+				if op.Kind != gamedata.OpZoneArmor {
+					continue
+				}
+				px, py := c.posAtLocked(float32(now))
+				outside := true
+				switch {
+				case thornsMob != nil:
+					outside = math.Hypot(float64(thornsMob.x-px), float64(thornsMob.y-py)) > op.Radius
+				case pvpAttacker != nil:
+					ax, ay := pvpAttacker.posAtLocked(float32(now))
+					outside = math.Hypot(float64(ax-px), float64(ay-py)) > op.Radius
+				}
+				if outside {
+					armorMul *= op.Value.At(level)
+				}
+				break
+			}
+		}
+	}
+	armor := (hs.av.PhysArmor + hs.st.modSum(now, "phys_armor")) * armorMul
 	dmg *= armorMitigation(armor)
+	// Rognar's «Костяной щит»: a flat, guaranteed cut to incoming damage («снижающий
+	// получаемый физический урон на 50%») -- distinct from armor_pct, which multiplies the
+	// ARMOR STAT and gets diminishing-returns'd by the shared 50/(a+50) curve (a ×1.5 armor
+	// buff never actually nets a 50% reduction). This engine's incoming-damage path doesn't
+	// tag hits as phys/magic (only the player's OWN outgoing attacks carry a Scale), so the
+	// reduction applies to all incoming damage while the shield is up, not physical-only --
+	// the closest honest equivalent given no dmg-type plumbing exists on this side.
+	if reduce := hs.st.modSum(now, "dmg_reduction_pct"); reduce > 0 {
+		dmg *= 1 - math.Min(reduce, 1)
+	} else if reduce < 0 {
+		// A NEGATIVE dmg_reduction_pct AMPLIFIES incoming damage (BlackDragon's «Неистовство»:
+		// "дракон получает на 20% больше урона от вражеских атак" -- a flat, rank-constant
+		// self-penalty, not the diminishing-returns armor curve).
+		dmg *= 1 - reduce
+	}
 	dmg = hs.st.absorb(now, dmg)
 	if thorns := hs.st.modSum(now, "thorns_pct"); thorns > 0 && dmg > 0 {
 		// Reflect a share of the blow back at whatever dealt it: a mob directly, an enemy
 		// player through the same PvP path (with the roles reversed so its own thorns
-		// don't re-reflect endlessly -- the bounce passes no attacker).
+		// don't re-reflect endlessly -- the bounce passes no attacker). Sigilion's «Удар
+		// наотмашь» is melee-only («При получении урона от ближней атаки») -- gated the same
+		// way BlackDragon's «Кровь дракона» OnDamaged proc gates MeleeOnly.
 		switch {
-		case thornsMob != nil:
+		case thornsMob != nil && thornsMob.mob.AttackRange <= 0:
 			s.hitMobLocked(c, thornsMob, dmg*thorns, c.objID)
-		case pvpAttacker != nil && pvpAttacker.huntState != nil:
+		case pvpAttacker != nil && pvpAttacker.huntState != nil && !pvpAttacker.huntState.hasProjectile:
 			s.hitPlayerFromLocked(pvpAttacker, c.objID, dmg*thorns, now, nil, nil)
 		}
 	}
@@ -2456,6 +2794,24 @@ func (s *Server) hitPlayerFromLocked(c *conn, damagerID int32, dmg float64, now 
 			}
 		} else if lm := hs.mobs[hs.deathLinkObj]; lm != nil && !lm.dead {
 			s.hitMobLocked(c, lm, share, c.objID)
+		}
+	}
+	// Op.DamageShare (Kiona's «Лесной покров»): a share of THIS damage heals every living
+	// ally near the marked player instead of just being dealt.
+	if hs.st.cloakHealCoeff > 0 && now < hs.st.cloakUntil {
+		if owner := s.creditConnLocked(c, hs.st.cloakOwner); owner != nil {
+			share := dmg * hs.st.cloakHealCoeff
+			px, py := c.posAtLocked(float32(now))
+			for _, mem := range owner.members() {
+				mh := mem.huntState
+				if mh == nil || mh.deadUntil > 0 {
+					continue
+				}
+				mx, my := mem.posAtLocked(float32(now))
+				if math.Hypot(float64(mx-px), float64(my-py)) <= hs.st.cloakRadius {
+					s.healPlayerLocked(mem, share)
+				}
+			}
 		}
 	}
 	hs.hp -= dmg
@@ -2571,6 +2927,11 @@ func (s *Server) tryReviveLocked(c *conn, now float64) bool {
 // latent until such a source is added; it is exercised directly by unit tests.
 func (s *Server) ccImmuneBlockLocked(c *conn, now float64) bool {
 	hs := c.huntState
+	if now < hs.tempCCImmuneUntil {
+		// Arianna's «Щит хранителя»/«Касание спасителя»: a cast-granted immunity window, not
+		// the passive's consume-then-cooldown -- blocks every attempt until the shield ends.
+		return true
+	}
 	slot := hs.ccImmuneSlot
 	if slot == 0 {
 		return false
@@ -2591,6 +2952,39 @@ func (s *Server) ccImmuneBlockLocked(c *conn, now float64) bool {
 	}
 	return false
 }
+
+// cleansePlayerDebuffsLocked reports whether the player has a learned OpCleanseOnHit
+// passive (Abominator's «Окоченение») and, if so, sheds every hostile effect
+// currently on them (stun/root/silence/slow/DoTs and any negative stat mod) in
+// response to one just landing. Like ccImmuneBlockLocked, no mob or avatar applies
+// player-facing CC/debuffs today, so this gate is latent until such a source exists;
+// it is exercised directly by unit tests.
+func (s *Server) cleansePlayerDebuffsLocked(c *conn, now float64) bool {
+	hs := c.huntState
+	slot := hs.cleanseSlot
+	if slot == 0 || int(hs.skillLevel[slot-1]) < 1 {
+		return false
+	}
+	hs.st.stunUntil = 0
+	hs.st.rootUntil = 0
+	hs.st.silenceUntil = 0
+	hs.st.slowUntil = 0
+	hs.st.dots = nil
+	var keep []statMod
+	for _, m := range hs.st.mods {
+		if m.value < 0 && m.until != 0 {
+			continue // sheds only timed HOSTILE mods, not permanent passive self-buffs
+		}
+		keep = append(keep, m)
+	}
+	hs.st.mods = keep
+	s.pushPlayerStatsLocked(c, now)
+	return true
+}
+
+// abominatorFeastRange is how close a transformed Трупоглот must be to a dying enemy
+// avatar to claim the permanent health from its death.
+const abominatorFeastRange = 15.0
 
 // playerDieLocked runs the death sequence: everything cancels, the corpse
 // shows for corpseHide seconds, RESPAWN announces the timer, and the tick
@@ -2653,6 +3047,26 @@ func (s *Server) playerDieLocked(c *conn, killer int32, now float64) {
 	// death clip on the object they render for this player).
 	s.broadcastAvatarObjLocked(c, battleproto.CmdOnKill, amf.NewArray().
 		Set("killer", killer).Set("id", c.objID))
+
+	// Abominator's «Трупоглот»: while transformed (TOGGLE slot 4 on), a nearby ENEMY
+	// avatar's death grants a PERMANENT +20 max HP ("При смерти вражеской аватары
+	// рядом, Трупоглот навсегда получит прибавку 20 к своему здоровью"). Only reachable
+	// in PvP (Штурм) -- Hunt has no enemy avatars.
+	for _, mem := range c.members() {
+		mhs := mem.huntState
+		if mhs == nil || mem == c || mhs.av.Prefab != "Avtr_HK_Abominator" || !mhs.toggleOn[3] {
+			continue
+		}
+		if mhs.deadUntil > 0 || !arenaEnemies(c, mem) {
+			continue
+		}
+		mx, my := mem.posAtLocked(float32(now))
+		if math.Hypot(float64(mx-cx), float64(my-cy)) > abominatorFeastRange {
+			continue
+		}
+		mhs.st.mods = append(mhs.st.mods, statMod{stat: "max_hp", value: 20, until: 0, src: "abominatorFeast"})
+		s.pushPlayerStatsLocked(mem, now)
+	}
 	// Respawn timer (absolute battle time) is this player's own UI only.
 	s.push(c, battleproto.CmdRespawn, amf.NewArray().
 		Set("id", c.selfPlayerID).

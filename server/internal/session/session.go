@@ -77,6 +77,16 @@ type Hero struct {
 	// Quests is the hero's persistent PvE quest state (accepted/in-progress/done/closed +
 	// kill progress + REPLAY cooldowns). See session/quests.go for the state machine.
 	Quests []QuestState
+	// Buffs is the hero's active timed GLOBAL buffs (rune/elixir effects), keyed by the
+	// granting article with an absolute expiry. Persisted so multi-day elixirs survive a
+	// relog. See session/buffs.go.
+	Buffs []GlobalBuff
+	// ClanID is the clan this hero belongs to (0 = none); ClanRole is the member's rank
+	// within it (ClanRoleWarrior..ClanRoleHead, 0 when clanless). Membership lives on the
+	// hero row; the clan header (name/tag/level/rating) is in the clans table. A hero is in
+	// at most one clan. See session/clan.go.
+	ClanID   int32
+	ClanRole int32
 }
 
 // BagItem is one persisted consumable stack. ArticleID is the gamedata item
@@ -123,6 +133,12 @@ type PendingBattle struct {
 	// huntInstance. Zero/unset means a private solo world (the Battle server keys it
 	// by the negative user id).
 	Room int32
+	// Team is the side the matchmaker assigned this player for a two-sided PvP match
+	// («Штурм»: 1 = Human/«Собор», 2 = Elf/«Изгнанники»). Zero/unset means the Battle
+	// server picks the side itself (a solo launch, a direct enter, or a test); it then
+	// alternates joiners across the two bases. Carried from Ctrl so the pre-battle
+	// «match found» roster and the actual in-battle side agree.
+	Team int32
 }
 
 type Store struct {
@@ -134,6 +150,10 @@ type Store struct {
 	lobbyArea    map[int32]int32          // userID -> central-square area the client last requested
 	groups       map[int32]*Group         // userID -> the party it belongs to (shared pointer)
 	friendReqs   map[int32]map[int32]bool // target userID -> set of users with a pending friend request to them
+	clansByID    map[int32]*Clan          // clanID -> clan header (roster derived from heroes' ClanID)
+	clanInvites  map[int32]clanInvite     // invitee userID -> the one pending clan invite for them (transient)
+	clanInviteCD map[int32]int64          // invitee userID -> earliest unix time a new invite may be sent
+	nextClanID   int32
 	nextUserID   int32
 	path         string  // SQLite database file; "" = in-memory only
 	db           *sql.DB // nil for an in-memory store (NewStore)
@@ -148,6 +168,10 @@ func NewStore() *Store {
 		lobbyArea:    map[int32]int32{},
 		groups:       map[int32]*Group{},
 		friendReqs:   map[int32]map[int32]bool{},
+		clansByID:    map[int32]*Clan{},
+		clanInvites:  map[int32]clanInvite{},
+		clanInviteCD: map[int32]int64{},
+		nextClanID:   1,
 		nextUserID:   1,
 	}
 }

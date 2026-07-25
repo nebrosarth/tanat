@@ -71,3 +71,15 @@ var authAck = func() []byte {
 	_ = amf.NewRawEncoder().EncodeMessage(&buf, int32(100))
 	return frame(buf.Bytes())
 }()
+
+// authReject is the framed AMF integer the client reads as AUTHORIZATION_FAILED (any
+// int != 100 -> MpdConnection.Parse fires ConnectionError.AUTHORIZATION_FAILED, which
+// TanatApp turns into the "cannot authorize" popup and a return to the LOGIN screen).
+// We send this instead of silently dropping the socket so a stale client whose session
+// died on server restart is thrown to the main menu rather than micro-reconnecting in a
+// tight loop. 6013 = WRONG_SESSION, matching the Ctrl channel's code.
+var authReject = func() []byte {
+	var buf bytes.Buffer
+	_ = amf.NewRawEncoder().EncodeMessage(&buf, int32(6013))
+	return frame(buf.Bytes())
+}()

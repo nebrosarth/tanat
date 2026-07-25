@@ -12,9 +12,11 @@ import (
 // viewer's own object list, and keeps it in sync as they move / attack / die.
 
 // renderAvatarForLocked builds owner's avatar on viewer's client: the avatar
-// prototype (idempotent -- re-registering the same id/desc is harmless), a
-// PLAYER_REG on team 1 (allies -- this is co-op PvE), CREATE_OBJECT, the bind, and
-// an initial position+stats SYNC. No-op if viewer already tracks owner.
+// prototype (idempotent -- re-registering the same id/desc is harmless), a PLAYER_REG
+// on owner's own team (playerTeam(): the co-op side in Hunt, but owner's real side in
+// «Арена»/«Штурм», so a viewer sees a teammate as FRIEND and an enemy hero as ENEMY),
+// CREATE_OBJECT, the bind, and an initial position+stats SYNC. No-op if viewer already
+// tracks owner.
 func (s *Server) renderAvatarForLocked(viewer, owner *conn, now float64) {
 	vh, oh := viewer.huntState, owner.huntState
 	if vh == nil || oh == nil || viewer == owner {

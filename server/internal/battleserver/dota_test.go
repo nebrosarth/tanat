@@ -69,7 +69,7 @@ func TestDotaInstanceStructures(t *testing.T) {
 		t.Fatalf("seeded %d structures, want %d", got, len(dm.Structures))
 	}
 	own := altarOf(inst, dotaPlayerTeam)
-	enemy := altarOf(inst, dotaEnemyTeam)
+	enemy := altarOf(inst, dotaTeamElf)
 	if own == nil || enemy == nil {
 		t.Fatalf("missing altar(s): own=%v enemy=%v", own, enemy)
 	}
@@ -97,7 +97,7 @@ func TestDotaInstanceStructures(t *testing.T) {
 func TestDotaAltarGuardedByGuns(t *testing.T) {
 	s, c, inst, cleanup := newDotaConn(t, "Avtr_Tank_Velial")
 	defer cleanup()
-	enemy := altarOf(inst, dotaEnemyTeam)
+	enemy := altarOf(inst, dotaTeamElf)
 	if enemy == nil {
 		t.Fatal("no enemy altar")
 	}
@@ -114,7 +114,7 @@ func TestDotaAltarGuardedByGuns(t *testing.T) {
 	}
 	// Raze every enemy cannon.
 	for _, m := range inst.mobs {
-		if m.dotaRole == gamedata.DotaGun && m.team == dotaEnemyTeam {
+		if m.dotaRole == gamedata.DotaGun && m.team == dotaTeamElf {
 			m.dead = true
 		}
 	}
@@ -134,13 +134,13 @@ func TestDotaAltarGuardedByGuns(t *testing.T) {
 func TestDotaWinOnEnemyAltar(t *testing.T) {
 	s, c, inst, cleanup := newDotaConn(t, "Avtr_Tank_Velial")
 	defer cleanup()
-	enemy := altarOf(inst, dotaEnemyTeam)
+	enemy := altarOf(inst, dotaTeamElf)
 	now := float64(s.battleTime())
 
 	c.lock()
 	// Clear the guard, then kill the altar via the player damage path.
 	for _, m := range inst.mobs {
-		if m.dotaRole == gamedata.DotaGun && m.team == dotaEnemyTeam {
+		if m.dotaRole == gamedata.DotaGun && m.team == dotaTeamElf {
 			m.dead = true
 		}
 	}
@@ -156,8 +156,8 @@ func TestDotaWinOnEnemyAltar(t *testing.T) {
 	if !inst.dota.ended {
 		t.Fatal("match did not end after the enemy altar fell")
 	}
-	if inst.dota.winner != dotaWinTeamSelf {
-		t.Fatalf("winner team = %d, want %d (player's side)", inst.dota.winner, dotaWinTeamSelf)
+	if inst.dota.winner != dotaTeamHuman {
+		t.Fatalf("winner team = %d, want %d (player's side)", inst.dota.winner, dotaTeamHuman)
 	}
 }
 
@@ -172,9 +172,9 @@ func TestDotaLoseOnOwnAltar(t *testing.T) {
 	own.dead = true // the enemy pushed it down
 	s.dotaTickLocked(c, now)
 	c.unlock()
-	if !inst.dota.ended || inst.dota.winner != dotaWinTeamEnemy {
+	if !inst.dota.ended || inst.dota.winner != dotaTeamElf {
 		t.Fatalf("own altar loss: ended=%v winner=%d, want ended=true winner=%d",
-			inst.dota.ended, inst.dota.winner, dotaWinTeamEnemy)
+			inst.dota.ended, inst.dota.winner, dotaTeamElf)
 	}
 }
 
@@ -211,7 +211,7 @@ func TestDotaCreepWaveSpawns(t *testing.T) {
 		if m.team == dotaPlayerTeam {
 			sawAlly = true
 		}
-		if m.team == dotaEnemyTeam {
+		if m.team == dotaTeamElf {
 			sawEnemy = true
 		}
 	}
@@ -234,7 +234,7 @@ func TestDotaCreepTargetsEnemyNotAlly(t *testing.T) {
 		id: 61000, mobIdx: inst.dota.m.ElfCreepMelee,
 		mob:  gamedata.Mobs()[inst.dota.m.ElfCreepMelee],
 		x:    own.x + 3, y: own.y,
-		team: dotaEnemyTeam,
+		team: dotaTeamElf,
 	}
 	inst.mobs[creep.id] = creep
 
@@ -264,7 +264,7 @@ func TestDotaCreepTargetsEnemyNotAlly(t *testing.T) {
 func TestDotaAltarOpensOnBaseCannons(t *testing.T) {
 	_, c, inst, cleanup := newDotaConn(t, "Avtr_Tank_Velial")
 	defer cleanup()
-	enemy := altarOf(inst, dotaEnemyTeam)
+	enemy := altarOf(inst, dotaTeamElf)
 	if enemy == nil {
 		t.Fatal("no enemy altar")
 	}
@@ -279,7 +279,7 @@ func TestDotaAltarOpensOnBaseCannons(t *testing.T) {
 	// Kill a NON-base enemy gun (a lane gun): the altar must stay shielded.
 	killedLane := false
 	for _, m := range inst.mobs {
-		if m.dotaRole == gamedata.DotaGun && m.team == dotaEnemyTeam && !guardSet[m.id] {
+		if m.dotaRole == gamedata.DotaGun && m.team == dotaTeamElf && !guardSet[m.id] {
 			m.dead = true
 			killedLane = true
 			break
@@ -297,7 +297,7 @@ func TestDotaAltarOpensOnBaseCannons(t *testing.T) {
 	}
 	laneAlive := 0
 	for _, m := range inst.mobs {
-		if m.dotaRole == gamedata.DotaGun && m.team == dotaEnemyTeam && !m.dead && !guardSet[m.id] {
+		if m.dotaRole == gamedata.DotaGun && m.team == dotaTeamElf && !m.dead && !guardSet[m.id] {
 			laneAlive++
 		}
 	}
@@ -315,7 +315,7 @@ func TestDotaAltarOpensOnBaseCannons(t *testing.T) {
 func TestDotaCreepSkipsShieldedAltar(t *testing.T) {
 	s, c, inst, cleanup := newDotaConn(t, "Avtr_Tank_Velial")
 	defer cleanup()
-	enemyAltar := altarOf(inst, dotaEnemyTeam)
+	enemyAltar := altarOf(inst, dotaTeamElf)
 	guards := inst.dota.altarGuards[enemyAltar.id]
 	if len(guards) == 0 {
 		t.Fatal("enemy altar has no guard cannons")
@@ -373,7 +373,7 @@ func TestDotaCreepVsCreepEncodesSwing(t *testing.T) {
 		id: 60002, mobIdx: inst.dota.m.ElfCreepMelee,
 		mob: gamedata.Mobs()[inst.dota.m.ElfCreepMelee],
 		x:   1, y: 0, hp: 500, maxHP: 500, dmgMin: 5, dmgMax: 8,
-		team: dotaEnemyTeam, lastSync: now,
+		team: dotaTeamElf, lastSync: now,
 	}
 
 	c.lock()

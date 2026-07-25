@@ -105,44 +105,74 @@ func TestZamaranReviveOnDeath(t *testing.T) {
 	}
 }
 
-// TestBlackDragonWingsAura verifies «Крылья тьмы»: the learned passive aura pulses
-// an attack-speed slow onto nearby enemies with no toggle and no mana upkeep.
-func TestBlackDragonWingsAura(t *testing.T) {
+// TestBlackDragonBloodOfDragonThorns verifies «Кровь дракона» (slot 3, NOT the prior
+// wiki-based "Крылья тьмы" rewrite): a MELEE attacker that strikes the dragon is slowed
+// (move AND attack speed) and takes a magic DoT, all for 3s. Reverted per client-locale
+// audit pass 5 -- the previous ambient proximity-aura encoding was the wrong skill.
+func TestBlackDragonBloodOfDragonThorns(t *testing.T) {
 	s, c, cleanup := newHuntConn(t, "Avtr_DPS_BlackDragon")
 	defer cleanup()
 	hs := c.huntState
-	hs.skillLevel[2] = 1 // «Крылья тьмы» learned at rank 1
+	hs.skillLevel[2] = 1 // «Кровь дракона» learned at rank 1
+	hs.hp = 1000
 
-	idx := mobIndexByPrefab(t, "Mob_Skeleton_1H_Melee_01")
-	m := &mobState{
+	// Register the on-damaged proc the way world-build does.
+	for i, sk := range hs.kit.Skills {
+		if sk.Type != "PASSIVE" {
+			continue
+		}
+		for _, op := range sk.Ops {
+			if op.Kind == gamedata.OpProc && op.OnDamaged {
+				hs.defenseProcs = append(hs.defenseProcs, procState{
+					slot: i + 1, chance: op.Chance, ops: op.Ops, meleeOnly: op.MeleeOnly,
+				})
+			}
+		}
+	}
+
+	idx := mobIndexByPrefab(t, "Mob_Skeleton_1H_Melee_01") // melee (AttackRange == 0)
+	attacker := &mobState{
 		id: 2400, mobIdx: idx, mob: gamedata.Mobs()[idx],
-		x: 2, y: 0, hp: 100, shown: true,
+		x: 1, y: 0, hp: 100, maxHP: 100, shown: true,
 	}
 	now := float64(s.battleTime())
 	c.mvMu.Lock()
-	hs.mobs[m.id] = m
-	hs.tr.add(m.id)
-	s.tickPassiveAurasLocked(c, now)
-	slowUntil := m.st.atkSlowUntil
-	factor := m.st.atkSlowFactor
+	hs.mobs[attacker.id] = attacker
+	hs.tr.add(attacker.id)
+	s.hitPlayerLocked(c, attacker, 10, now)
+	slowUntil := attacker.st.slowUntil
+	atkSlowUntil := attacker.st.atkSlowUntil
 	c.mvMu.Unlock()
 
 	if slowUntil <= now {
-		t.Fatalf("passive aura did not attack-slow the nearby mob (atkSlowUntil=%g now=%g)", slowUntil, now)
+		t.Fatalf("melee attacker was not move-slowed by the thorns (slowUntil=%g now=%g)", slowUntil, now)
 	}
-	if factor != 0.8 { // rank-1 speedCoef
-		t.Fatalf("attack-slow factor = %g, want 0.8", factor)
+	if atkSlowUntil <= now {
+		t.Fatalf("melee attacker was not attack-slowed by the thorns (atkSlowUntil=%g now=%g)", atkSlowUntil, now)
+	}
+	if len(attacker.st.dots) == 0 {
+		t.Fatal("melee attacker did not take the thorns DoT")
 	}
 }
 
-// TestWilfangCloakBlocksCC verifies «Защитный покров»: the learned OpImmune passive
-// blocks an incoming CC once, then goes on cooldown for Dur seconds before it can
-// block again.
-func TestWilfangCloakBlocksCC(t *testing.T) {
+// TestCcImmunePassiveBlocksCC verifies the OpImmune primitive (Wilfang's «Защитный
+// покров» was the pass-4 skill it modelled; a client-locale re-audit in pass 5 reverted
+// Wilfang's slot 3 to «Ядовитый укус» instead, so this test now exercises the primitive
+// directly against a synthetic kit rather than any specific avatar's authored data --
+// OpImmune remains a valid, reusable engine mechanic, just unassigned for now, same as
+// it was documented "latent" even while it belonged to Wilfang): the learned OpImmune
+// passive blocks an incoming CC once, then goes on cooldown for Dur seconds before it
+// can block again.
+func TestCcImmunePassiveBlocksCC(t *testing.T) {
 	s, c, cleanup := newHuntConn(t, "Avtr_Dsb_Wilfang")
 	defer cleanup()
 	hs := c.huntState
-	hs.skillLevel[2] = 1 // «Защитный покров» learned at rank 1
+	hs.kit = &gamedata.AvatarSkills{Skills: [4]gamedata.Skill{
+		{}, {},
+		{Ops: []gamedata.Op{{Kind: gamedata.OpImmune, Dur: gamedata.PerLevel{13, 13, 13, 13}, On: "self"}}},
+		{},
+	}}
+	hs.skillLevel[2] = 1 // synthetic immunity passive learned at rank 1
 	hs.ccImmuneSlot = 3
 
 	now := float64(s.battleTime())

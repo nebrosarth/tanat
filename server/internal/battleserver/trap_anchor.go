@@ -43,7 +43,21 @@ func trapUsesAnchor(prefab string, slot int) bool {
 // rather than trailing the caster. Like trapUsesAnchor the fx mode is baked in the
 // client, hand-maintained by prefab+slot: Titanid's «Землетрясение» (slot 1) quake fx.
 func payloadFxUsesAnchor(prefab string, slot int) bool {
-	return prefab == "Avtr_Tank_Titanid" && slot == 1
+	// Titanid's «Землетрясение» (slot 1) quake fx; Edilia's «Дерево жизни» (slot 4) tree --
+	// both are SELF-mode ground fx that would otherwise trail the caster instead of standing
+	// at the cast point (the tree "follows Edilia" report).
+	return (prefab == "Avtr_Tank_Titanid" && slot == 1) ||
+		(prefab == "Avtr_Dsb_Edilia" && slot == 4)
+}
+
+// payloadTargetFxOwnedToTarget reports whether a skill's target-mode payload fx is a
+// SELF-baked prefab that must be OWNED by (parented to) the struck enemy, not the caster.
+// A SELF-baked fx follows its owner GameObject; started with owner=caster it renders on the
+// avatar instead of the victim (Charlie/Sharli s1 «Ожог» burn appearing on Sharli). Kept a
+// narrow prefab+slot allowlist so genuine caster-anchored or TARGET-baked payloads are
+// untouched.
+func payloadTargetFxOwnedToTarget(prefab string, slot int) bool {
+	return prefab == "Avtr_DPS_Sharli" && slot == 1
 }
 
 // allocAnchorID hands out a party-wide anchor object id (instance space) or a per-conn

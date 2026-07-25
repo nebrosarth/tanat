@@ -61,7 +61,11 @@ func (h *Hub) handleConn(nc net.Conn) {
 	u, valid := h.Store.BySessKey(sid)
 	if !valid || u.ID != id {
 		log.Printf("mpd: %s auth failed (id=%d)", nc.RemoteAddr(), id)
-		return // dropping the socket (no ack) makes the client treat it as failed
+		// Send an explicit rejection (AMF int != 100) rather than dropping silently:
+		// with micro-reconnect ON (central square) a bare close just makes the client
+		// reconnect forever. AUTHORIZATION_FAILED sends it to the login screen instead.
+		_, _ = nc.Write(authReject)
+		return
 	}
 
 	c := &Conn{Conn: nc, userID: id}

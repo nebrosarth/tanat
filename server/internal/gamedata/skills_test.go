@@ -34,7 +34,9 @@ var validStat = map[string]bool{
 	"move_speed_pct": true, "lifesteal_pct": true, "crit_pct": true, "dodge_pct": true,
 	"spell_power": true, "hp_regen": true, "mana_regen": true, "max_hp": true,
 	"thorns_pct": true, "armor_pct": true,
-	"attack_range": true, "crit_dmg_pct": true,
+	"attack_range": true, "crit_dmg_pct": true, "dmg_flat": true,
+	"view_radius_pct": true,
+	"dmg_reduction_pct": true,
 }
 
 // TestEveryAvatarHasAuthoredKit fails if any playable avatar is missing from the

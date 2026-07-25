@@ -160,7 +160,7 @@ func TestStormCreepInReachStaysPlanted(t *testing.T) {
 		active: true, shown: true}
 	enemy := &mobState{id: 62003, mobIdx: ei, mob: gamedata.Mobs()[ei],
 		x: float32(wp.X) + 1.5, y: float32(wp.Y), hp: 5000, maxHP: 5000,
-		team: dotaEnemyTeam, lastSync: now, active: true, shown: true}
+		team: dotaTeamElf, lastSync: now, active: true, shown: true}
 
 	c.lock()
 	inst.mobs[a.id], inst.mobs[b.id], inst.mobs[enemy.id] = a, b, enemy
@@ -237,7 +237,7 @@ func TestStormEngagementUnsticks(t *testing.T) {
 	}
 	enemy := &mobState{id: 65100, mobIdx: ei, mob: gamedata.Mobs()[ei],
 		x: float32(wp.X) + 0.9, y: float32(wp.Y), hp: 100000, maxHP: 100000,
-		team: dotaEnemyTeam, lastSync: now, active: true, shown: true}
+		team: dotaTeamElf, lastSync: now, active: true, shown: true}
 	inst.mobs[enemy.id] = enemy
 
 	start := minPairDist(allies)
@@ -323,7 +323,7 @@ func TestSummonHoldsStillThroughItsSwing(t *testing.T) {
 	// An enemy inside the pet's reach, so it commits to a swing...
 	enemy := &mobState{id: 64001, mobIdx: ei, mob: gamedata.Mobs()[ei],
 		x: px + 1.2, y: py, hp: 9000, maxHP: 9000,
-		team: dotaEnemyTeam, lastSync: now, active: true, shown: true}
+		team: dotaTeamElf, lastSync: now, active: true, shown: true}
 	// ...and three allies piled onto the pet, all to ONE side so the push is directional
 	// and unmistakably past the deadband (symmetric bodies would cancel to a zero sum and
 	// prove nothing). Allied, or the pet would fight one of them instead of the enemy under

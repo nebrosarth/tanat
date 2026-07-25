@@ -185,13 +185,22 @@ func (s *Server) startSkillOrderLocked(c *conn, slot int, target int32, px, py f
 			// where OpPull's victim comes from, which bypasses opTargetsLocked entirely.
 			// Gate on the skill's own declared mask: FRIEND skills are castable on an ally
 			// creep/building; a hostile-only skill turns an ally target away.
-			if !ms.hostile() && !skillHasTargetFlag(def, "FRIEND") {
+			if !ms.enemyOf(c.playerTeam()) && !skillHasTargetFlag(def, "FRIEND") {
 				s.orderDoneLocked(c, parent)
 				return
 			}
 			tx, ty = ms.x, ms.y
 			hasPos = true
 		}
+	}
+
+	// A self-cast of a friend-or-foe skill (the client now lets NOT_BUILDING accept a click on
+	// the caster -- Frost s3, Kiona s4): route it through the ally path so the ally-side ops
+	// (heal/shield/buff) land on the caster. A pure enemy skill aimed at self still fizzles.
+	if target == c.objID && allyObj == 0 && skillHasTargetFlag(def, "FRIEND") {
+		allyObj = c.objID
+		tx, ty = c.posAtLocked(s.battleTime())
+		hasPos = true
 	}
 
 	// A unit-target skill cast with no valid target/position: fire in place.
@@ -279,7 +288,12 @@ func (s *Server) cancelOrderLocked(c *conn) {
 // prefab + slot. Elgorm's «Стрелы Аркана» (slot 4) is a channel; Titanid's
 // «Землетрясение» quake, by contrast, stays fire-and-forget.
 func channelInterruptible(prefab string, slot int) bool {
-	return prefab == "Avtr_Dsb_Elgorm" && slot == 4
+	// Elgorm's «Стрелы Аркана» (ground arrow rain) and Morlokai's «Кабала» (a caster-held
+	// hold-target siphon) both END when the caster acts again -- moves, is stunned, casts,
+	// or attacks. The tick already breaks a unit channel on move/stun; the interruptible
+	// flag additionally lets a new cast or attack cancel it (breakInterruptibleChannelsLocked).
+	return (prefab == "Avtr_Dsb_Elgorm" && slot == 4) ||
+		(prefab == "Avtr_Dsb_Morlokay" && slot == 2)
 }
 
 // channelPulseDelay is the lead-in before a channel's FIRST damage pulse, matching
@@ -589,7 +603,13 @@ func (s *Server) firePayloadLocked(c *conn, p payload, now float64) {
 			if tid == 0 {
 				tid = c.objID
 			}
-			uid := s.fxStartLocked(c, def.PayloadFx, c.objID, tid, p.hasPos, fpx, fpy)
+			// A SELF-baked target-mode fx follows its OWNER; for those skills own it to the
+			// struck enemy so the visual lands on the victim, not the caster (Sharli s1).
+			fxOwner := c.objID
+			if tid != 0 && payloadTargetFxOwnedToTarget(hs.av.Prefab, p.slot) {
+				fxOwner = tid
+			}
+			uid := s.fxStartLocked(c, def.PayloadFx, fxOwner, tid, p.hasPos, fpx, fpy)
 			hs.scheduleFxEnd(uid, now+fxLife)
 		case "point":
 			// A SELF-baked ground fx trails the caster; for a skill whose point payload
@@ -689,6 +709,26 @@ func (s *Server) toggleSkillLocked(c *conn, slot int) {
 			hs.shieldStartedAt = now
 			hs.shieldHitsLeft = shieldExplodeHits
 		}
+		if op.Kind == gamedata.OpZoneArmor {
+			// Inshari's «Угнетение»: remember which toggle carries the zone-gated armor so
+			// hitPlayerFromLocked can read its live Value/Radius against the attacker's
+			// position.
+			hs.zoneArmorSlot = slot
+		}
+		if op.Kind == gamedata.OpMeleeForm {
+			// Grimlok's «Темная сторона»: force melee range/no-projectile for the duration,
+			// restored on toggle-off.
+			hs.meleeFormSlot = slot
+			hs.meleeFormWasProjectile = hs.hasProjectile
+			hs.hasProjectile = false
+		}
+		if op.Kind == gamedata.OpStealth {
+			// Astarot's «Слуга тьмы»: real invisibility for as long as the toggle stays on
+			// (mana holds out). tickTogglesLocked re-arms invisibleUntil every tick; start it
+			// here too so stealth is live from the moment of activation, not one tick later.
+			hs.toggleStealthSlot = slot
+			s.applySkillStealthLocked(c, 1.0, op.BreakOnMove, now)
+		}
 	}
 }
 
@@ -703,6 +743,17 @@ func (s *Server) toggleOffLocked(c *conn, slot int, now float64, byUser bool) {
 	hs.toggleOn[slot-1] = false
 	if hs.shieldExplodeSlot == slot {
 		hs.shieldExplodeSlot = 0 // bone shield down: stop counting hits
+	}
+	if hs.zoneArmorSlot == slot {
+		hs.zoneArmorSlot = 0
+	}
+	if hs.meleeFormSlot == slot {
+		hs.meleeFormSlot = 0
+		hs.hasProjectile = hs.meleeFormWasProjectile
+	}
+	if hs.toggleStealthSlot == slot {
+		hs.toggleStealthSlot = 0
+		s.breakInvisibilityLocked(c, now)
 	}
 	s.fxEndLocked(c, hs.toggleFx[slot-1])
 	hs.toggleFx[slot-1] = 0
@@ -780,9 +831,22 @@ type opCtx struct {
 	hasPos bool
 	toggle bool
 	dmgIn  float64 // size of the hit that triggered an on-damaged proc (0 otherwise)
+	// dmgBonus is flat extra damage folded into this call's OpDamage (Op.Growth's
+	// per-pulse channel ramp, set by tickChannelsLocked; 0 otherwise).
+	dmgBonus float64
+	// durBonus is flat extra duration folded into this call's OpStun (Op.Growth's
+	// per-pulse channel ramp on a nested stun, set by tickChannelsLocked; 0 otherwise).
+	durBonus float64
+	// radiusBonus widens this call's AoE (Op.RadiusGrowth's per-pulse channel ramp, set
+	// by tickChannelsLocked; 0 otherwise).
+	radiusBonus float64
 	// allyTarget is the friendly avatar a FRIEND-castable skill was aimed at (nil for a
 	// self/AoE cast). Ops with On=="ally" apply to it (or the caster if nil).
 	allyTarget *conn
+	// hitCount is how many enemies this cast's OpDamage actually landed on, set by that
+	// case for a LATER op in the SAME ops list to read (Op.ScalePerHit, Nerlag's
+	// «Поголовная бойня»). 0 until an OpDamage has run.
+	hitCount int
 }
 
 // centerLocked returns the AoE center: target mob, else point, else caster.
@@ -798,13 +862,13 @@ func (s *Server) centerLocked(c *conn, ctx opCtx) (float32, float32) {
 
 // mobsWithinLocked collects living ENEMIES whose body (centre within r + the mob's
 // own radius) overlaps the circle of radius r at (x,y), so an AoE that reaches a
-// big boss's edge still hits it. See mobState.hostile: in «Штурм» this map also
-// holds the player's own creeps and buildings, and every op routed through here
+// big boss's edge still hits it. See mobState.enemyOf: in «Штурм» this map also
+// holds the caster's own creeps and buildings, and every op routed through here
 // (damage, DoT, stun, root, slow, silence, knockback) was landing on them.
 func (c *conn) mobsWithinLocked(x, y float32, r float64) []*mobState {
 	var out []*mobState
 	for _, m := range c.huntState.mobs {
-		if m.dead || !m.hostile() {
+		if m.dead || !m.enemyOf(c.playerTeam()) {
 			continue
 		}
 		if math.Hypot(float64(m.x-x), float64(m.y-y)) <= r+m.mob.Radius() {
@@ -812,6 +876,19 @@ func (c *conn) mobsWithinLocked(x, y float32, r float64) []*mobState {
 		}
 	}
 	return out
+}
+
+// mobHasAllyNearLocked reports whether the target mob has ANY OTHER living enemy within
+// radius of it -- i.e. it is NOT isolated. Used by the TargetIsolated op gate (Vigilans's
+// «Свидание со смертью»). Every hostile mob is an ally of every other, so any other live
+// mob in range counts (a Hunt pack, a «Штурм» creep wave).
+func (s *Server) mobHasAllyNearLocked(c *conn, target *mobState, radius float64) bool {
+	for _, m := range c.mobsWithinLocked(target.x, target.y, radius) {
+		if m.id != target.id {
+			return true
+		}
+	}
+	return false
 }
 
 // friendlyMember resolves an object id to a same-instance party member's conn (a
@@ -931,7 +1008,7 @@ func (c *conn) mobsAlongLineLocked(cx, cy, tx, ty float32, halfWidth, maxLen flo
 	ux, uy := dx/dlen, dy/dlen // unit direction toward the aim point
 	var out []*mobState
 	for _, m := range c.huntState.mobs {
-		if m.dead || !m.hostile() { // allies are not in the swath -- see mobState.hostile
+		if m.dead || !m.enemyOf(c.playerTeam()) { // allies are not in the swath -- see enemyOf
 			continue
 		}
 		rx, ry := float64(m.x-cx), float64(m.y-cy)
@@ -1026,14 +1103,48 @@ func (s *Server) damageTargetsLocked(c *conn, ctx opCtx, radius float64) []*mobS
 // (the N nearest to the AoE centre). A capped op (Rognar's «Могильный холод», two
 // targets) hits only that subset of everything in range; uncapped ops are unchanged.
 func (s *Server) opTargetsLocked(c *conn, ctx opCtx, op gamedata.Op) []*mobState {
-	targets := s.damageTargetsLocked(c, ctx, op.Radius)
-	if op.MaxTargets > 0 && len(targets) > op.MaxTargets {
-		cx, cy := s.centerLocked(c, ctx)
+	targets := s.damageTargetsLocked(c, ctx, op.Radius+ctx.radiusBonus)
+	// ExcludeCenterTarget drops the AoE's own center (the struck/aimed unit) from its own
+	// splash/chain -- Titanid's «Ударная волна» ("все ДРУГИЕ враги"), PlusMinus's
+	// «Сверхпроводимость» ("четырем СОСЕДНИМ целям") -- so the primary target isn't hit a
+	// second time as one of its own splash victims.
+	if op.ExcludeCenterTarget && ctx.target != nil {
+		filtered := targets[:0]
+		for _, m := range targets {
+			if m != ctx.target {
+				filtered = append(filtered, m)
+			}
+		}
+		targets = filtered
+	}
+	// Sort nearest-first whenever a cap OR a per-target decay cares about hop order
+	// (PlusMinus's «Сверхпроводимость» chain decays by distance-from-epicentre order),
+	// not only when the cap actually trims the list -- otherwise an uncapped-count hit
+	// (fewer live enemies than MaxTargets) would decay in undefined map-iteration order.
+	if op.MaxTargets > 0 {
+		if op.Randomize {
+			rand.Shuffle(len(targets), func(i, j int) { targets[i], targets[j] = targets[j], targets[i] })
+		} else {
+			cx, cy := s.centerLocked(c, ctx)
+			sort.Slice(targets, func(i, j int) bool {
+				return math.Hypot(float64(targets[i].x-cx), float64(targets[i].y-cy)) <
+					math.Hypot(float64(targets[j].x-cx), float64(targets[j].y-cy))
+			})
+		}
+		if len(targets) > op.MaxTargets {
+			targets = targets[:op.MaxTargets]
+		}
+	}
+	// PerTargetGrowth (Nerlag's «Метание топоров») walks OUTWARD from the caster along the
+	// throw, so the "first, second, third..." index has to be nearest-to-CASTER first --
+	// unlike MaxTargets' nearest-to-CENTER sort (the center is the aim point for a point/
+	// beam cast, which would rank the growth backwards).
+	if op.PerTargetGrowth.At(ctx.level) > 0 || op.PerTargetGrowthSP > 0 {
+		cx, cy := c.posAtLocked(s.battleTime())
 		sort.Slice(targets, func(i, j int) bool {
 			return math.Hypot(float64(targets[i].x-cx), float64(targets[i].y-cy)) <
 				math.Hypot(float64(targets[j].x-cx), float64(targets[j].y-cy))
 		})
-		targets = targets[:op.MaxTargets]
 	}
 	return targets
 }
@@ -1053,9 +1164,15 @@ func (s *Server) skillDamageLocked(c *conn, op gamedata.Op, ctx opCtx, victim *m
 	} else if op.Scale == "magic" {
 		dmg += hs.spellPowerLocked(now)
 	}
+	if pct := op.PctOfAttack.At(ctx.level); pct > 0 {
+		dmg += hs.baseAttackLocked(now) * pct
+	}
 	// Soul-scaled bonus (Gellar's «Армия душ»: +damagePerSoul per banked soul).
 	if ps := op.PerSoul.At(ctx.level); ps > 0 {
 		dmg += ps * float64(hs.soulStacks) * hs.powerMul()
+		if op.PerSoulSP > 0 {
+			dmg += op.PerSoulSP * hs.spellPowerLocked(now) * float64(hs.soulStacks)
+		}
 	}
 	if op.Scale == "phys" {
 		dmg *= hs.st.modMul(now, "dmg_pct")
@@ -1092,6 +1209,18 @@ func (s *Server) applyOpsLocked(c *conn, ops []gamedata.Op, ctx opCtx, now float
 				continue
 			}
 		}
+		// Isolation gate: an op flagged TargetIsolated fires only if the aimed enemy has NO
+		// living ally within TriggerRadius of it (Vigilans's «Свидание со смертью» punishes a
+		// foe caught away from its pack). No target, or an ally nearby, skips the op.
+		if op.TargetIsolated {
+			r := op.TriggerRadius
+			if r <= 0 {
+				r = 6
+			}
+			if ctx.target == nil || s.mobHasAllyNearLocked(c, ctx.target, r) {
+				continue
+			}
+		}
 		// Friend-or-foe DUAL cast: an "enemy" op fires only when a foe was aimed, an "ally"
 		// op only when a friend was aimed (Kiona's «Страж леса», Frost's «Гробница холода»,
 		// Hekata's «Выбор скверны»). This keeps the enemy half from splashing a friend's
@@ -1109,14 +1238,64 @@ func (s *Server) applyOpsLocked(c *conn, ops []gamedata.Op, ctx opCtx, now float
 		switch op.Kind {
 		case gamedata.OpDamage:
 			if op.Apply == "self" {
+				// RefundIfHit (Abominator's «Бросок плоти»: «теряет здоровье, которое он может
+				// восстановить, ударив цель») -- skip the self-cost entirely when the cast's
+				// paired enemy-facing hit actually connected (ctx.target alive). A cast that
+				// resolved with no live target (rare: it died/left before the payload landed)
+				// still pays the cost, matching the client's "can restore BY HITTING" framing.
+				if op.RefundIfHit && ctx.target != nil && !ctx.target.dead {
+					break
+				}
 				// A self-sacrifice cost (Abominator): pure health drain, no armor.
 				dmg := op.Value.At(ctx.level)
 				hs.hp = math.Max(1, hs.hp-dmg) // never suicide on a cost
 				s.syncSelfLocked(c, syncHealth)
 				break
 			}
-			for _, m := range s.opTargetsLocked(c, ctx, op) {
-				s.hitMobLocked(c, m, s.skillDamageLocked(c, op, ctx, m), c.objID)
+			targets := s.opTargetsLocked(c, ctx, op)
+			for i, m := range targets {
+				dmg := s.skillDamageLocked(c, op, ctx, m) + ctx.dmgBonus
+				if pct := op.SelfMaxHPPct.At(ctx.level); pct > 0 {
+					dmg = pct * hs.maxHPLocked(now)
+				}
+				// MissingHPLinear (Inshari's «Возмездие»): a true execute -- damage scales
+				// linearly with the TARGET's own missing HP, capped at DamageCap(+PerSP×SP)
+				// -- «наносит {*damagePerHP} ... за каждую единицу здоровья отсутствующую у
+				// цели, но не более {*damageMax}+{*@damageSP}».
+				if lin := op.MissingHPLinear.At(ctx.level); lin > 0 {
+					dmg = lin * (m.maxHealth() - m.hp)
+					if cap := op.DamageCap.At(ctx.level); cap > 0 {
+						capVal := cap
+						if op.PerSP > 0 {
+							capVal += hs.spellPowerLocked(now) * op.PerSP
+						}
+						if dmg > capVal {
+							dmg = capVal
+						}
+					}
+				}
+				if op.PerTargetDecay > 0 {
+					dmg *= math.Pow(1-op.PerTargetDecay, float64(i))
+				}
+				// PerTargetGrowth (Nerlag's «Метание топоров»): each successive target (nearest-
+				// to-caster-first, see opTargetsLocked) takes MORE than the last, not the same
+				// flat number.
+				if g := op.PerTargetGrowth.At(ctx.level); g > 0 || op.PerTargetGrowthSP > 0 {
+					bonus := g
+					if op.PerTargetGrowthSP > 0 {
+						bonus += op.PerTargetGrowthSP * hs.spellPowerLocked(now)
+					}
+					dmg += bonus * float64(i)
+				}
+				s.hitMobLocked(c, m, dmg, c.objID)
+			}
+			// Lets a LATER op in this same cast scale off how many enemies actually got hit
+			// (Nerlag's «Поголовная бойня», Op.ScalePerHit).
+			ctx.hitCount = len(targets)
+			// Op.OnAnyDamage passives (Anhel's «Зов фантомов») also get a roll here: the
+			// caster's own skill damage landing, not just a basic attack.
+			if len(targets) > 0 {
+				s.runAnyDamageProcsLocked(c, now)
 			}
 
 		case gamedata.OpExecute:
@@ -1146,14 +1325,19 @@ func (s *Server) applyOpsLocked(c *conn, ops []gamedata.Op, ctx opCtx, now float
 			}
 
 		case gamedata.OpManaScaledDamage:
-			// Neirofim's «Паралич воли»: damage grows with the target's MISSING mana, the slow
-			// with its REMAINING mana. Manaless (melee) mobs take only the base and no slow.
+			// Neirofim's «Паралич воли»: the base hit ALWAYS lands («наносит магический урон и
+			// замедляет цель, в зависимости от количества маны у цели» -- only the MAGNITUDE is a
+			// function of mana, not whether it connects at all). A mana-less (melee) mob still
+			// takes the flat base+PerSP damage; only the missing-mana bonus and the slow (which
+			// have nothing to scale from) are skipped for it.
 			if m := ctx.target; m != nil && !m.dead {
 				dmg := op.Value.At(ctx.level) * hs.powerMul()
 				if op.PerSP > 0 {
 					dmg += hs.spellPowerLocked(now) * op.PerSP
 				}
-				dmg += op.Value2.At(ctx.level) * (m.maxMana - m.mana)
+				if m.maxMana > 0 {
+					dmg += op.Value2.At(ctx.level) * (m.maxMana - m.mana)
+				}
 				s.hitMobLocked(c, m, dmg, c.objID)
 				if dur := op.Dur.At(ctx.level); dur > 0 && m.maxMana > 0 {
 					m.st.slowUntil = now + dur
@@ -1170,6 +1354,8 @@ func (s *Server) applyOpsLocked(c *conn, ops []gamedata.Op, ctx opCtx, now float
 				amt := op.Value.At(ctx.level)
 				if op.Apply == "own_mana" {
 					amt *= hs.maxManaLocked(now) // a % of the caster's own pool
+				} else if op.PerSP > 0 {
+					amt += hs.spellPowerLocked(now) * op.PerSP
 				}
 				if drained := m.drainManaLocked(amt); drained > 0 {
 					switch {
@@ -1184,12 +1370,24 @@ func (s *Server) applyOpsLocked(c *conn, ops []gamedata.Op, ctx opCtx, now float
 				}
 			}
 
+		case gamedata.OpManaBurnArea:
+			// PlusMinus's «Шаровая молния»: burn mana from every enemy in the blast, no
+			// damage-back component.
+			cx, cy := s.centerLocked(c, ctx)
+			drain := op.Value.At(ctx.level)
+			if op.PerSP > 0 {
+				drain += hs.spellPowerLocked(now) * op.PerSP
+			}
+			for _, m := range c.mobsWithinLocked(cx, cy, op.Radius) {
+				m.drainManaLocked(drain)
+			}
+
 		case gamedata.OpSilenceAll:
 			// Neirofim's «Молчание»: silence every hostile mob on the map, and drain mana from
 			// those nearby. Boss casting honours silenceUntil (tryBossSkillLocked).
 			dur := op.Dur.At(ctx.level)
 			for _, m := range hs.mobs {
-				if m.dead || !m.hostile() {
+				if m.dead || !m.enemyOf(c.playerTeam()) {
 					continue
 				}
 				m.st.silenceUntil = math.Max(m.st.silenceUntil, now+dur)
@@ -1229,6 +1427,52 @@ func (s *Server) applyOpsLocked(c *conn, ops []gamedata.Op, ctx opCtx, now float
 				hs.hp = math.Max(1, hs.hp-cost)
 				s.syncSelfLocked(c, syncHealth)
 				hs.nextHitBonus += op.Value.At(ctx.level) * cost
+			}
+
+		case gamedata.OpSelfRecoil:
+			// Sigilion's «Мощь берсерка»: arm the per-attack self-punish window, consumed
+			// in scheduleHitAfterLocked against the swing's LIVE dmg_pct bonus.
+			hs.recoilFrac = op.Value.At(ctx.level)
+			hs.recoilUntil = now + op.Dur.At(ctx.level)
+
+		case gamedata.OpAttackManaBonus:
+			// Miriam's «Зачарованные стрелы»: arm the mana-fueled attack window, consumed
+			// in scheduleHitAfterLocked.
+			hs.manaShotDmg = op.Value.At(ctx.level)
+			if op.PerSP > 0 {
+				hs.manaShotDmg += hs.spellPowerLocked(now) * op.PerSP
+			}
+			hs.manaShotCost = op.Value2.At(ctx.level)
+			hs.manaShotUntil = now + op.Dur.At(ctx.level)
+
+		case gamedata.OpAttackCleave:
+			// BlackDragon's «Неистовство»: arm the cleave window, consumed in
+			// scheduleHitAfterLocked.
+			hs.cleaveRadius = op.Radius
+			hs.cleaveUntil = now + op.Dur.At(ctx.level)
+
+		case gamedata.OpHitStack:
+			// Gayal's «Меч жажды»: arm the per-hit stacking window, consumed in
+			// scheduleHitAfterLocked. Re-casting refreshes the window and the per-stack
+			// magnitudes, but leaves any stacks already banked alone.
+			hs.hitStackUntil = now + op.Dur.At(ctx.level)
+			hs.hitStackCap = int(op.Count.At(ctx.level))
+			hs.hitStackLSPer = op.Value.At(ctx.level)
+			hs.hitStackSpdPer = op.Value2.At(ctx.level)
+			hs.hitStackBurstDmg = op.StackBurstDamage.At(ctx.level)
+			hs.hitStackBurstSP = op.PerSP
+
+		case gamedata.OpCastMark:
+			// Einzenhaim's «Изгнание колдовства»: mark every enemy in the spray so
+			// tryBossSkillLocked can punish one that casts within the window.
+			for _, m := range s.opTargetsLocked(c, ctx, op) {
+				dmg := op.Value.At(ctx.level)
+				if op.PerSP > 0 {
+					dmg += hs.spellPowerLocked(now) * op.PerSP
+				}
+				m.st.castMarkUntil = now + op.Dur.At(ctx.level)
+				m.st.castMarkDmg = dmg
+				m.st.castMarkOwner = c.objID
 			}
 
 		case gamedata.OpConsumeSouls:
@@ -1272,21 +1516,136 @@ func (s *Server) applyOpsLocked(c *conn, ops []gamedata.Op, ctx opCtx, now float
 				s.healPlayerLocked(c, dmg*op.Value2.At(ctx.level))
 			}
 
+		case gamedata.OpDrainMaxHP:
+			for _, m := range s.opTargetsLocked(c, ctx, op) {
+				amt := op.Value.At(ctx.level) * hs.powerMul()
+				if op.PerSP > 0 {
+					amt += hs.spellPowerLocked(now) * op.PerSP
+				}
+				m.maxHP = math.Max(1, m.maxHealth()-amt)
+				if m.hp > m.maxHP {
+					m.hp = m.maxHP
+				}
+			}
+
 		case gamedata.OpDot:
 			for _, m := range s.opTargetsLocked(c, ctx, op) {
+				perSec := op.Value.At(ctx.level)
+				// VictimMaxHPPct (Elgorm's «Оскверненная почва»): the DoT punishes tanky/
+				// high-HP targets harder -- a fraction of the TARGET's own max HP, not a
+				// flat per-rank number.
+				if pct := op.VictimMaxHPPct.At(ctx.level); pct > 0 {
+					perSec = pct * m.maxHealth()
+				}
+				if op.PerSP > 0 {
+					perSec += hs.spellPowerLocked(now) * op.PerSP
+				}
+				perSecEnd := perSec
+				if len(op.DecayTo) > 0 {
+					perSecEnd = op.DecayTo.At(ctx.level)
+				}
 				m.st.dots = append(m.st.dots, overTime{
-					perSec: op.Value.At(ctx.level), until: now + op.Dur.At(ctx.level),
+					perSec: perSec, perSecEnd: perSecEnd, startAt: now,
+					until: now + op.Dur.At(ctx.level),
 					nextTick: now + dotTickInterval, srcObj: c.objID,
 				})
 				// Persistent acid/poison visual on the victim (one shared copy, shown
 				// to the whole party). An empty DotFx is a no-op inside the helper.
 				s.ensureMobStatusFxLocked(c, m, &m.st.dotFx, op.DotFx)
+				// Wilfang's «Ядовитый укус»: a death while still poisoned detonates an AoE
+				// burst, read in the mob-death branch before the status wipe.
+				if op.ExplodeOnDeath {
+					dmg := op.ExplodeDamage.At(ctx.level)
+					if op.ExplodeSP > 0 {
+						dmg += hs.spellPowerLocked(now) * op.ExplodeSP
+					}
+					m.st.poisonExplodeUntil = now + op.Dur.At(ctx.level)
+					m.st.poisonExplodeOwner = c.objID
+					m.st.poisonExplodeDmg = dmg
+					m.st.poisonExplodeRadius = op.ExplodeRadius
+				}
+			}
+
+		case gamedata.OpChainHeal:
+			// Kiona's «Лечебная волна»: hops between up to Count living allies (self first),
+			// healing each; enemies near WHICHEVER ally is currently being healed take
+			// Value2 magic damage. Solo (no teammates) simply heals+splashes around Kiona
+			// herself, matching the self-only fallback used elsewhere in this file.
+			steps := int(op.Count.At(ctx.level))
+			if steps < 1 {
+				steps = 1
+			}
+			healAmt := op.Value.At(ctx.level) * hs.powerMul()
+			if op.PerSP > 0 {
+				healAmt += hs.spellPowerLocked(now) * op.PerSP
+			}
+			dmgAmt := op.Value2.At(ctx.level) * hs.powerMul()
+			radius := op.Radius
+			if radius <= 0 {
+				radius = 4
+			}
+			hit := 0
+			for _, mem := range c.members() {
+				if hit >= steps {
+					break
+				}
+				mh := mem.huntState
+				if mh == nil || mh.deadUntil > 0 {
+					continue
+				}
+				s.healPlayerLocked(mem, healAmt)
+				if dmgAmt > 0 {
+					mx, my := mem.posAtLocked(float32(now))
+					for _, m := range c.mobsWithinLocked(mx, my, radius) {
+						s.hitMobLocked(c, m, dmgAmt, c.objID)
+					}
+				}
+				hit++
+			}
+
+		case gamedata.OpDamageShare:
+			// Kiona's «Лесной покров»: mark whichever unit this cast resolved (enemy mob OR
+			// ally player) to share Value fraction of any damage it takes as healing to
+			// nearby allies for the duration.
+			coeff := op.Value.At(ctx.level)
+			dur := op.Dur.At(ctx.level)
+			radius := op.Radius
+			if radius <= 0 {
+				radius = 5
+			}
+			switch {
+			case ctx.target != nil:
+				ctx.target.st.cloakUntil = now + dur
+				ctx.target.st.cloakOwner = c.objID
+				ctx.target.st.cloakHealCoeff = coeff
+				ctx.target.st.cloakRadius = radius
+			case ctx.allyTarget != nil:
+				ahs := ctx.allyTarget.huntState
+				ahs.st.cloakUntil = now + dur
+				ahs.st.cloakOwner = c.objID
+				ahs.st.cloakHealCoeff = coeff
+				ahs.st.cloakRadius = radius
+			default:
+				hs.st.cloakUntil = now + dur
+				hs.st.cloakOwner = c.objID
+				hs.st.cloakHealCoeff = coeff
+				hs.st.cloakRadius = radius
+			}
+
+		case gamedata.OpRevealTarget:
+			// Velial's «Трибунал»: the marked enemy stays fully revealed to the whole team
+			// (bypasses mobViewDistLocked's distance-based fog) for the duration.
+			if m := ctx.target; m != nil {
+				m.st.revealUntil = now + op.Dur.At(ctx.level)
 			}
 
 		case gamedata.OpHeal:
 			amt := op.Value.At(ctx.level) * hs.powerMul()
 			if op.PerSP > 0 {
 				amt += hs.spellPowerLocked(now) * op.PerSP
+			}
+			if pct := op.SelfMaxHPPct.At(ctx.level); pct > 0 {
+				amt = pct * hs.maxHPLocked(now)
 			}
 			// Value2 scales the heal by the size of the hit that triggered this op --
 			// Nerlag's «Прилив крови» (on-damaged proc) heals for the damage just taken.
@@ -1305,6 +1664,9 @@ func (s *Server) applyOpsLocked(c *conn, ops []gamedata.Op, ctx opCtx, now float
 
 		case gamedata.OpHot:
 			perSec := op.Value.At(ctx.level) * hs.powerMul()
+			if op.PerSP > 0 {
+				perSec += hs.spellPowerLocked(now) * op.PerSP
+			}
 			if op.On == "allies" || op.On == "ally" {
 				for _, mem := range s.allyTargetsLocked(c, ctx, op) {
 					s.addAllyHotLocked(mem, perSec, now+op.Dur.At(ctx.level), now)
@@ -1316,12 +1678,16 @@ func (s *Server) applyOpsLocked(c *conn, ops []gamedata.Op, ctx opCtx, now float
 			}
 
 		case gamedata.OpManaRestore:
-			hs.mana = math.Min(hs.maxManaLocked(now), hs.mana+op.Value.At(ctx.level)*hs.powerMul())
+			amt := op.Value.At(ctx.level) * hs.powerMul()
+			if op.PerSP > 0 {
+				amt += hs.spellPowerLocked(now) * op.PerSP
+			}
+			hs.mana = math.Min(hs.maxManaLocked(now), hs.mana+amt)
 			s.syncSelfLocked(c, syncMana)
 
 		case gamedata.OpStun:
 			for _, m := range s.opTargetsLocked(c, ctx, op) {
-				s.stunMobLocked(c, m, now, op.Dur.At(ctx.level))
+				s.stunMobLocked(c, m, now, op.Dur.At(ctx.level)+ctx.durBonus)
 			}
 
 		case gamedata.OpRoot:
@@ -1335,6 +1701,11 @@ func (s *Server) applyOpsLocked(c *conn, ops []gamedata.Op, ctx opCtx, now float
 			for _, m := range s.opTargetsLocked(c, ctx, op) {
 				m.st.slowUntil = now + op.Dur.At(ctx.level)
 				m.st.slowFactor = op.Value.At(ctx.level)
+				m.st.slowFactorEnd = m.st.slowFactor
+				if len(op.DecayTo) > 0 {
+					m.st.slowFactorEnd = op.DecayTo.At(ctx.level)
+				}
+				m.st.slowStart = now
 				s.ensureMobStatusFxLocked(c, m, &m.st.slowFx, "SlowMoveEffect")
 				s.syncMobSpeedLocked(c, m, now)
 			}
@@ -1356,6 +1727,30 @@ func (s *Server) applyOpsLocked(c *conn, ops []gamedata.Op, ctx opCtx, now float
 			}
 
 		case gamedata.OpBuffStat:
+			// ScalePerHit (Nerlag's «Поголовная бойня»): rescale the authored Value by how
+			// many enemies THIS SAME cast's OpDamage just hit (ctx.hitCount, set earlier in
+			// this ops list) before any of the branches below read op.Value. 0 hits = no
+			// buff at all.
+			if op.ScalePerHit {
+				n := float64(ctx.hitCount)
+				if n <= 0 {
+					break
+				}
+				v := op.Value.At(ctx.level)
+				if strings.HasSuffix(op.Stat, "_pct") {
+					v = 1 + (v-1)*n
+				} else {
+					v = v * n
+				}
+				op.Value = gamedata.PerLevel{v}
+			}
+			// PerSP (Veritas's «Благословение жизни»/«Метаморфоза»): add the caster's own
+			// spell power to the authored Value, same as OpDamage/OpHeal already do. Collapses
+			// to a single-level PerLevel so every branch below reads the scaled total
+			// regardless of ctx.level, mirroring the ScalePerHit rescale above.
+			if op.PerSP > 0 {
+				op.Value = gamedata.PerLevel{op.Value.At(ctx.level) + hs.spellPowerLocked(now)*op.PerSP}
+			}
 			// On:"target" with NO unit target is a self-cast (the client always ships a
 			// targetPos, so hasPos alone does not mean a unit was picked): buff the
 			// caster. It must not fall through to opTargetsLocked -- damageTargetsLocked's
@@ -1363,7 +1758,24 @@ func (s *Server) applyOpsLocked(c *conn, ops []gamedata.Op, ctx opCtx, now float
 			// for DAMAGE ops and hands a friendly buff to whatever stands nearby. That
 			// scan is hostile-only, so a self-cast «Щит хранителя» was handing +30
 			// magic_armor to the enemies around it and nothing to the caster.
-			if op.On == "allies" || op.On == "ally" {
+			if op.On == "own_summons" {
+				// Anhel's «Гнев океана»: "себе, и всем своим клонам" -- the caster's own
+				// self-buff is a SEPARATE op (On:"self"/"target"); this one only reaches her
+				// live summoned units. Grimlok's «Дикость» additionally buffs move speed
+				// (Stat=="move_speed_pct"), a separate live multiplier from attack speed.
+				until := now + op.Dur.At(ctx.level)
+				mul := op.Value.At(ctx.level)
+				for _, sm := range hs.summons {
+					if sm.dead {
+						continue
+					}
+					if op.Stat == "move_speed_pct" {
+						sm.moveSpeedMul, sm.moveSpeedMulUntil = mul, until
+					} else {
+						sm.atkSpeedMul, sm.atkSpeedMulUntil = mul, until
+					}
+				}
+			} else if op.On == "allies" || op.On == "ally" {
 				// Buff friendly avatars (self + nearby / aimed allies): Arianna's «Аура
 				// стойкости», Sandariel's «Прыжок» speed, Hekata's «Пепельный смерч» ally
 				// attack. Self keeps the caster's own buff icon; allies get the stat only.
@@ -1406,15 +1818,35 @@ func (s *Server) applyOpsLocked(c *conn, ops []gamedata.Op, ctx opCtx, now float
 			if op.On == "allies" || op.On == "ally" {
 				for _, mem := range s.allyTargetsLocked(c, ctx, op) {
 					s.applyShieldLocked(mem, amount, until)
+					if op.GrantsCCImmune {
+						mem.huntState.tempCCImmuneUntil = until
+					}
 				}
 			} else {
 				s.applyShieldLocked(c, amount, until)
+				if op.GrantsCCImmune {
+					hs.tempCCImmuneUntil = until
+				}
 			}
 
 		case gamedata.OpBlink:
 			s.blinkLocked(c, ctx)
 
 		case gamedata.OpDash:
+			if op.PushAside > 0 {
+				// «Отпихивая всех врагов в стороны»: shove enemies along the charge's path,
+				// separate from (and before) the arrival-point slow+damage AoE below.
+				tx, ty := ctx.px, ctx.py
+				if ctx.target != nil {
+					tx, ty = ctx.target.x, ctx.target.y
+				}
+				if ctx.hasPos || ctx.target != nil {
+					cx, cy := c.posAtLocked(float32(now))
+					for _, m := range c.mobsAlongLineLocked(cx, cy, tx, ty, 2.5, math.Hypot(float64(tx-cx), float64(ty-cy))) {
+						s.knockbackMobLocked(c, m, op.PushAside, now)
+					}
+				}
+			}
 			s.dashLocked(c, ctx, op.Value.At(ctx.level), now, op.NoClip)
 			// Strike on arrival: defer the ops AFTER this dash until the lunge lands
 			// (hs.dashUntil), so damage/root/barrier hit on impact, not on cast.
@@ -1443,16 +1875,59 @@ func (s *Server) applyOpsLocked(c *conn, ops []gamedata.Op, ctx opCtx, now float
 			}
 
 		case gamedata.OpStealth:
+			if op.On == "allies" {
+				// Sandariel's «Сокрывающая вуаль»: cloaks nearby ALLIES, not herself -- she
+				// "остаётся видимой" (stays visible; her own dodge_pct buff is a separate op).
+				allyOp := op
+				if allyOp.Radius <= 0 {
+					allyOp.Radius = 5
+				}
+				for _, mem := range s.allyTargetsLocked(c, ctx, allyOp) {
+					if mem != c {
+						s.applySkillStealthLocked(mem, op.Dur.At(ctx.level), op.BreakOnMove, now)
+					}
+				}
+				break
+			}
 			// Cloak the caster (Lirvein/Sandariel/Astarot/Wilfang stealth skills). The
 			// cast's own breakInvisibilityLocked already fired at the top of doSkillLocked
 			// (before ops run), so this grant survives until the NEXT attack/cast reveals it.
-			s.applySkillStealthLocked(c, op.Dur.At(ctx.level), now)
+			// op.BreakOnMove additionally reveals it on any move order (Wilfang's «Засада»).
+			s.applySkillStealthLocked(c, op.Dur.At(ctx.level), op.BreakOnMove, now)
+			// A stealth op carrying nested Ops arms a reveal burst, detonated the instant
+			// invisibility breaks -- «при этом окружающие враги получают урон» (Wilfang's
+			// «Засада»: damage lands when the ambush ends, not at cast).
+			if len(op.Ops) > 0 {
+				hs.stealthBurst = op.Ops
+				hs.stealthBurstSlot = ctx.slot
+				hs.stealthBurstLevel = ctx.level
+			}
+
+		case gamedata.OpTreeForm:
+			// Urg's «Древесный камуфляж»: turn the ally (self in solo) into a tree — the
+			// reveal burst detonates when they leave the form (urg.go).
+			s.applyTreeFormLocked(c, op, ctx, now)
+
+		case gamedata.OpGrove:
+			// Urg's «Непроглядные дебри»: grow the tree ring; the fall-damage is deferred
+			// to when the trees vanish (urg.go). The while-standing silence is a sibling op.
+			s.applyGroveLocked(c, op, ctx, now)
 
 		case gamedata.OpOnKill:
-			// Run the nested ops only if this cast's primary target died from it
-			// (Lirvein's «Изощренный бросок» reset+empower on a kill).
+			// Run the nested ops immediately if this cast's primary target died from it
+			// (Lirvein's «Изощренный бросок» reset+empower on a kill). Otherwise, if the
+			// op carries a Dur, mark the (surviving) target: a later kill by ANY source
+			// before the mark expires still credits this caster (see the mob-death branch).
 			if ctx.target != nil && ctx.target.dead {
 				s.applyOpsLocked(c, op.Ops, ctx, now)
+			} else if ctx.target != nil && !ctx.target.dead {
+				if dur := op.Dur.At(ctx.level); dur > 0 {
+					ctx.target.st.killMarkUntil = now + dur
+					ctx.target.st.killMarkOwner = c.objID
+					ctx.target.st.killMarkOps = op.Ops
+					ctx.target.st.killMarkLevel = ctx.level
+					ctx.target.st.killMarkSlot = ctx.slot
+				}
 			}
 
 		case gamedata.OpCooldownReset:
@@ -1478,10 +1953,35 @@ func (s *Server) applyOpsLocked(c *conn, ops []gamedata.Op, ctx opCtx, now float
 				fx: uid, triggerFx: op.TriggerFx, anchor: anchor,
 			})
 
+		case gamedata.OpVisionWard:
+			s.spawnVisionWardLocked(c, op, ctx, now)
+
 		case gamedata.OpBounce:
 			s.startBounceLocked(c, op, ctx, now)
 
 		case gamedata.OpChannel:
+			// Op.Growth on a nested OpDamage (Miriam's «Убийственный залп») ramps the
+			// channel's damage additively per pulse; on a nested OpStun (Titanid's
+			// «Землетрясение») it ramps the stun duration instead; Op.RadiusGrowth widens
+			// either's AoE per pulse -- read them once here into the channelState so
+			// tickChannelsLocked can apply pulseCount×growth each tick.
+			var growth, growthSP, stunGrowth, radiusGrowth, growthPerEnemy, growthRadius float64
+			for _, nested := range op.Ops {
+				if nested.Kind == gamedata.OpDamage && len(nested.Growth) > 0 {
+					growth = nested.Growth.At(ctx.level)
+					growthSP = nested.GrowthPerSP
+				}
+				if nested.Kind == gamedata.OpStun && len(nested.Growth) > 0 {
+					stunGrowth = nested.Growth.At(ctx.level)
+				}
+				if nested.RadiusGrowth > 0 {
+					radiusGrowth = nested.RadiusGrowth
+				}
+				if nested.Kind == gamedata.OpDamage && len(nested.GrowthPerEnemy) > 0 {
+					growthPerEnemy = nested.GrowthPerEnemy.At(ctx.level)
+					growthRadius = nested.Radius
+				}
+			}
 			hs.channels = append(hs.channels, channelState{
 				slot: ctx.slot, level: ctx.level,
 				until: now + op.Dur.At(ctx.level), interval: op.Interval,
@@ -1492,6 +1992,14 @@ func (s *Server) applyOpsLocked(c *conn, ops []gamedata.Op, ctx opCtx, now float
 				target:    mobID(ctx.target),
 				px:        ctx.px, py: ctx.py, hasPos: ctx.hasPos, ops: op.Ops,
 				interruptible: channelInterruptible(hs.av.Prefab, ctx.slot),
+				breakDist:     op.TriggerRadius,               // >0 = leash (Inshari siphon)
+				stunOnBreak:   op.Value2.At(ctx.level),        // stun seconds when the leash snaps
+				growth:        growth,
+				growthSP:      growthSP,
+				stunGrowth:    stunGrowth,
+				radiusGrowth:  radiusGrowth,
+				growthPerEnemy: growthPerEnemy,
+				growthRadius:   growthRadius,
 			})
 
 		case gamedata.OpProc:
@@ -1502,8 +2010,9 @@ func (s *Server) applyOpsLocked(c *conn, ops []gamedata.Op, ctx opCtx, now float
 		case gamedata.OpAura:
 			// aura pulses run from the tick while the toggle is on; nothing here.
 
-		case gamedata.OpRevive, gamedata.OpImmune, gamedata.OpHealOnKill,
-			gamedata.OpConsecutiveHit, gamedata.OpAttackSpeedStreak, gamedata.OpShieldExplode:
+		case gamedata.OpRevive, gamedata.OpImmune, gamedata.OpHealOnKill, gamedata.OpManaOnKill,
+			gamedata.OpConsecutiveHit, gamedata.OpAttackSpeedStreak, gamedata.OpShieldExplode,
+			gamedata.OpCleanseOnHit, gamedata.OpMoveChargeAttack, gamedata.OpZoneArmor, gamedata.OpMeleeForm:
 			// Passive/toggle-only mechanics: registered at world-build (or on toggle-on) and
 			// honored in the death / player-CC / on-kill / basic-attack / incoming-hit gates.
 			// Nothing to run inside an ops batch.
@@ -1516,6 +2025,9 @@ func (s *Server) applyOpsLocked(c *conn, ops []gamedata.Op, ctx opCtx, now float
 				if dur := op.Dur.At(ctx.level); dur > 0 {
 					hs.killWindowUntil = now + dur
 					hs.killWindowPerKill = op.Value.At(ctx.level)
+					if op.PerSP > 0 {
+						hs.killWindowPerKill += hs.spellPowerLocked(now) * op.PerSP
+					}
 					hs.killWindowCap = int(op.Value2.At(ctx.level))
 					hs.killWindowStacks = 0
 				}
@@ -1564,8 +2076,12 @@ func (hs *huntState) maxManaLocked(now float64) float64 {
 }
 
 // effAttackRangeLocked is the avatar's live auto-attack reach: its base AttackRange
-// plus any attack_range buff (Teridin's «Прицеливание» passive).
+// plus any attack_range buff (Teridin's «Прицеливание» passive) -- or a flat melee
+// reach while Grimlok's «Темная сторона» (Op.MeleeForm) toggle is active.
 func (hs *huntState) effAttackRangeLocked(now float64) float64 {
+	if hs.meleeFormSlot > 0 {
+		return meleeReach
+	}
 	return hs.av.AttackRange + hs.st.modSum(now, "attack_range")
 }
 
@@ -1591,8 +2107,42 @@ func (s *Server) addPlayerModLocked(c *conn, ctx opCtx, op gamedata.Op, now floa
 	}
 	mod := statMod{stat: op.Stat, value: op.Value.At(ctx.level), until: until, src: castSrc(ctx)}
 
+	// StackCap (Titanid's «Каменная кожа»): clamp this stack to the remaining headroom
+	// under the cap, shared across every live mod from the SAME skill+stat; drop it
+	// entirely once the cap is already full.
+	if cap := op.StackCap.At(ctx.level); cap > 0 {
+		var sum float64
+		for _, m := range hs.st.mods {
+			if m.stat == mod.stat && m.src == mod.src && (m.until == 0 || now < m.until) {
+				sum += m.value
+			}
+		}
+		if room := cap - sum; room < mod.value {
+			mod.value = room
+		}
+		if mod.value <= 0 {
+			return
+		}
+	}
+
+	// A multi-stat self/ally buff (Urg's «Дубовая кора» stacks block + armor + regen in one
+	// cast) must show ONE icon and ONE glow, not one per stat op. If a live mod from THIS same
+	// cast already carries the icon/fx, this op only contributes its stat -- no duplicate.
+	srcHasIcon, srcHasFx := false, false
+	for _, m := range hs.st.mods {
+		if m.src != mod.src {
+			continue
+		}
+		if m.buffEffID != 0 {
+			srcHasIcon = true
+		}
+		if m.fxUID != 0 {
+			srcHasFx = true
+		}
+	}
+
 	// Buff-bar icon (only for timed, non-toggle, icon-enabled skills).
-	if def.BuffIcon && dur > 0 {
+	if def.BuffIcon && dur > 0 && !srcHasIcon {
 		mod.buffEffID = hs.newEffID()
 		args := amf.NewArray().Set("duration", dur).Set("level", int32(ctx.level))
 		for k, v := range def.TipArgs {
@@ -1604,7 +2154,7 @@ func (s *Server) addPlayerModLocked(c *conn, ctx opCtx, op gamedata.Op, now floa
 	// A toggle owns its persistent BuffFx via hs.toggleFx (started in
 	// toggleSkillLocked); don't start a second copy here or it would leak the
 	// duplicate on toggle-off.
-	if def.BuffFx != "" && def.BuffFxOn != "target" && !ctx.toggle {
+	if def.BuffFx != "" && def.BuffFxOn != "target" && !ctx.toggle && !srcHasFx {
 		if def.BuffFxOn == "ground" {
 			// A stationary barrier (e.g. Vigilans' ult). CONFIRMED on the client: this
 			// prefab's barrier gfx is SELF-mode -- it PARENTS to the EFFECT_START owner
@@ -1665,6 +2215,10 @@ func (s *Server) pushPlayerStatsLocked(c *conn, now float64) {
 	dmgMul := st.modMul(now, "dmg_pct") * hs.powerMul()
 	// Flat basic-attack bonuses from avatar tree items (DamageMin/AttackSpeed).
 	dmgFlat := st.modSum(now, "dmg_flat")
+	// Velial's «Воля к победе» adds a flat, post-multiplier bonus scaling with his own missing
+	// HP. Fold it into the DISPLAYED damage so the avatar card shows it added to the attack
+	// (it tracks HP live via refreshPassiveBuffCountersLocked, which re-pushes these stats).
+	missBonus := hs.casterMissingHPBonusLocked(now)
 	atkSpeed := a.AttackSpeed + st.modSum(now, "atk_speed_flat")
 	armMul := st.modMul(now, "armor_pct")
 	maxHP := hs.maxHPLocked(now)
@@ -1676,8 +2230,8 @@ func (s *Server) pushPlayerStatsLocked(c *conn, now float64) {
 		hs.mana = maxMana
 	}
 	b := newSyncBlob(float32(now)).
-		setFloats(syncDmgMin, idx, float32((float64(a.DmgMin)+dmgFlat)*dmgMul)).
-		setFloats(syncDmgMax, idx, float32((float64(a.DmgMax)+dmgFlat)*dmgMul)).
+		setFloats(syncDmgMin, idx, float32((float64(a.DmgMin)+dmgFlat)*dmgMul+missBonus)).
+		setFloats(syncDmgMax, idx, float32((float64(a.DmgMax)+dmgFlat)*dmgMul+missBonus)).
 		setFloats(syncAttackSpeed, idx, float32(atkSpeed*st.attackFactor(now))).
 		setFloats(syncMaxHealth, idx, float32(maxHP)).
 		setFloats(syncHealth, idx, float32(hs.hp/maxHP)).
@@ -1687,7 +2241,8 @@ func (s *Server) pushPlayerStatsLocked(c *conn, now float64) {
 		setFloats(syncMagicArmor, idx, float32((a.MagicArmor+st.modSum(now, "magic_armor"))*armMul)).
 		setFloats(syncSpellPower, idx, float32(hs.spellPowerLocked(now))).
 		setFloats(syncAttackRange, idx, float32(hs.effAttackRangeLocked(now))).
-		setFloats(syncSpeed, idx, float32(c.curSpeedLocked(now)))
+		setFloats(syncSpeed, idx, float32(c.curSpeedLocked(now))).
+		setFloats(syncViewRadius, idx, effectiveViewRadius(avatarViewRadius*float32(st.modMul(now, "view_radius_pct"))))
 	s.push(c, battleproto.CmdSync, amf.NewArray().Set("data", b.build(hs.tr.count())))
 	c.applySpeedLocked(s, now)
 }

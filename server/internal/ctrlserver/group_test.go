@@ -9,6 +9,7 @@ import (
 
 	"tanatserver/internal/amf"
 	"tanatserver/internal/ctrlproto"
+	"tanatserver/internal/gamedata"
 	"tanatserver/internal/mpd"
 )
 
@@ -136,6 +137,36 @@ func TestGroupListSoloIsSelfLeader(t *testing.T) {
 	}
 	if users, _ := gl.GetArray("users"); len(users.Dense) != 0 {
 		t.Errorf("solo group_list should have no members, got %d", len(users.Dense))
+	}
+}
+
+// TestGlobalBuffsRepushedOnConnect: a hero holding an active global buff (rune/elixir) gets
+// user|update_global_buffs re-pushed the instant their MPD socket registers, so the buff bar
+// shows the icon again after a relog (OnMPDConnect) -- the client's mGlobalBuffs is otherwise
+// empty on a fresh connect and never re-syncs on its own.
+func TestGlobalBuffsRepushedOnConnect(t *testing.T) {
+	srv := New()
+	hub := mpd.NewHub(srv.Store)
+	srv.MPD = hub
+	hub.OnConnect = srv.OnMPDConnect
+	hub.OnDisconnect = srv.NotifyOffline
+
+	ln, _ := net.Listen("tcp", "127.0.0.1:0")
+	t.Cleanup(func() { ln.Close() })
+	go hub.Serve(ln)
+
+	uid, key := newShopHero(t, srv, 1, 10, 0)
+	rune := gamedata.Runes()[0]
+	srv.Store.AddGlobalBuff(uid, rune.ArticleID, 3600)
+
+	_, br := dialMPD(t, ln.Addr().String(), uid, key)
+	args := readPushArgs(t, br, "user|update_global_buffs")
+	buffs, ok := args.GetArray("buffs")
+	if !ok {
+		t.Fatalf("update_global_buffs push missing buffs: %#v", args)
+	}
+	if _, ok := buffs.Assoc[itoaTest(rune.ArticleID)]; !ok {
+		t.Errorf("re-push missing active rune %d: %#v", rune.ArticleID, buffs.Assoc)
 	}
 }
 

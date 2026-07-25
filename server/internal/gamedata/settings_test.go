@@ -68,6 +68,37 @@ func TestTunableMobSlope(t *testing.T) {
 	}
 }
 
+func TestMobRegenKnobs(t *testing.T) {
+	restoreSettings(t)
+	// Defaults reproduce the old hard-coded mob regen constants.
+	if got := MobManaRegenFrac(); got < 0.0599 || got > 0.0601 {
+		t.Errorf("default MobManaRegenFrac() = %g, want 0.06", got)
+	}
+	if got := MobHPRegenFrac(); got < 0.3999 || got > 0.4001 {
+		t.Errorf("default MobHPRegenFrac() = %g, want 0.4", got)
+	}
+	// Admin edit takes effect live.
+	Update(func(s *Settings) { s.MobManaRegenFrac = 0; s.MobHPRegenFrac = 0.9 })
+	if MobManaRegenFrac() != 0 {
+		t.Errorf("MobManaRegenFrac() = %g, want 0 (drain sticks)", MobManaRegenFrac())
+	}
+	if MobHPRegenFrac() != 0.9 {
+		t.Errorf("MobHPRegenFrac() = %g, want 0.9", MobHPRegenFrac())
+	}
+	// A negative regen is clamped to 0 (never a heal-drain).
+	Update(func(s *Settings) { s.MobManaRegenFrac = -1; s.MobHPRegenFrac = -1 })
+	if MobManaRegenFrac() != 0 || MobHPRegenFrac() != 0 {
+		t.Errorf("negative regen not clamped: mana=%g hp=%g", MobManaRegenFrac(), MobHPRegenFrac())
+	}
+	// A blob written before these knobs existed keeps the defaults, not 0.
+	if err := ApplyJSON([]byte(`{"fog_of_war":true}`)); err != nil {
+		t.Fatal(err)
+	}
+	if got := MobManaRegenFrac(); got < 0.0599 || got > 0.0601 {
+		t.Errorf("old blob dropped MobManaRegenFrac to %g, want default 0.06", got)
+	}
+}
+
 func TestAvatarOverrideRoundTrip(t *testing.T) {
 	restoreSettings(t)
 	const id = 8 // Mihalych

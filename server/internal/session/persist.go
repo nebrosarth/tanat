@@ -55,7 +55,9 @@ var schemaStmts = []string{
 		level         INTEGER NOT NULL DEFAULT 1,
 		exp           INTEGER NOT NULL DEFAULT 0,
 		next_exp      INTEGER NOT NULL DEFAULT 0,
-		next_item_id  INTEGER NOT NULL DEFAULT 0
+		next_item_id  INTEGER NOT NULL DEFAULT 0,
+		clan_id       INTEGER NOT NULL DEFAULT 0,
+		clan_role     INTEGER NOT NULL DEFAULT 0
 	)`,
 	`CREATE TABLE IF NOT EXISTS bag_items (
 		user_id    INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -85,6 +87,12 @@ var schemaStmts = []string{
 		cooldown_until INTEGER NOT NULL,
 		PRIMARY KEY (user_id, quest_id)
 	)`,
+	`CREATE TABLE IF NOT EXISTS hero_buffs (
+		user_id      INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+		article_id   INTEGER NOT NULL,
+		expires_unix INTEGER NOT NULL,
+		PRIMARY KEY (user_id, article_id)
+	)`,
 	`CREATE TABLE IF NOT EXISTS friends (
 		user_id   INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
 		friend_id INTEGER NOT NULL,
@@ -94,6 +102,19 @@ var schemaStmts = []string{
 		user_id   INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
 		ignore_id INTEGER NOT NULL,
 		PRIMARY KEY (user_id, ignore_id)
+	)`,
+	// clans is a top-level entity (not owned by one account): the header shown in the
+	// clan window. Membership + role live on the hero row (heroes.clan_id/clan_role), so
+	// the roster is derived, and deleting an account just clears its own membership. Name
+	// and tag are unique case-insensitively (sources CLAN_NAME_EXIST / TAG_EXIST).
+	`CREATE TABLE IF NOT EXISTS clans (
+		id           INTEGER PRIMARY KEY,
+		name         TEXT NOT NULL UNIQUE COLLATE NOCASE,
+		tag          TEXT NOT NULL UNIQUE COLLATE NOCASE,
+		level        INTEGER NOT NULL DEFAULT 1,
+		rating       INTEGER NOT NULL DEFAULT 0,
+		head_user_id INTEGER NOT NULL DEFAULT 0,
+		created_at   INTEGER NOT NULL DEFAULT 0
 	)`,
 	`INSERT INTO meta(key, value) VALUES('schema_version', '1')
 		ON CONFLICT(key) DO NOTHING`,
@@ -181,6 +202,8 @@ func openDB(path string) (*sql.DB, error) {
 func migrateSchema(db *sql.DB) error {
 	adds := []struct{ table, column, ddl string }{
 		{"users", "banned", "ALTER TABLE users ADD COLUMN banned INTEGER NOT NULL DEFAULT 0"},
+		{"heroes", "clan_id", "ALTER TABLE heroes ADD COLUMN clan_id INTEGER NOT NULL DEFAULT 0"},
+		{"heroes", "clan_role", "ALTER TABLE heroes ADD COLUMN clan_role INTEGER NOT NULL DEFAULT 0"},
 	}
 	for _, a := range adds {
 		has, err := columnExists(db, a.table, a.column)
@@ -276,7 +299,7 @@ func (s *Store) loadAllLocked() error {
 	}
 
 	hrows, err := s.db.Query(`SELECT user_id, race, gender, face, hair, dist_mark, skin_color,
-		hair_color, money, diamond_money, level, exp, next_exp, next_item_id FROM heroes`)
+		hair_color, money, diamond_money, level, exp, next_exp, next_item_id, clan_id, clan_role FROM heroes`)
 	if err != nil {
 		return err
 	}
@@ -285,7 +308,7 @@ func (s *Store) loadAllLocked() error {
 		h := &Hero{}
 		if err := hrows.Scan(&uid, &h.Race, &gender, &h.Face, &h.Hair, &h.DistMark,
 			&h.SkinColor, &h.HairColor, &h.Money, &h.DiamondMoney, &h.Level,
-			&h.Exp, &h.NextExp, &h.NextItemID); err != nil {
+			&h.Exp, &h.NextExp, &h.NextItemID, &h.ClanID, &h.ClanRole); err != nil {
 			hrows.Close()
 			return err
 		}
@@ -359,6 +382,21 @@ func (s *Store) loadAllLocked() error {
 		return err
 	}
 
+	if err := s.loadChild(`SELECT user_id, article_id, expires_unix FROM hero_buffs ORDER BY user_id, article_id`,
+		func(rows *sql.Rows) error {
+			var uid, art int32
+			var exp int64
+			if err := rows.Scan(&uid, &art, &exp); err != nil {
+				return err
+			}
+			if h := s.heroOf(uid); h != nil {
+				h.Buffs = append(h.Buffs, GlobalBuff{ArticleID: art, ExpiresUnix: exp})
+			}
+			return nil
+		}); err != nil {
+		return err
+	}
+
 	if err := s.loadChild(`SELECT user_id, friend_id FROM friends ORDER BY user_id, friend_id`,
 		func(rows *sql.Rows) error {
 			var uid, fid int32
@@ -384,6 +422,10 @@ func (s *Store) loadAllLocked() error {
 			}
 			return nil
 		}); err != nil {
+		return err
+	}
+
+	if err := s.loadClansLocked(); err != nil {
 		return err
 	}
 
@@ -505,7 +547,7 @@ func writeUserTx(tx *sql.Tx, u *User) error {
 
 	if u.Hero == nil {
 		// No hero: drop the hero row and anything that hangs off it.
-		for _, tbl := range []string{"heroes", "bag_items", "owned_items", "dressed_items", "quests"} {
+		for _, tbl := range []string{"heroes", "bag_items", "owned_items", "dressed_items", "quests", "hero_buffs"} {
 			if _, err := tx.Exec("DELETE FROM "+tbl+" WHERE user_id=?", u.ID); err != nil {
 				return err
 			}
@@ -514,15 +556,17 @@ func writeUserTx(tx *sql.Tx, u *User) error {
 		h := u.Hero
 		if _, err := tx.Exec(
 			`INSERT INTO heroes(user_id, race, gender, face, hair, dist_mark, skin_color,
-			   hair_color, money, diamond_money, level, exp, next_exp, next_item_id)
-			 VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			   hair_color, money, diamond_money, level, exp, next_exp, next_item_id, clan_id, clan_role)
+			 VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 			 ON CONFLICT(user_id) DO UPDATE SET
 			   race=excluded.race, gender=excluded.gender, face=excluded.face, hair=excluded.hair,
 			   dist_mark=excluded.dist_mark, skin_color=excluded.skin_color, hair_color=excluded.hair_color,
 			   money=excluded.money, diamond_money=excluded.diamond_money, level=excluded.level,
-			   exp=excluded.exp, next_exp=excluded.next_exp, next_item_id=excluded.next_item_id`,
+			   exp=excluded.exp, next_exp=excluded.next_exp, next_item_id=excluded.next_item_id,
+			   clan_id=excluded.clan_id, clan_role=excluded.clan_role`,
 			u.ID, h.Race, boolToInt(h.Gender), h.Face, h.Hair, h.DistMark, h.SkinColor,
-			h.HairColor, h.Money, h.DiamondMoney, h.Level, h.Exp, h.NextExp, h.NextItemID); err != nil {
+			h.HairColor, h.Money, h.DiamondMoney, h.Level, h.Exp, h.NextExp, h.NextItemID,
+			h.ClanID, h.ClanRole); err != nil {
 			return err
 		}
 		if err := rewriteChild(tx, "bag_items", u.ID,
@@ -546,6 +590,13 @@ func writeUserTx(tx *sql.Tx, u *User) error {
 			`INSERT INTO quests(user_id, quest_id, status, progress, cooldown_until) VALUES(?, ?, ?, ?, ?)`,
 			len(h.Quests), func(i int) []any {
 				return []any{u.ID, h.Quests[i].QuestID, h.Quests[i].Status, h.Quests[i].Progress, h.Quests[i].CooldownUntil}
+			}); err != nil {
+			return err
+		}
+		if err := rewriteChild(tx, "hero_buffs", u.ID,
+			`INSERT INTO hero_buffs(user_id, article_id, expires_unix) VALUES(?, ?, ?)`,
+			len(h.Buffs), func(i int) []any {
+				return []any{u.ID, h.Buffs[i].ArticleID, h.Buffs[i].ExpiresUnix}
 			}); err != nil {
 			return err
 		}

@@ -245,6 +245,20 @@ func (s *Server) useItemLocked(c *conn, wireID int32, now float64) {
 	hs.bag[article]--
 	s.Store.RemoveBagItem(c.selfPlayerID, article, 1)
 	s.push(c, battleproto.CmdRemFromInv, amf.NewArray().Set("id", wireID).Set("count", int32(1)))
+	// Drive the item-slot cooldown sweep. BattleInventory.OnActionDone fills
+	// mTypeCooldowns[protoId] -- and thus greys out the slot + counts down -- ONLY from an
+	// ACTION_DONE carrying item=true, action=the item's proto id (its article, registered by
+	// ensureItemProtoLocked), and cooldown=the absolute battle-time the CD ends. Skills push
+	// the identical packet with item=false (mobai.go's actionDone drain). The server already
+	// enforces the cooldown (itemCooldownUntil above); without this packet the client just
+	// never shows it. Self-only: BattleInventory gates on AvatarObjId==id, so teammates ignore it.
+	if it.Cooldown > 0 {
+		s.push(c, battleproto.CmdActionDone, amf.NewArray().
+			Set("id", c.objID).
+			Set("action", article).
+			Set("item", true).
+			Set("cooldown", now+it.Cooldown))
+	}
 }
 
 // applyRegenHoTLocked grants a Health/Mana potion's heal/mana-over-time: the
@@ -311,7 +325,7 @@ func (s *Server) applyInvisibilityLocked(c *conn, it gamedata.Item, dur float64,
 // Unlike the potion it mints no separate buff-effector -- the skill's own BuffFx/BuffIcon
 // (e.g. InvisibilityEffect) carries the buff-bar timer. Stealth breaks the moment the
 // player next acts (breakInvisibilityLocked at cast/attack time).
-func (s *Server) applySkillStealthLocked(c *conn, dur, now float64) {
+func (s *Server) applySkillStealthLocked(c *conn, dur float64, breakOnMove bool, now float64) {
 	if dur <= 0 {
 		return
 	}
@@ -320,6 +334,7 @@ func (s *Server) applySkillStealthLocked(c *conn, dur, now float64) {
 		return
 	}
 	hs.invisibleUntil = now + dur
+	hs.stealthBreaksOnMove = breakOnMove
 	if hs.invisFxUID == 0 {
 		hs.invisFxUID = s.worldFxStartLocked(c, mobShadeFx, c.objID, 0, false, 0, 0)
 	}
@@ -336,6 +351,7 @@ func (s *Server) breakInvisibilityLocked(c *conn, now float64) {
 		return // not currently stealthed
 	}
 	hs.invisibleUntil = 0
+	hs.stealthBreaksOnMove = false
 	if hs.invisFxUID != 0 {
 		s.worldFxEndLocked(c, hs.invisFxUID)
 		hs.invisFxUID = 0
@@ -344,6 +360,12 @@ func (s *Server) breakInvisibilityLocked(c *conn, now float64) {
 		s.push(c, battleproto.CmdRemEffector, amf.NewArray().Set("id", hs.invisBuffEffID))
 		hs.invisBuffEffID = 0
 	}
+	// Urg's tree camouflage detonates the moment the form ends: this reveal path (move/
+	// attack/cast) is exactly "выходит из формы дерева". No-op when no tree form is armed.
+	s.fireTreeFormBurstLocked(c, now)
+	// Wilfang's «Засада» detonates the instant the ambush ends, on this same reveal path.
+	// No-op when no stealth burst is armed.
+	s.fireStealthBurstLocked(c, now)
 }
 
 // applyRevelationLocked grants timed "see invisible enemies" state

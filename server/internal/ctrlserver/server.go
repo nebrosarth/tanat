@@ -63,6 +63,12 @@ type Server struct {
 	fightSel     map[int32]fightSelection
 	dotaQueue    map[int32][]int32
 	nextDotaRoom int32
+
+	// castleMu guards castleRosters: the in-memory fighter enrollment per castle (castleID
+	// -> roster) backing the castle-siege registration screens. The live siege battle is
+	// deferred; this only records who signed up. Lazily created. See castle.go.
+	castleMu      sync.Mutex
+	castleRosters map[int32]*castleRoster
 }
 
 func New() *Server {
@@ -211,6 +217,7 @@ func (s *Server) handleItemsProto() *amf.MixedArray {
 			Set("short", "").
 			Set("long", it.DescKey).
 			Set("icon", it.Icon).
+			Set("prefab", ""). // see wearableArticleEntry: absent "prefab" -> client PPrefab.Load throws -> null Prefab
 			Set("price", int32(0)).
 			Set("sell_price", int32(0)).
 			Set("type_id", int32(1)).
@@ -238,7 +245,89 @@ func (s *Server) handleItemsProto() *amf.MixedArray {
 	for _, w := range gamedata.Wearables() {
 		root.Add(wearableArticleEntry(w))
 	}
+	// Extended bag items ("прочие предметы"): runes(15)/elixirs(18)/chests(21)/totems(16).
+	// Each is a plain PArticle keyed off its real baked title/icon/long. CHESTS carry an
+	// "action" (the id echoed back in common|action) so the client shows an OPEN button;
+	// runes/elixirs/totems ship without an action for now (their use/deploy effect is a
+	// later phase), so they exist + can be granted without a dead button.
+	for _, r := range gamedata.Runes() {
+		e := bagCatalogEntry(r.ArticleID, gamedata.KindRune, r.NameKey, r.DescKey, r.Icon, r.ArticleID)
+		// S4+ runes' LongDesc uses {Health}/{Mana}/{DamageMin}(+regen) placeholders the client
+		// substitutes from the article's params (FormatedTipMgr.GetItemFormatedText). Without them
+		// the card prints the raw "{Health}" token, so ship one params entry per placeholder; the
+		// values are exactly what applyGlobalBuffs folds into the avatar (display == effect).
+		if params := runeParamsAMF(r); params != nil {
+			e.Set("params", params)
+		}
+		root.Add(e)
+	}
+	for _, e := range gamedata.Elixirs() {
+		// Only the timed hero-wide elixirs (kind 18) get a USE button; mastery elixirs (kind
+		// 24) apply per-avatar (deferred), so they stay actionless for now.
+		action := int32(0)
+		if e.Kind == gamedata.KindElixir {
+			action = e.ArticleID
+		}
+		root.Add(bagCatalogEntry(e.ArticleID, e.Kind, e.NameKey, e.DescKey, e.Icon, action))
+	}
+	for _, c := range gamedata.Chests() {
+		root.Add(bagCatalogEntry(c.ArticleID, gamedata.KindChest, c.NameKey, c.DescKey, c.Icon, c.ArticleID))
+	}
+	for _, t := range gamedata.Totems() {
+		root.Add(bagCatalogEntry(t.ArticleID, gamedata.KindTotem, t.NameKey, t.DescKey, t.Icon, 0))
+	}
 	return root
+}
+
+// bagCatalogEntry builds one /xml/items.amf PArticle for a simple extended-bag item (rune/
+// elixir/chest/totem): the five required PCtrlDesc keys + the basic PArticle fields the bag
+// tooltip reads. actionID>0 attaches an "action" {id,title,description} so the client renders
+// the USABLE_BUTTON (open/use) and echoes action_id back in common|action; the id is the
+// item's own article id. type_id=1 puts it in the hero bag tab.
+func bagCatalogEntry(id, kindID int32, nameKey, descKey, icon string, actionID int32) *amf.MixedArray {
+	e := amf.NewArray().
+		Set("id", id).
+		Set("title", nameKey).
+		Set("short", "").
+		Set("long", descKey).
+		Set("icon", icon).
+		Set("prefab", ""). // see wearableArticleEntry: absent "prefab" -> client PPrefab.Load throws -> null Prefab
+		Set("price", int32(0)).
+		Set("sell_price", int32(0)).
+		Set("type_id", int32(1)).
+		Set("kind_id", kindID).
+		Set("min_hero_level", int32(1)).
+		Set("min_ava_level", int32(0)).
+		Set("cnt", int32(1)).
+		Set("price_type", int32(1)).
+		Set("sort", int32(0)).
+		Set("flags", int32(0))
+	if actionID > 0 {
+		e.Set("action", amf.NewArray().
+			Set("id", actionID).
+			Set("title", "").
+			Set("description", ""))
+	}
+	return e
+}
+
+// runeParamsAMF builds the items.amf "params" array a rune's card needs so the client resolves
+// every {placeholder} in its LongDesc, or nil for a literal-desc rune (S1-S3) that needs none.
+// Each entry is {skill_id, impact:0(ADD), value} -- the exact shape PArticle.Load parses into the
+// AddStat map GetItemFormatedText substitutes from.
+func runeParamsAMF(r gamedata.Rune) *amf.MixedArray {
+	cp := r.CardParams()
+	if len(cp) == 0 {
+		return nil
+	}
+	params := amf.NewArray()
+	for _, p := range cp {
+		params.Add(amf.NewArray().
+			Set("skill_id", p.Key).
+			Set("impact", int32(0)).
+			Set("value", p.Value))
+	}
+	return params
 }
 
 // treeArticleEntry builds one avatar-tree article for items.amf. Beyond the five
@@ -266,6 +355,7 @@ func treeArticleEntry(it gamedata.AvatarItem) *amf.MixedArray {
 		Set("short", "").
 		Set("long", it.DescKey).
 		Set("icon", it.Icon).
+		Set("prefab", ""). // see wearableArticleEntry: absent "prefab" -> client PPrefab.Load throws -> null Prefab
 		Set("price", it.Price).
 		Set("sell_price", int32(0)).
 		Set("type_id", int32(2)). // CtrlThing.PlaceType.AVATAR
@@ -375,6 +465,32 @@ func (s *Server) dispatch(req ctrlproto.Request, resp *ctrlproto.Response) {
 		s.handleUserUndress(req, resp)
 	case ctrlproto.CmdKey("castle", "list"):
 		s.handleCastleList(req, resp)
+	case ctrlproto.CmdKey("castle", "info"):
+		s.handleCastleInfo(req, resp)
+	case ctrlproto.CmdKey("castle", "history"):
+		s.handleCastleHistory(req, resp)
+	case ctrlproto.CmdKey("castle", "fighters"):
+		s.handleCastleFighters(req, resp)
+	case ctrlproto.CmdKey("castle", "set_fighters"):
+		s.handleCastleSetFighters(req, resp)
+	case ctrlproto.CmdKey("castle", "desert"):
+		s.handleCastleDesert(req, resp)
+	case ctrlproto.CmdKey("castle", "battle_info"):
+		s.handleCastleBattleInfo(req, resp)
+	case ctrlproto.CmdKey("clan", "create"):
+		s.handleClanCreate(req, resp)
+	case ctrlproto.CmdKey("clan", "info"):
+		s.handleClanInfo(req, resp)
+	case ctrlproto.CmdKey("clan", "remove_user"):
+		s.handleClanRemoveUser(req, resp)
+	case ctrlproto.CmdKey("clan", "remove"):
+		s.handleClanRemove(req, resp)
+	case ctrlproto.CmdKey("clan", "change_role"):
+		s.handleClanChangeRole(req, resp)
+	case ctrlproto.CmdKey("clan", "invite"):
+		s.handleClanInvite(req, resp)
+	case ctrlproto.CmdKey("clan", "invite_answer"):
+		s.handleClanInviteAnswer(req, resp)
 	case ctrlproto.CmdKey("user", "group_list"):
 		s.handleGroupList(req, resp)
 	case ctrlproto.CmdKey("user", "join_from_group_request"):
@@ -403,6 +519,10 @@ func (s *Server) dispatch(req ctrlproto.Request, resp *ctrlproto.Response) {
 		s.handleUserFind(req, resp)
 	case ctrlproto.CmdKey("common", "can_reconnect"):
 		s.handleCanReconnect(req, resp)
+	case ctrlproto.CmdKey("common", "action"):
+		s.handleCommonAction(req, resp)
+	case ctrlproto.CmdKey("user", "get_global_buffs"):
+		s.handleGetGlobalBuffs(req, resp)
 	case ctrlproto.CmdKey("arena", "get_maps_info"):
 		s.handleArenaMapsInfoReal(req, resp)
 	case ctrlproto.CmdKey("arena", "get_map_type_descs"):

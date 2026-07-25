@@ -94,6 +94,17 @@
   th{color:var(--muted); font-weight:600; font-size:11.5px; text-transform:uppercase; letter-spacing:.04em; background:var(--panel2); position:sticky; top:0}
   tbody tr:hover{background:var(--panel2)}
   tr.modified{background:rgba(217,164,65,.06)}
+  /* Pin the per-row actions column to the right edge so Save/Reset stay visible on
+     wide stat tables that overflow horizontally (otherwise the buttons scroll off
+     the right and look missing). Sticky cells need an OPAQUE background so the
+     columns scrolling underneath don't bleed through; the modified/hover tints are
+     re-composited over an opaque panel via a same-colour gradient. */
+  th.actcol, td.actcol{position:sticky; right:0}
+  td.actcol{background:var(--panel); z-index:1; border-left:1px solid var(--line); box-shadow:-10px 0 10px -8px rgba(0,0,0,.45)}
+  th.actcol{z-index:2; border-left:1px solid var(--line); box-shadow:-10px 0 10px -8px rgba(0,0,0,.45)}
+  tbody tr:hover td.actcol{background:var(--panel2)}
+  tr.modified td.actcol{background:linear-gradient(rgba(217,164,65,.06),rgba(217,164,65,.06)), var(--panel)}
+  tr.modified:hover td.actcol{background:linear-gradient(rgba(217,164,65,.06),rgba(217,164,65,.06)), var(--panel2)}
   td .cell-in{width:78px}
   td.name b{color:var(--text)}
   td.name small{color:var(--muted); display:block; font-size:11px}
@@ -214,9 +225,13 @@
         <p class="hint" style="margin-bottom:10px">Расходники складываются в сумку стопкой; экипировка выдаётся отдельными экземплярами в инвентарь (не надета). Бесплатно.</p>
         <div class="field" style="max-width:none">
           <div style="display:flex; gap:10px; flex-wrap:wrap; align-items:flex-end">
-            <div style="width:150px"><small class="muted">Тип</small>
+            <div style="width:170px"><small class="muted">Тип</small>
               <select id="mgGrantKind">
-                <option value="potion">Расходник</option>
+                <option value="potion">Расходник (зелье)</option>
+                <option value="rune">Руна</option>
+                <option value="elixir">Эликсир</option>
+                <option value="chest">Сундук</option>
+                <option value="totem">Тотем</option>
                 <option value="wearable">Экипировка</option>
               </select>
             </div>
@@ -234,11 +249,11 @@
         <div class="grid" style="grid-template-columns:1fr 1fr">
           <div>
             <div class="muted" style="margin-bottom:6px; font-size:12px">Сумка (расходники)</div>
-            <div class="scroll"><table id="mgBagTable"><thead><tr><th>Артикул</th><th>Предмет</th><th>Кол-во</th></tr></thead><tbody></tbody></table></div>
+            <div class="scroll"><table id="mgBagTable"><thead><tr><th>Артикул</th><th>Предмет</th><th>Кол-во</th><th></th></tr></thead><tbody></tbody></table></div>
           </div>
           <div>
             <div class="muted" style="margin-bottom:6px; font-size:12px">Экипировка (в инвентаре / надето)</div>
-            <div class="scroll"><table id="mgGearTable"><thead><tr><th>id</th><th>Артикул</th><th>Предмет</th><th>Где</th></tr></thead><tbody></tbody></table></div>
+            <div class="scroll"><table id="mgGearTable"><thead><tr><th>id</th><th>Артикул</th><th>Предмет</th><th>Где</th><th></th></tr></thead><tbody></tbody></table></div>
           </div>
         </div>
       </div>
@@ -274,6 +289,8 @@
       <div class="toolbar">
         <input type="text" id="mobSearch" placeholder="Поиск по префабу / ключу…">
         <div class="spacer"></div>
+        <button class="btn small primary" id="btnSaveAllMobs" title="Сохранить статы всех показанных мобов">Сохранить всех</button>
+        <button class="btn small" id="btnResetAllMobs" title="Сбросить переопределения статов у ВСЕХ мобов">Сбросить всех</button>
       </div>
       <div class="scroll"><table id="mobsTable"><thead></thead><tbody></tbody></table></div>
     </section>
@@ -306,10 +323,13 @@ const CONFIG_FIELDS = [
   {key:"mob_coin_per_level",   label:"Монеты мобов за уровень", desc:"Прибавка монет за уровень (0.15 = +15%/ур)."},
   {key:"hero_power_per_level", label:"Сила героя за уровень",   desc:"Рост урона/лечения/силы магии героя за уровень (0.06)."},
   {key:"hero_health_per_level",label:"HP героя за уровень",     desc:"Рост макс. HP/маны героя за уровень (0.06)."},
+  {key:"mob_mana_regen_frac",  label:"Реген маны мобов",        desc:"Доля пула маны, восстанавливаемая в бою за секунду (0.06 = 6%/сек). 0 = моб не регенит ману (дренаж «прилипает»)."},
+  {key:"mob_hp_regen_frac",    label:"Реген HP мобов (возврат)",desc:"Доля макс. HP/сек, пока моб идёт домой после ухода игрока (0.40 = 40%/сек). НЕ реген в бою — в бою моб не лечится. 0 = приходит домой с текущим HP."},
   {key:"xp_multiplier",        label:"Множитель опыта (ивент)", desc:"Общий множитель всего опыта. 1 = обычный, 2 = ×2."},
   {key:"coin_multiplier",      label:"Множитель монет (ивент)", desc:"Общий множитель всех монет. 1 = обычный, 2 = ×2."},
   {key:"new_hero_money",       label:"Стартовые монеты",        desc:"Кошелёк нового героя (бронза).", int:true},
   {key:"new_hero_diamond",     label:"Стартовые кристаллы",     desc:"Кошелёк нового героя (кристаллы).", int:true},
+  {key:"hunt_start_level",     label:"Стартовый уровень аватара", desc:"Уровень, с которым аватар входит в бой (даёт очки навыков за эти уровни). 0 = обычный старт с 1 ур.", int:true},
 ];
 
 /* ---------- networking ---------- */
@@ -471,6 +491,12 @@ function renderConfig(){
     <span>Включён (выкл = все мобы видны сразу)</span></div>
     <div class="desc">Мобы «Охоты» проявляются при приближении и полупрозрачны на краю обзора. Выкл — вся карта открыта.</div>`;
   g.appendChild(hfog);
+  const wtf=document.createElement("div"); wtf.className="field";
+  wtf.innerHTML=`<label>WTF-режим (тест)</label>
+    <div class="toggle"><input type="checkbox" id="cfg_wtf" ${s.wtf_mode?"checked":""}>
+    <span>Включён (навыки без маны и без перезарядки)</span></div>
+    <div class="desc">Тестовый режим: навыки аватара не тратят ману и не уходят в откат. Мобов не касается.</div>`;
+  g.appendChild(wtf);
   for(const f of CONFIG_FIELDS){
     const d=document.createElement("div"); d.className="field";
     const step=f.int?"1":"0.01";
@@ -486,6 +512,7 @@ document.getElementById("btnSaveConfig").addEventListener("click", async ()=>{
     const body={
       fog_of_war:document.getElementById("cfg_fog").checked,
       hunt_fog:document.getElementById("cfg_hunt_fog").checked,
+      wtf_mode:document.getElementById("cfg_wtf").checked,
     };
     for(const f of CONFIG_FIELDS){
       const v=document.getElementById("cfg_"+f.key).value;
@@ -501,7 +528,7 @@ document.getElementById("btnSaveConfig").addEventListener("click", async ()=>{
 function statTable(tableId, fields, rows, meta, saveFn){
   const table=document.getElementById(tableId);
   const thead=table.querySelector("thead"), tbody=table.querySelector("tbody");
-  thead.innerHTML="<tr>"+meta.head+fields.map(f=>`<th class="num">${STAT_RU[f]||f}</th>`).join("")+"<th>Действия</th></tr>";
+  thead.innerHTML="<tr>"+meta.head+fields.map(f=>`<th class="num">${STAT_RU[f]||f}</th>`).join("")+`<th class="actcol">Действия</th></tr>`;
   tbody.innerHTML="";
   for(const r of rows){
     const tr=document.createElement("tr");
@@ -513,7 +540,7 @@ function statTable(tableId, fields, rows, meta, saveFn){
       const val = (ov[f]!=null)?ov[f]:authored;
       cells+=`<td><input type="number" step="0.01" class="cell-in num" data-f="${f}" data-auth="${authored}" value="${round4(val)}"></td>`;
     }
-    cells+=`<td><div class="actions">
+    cells+=`<td class="actcol"><div class="actions">
       <button class="btn small primary" data-act="save">Сохранить</button>
       <button class="btn small" data-act="reset">Сброс</button></div></td>`;
     tr.innerHTML=cells;
@@ -525,7 +552,15 @@ function statTable(tableId, fields, rows, meta, saveFn){
       });
       saveFn(r, override, tr);
     });
-    tr.querySelector('[data-act="reset"]').addEventListener("click",()=>saveFn(r, {}, tr));
+    tr.querySelector('[data-act="reset"]').addEventListener("click",async ()=>{
+      // Clear the server override, then (on success) restore the input cells to their
+      // authored values so the row updates in place -- without this the typed numbers
+      // lingered until a page reload even though the override was already cleared.
+      const ok = await saveFn(r, {}, tr);
+      if(ok!==false){
+        tr.querySelectorAll("input[data-f]").forEach(inp=>{ inp.value = round4(parseFloat(inp.dataset.auth)); });
+      }
+    });
     tbody.appendChild(tr);
   }
 }
@@ -542,8 +577,9 @@ function renderAvatars(){
       await api("/api/avatar",{method:"POST",body:{id:a.id,override}});
       a.override=Object.keys(override).length?override:null;
       tr.classList.toggle("modified", !!a.override);
-      toast(a.short_name+": статы сохранены");
-    }catch(err){ toast(err.message,"bad"); }
+      toast(a.short_name+": статы "+(a.override?"сохранены":"сброшены"));
+      return true;
+    }catch(err){ toast(err.message,"bad"); return false; }
   });
 }
 function renderMobs(){
@@ -558,12 +594,50 @@ function renderMobs(){
       await api("/api/mob",{method:"POST",body:{index:m.index,override}});
       m.override=Object.keys(override).length?override:null;
       tr.classList.toggle("modified", !!m.override);
-      toast("Моб #"+m.index+": статы сохранены");
-    }catch(err){ toast(err.message,"bad"); }
+      toast("Моб #"+m.index+": статы "+(m.override?"сохранены":"сброшены"));
+      return true;
+    }catch(err){ toast(err.message,"bad"); return false; }
   });
 }
 document.getElementById("avatarSearch").addEventListener("input", renderAvatars);
 document.getElementById("mobSearch").addEventListener("input", renderMobs);
+
+// Save every currently-shown mob row whose inputs differ from what the server holds --
+// one click instead of per-row saving. Reads each row's "#" cell to find its mob.
+async function saveAllMobs(){
+  const rows=document.querySelectorAll("#mobsTable tbody tr");
+  let saved=0, failed=0;
+  for(const tr of rows){
+    const idx=parseInt(tr.querySelector("td.mono")?.textContent);
+    const m=STATE.mobs.find(x=>x.index===idx);
+    if(!m) continue;
+    const override={};
+    tr.querySelectorAll("input[data-f]").forEach(inp=>{
+      const f=inp.dataset.f, auth=parseFloat(inp.dataset.auth), v=parseFloat(inp.value);
+      if(!isNaN(v) && Math.abs(v-auth)>1e-9) override[f]=v;
+    });
+    // Skip rows that already match the server (nothing to write).
+    if(JSON.stringify(override)===JSON.stringify(m.override||{})) continue;
+    try{
+      await api("/api/mob",{method:"POST",body:{index:m.index,override}});
+      m.override=Object.keys(override).length?override:null;
+      tr.classList.toggle("modified", !!m.override);
+      saved++;
+    }catch(err){ failed++; }
+  }
+  toast("Сохранено мобов: "+saved+(failed?(", ошибок: "+failed):""), failed?"bad":"");
+}
+async function resetAllMobs(){
+  if(!confirm("Сбросить переопределения статов у ВСЕХ мобов к исходным значениям?")) return;
+  try{
+    const res=await api("/api/mobs/reset",{method:"POST"});
+    STATE.mobs.forEach(m=>{ m.override=null; });
+    renderMobs();
+    toast("Сброшены статы всех мобов"+(res&&res.cleared!=null?(" ("+res.cleared+")"):""));
+  }catch(err){ toast(err.message,"bad"); }
+}
+document.getElementById("btnSaveAllMobs").addEventListener("click", saveAllMobs);
+document.getElementById("btnResetAllMobs").addEventListener("click", resetAllMobs);
 
 /* ---------- manage: quests + item grants ---------- */
 let MG_ID = null, MG_INV = null;
@@ -614,9 +688,27 @@ function fillGrantItems(){
   const race=document.getElementById("mgGrantRace").value;
   const sel=document.getElementById("mgGrantItem");
   document.getElementById("mgGrantRace").disabled = (kind!=="wearable");
+  const bagLabel=x=>{
+    const bits=[];
+    if(x.tier) bits.push("S"+x.tier);
+    if(x.color) bits.push(x.color);
+    if(x.extra) bits.push(x.extra);
+    const meta=bits.length?(" ["+bits.join(" ")+"]"):"";
+    return `${esc(prettyKey(x.name_key))}${meta} (арт. ${x.article})`;
+  };
+  const opts=arr=>arr.map(x=>`<option value="${x.article}">${bagLabel(x)}</option>`).join("");
   if(kind==="potion"){
     sel.innerHTML=(CATALOG.potions||[]).map(p=>
       `<option value="${p.article}">${(ITEM_KIND[p.kind]||"?")} · ${esc(prettyKey(p.name_key))} (арт. ${p.article})</option>`).join("");
+  } else if(kind==="rune"){
+    sel.innerHTML=opts(CATALOG.runes||[]);
+  } else if(kind==="elixir"){
+    // elixirs + mastery elixirs share the same catalog list (family field distinguishes)
+    sel.innerHTML=opts([...(CATALOG.elixirs||[])]);
+  } else if(kind==="chest"){
+    sel.innerHTML=opts(CATALOG.chests||[]);
+  } else if(kind==="totem"){
+    sel.innerHTML=opts(CATALOG.totems||[]);
   } else {
     sel.innerHTML=(CATALOG.wearables||[]).filter(w=>!race||w.race===race).map(w=>
       `<option value="${w.article}">${w.race} S${w.tier} ${w.color} · ${w.slot} — ${esc(prettyKey(w.name_key))} [ур.${w.min_level}] (арт. ${w.article})</option>`).join("");
@@ -692,23 +784,49 @@ function itemName(article){
   if(p) return (ITEM_KIND[p.kind]||"")+" · "+prettyKey(p.name_key);
   const w=(CATALOG.wearables||[]).find(x=>x.article===article);
   if(w) return w.race+" S"+w.tier+" "+w.color+" "+w.slot+" · "+prettyKey(w.name_key);
+  const FAM_RU={rune:"Руна",elixir:"Эликсир",mastery:"Мастерство",chest:"Сундук",totem:"Тотем"};
+  for(const list of [CATALOG.runes,CATALOG.elixirs,CATALOG.chests,CATALOG.totems]){
+    const b=(list||[]).find(x=>x.article===article);
+    if(b) return (FAM_RU[b.family]||b.family)+" · "+prettyKey(b.name_key);
+  }
   return "";
 }
 function renderInv(){
   const bt=document.querySelector("#mgBagTable tbody"); bt.innerHTML="";
   const bag=MG_INV.bag||[];
-  if(!bag.length) bt.innerHTML=`<tr><td colspan="3" class="muted">пусто</td></tr>`;
+  if(!bag.length) bt.innerHTML=`<tr><td colspan="4" class="muted">пусто</td></tr>`;
   for(const b of bag){
-    bt.innerHTML+=`<tr><td class="num mono">${b.ArticleID}</td><td>${esc(itemName(b.ArticleID))}</td><td class="num">${b.Count}</td></tr>`;
+    const tr=document.createElement("tr");
+    tr.innerHTML=`<td class="num mono">${b.ArticleID}</td><td>${esc(itemName(b.ArticleID))}</td><td class="num">${b.Count}</td>`;
+    const td=document.createElement("td");
+    const btn=document.createElement("button"); btn.className="btn small danger"; btn.textContent="Удалить";
+    btn.addEventListener("click",()=>removeItem({kind:"bag",article_id:b.ArticleID},`${esc(itemName(b.ArticleID))} ×${b.Count}`));
+    td.appendChild(btn); tr.appendChild(td); bt.appendChild(tr);
   }
   const gt=document.querySelector("#mgGearTable tbody"); gt.innerHTML="";
-  const owned=(MG_INV.owned||[]).map(o=>({id:o.ID,art:o.ArticleID,where:"инвентарь"}));
-  const dressed=(MG_INV.dressed||[]).map(d=>({id:d.ID,art:d.ArticleID,where:"надето"}));
+  const owned=(MG_INV.owned||[]).map(o=>({id:o.ID,art:o.ArticleID,where:"инвентарь",kind:"owned",instance_id:o.ID}));
+  const dressed=(MG_INV.dressed||[]).map(d=>({id:d.ID,art:d.ArticleID,where:"надето",kind:"dressed",slot:d.Slot}));
   const gear=owned.concat(dressed);
-  if(!gear.length) gt.innerHTML=`<tr><td colspan="4" class="muted">пусто</td></tr>`;
+  if(!gear.length) gt.innerHTML=`<tr><td colspan="5" class="muted">пусто</td></tr>`;
   for(const g of gear){
-    gt.innerHTML+=`<tr><td class="num mono">${g.id}</td><td class="num mono">${g.art}</td><td>${esc(itemName(g.art))}</td><td class="muted">${g.where}</td></tr>`;
+    const tr=document.createElement("tr");
+    tr.innerHTML=`<td class="num mono">${g.id}</td><td class="num mono">${g.art}</td><td>${esc(itemName(g.art))}</td><td class="muted">${g.where}</td>`;
+    const td=document.createElement("td");
+    const btn=document.createElement("button"); btn.className="btn small danger"; btn.textContent="Удалить";
+    const params=g.kind==="owned"?{kind:"owned",instance_id:g.instance_id}:{kind:"dressed",slot:g.slot};
+    btn.addEventListener("click",()=>removeItem(params,`${esc(itemName(g.art))} (${g.where})`));
+    td.appendChild(btn); tr.appendChild(td); gt.appendChild(tr);
   }
+}
+
+async function removeItem(params,label){
+  if(MG_ID==null) return;
+  if(!confirm("Удалить у игрока: "+label+"?")) return;
+  try{
+    await api("/api/player/item/remove",{method:"POST",body:Object.assign({id:MG_ID},params)});
+    toast("Удалено: "+label);
+    await loadManage();
+  }catch(err){ toast(err.message,"bad"); }
 }
 
 /* ---------- utils ---------- */

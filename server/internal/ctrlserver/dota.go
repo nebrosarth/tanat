@@ -29,12 +29,16 @@ import (
 const dotaRoomBase int32 = 200000
 
 // fightSelection is the in-flight DOTA choice held between fight|select_avatar and the
-// arg-less fight|ready: the map, the chosen avatar, and the shared-world room the
-// matched players will all launch into.
+// arg-less fight|ready: the map, the chosen avatar, the shared-world room the matched
+// players will all launch into, and the side the matchmaker put this player on.
 type fightSelection struct {
 	mapID    int32
 	avatarID int32
 	room     int32
+	// team is the assigned PvP side for a «Штурм» match: 1 = Human/«Собор», 2 =
+	// Elf/«Изгнанники». 0 for a co-op/«Арена» launch where the Battle server picks sides
+	// itself. Carried into PendingBattle so the pre-battle roster and the battle agree.
+	team int32
 }
 
 func (s *Server) setFightSel(uid int32, sel fightSelection) {
@@ -109,16 +113,27 @@ func (s *Server) handleFightJoin(req ctrlproto.Request, resp *ctrlproto.Response
 	if size < 1 {
 		size = 1
 	}
+	_, isDota := gamedata.DotaMapByID(mapID)
 	waiting := append([]int32(nil), s.dotaQueue[mapID]...) // snapshot for queue-size pushes
 	var match []int32
 	var room int32
+	teams := map[int32]int32{} // uid -> assigned side (0 = Battle server picks)
 	if int32(len(s.dotaQueue[mapID])) >= size {
 		match = append([]int32(nil), s.dotaQueue[mapID][:size]...)
 		s.dotaQueue[mapID] = s.dotaQueue[mapID][size:]
 		s.nextDotaRoom++
 		room = dotaRoomBase + s.nextDotaRoom
-		for _, uid := range match {
-			s.fightSel[uid] = fightSelection{mapID: mapID, avatarID: -1, room: room}
+		for i, uid := range match {
+			// «Штурм» is true PvP: split the matched players across the two bases,
+			// alternating Human/Elf so an even lobby is balanced (1v1, 2v2, ...). An odd
+			// match gives the extra player to «Собор» (team 1). «Арена» keeps team 0 and
+			// lets the Battle server assign sides (it has its own alternating counter).
+			var team int32
+			if isDota {
+				team = int32(1 + i%2)
+			}
+			teams[uid] = team
+			s.fightSel[uid] = fightSelection{mapID: mapID, avatarID: -1, room: room, team: team}
 		}
 	}
 	s.fightMu.Unlock()
@@ -142,15 +157,21 @@ func (s *Server) handleFightJoin(req ctrlproto.Request, resp *ctrlproto.Response
 		return
 	}
 	// Match found: push start_select_avatar to every matched player with the shared
-	// roster (all on team 1 -- co-op push against the enemy base in v1).
+	// roster. Each fighter carries the side the matchmaker gave them, so the «match found»
+	// screen splits into the two columns (team 1 vs the rest) the client renders -- a
+	// «Штурм» PvP match shows «Собор» vs «Изгнанники», a co-op/«Арена» one shows one team.
 	fighters := amf.NewArray()
 	for _, uid := range match {
 		nick := ""
 		if usr, ok := s.Store.ByID(uid); ok {
 			nick = usr.Username
 		}
+		team := teams[uid]
+		if team == 0 {
+			team = 1 // display default for co-op/«Арена»: the client groups by team-1-vs-rest
+		}
 		fighters.Set(strconv.Itoa(int(uid)), amf.NewArray().
-			Set("nick", nick).Set("tag", "").Set("team", int32(1)))
+			Set("nick", nick).Set("tag", "").Set("team", team))
 	}
 	for _, uid := range match {
 		s.MPD.Push(uid, "fight|start_select_avatar", amf.NewArray().
@@ -254,6 +275,7 @@ func (s *Server) handleFightReady(req ctrlproto.Request, resp *ctrlproto.Respons
 		Passwd:   passwd,
 		Scene:    scene,
 		Room:     room,
+		Team:     sel.team, // the matchmaker-assigned «Штурм» side (0 = Battle server picks)
 	})
 	s.clearFightSel(u.ID)
 	log.Printf("ctrl: fight|ready user=%d map=%d avatar=%d scene=%s room=%d -> launch",

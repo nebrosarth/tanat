@@ -110,9 +110,11 @@ func TestMPDHandshakeAndPush(t *testing.T) {
 	}
 }
 
-// TestMPDAuthFailDropsSocket: a login frame with a bad session id gets no auth ack
-// and the socket is closed (the client then treats it as AUTHORIZATION_FAILED).
-func TestMPDAuthFailDropsSocket(t *testing.T) {
+// TestMPDAuthFailRejects: a login frame with a bad session id gets a rejection frame
+// carrying an AMF int != 100, which the client reads as AUTHORIZATION_FAILED and turns
+// into a return to the login screen (instead of micro-reconnecting forever). The socket
+// is then closed.
+func TestMPDAuthFailRejects(t *testing.T) {
 	store := session.NewStore()
 	u, _, _ := store.LoginOrRegister("a@example.com", "pw")
 	_, addr := startHub(t, store)
@@ -127,10 +129,22 @@ func TestMPDAuthFailDropsSocket(t *testing.T) {
 	if _, err := c.Write(loginFrame(u.ID, "wrong-sid")); err != nil {
 		t.Fatal(err)
 	}
-	// The server drops the connection; a read must hit EOF, not an auth ack.
+	// A rejection frame must arrive (not the ack, not silence), decoding to int != 100.
 	br := bufio.NewReader(c)
+	body, err := readFrame(br)
+	if err != nil {
+		t.Fatalf("expected a rejection frame on bad sid, got read error: %v", err)
+	}
+	code, err := amf.NewDecoder(bytes.NewReader(body)).DecodeMessage()
+	if err != nil {
+		t.Fatalf("rejection frame not decodable AMF: %v (% x)", err, body)
+	}
+	if n, isInt := code.(int32); !isInt || n == 100 {
+		t.Fatalf("rejection code = %v (%T), want an int != 100", code, code)
+	}
+	// After the rejection the server closes the socket.
 	if _, err := readFrame(br); err == nil {
-		t.Fatal("expected the socket to be dropped on bad sid, but a frame arrived")
+		t.Fatal("expected the socket to close after the rejection frame")
 	}
 }
 

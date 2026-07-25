@@ -85,8 +85,10 @@ func main() {
 	// and is advertised under the same host; the central square stays on the main
 	// battle listener above.
 	srv.MatchLauncher = battleserver.NewMatchHost(srv.Store, hub, *battleHost)
-	// Party co-members get online/offline pushes as a user's MPD socket comes and goes.
-	hub.OnConnect = srv.NotifyOnline
+	// Party co-members get online/offline pushes as a user's MPD socket comes and goes; a
+	// connect also re-pushes the hero's own active global buffs so the buff bar shows rune/
+	// elixir icons again after a relog (see OnMPDConnect).
+	hub.OnConnect = srv.OnMPDConnect
 	hub.OnDisconnect = srv.NotifyOffline
 	if _, portStr, err := splitHostPort(*mpdAddr); err == nil {
 		if port, err := strconv.Atoi(portStr); err == nil {

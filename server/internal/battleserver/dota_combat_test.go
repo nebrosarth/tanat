@@ -82,7 +82,7 @@ func structWithEnemyInRange(t *testing.T, s *Server, c *conn, inst *huntInstance
 	victim := &mobState{
 		id: 61000, mobIdx: idx, mob: gamedata.Mobs()[idx],
 		x: st.x + gap, y: st.y, hp: 5000, maxHP: 5000,
-		team: dotaEnemyTeam, lastSync: now,
+		team: dotaTeamElf, lastSync: now,
 	}
 	inst.mobs[victim.id] = victim
 	return st, victim
@@ -248,7 +248,7 @@ func TestDotaCreepHoldsStillThroughItsSwing(t *testing.T) {
 	enemy := &mobState{
 		id: 60002, mobIdx: eidx, mob: gamedata.Mobs()[eidx],
 		x: 1, y: 0, hp: 500, maxHP: 500, dmgMin: 5, dmgMax: 8,
-		team: dotaEnemyTeam, lastSync: now,
+		team: dotaTeamElf, lastSync: now,
 	}
 
 	c.lock()
@@ -348,7 +348,7 @@ func TestSummonSkipsAlliedCreeps(t *testing.T) {
 	}
 	enemy := &mobState{ // the real enemy, further away
 		id: 60002, mobIdx: eidx, mob: gamedata.Mobs()[eidx],
-		x: 6, y: 0, hp: 500, maxHP: 500, team: dotaEnemyTeam, lastSync: now,
+		x: 6, y: 0, hp: 500, maxHP: 500, team: dotaTeamElf, lastSync: now,
 	}
 	c.lock()
 	inst.mobs[ally.id] = ally
@@ -394,26 +394,32 @@ func TestSummonStillFightsHuntMobs(t *testing.T) {
 // TestMiriamStormShotDataKnocksBack pins the DATA: the shipped client description
 // (IDS_MiriamSkill1_LongDesc) promises "...отбрасывая назад и обездвиживая на 2 секунды",
 // and the knockback was the one part never modelled -- the shot read as a plain stun-nuke.
+// A bare "обездвиживает" with no "не может использовать способности" clause is this
+// file's own convention for ROOT, not a full stun -- re-verified against Miriam's own
+// client text, this was corrected from OpStun to OpRoot. (Wilfang s1 was once cited as
+// the precedent for this convention; Wilfang's OWN text turned out to say literal
+// "оглушаются" -- a real stun -- so it was reverted back to OpStun and is no longer
+// an example of this pattern.)
 func TestMiriamStormShotDataKnocksBack(t *testing.T) {
 	av := avatarByPrefab(t, "Avtr_DPS_Miriam")
 	sk := gamedata.SkillsFor(av).Skills[0]
 	if sk.NameRu != "Выстрел бури" {
 		t.Fatalf("slot 1 is %q, not «Выстрел бури» -- the roster moved", sk.NameRu)
 	}
-	var knock, stun *gamedata.Op
+	var knock, root *gamedata.Op
 	for i := range sk.Ops {
 		switch sk.Ops[i].Kind {
 		case gamedata.OpKnockback:
 			knock = &sk.Ops[i]
-		case gamedata.OpStun:
-			stun = &sk.Ops[i]
+		case gamedata.OpRoot:
+			root = &sk.Ops[i]
 		}
 	}
 	if knock == nil {
 		t.Fatal("«Выстрел бури» has no knockback op, but its description promises «отбрасывая назад»")
 	}
-	if stun == nil {
-		t.Fatal("«Выстрел бури» lost its «обездвиживая» stun")
+	if root == nil {
+		t.Fatal("«Выстрел бури» lost its «обездвиживая» root")
 	}
 	if knock.Value.At(0) <= 0 {
 		t.Fatalf("knockback distance %g pushes nobody anywhere", knock.Value.At(0))

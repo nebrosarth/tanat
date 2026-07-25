@@ -106,9 +106,11 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/api/player/inventory", s.guard(false, s.handlePlayerInventory))
 	mux.HandleFunc("/api/player/quest", s.guard(true, s.handlePlayerQuest))
 	mux.HandleFunc("/api/player/grant", s.guard(true, s.handlePlayerGrant))
+	mux.HandleFunc("/api/player/item/remove", s.guard(true, s.handlePlayerItemRemove))
 	mux.HandleFunc("/api/settings", s.guard(true, s.handleSettings))
 	mux.HandleFunc("/api/avatar", s.guard(true, s.handleAvatarOverride))
 	mux.HandleFunc("/api/mob", s.guard(true, s.handleMobOverride))
+	mux.HandleFunc("/api/mobs/reset", s.guard(true, s.handleMobResetAll))
 	return mux
 }
 
@@ -395,6 +397,17 @@ type wearableCatView struct {
 	NameKey  string `json:"name_key"`
 }
 
+// bagCatView is one extended-bag item (rune/elixir/chest/totem) for the grant picker: enough
+// to label it (family + tier/color + name key) and address it (article).
+type bagCatView struct {
+	Article int32  `json:"article"`
+	Family  string `json:"family"`
+	Tier    int32  `json:"tier"`
+	Color   string `json:"color"`
+	Extra   string `json:"extra"` // per-family detail (rune stat / elixir boost / chest avatar / totem family)
+	NameKey string `json:"name_key"`
+}
+
 // handleCatalog serves the static gamedata catalogs the UI needs to build its quest and
 // item pickers: every quest, every consumable (potion), every wearable. Read-only; the UI
 // fetches it once after login.
@@ -419,10 +432,35 @@ func (s *Server) handleCatalog(w http.ResponseWriter, r *http.Request) {
 			MinLevel: wr.MinHeroLevel, Price: wr.Price, NameKey: wr.NameKey,
 		})
 	}
+	// Extended bag families -- one flat list per family for the grant picker.
+	runes := make([]bagCatView, 0, len(gamedata.Runes()))
+	for _, r := range gamedata.Runes() {
+		runes = append(runes, bagCatView{Article: r.ArticleID, Family: "rune", Tier: r.Tier, Color: r.Color, Extra: r.Stat, NameKey: r.NameKey})
+	}
+	elixirs := make([]bagCatView, 0, len(gamedata.Elixirs()))
+	for _, e := range gamedata.Elixirs() {
+		fam := "elixir"
+		if e.Kind == gamedata.KindMastery {
+			fam = "mastery"
+		}
+		elixirs = append(elixirs, bagCatView{Article: e.ArticleID, Family: fam, Extra: e.Boost, NameKey: e.NameKey})
+	}
+	chests := make([]bagCatView, 0, len(gamedata.Chests()))
+	for _, c := range gamedata.Chests() {
+		chests = append(chests, bagCatView{Article: c.ArticleID, Family: "chest", Tier: c.Grade, Color: c.Color, Extra: c.Avatar, NameKey: c.NameKey})
+	}
+	totems := make([]bagCatView, 0, len(gamedata.Totems()))
+	for _, t := range gamedata.Totems() {
+		totems = append(totems, bagCatView{Article: t.ArticleID, Family: "totem", Color: t.Color, Extra: t.Family, NameKey: t.NameKey})
+	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"quests":    quests,
 		"potions":   potions,
 		"wearables": wearables,
+		"runes":     runes,
+		"elixirs":   elixirs,
+		"chests":    chests,
+		"totems":    totems,
 	})
 }
 
@@ -519,12 +557,13 @@ func (s *Server) handlePlayerGrant(w http.ResponseWriter, r *http.Request) {
 		req.Count = grantCountCap
 	}
 	switch {
-	case isItem(req.ArticleID):
+	case isBagStack(req.ArticleID):
+		// Potions, runes, elixirs, chests, totems -- all stack in the consumable bag.
 		if !s.store.AddBagItem(req.ID, req.ArticleID, req.Count) {
 			writeErr(w, http.StatusBadRequest, "у аккаунта нет героя")
 			return
 		}
-		log.Printf("admin: granted potion %d x%d to hero %d", req.ArticleID, req.Count, req.ID)
+		log.Printf("admin: granted bag item %d x%d to hero %d", req.ArticleID, req.Count, req.ID)
 	case isWearable(req.ArticleID):
 		added, ok := s.store.AdminGrantWearable(req.ID, req.ArticleID, req.Count)
 		if !ok {
@@ -539,7 +578,51 @@ func (s *Server) handlePlayerGrant(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 }
 
-func isItem(article int32) bool     { _, ok := gamedata.ItemByArticle(article); return ok }
+// handlePlayerItemRemove destroys items a hero holds (the inverse of grant -- no refund). The
+// "kind" field selects the collection and the key: "bag" removes a stacking article (all of it,
+// or `count` units), "owned" removes one unequipped wearable by instance id, "dressed" destroys
+// whatever is worn in `slot`.
+func (s *Server) handlePlayerItemRemove(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		ID        int32  `json:"id"`
+		Kind      string `json:"kind"`
+		ArticleID int32  `json:"article_id"` // kind=bag
+		Count     int32  `json:"count"`      // kind=bag (0 = whole stack)
+		InstanceID int32 `json:"instance_id"` // kind=owned
+		Slot      int32  `json:"slot"`        // kind=dressed
+	}
+	if !readJSON(w, r, &req) {
+		return
+	}
+	switch req.Kind {
+	case "bag":
+		if _, ok := s.store.AdminRemoveBagArticle(req.ID, req.ArticleID, req.Count); !ok {
+			writeErr(w, http.StatusBadRequest, "у героя нет этого предмета")
+			return
+		}
+		log.Printf("admin: removed bag item %d (x%d) from hero %d", req.ArticleID, req.Count, req.ID)
+	case "owned":
+		if !s.store.AdminRemoveOwned(req.ID, req.InstanceID) {
+			writeErr(w, http.StatusBadRequest, "у героя нет этого предмета")
+			return
+		}
+		log.Printf("admin: removed owned instance %d from hero %d", req.InstanceID, req.ID)
+	case "dressed":
+		if !s.store.AdminRemoveDressed(req.ID, req.Slot) {
+			writeErr(w, http.StatusBadRequest, "в этом слоте ничего нет")
+			return
+		}
+		log.Printf("admin: removed dressed item (slot %d) from hero %d", req.Slot, req.ID)
+	default:
+		writeErr(w, http.StatusBadRequest, "неизвестный вид предмета")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+}
+
+// isBagStack reports whether an article is any stacking bag item (potion/rune/elixir/chest/
+// totem) -- everything ResolveBagArticle knows. isWearable is the discrete-instance family.
+func isBagStack(article int32) bool { _, ok := gamedata.ResolveBagArticle(article); return ok }
 func isWearable(article int32) bool { _, ok := gamedata.WearableByArticle(article); return ok }
 
 // ---- gameplay settings ----
@@ -553,10 +636,14 @@ type settingsReq struct {
 	MobCoinPerLevel    float64 `json:"mob_coin_per_level"`
 	HeroPowerPerLevel  float64 `json:"hero_power_per_level"`
 	HeroHealthPerLevel float64 `json:"hero_health_per_level"`
+	MobManaRegenFrac   float64 `json:"mob_mana_regen_frac"`
+	MobHPRegenFrac     float64 `json:"mob_hp_regen_frac"`
 	XPMultiplier       float64 `json:"xp_multiplier"`
 	CoinMultiplier     float64 `json:"coin_multiplier"`
 	NewHeroMoney       int32   `json:"new_hero_money"`
 	NewHeroDiamond     int32   `json:"new_hero_diamond"`
+	WtfMode            bool    `json:"wtf_mode"`
+	HuntStartLevel     int32   `json:"hunt_start_level"`
 }
 
 // handleSettings replaces the SCALAR gameplay knobs (fog + all multipliers/slopes
@@ -576,13 +663,17 @@ func (s *Server) handleSettings(w http.ResponseWriter, r *http.Request) {
 		st.MobCoinPerLevel = req.MobCoinPerLevel
 		st.HeroPowerPerLevel = req.HeroPowerPerLevel
 		st.HeroHealthPerLevel = req.HeroHealthPerLevel
+		st.MobManaRegenFrac = req.MobManaRegenFrac
+		st.MobHPRegenFrac = req.MobHPRegenFrac
 		st.XPMultiplier = req.XPMultiplier
 		st.CoinMultiplier = req.CoinMultiplier
 		st.NewHeroMoney = req.NewHeroMoney
 		st.NewHeroDiamond = req.NewHeroDiamond
+		st.WtfMode = req.WtfMode
+		st.HuntStartLevel = req.HuntStartLevel
 	})
 	s.persistSettings()
-	log.Printf("admin: updated gameplay settings (fog=%v huntfog=%v xpx%.2f coinx%.2f)", req.FogOfWar, req.HuntFog, req.XPMultiplier, req.CoinMultiplier)
+	log.Printf("admin: updated gameplay settings (fog=%v huntfog=%v xpx%.2f coinx%.2f wtf=%v startlvl=%d mobmana=%.3f mobhp=%.3f)", req.FogOfWar, req.HuntFog, req.XPMultiplier, req.CoinMultiplier, req.WtfMode, req.HuntStartLevel, req.MobManaRegenFrac, req.MobHPRegenFrac)
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "settings": gamedata.Snapshot()})
 }
 
@@ -634,6 +725,20 @@ func (s *Server) handleMobOverride(w http.ResponseWriter, r *http.Request) {
 	s.persistSettings()
 	log.Printf("admin: mob %d override -> %v", req.Index, clean)
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+}
+
+// handleMobResetAll clears EVERY per-mob stat override in one shot, reverting the whole
+// roster to its authored (level-1) stats. persistSettings() writes the cleared map
+// through to SQLite, so the reset survives a restart.
+func (s *Server) handleMobResetAll(w http.ResponseWriter, r *http.Request) {
+	n := 0
+	gamedata.Update(func(st *gamedata.Settings) {
+		n = len(st.MobOverrides)
+		st.MobOverrides = map[int32]map[string]float64{}
+	})
+	s.persistSettings()
+	log.Printf("admin: reset ALL mob overrides (%d cleared)", n)
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "cleared": n})
 }
 
 // persistSettings writes the live settings to the store's meta table so tuning

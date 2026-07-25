@@ -264,8 +264,10 @@ func TestItemsAmfCarriesCtrlPrototypeFields(t *testing.T) {
 		t.Fatalf("items.amf root is %T", v)
 	}
 	// Potions come first, then the avatar battle-tree items, then the hero-gear
-	// wearables -- one shared blob.
-	wantEntries := len(gamedata.Items()) + len(gamedata.AvatarItems()) + len(gamedata.Wearables())
+	// wearables, then the extended-bag families (runes/elixirs/chests/totems) -- one
+	// shared blob.
+	wantEntries := len(gamedata.Items()) + len(gamedata.AvatarItems()) + len(gamedata.Wearables()) +
+		len(gamedata.Runes()) + len(gamedata.Elixirs()) + len(gamedata.Chests()) + len(gamedata.Totems())
 	if len(root.Dense) != wantEntries {
 		t.Fatalf("items.amf: %d entries, want %d", len(root.Dense), wantEntries)
 	}
@@ -292,6 +294,30 @@ func TestItemsAmfCarriesCtrlPrototypeFields(t *testing.T) {
 		// this field was missing entirely.
 		if kind, ok := entry.GetInt("kind_id"); !ok || kind == 0 {
 			t.Errorf("items.amf[%d] (article %d) kind_id = %d, ok=%v -- must not be 0 (QUEST_ITEM)", i, want.ArticleID, kind, ok)
+		}
+	}
+}
+
+// TestItemsAmfEveryEntryHasPrefab guards the "Информация о герое" NRE: the client's
+// PPrefab.Load does a bare _data["prefab"], and a MISSING key throws KeyNotFoundException
+// that PropertyHolder swallows -- leaving the article's Prefab property unregistered (null).
+// HeroInfo.OnHeroLoaded then dereferences a dressed item's ctrlPrototype.Prefab.mValue and
+// NREs, so the hero-info window never opens for any hero wearing gear. Every items.amf entry
+// must therefore carry a "prefab" key (empty is fine).
+func TestItemsAmfEveryEntryHasPrefab(t *testing.T) {
+	srv := New()
+	root := srv.handleItemsProto()
+	if len(root.Dense) == 0 {
+		t.Fatal("items.amf is empty")
+	}
+	for i, raw := range root.Dense {
+		entry, ok := raw.(*amf.MixedArray)
+		if !ok {
+			t.Fatalf("items.amf[%d] is %T", i, raw)
+		}
+		id, _ := entry.GetInt("id")
+		if _, ok := entry.GetString("prefab"); !ok {
+			t.Errorf("items.amf[%d] (article %d) missing required \"prefab\" key -> client PPrefab.Load throws, Prefab left null", i, id)
 		}
 	}
 }

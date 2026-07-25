@@ -37,19 +37,43 @@ const (
 	dotaStructProtoBase     int32 = 960 // building proto = base + DotaStructure.ID
 
 	// Combat tuning.
-	dotaCreepAggro   = 13.0 // a creep engages an enemy within this radius, else marches
-	dotaMeleeReach   = 2.2  // melee attack reach added to the two body radii
-	dotaWaypointHit  = 3.0  // a creep advances to the next lane waypoint within this
-	dotaPlayerTeam   = int32(1)
-	dotaEnemyTeam    = int32(-1)
-	dotaWinTeamSelf  = int32(1) // BATTLE_END winner when the player's side wins
-	dotaWinTeamEnemy = int32(2) // ... and when it loses (enemy = display team 2)
+	dotaCreepAggro  = 13.0 // a creep engages an enemy within this radius, else marches
+	dotaMeleeReach  = 2.2  // melee attack reach added to the two body radii
+	dotaWaypointHit = 3.0  // a creep advances to the next lane waypoint within this
+
+	// Team model. «Штурм» is ABSOLUTE-team, not player-relative: the Human base
+	// («Собор») and everything fighting for it are team 1, the Elf base
+	// («Изгнанники») and its side are team 2, on EVERY client. Two distinct positive
+	// teams with no <Teams> table read as mutually hostile on the client
+	// (TeamRecognizer.GetFriendliness: neither team is in a group and the battle is
+	// not all-neutral, so team != selfTeam -> ENEMY), while same-team is FRIEND -- so a
+	// Human player and an Elf player are enemies to each other AND to the other side's
+	// creeps/cannons, with no per-viewer team rewriting. This replaces the old relative
+	// model (own side = 1, opponent = -1) that only ever worked because the opponent was
+	// pure bots: an Elf-side player needs the Human side to be team 1 on their screen too.
+	dotaTeamHuman = int32(1)
+	dotaTeamElf   = int32(2)
+
+	// dotaPlayerTeam is the DEFAULT side of a player whose team was never set (a solo
+	// launch, a direct enter, a bare test conn): the Human side. playerTeam() falls back
+	// to it, so a lone «Штурм» pusher fights for «Собор» exactly as before.
+	dotaPlayerTeam = dotaTeamHuman
+	// dotaEnemyTeam is the teamVal() fallback for a Hunt mob that never set a team (0):
+	// an unconditional enemy of the default side. It is NOT a «Штурм» structure team --
+	// every DOTA structure and creep carries an explicit absolute team (1 or 2).
+	dotaEnemyTeam = int32(-1)
 )
 
 // dotaState is the per-instance «Штурм» simulation, hung on huntInstance.dota.
 type dotaState struct {
-	m          gamedata.DotaMap
-	playerSide gamedata.DotaSide // the side every (solo v1) player fights for
+	m gamedata.DotaMap
+
+	// nextSide alternates as players join so the two bases fill evenly (Human, Elf,
+	// Human, ...). Read/advanced under the instance lock in the world-state build, the
+	// twin of arenaState.nextTeam. Only consulted when a joiner arrives with no
+	// pre-assigned side (PendingBattle.Team == 0): a solo/test launch, or the fallback
+	// if the matchmaker didn't split. A matched player carries their side from Ctrl.
+	nextSide gamedata.DotaSide
 
 	nextWave   map[int32]float64 // generator objID -> next creep-wave battle-time
 	nextCreep  int32             // rolling creep objID
@@ -72,26 +96,39 @@ type dotaState struct {
 	winner int32
 }
 
-// teamForSide maps a baked map side to the in-battle team from the player's point of
-// view: the player's own side is team 1 (allies), the opponent team -1 (enemies).
-func (d *dotaState) teamForSide(side gamedata.DotaSide) int32 {
-	if side == d.playerSide {
-		return dotaPlayerTeam
+// teamForSide maps a baked map side to its ABSOLUTE in-battle team: Human -> team 1,
+// Elf -> team 2, the same on every client (see the team-model note on the constants).
+func teamForSide(side gamedata.DotaSide) int32 {
+	if side == gamedata.DotaSideElf {
+		return dotaTeamElf
 	}
-	return dotaEnemyTeam
+	return dotaTeamHuman
 }
 
-// enemySide is the side opposite the player's.
-func (d *dotaState) enemySide() gamedata.DotaSide {
-	if d.playerSide == gamedata.DotaSideHuman {
+// sideForTeam is the inverse: a team back to its baked side (used to place a player
+// whose side arrived pre-assigned from the matchmaker).
+func sideForTeam(team int32) gamedata.DotaSide {
+	if team == dotaTeamElf {
 		return gamedata.DotaSideElf
 	}
 	return gamedata.DotaSideHuman
 }
 
-// playerSpawn is where a player of this world's side starts (near its own altar).
-func (d *dotaState) playerSpawn() (float64, float64) {
-	if d.playerSide == gamedata.DotaSideElf {
+// assignSide hands the next joining player a side, alternating Human/Elf so the two
+// bases fill evenly. Caller holds the instance lock. The twin of arenaState.assignTeam.
+func (d *dotaState) assignSide() gamedata.DotaSide {
+	s := d.nextSide
+	if d.nextSide == gamedata.DotaSideHuman {
+		d.nextSide = gamedata.DotaSideElf
+	} else {
+		d.nextSide = gamedata.DotaSideHuman
+	}
+	return s
+}
+
+// sideSpawn is where a player of `side` starts and respawns: near that side's own altar.
+func (d *dotaState) sideSpawn(side gamedata.DotaSide) (float64, float64) {
+	if side == gamedata.DotaSideElf {
 		return d.m.SpawnElf.X, d.m.SpawnElf.Y
 	}
 	return d.m.SpawnHuman.X, d.m.SpawnHuman.Y
@@ -173,14 +210,14 @@ func newDotaInstance(s *Server, id, mapID int32) *huntInstance {
 		nextDropItemID: dropItemBaseID,
 	}
 	d := &dotaState{
-		m:          dm,
-		playerSide: gamedata.DotaSideHuman,
-		nextWave:   map[int32]float64{},
-		nextCreep:  dotaCreepIDBase,
+		m:         dm,
+		nextSide:  gamedata.DotaSideHuman, // the first (or solo) joiner fights for «Собор»
+		nextWave:  map[int32]float64{},
+		nextCreep: dotaCreepIDBase,
 	}
 	inst.dota = d
 	for _, sc := range dm.Structures {
-		ms := newDotaStructure(sc, d.teamForSide(sc.Side))
+		ms := newDotaStructure(sc, teamForSide(sc.Side))
 		inst.mobs[ms.id] = ms
 		if sc.Role == gamedata.DotaCreepTower {
 			d.nextWave[ms.id] = float64(s.battleTime()) + gamedata.CreepFirstWave
@@ -515,27 +552,26 @@ func (s *Server) dotaLandHitLocked(rep *conn, m *mobState, now float64) {
 	}
 }
 
-// dotaCheckWinLocked ends the match when an altar is gone: the player's side wins if
-// the enemy altar fell, loses if its own did. Sends BATTLE_END once to every member.
+// dotaCheckWinLocked ends the match when a base altar is gone: whichever side's altar
+// fell, the OTHER side wins. Absolute-team, so the answer is the same for every viewer
+// (the end screen colours team 1 blue, team 2 red). Sends BATTLE_END once to everyone.
 func (s *Server) dotaCheckWinLocked(rep *conn, now float64) {
-	d := rep.inst.dota
-	enemyTeam := d.teamForSide(d.enemySide())
-	var enemyAltar, ownAltar *mobState
+	var humanAltar, elfAltar *mobState
 	for _, m := range rep.inst.mobs {
 		if !m.structure || !m.altar {
 			continue
 		}
-		if m.team == enemyTeam {
-			enemyAltar = m
+		if m.team == dotaTeamElf {
+			elfAltar = m
 		} else {
-			ownAltar = m
+			humanAltar = m
 		}
 	}
 	switch {
-	case enemyAltar == nil || enemyAltar.dead:
-		s.dotaEndLocked(rep, dotaWinTeamSelf, now)
-	case ownAltar == nil || ownAltar.dead:
-		s.dotaEndLocked(rep, dotaWinTeamEnemy, now)
+	case humanAltar == nil || humanAltar.dead:
+		s.dotaEndLocked(rep, dotaTeamElf, now) // «Собор» fell -> «Изгнанники» win
+	case elfAltar == nil || elfAltar.dead:
+		s.dotaEndLocked(rep, dotaTeamHuman, now) // «Изгнанники» fell -> «Собор» wins
 	}
 }
 
@@ -628,7 +664,7 @@ func (s *Server) dotaSpawnCreepWaveLocked(rep *conn, bar gamedata.DotaStructure,
 	}
 	lane := d.m.Lanes[li]
 	melee, ranged := d.m.CreepMobIdx(bar.Side)
-	team := d.teamForSide(bar.Side)
+	team := teamForSide(bar.Side)
 	fwd := bar.Side == gamedata.DotaSideHuman // human marches lane forward, elf reverses
 	entry := laneEntryIdx(lane, bar.X, bar.Z, fwd)
 	for i := 0; i < gamedata.CreepsPerWave; i++ {
@@ -871,30 +907,30 @@ func (s *Server) dotaAcquireTargetLocked(rep *conn, m *mobState, radius, now flo
 		}
 		consider(&dotaTarget{mob: o, x: o.x, y: o.y, radius: float32(o.mob.Radius())})
 	}
-	// enemy players AND their summons: only if m is on the opposite side (in solo v1 the
-	// player is team 1, so only enemy-team creeps/cannons ever target them). A pet fights
-	// for its owner, so it shares the player's team and belongs in the same gate.
-	if m.teamVal() != dotaPlayerTeam {
-		for _, mem := range rep.inst.members {
-			hs := mem.huntState
-			if hs == nil {
+	// enemy players AND their summons: a creep/cannon strikes any player whose side
+	// differs from its own -- Human units hunt Elf heroes and vice versa (true PvP), and
+	// a solo Human pusher is hunted only by the Elf-side bots exactly as before. A pet
+	// fights for its owner, so it shares that player's side and is gated the same way; a
+	// same-side hero or pet is skipped, so no unit ever shoots its own team.
+	for _, mem := range rep.inst.members {
+		hs := mem.huntState
+		if hs == nil || mem.playerTeam() == m.teamVal() {
+			continue
+		}
+		if hs.deadUntil == 0 && now >= hs.invisibleUntil {
+			px, py := mem.posAtLocked(float32(now))
+			consider(&dotaTarget{player: mem, x: px, y: py, radius: float32(hs.av.Radius())})
+		}
+		// Summons live in their owner's map, never in inst.mobs, so the mob scan above
+		// cannot see them. Only the Hunt driver was ever taught that, which made a pet
+		// in «Штурм» untouchable: it dealt full damage through the shared summon tick
+		// and no creep, cannon or tower could hit back for the whole match.
+		// Liveness matches tickSummonsLocked's own test, not just the lazily-set flag.
+		for _, sm := range hs.summons {
+			if !sm.alive(now) {
 				continue
 			}
-			if hs.deadUntil == 0 && now >= hs.invisibleUntil {
-				px, py := mem.posAtLocked(float32(now))
-				consider(&dotaTarget{player: mem, x: px, y: py, radius: float32(hs.av.Radius())})
-			}
-			// Summons live in their owner's map, never in inst.mobs, so the mob scan above
-			// cannot see them. Only the Hunt driver was ever taught that, which made a pet
-			// in «Штурм» untouchable: it dealt full damage through the shared summon tick
-			// and no creep, cannon or tower could hit back for the whole match.
-			// Liveness matches tickSummonsLocked's own test, not just the lazily-set flag.
-			for _, sm := range hs.summons {
-				if !sm.alive(now) {
-					continue
-				}
-				consider(&dotaTarget{summon: sm, x: sm.x, y: sm.y, radius: summonRadius})
-			}
+			consider(&dotaTarget{summon: sm, x: sm.x, y: sm.y, radius: summonRadius})
 		}
 	}
 	return best
@@ -1005,18 +1041,18 @@ func (s *Server) dotaDamageLocked(rep *conn, victim *mobState, dmg float64, atta
 	// for a timed task) the player's task. The player-landed twin is in hitMobFlagsLocked.
 	s.creditPvpStructureKillLocked(rep.inst, victim)
 	if victim.altar {
-		s.dotaEndLocked(rep, d.teamForVictorOver(victim.team), now)
+		s.dotaEndLocked(rep, teamForVictorOver(victim.team), now)
 	}
 	s.dotaScheduleCorpseLocked(rep.inst, victim.id)
 }
 
 // teamForVictorOver returns the BATTLE_END winner team when the altar of `loserTeam`
-// falls: the player's display team (1) if the ENEMY altar fell, else the enemy's (2).
-func (d *dotaState) teamForVictorOver(loserTeam int32) int32 {
-	if loserTeam == dotaPlayerTeam {
-		return dotaWinTeamEnemy
+// falls: simply the OTHER side. Absolute-team, so it does not depend on any viewer.
+func teamForVictorOver(loserTeam int32) int32 {
+	if loserTeam == dotaTeamHuman {
+		return dotaTeamElf
 	}
-	return dotaWinTeamSelf
+	return dotaTeamHuman
 }
 
 // dotaScheduleCorpseLocked removes a dead structure/creep from every client and the

@@ -18,11 +18,18 @@ func init() {
 				ManaCost: []int{35, 40, 45, 50}, Cooldown: []int{22, 21, 20, 19},
 				CastFx: "BlackDragonSkill1", CastFxDur: 0.8, PayloadFx: "BlackDragonSkill1Effect", PayloadFxAt: "self", PayloadDelay: 0.2,
 				BuffFx: "BlackDragonSkill1Effect", BuffFxOn: "self", BuffIcon: true, BuffDescVariant: "BuffSelf",
+				// «Неистовство»: client text ALSO makes attacks hit multiple targets
+				// («нанесение урона нескольким целям» / «наносить ей урон по области») --
+				// missing before, now a real cleave via OpAttackCleave.
 				Ops: []Op{
 					{Kind: OpBuffStat, Value: PerLevel{1.25, 1.35, 1.45, 1.55}, Dur: PerLevel{20, 20, 20, 20}, Stat: "attack_speed_pct", On: "self"},
-					// Downside: while enraged the dragon takes extra damage -- modelled as a
-					// negative-armor self debuff for the buff duration (no damage_taken stat exists).
-					{Kind: OpBuffStat, Value: PerLevel{-8, -12, -16, -20}, Dur: PerLevel{20, 20, 20, 20}, Stat: "phys_armor", On: "self"},
+					{Kind: OpAttackCleave, Dur: PerLevel{20, 20, 20, 20}, Radius: 4},
+					// Downside: while enraged the dragon takes a flat, rank-CONSTANT +20% more
+					// damage (client: literal "20%" at every rank, no per-rank placeholder) --
+					// a negative dmg_reduction_pct amplifies incoming damage directly, unlike
+					// phys_armor which runs through the diminishing-returns armor curve and can
+					// never actually net a clean 20% at any rank.
+					{Kind: OpBuffStat, Value: PerLevel{-0.2, -0.2, -0.2, -0.2}, Dur: PerLevel{20, 20, 20, 20}, Stat: "dmg_reduction_pct", On: "self"},
 				},
 				TipArgs: map[string]PerLevel{
 					"speedCoef": PerLevel{1.25, 1.35, 1.45, 1.55},
@@ -36,11 +43,11 @@ func init() {
 				BuffFx: "", BuffFxOn: "", BuffIcon: false, BuffDescVariant: "",
 				Ops: []Op{
 					// CLIENT «Выжигание маны»: «каждый удар, КРОМЕ повреждений, сжигает {manaBurn}
-					// маны». Every basic attack burns the target's mana (no refund/damage from the
-					// burn itself); a small bonus magic hit is kept as an undescribed solo-aid.
+					// маны». Every basic attack burns the target's mana only -- no bonus damage
+					// (a prior pass added an undescribed extra hit; the client text names only
+					// the mana burn).
 					{Kind: OpProc, Chance: PerLevel{1, 1, 1, 1}, Ops: []Op{
-						{Kind: OpManaBurnHit, Value: PerLevel{15, 22, 30, 40}, Value2: PerLevel{0, 0, 0, 0}},
-						{Kind: OpDamage, Value: PerLevel{8, 12, 16, 22}, Scale: "magic"},
+						{Kind: OpManaBurnHit, Value: PerLevel{15, 22, 30, 40}, Value2: PerLevel{0, 0, 0, 0}, PerSP: 1},
 					}},
 				},
 				TipArgs: map[string]PerLevel{
@@ -49,21 +56,28 @@ func init() {
 				},
 			},
 			{
-				// «Крылья тьмы»: passive aura that slows the ATTACK SPEED of enemies near the
-				// dragon. Runs via tickPassiveAurasLocked (no toggle, no mana upkeep).
-				// speedCoef {0.8..0.65} is the enemy attack-speed multiplier per rank.
-				Slot: 3, NameRu: "Крылья тьмы", Type: "PASSIVE",
-				Target: "", Targeting: "", Distance: 0, AoERadius: 5, AoEWidth: 0,
+				// «Кровь дракона» (NOT «Крылья тьмы» -- that name belonged to a prior
+				// wiki-based rewrite that swapped in the wrong mechanic entirely). Client:
+				// «При ближней атаке по дракону, враги снижают скорость атаки и перемещения
+				// на {speedCoef}% и получают {damage}+{@damageSP} магического урона в секунду
+				// в течение 3 секунд» -- a reactive thorns effect on being MELEE-struck, not
+				// an ambient proximity aura.
+				Slot: 3, NameRu: "Кровь дракона", Type: "PASSIVE",
+				Target: "", Targeting: "", Distance: 0, AoERadius: 0, AoEWidth: 0,
 				ManaCost: []int{0, 0, 0, 0}, Cooldown: []int{0, 0, 0, 0},
 				CastFx: "", CastFxDur: 0, PayloadFx: "", PayloadFxAt: "", PayloadDelay: 0,
-				BuffFx: "", BuffFxOn: "", BuffIcon: false, BuffDescVariant: "BuffTarget",
+				BuffFx: "", BuffFxOn: "", BuffIcon: false, BuffDescVariant: "",
 				Ops: []Op{
-					{Kind: OpAura, TickCost: PerLevel{0, 0, 0, 0}, Radius: 5, Interval: 1, Ops: []Op{
-						{Kind: OpAttackSlow, Value: PerLevel{0.8, 0.75, 0.7, 0.65}, Dur: PerLevel{1.5, 1.5, 1.5, 1.5}},
+					{Kind: OpProc, OnDamaged: true, MeleeOnly: true, Chance: PerLevel{1, 1, 1, 1}, Ops: []Op{
+						{Kind: OpSlow, Value: PerLevel{0.8, 0.75, 0.7, 0.65}, Dur: PerLevel{3, 3, 3, 3}},
+						{Kind: OpAttackSlow, Value: PerLevel{0.8, 0.75, 0.7, 0.65}, Dur: PerLevel{3, 3, 3, 3}},
+						{Kind: OpDot, Value: PerLevel{15, 20, 25, 30}, Dur: PerLevel{3, 3, 3, 3}, Scale: "magic", PerSP: 1},
 					}},
 				},
 				TipArgs: map[string]PerLevel{
 					"speedCoef": PerLevel{0.8, 0.75, 0.7, 0.65},
+					"damage":    PerLevel{15, 20, 25, 30},
+					"damageSP":  PerLevel{1, 1, 1, 1},
 				},
 			},
 			{
@@ -113,7 +127,7 @@ func init() {
 				CastFx: "CerberSkill2", CastFxDur: 0.8, PayloadFx: "CerberSkill2Effect", PayloadFxAt: "self", PayloadDelay: 0.2,
 				BuffFx: "", BuffFxOn: "", BuffIcon: true, BuffDescVariant: "BuffSelf",
 				Ops: []Op{
-					{Kind: OpBuffStat, Value: PerLevel{1.15, 1.2, 1.25, 1.3}, Dur: PerLevel{12, 12, 12, 12}, Stat: "dmg_pct", On: "self"},
+					{Kind: OpBuffStat, Value: PerLevel{40, 55, 70, 85}, Dur: PerLevel{12, 12, 12, 12}, Stat: "dmg_flat", On: "self", PerSP: 1},
 					{Kind: OpBuffStat, Value: PerLevel{1.12, 1.16, 1.2, 1.25}, Dur: PerLevel{12, 12, 12, 12}, Stat: "move_speed_pct", On: "self"},
 				},
 				TipArgs: map[string]PerLevel{
@@ -129,7 +143,7 @@ func init() {
 				CastFx: "", CastFxDur: 0, PayloadFx: "", PayloadFxAt: "", PayloadDelay: 0,
 				BuffFx: "", BuffFxOn: "", BuffIcon: false, BuffDescVariant: "",
 				Ops: []Op{
-					{Kind: OpHealOnKill, Value: PerLevel{0.1, 0.14, 0.18, 0.22}, Value2: PerLevel{80, 120, 160, 200}},
+					{Kind: OpHealOnKill, Value: PerLevel{0.1, 0.14, 0.18, 0.22}, Value2: PerLevel{80, 120, 160, 200}, PerSP: 1},
 				},
 				TipArgs: map[string]PerLevel{
 					"healthCoeff": PerLevel{0.1, 0.14, 0.18, 0.22},
@@ -145,7 +159,7 @@ func init() {
 				BuffFx: "CerberSkill4Effect2", BuffFxOn: "target", BuffIcon: false, BuffDescVariant: "",
 				Ops: []Op{
 					{Kind: OpSilence, Dur: PerLevel{4, 5, 6, 7}},
-					{Kind: OpDot, Value: PerLevel{34, 46, 58, 72}, Dur: PerLevel{4, 5, 6, 7}, Scale: "magic"},
+					{Kind: OpDot, Value: PerLevel{34, 46, 58, 72}, Dur: PerLevel{4, 5, 6, 7}, Scale: "magic", PerSP: 1},
 				},
 				TipArgs: map[string]PerLevel{
 					"damageAmount": PerLevel{34, 46, 58, 72},
@@ -184,8 +198,14 @@ func init() {
 				CastFx: "EinzenhaimSkill2", CastFxDur: 0.8, PayloadFx: "EinzenhaimSkill2", PayloadFxAt: "target", PayloadDelay: 0.3,
 				BuffFx: "", BuffFxOn: "", BuffIcon: false, BuffDescVariant: "",
 				Ops: []Op{
-					{Kind: OpDamage, Value: PerLevel{60, 95, 130, 170}, Scale: "magic"},
+					// CLIENT «Пальба навскидку»: "делает {shots} быстрых выстрелов... нанося
+					// {*damage}+{*@damageSP} урона ЗА КАЖДЫЙ выстрел" -- a real N-shot volley
+					// (OpChannel at a rapid cadence), not one lump hit. shots = 3/4/4/5; the
+					// channel's Dur is set to land exactly that many 0.25s pulses.
 					{Kind: OpSlow, Value: PerLevel{0.75, 0.7, 0.65, 0.6}, Dur: PerLevel{3, 3, 4, 4}},
+					{Kind: OpChannel, Dur: PerLevel{0.55, 0.8, 0.8, 1.05}, Interval: 0.25, Ops: []Op{
+						{Kind: OpDamage, Value: PerLevel{20, 28, 36, 46}, Scale: "magic"},
+					}},
 				},
 				TipArgs: map[string]PerLevel{
 					"damage":   PerLevel{20, 28, 36, 46},
@@ -200,7 +220,12 @@ func init() {
 				CastFx: "EinzenhaimSkill3", CastFxDur: 0.7, PayloadFx: "EinzenhaimSkill3", PayloadFxAt: "target", PayloadDelay: 0.3,
 				BuffFx: "", BuffFxOn: "", BuffIcon: false, BuffDescVariant: "BuffTarget",
 				Ops: []Op{
-					{Kind: OpDamage, Value: PerLevel{85, 120, 160, 205}, Scale: "magic"},
+					// CLIENT «Выстрел с отдачей»: "игнорируя любую защиту" -- unmitigated (pure)
+					// damage, not a normal magic hit. The caster's own recoil ("аватар отлетает
+					// назад") is a purely cosmetic self-displacement with no stated distance;
+					// OpKnockback only pushes the ENEMY target, so it is left as a client-side
+					// animation detail, not modeled server-side.
+					{Kind: OpDamage, Value: PerLevel{85, 120, 160, 205}, Scale: "pure"},
 					{Kind: OpStun, Dur: PerLevel{1.5, 2, 2, 2.5}},
 				},
 				TipArgs: map[string]PerLevel{
@@ -216,8 +241,13 @@ func init() {
 				CastFx: "EinzenhaimSkill4", CastFxDur: 1, PayloadFx: "EinzenhaimSkill4Effect1", PayloadFxAt: "point", PayloadDelay: 0.4,
 				BuffFx: "", BuffFxOn: "", BuffIcon: false, BuffDescVariant: "BuffTarget",
 				Ops: []Op{
+					// CLIENT «Изгнание колдовства»: sprayed enemies also take {*castDamage} extra
+					// damage "при применении любого навыка в течение {duration} секунд" -- marks
+					// every enemy caught in the spray (OpCastMark), punished if THEY cast within
+					// the same window (bosses only actually cast skills today).
 					{Kind: OpChannel, Dur: PerLevel{5, 6, 7, 8}, Interval: 1, Ops: []Op{
 						{Kind: OpDamage, Value: PerLevel{30, 42, 54, 68}, Scale: "magic", Radius: 4},
+						{Kind: OpCastMark, Value: PerLevel{40, 55, 70, 90}, PerSP: 1, Dur: PerLevel{5, 6, 7, 8}, Radius: 4},
 					}},
 				},
 				TipArgs: map[string]PerLevel{
@@ -236,15 +266,19 @@ func init() {
 		Prefab: "Avtr_DPS_Gayal", AttackProjectile: false,
 		Skills: [4]Skill{
 			{
+				// «Меч жажды»: casting arms a stacking window -- each landing basic attack
+				// adds +5% lifesteal and +speedInc attack speed, up to 5 stacks, then the
+				// sword bursts for {*damage}+{*@damageSP} bonus magic damage and resets.
 				Slot: 1, NameRu: "Меч жажды", Type: "ACTIVE",
-				Target: "ENEMY+NOT_BUILDING", Targeting: "TARGET", Distance: 3, AoERadius: 0, AoEWidth: 0,
+				Target: "", Targeting: "SELF", Distance: 0, AoERadius: 0, AoEWidth: 0,
 				ManaCost: []int{25, 30, 35, 40}, Cooldown: []int{10, 10, 9, 9},
-				CastFx: "", CastFxDur: 0, PayloadFx: "GayalSkill1Effect2", PayloadFxAt: "target", PayloadDelay: 0.3,
-				BuffFx: "GayalSkill1Effect1", BuffFxOn: "self", BuffIcon: true, BuffDescVariant: "BuffTarget",
+				CastFx: "", CastFxDur: 0, PayloadFx: "GayalSkill1Effect2", PayloadFxAt: "self", PayloadDelay: 0.3,
+				BuffFx: "GayalSkill1Effect1", BuffFxOn: "self", BuffIcon: true, BuffDescVariant: "BuffSelf",
 				Ops: []Op{
-					{Kind: OpLifestealHit, Value: PerLevel{65, 105, 150, 195}, Value2: PerLevel{0.4, 0.45, 0.5, 0.55}, Scale: "magic"},
-					{Kind: OpBuffStat, Value: PerLevel{1.15, 1.2, 1.25, 1.3}, Dur: PerLevel{6, 6, 6, 6}, Stat: "attack_speed_pct", On: "self"},
-					{Kind: OpBuffStat, Value: PerLevel{0.15, 0.2, 0.25, 0.3}, Dur: PerLevel{6, 6, 6, 6}, Stat: "lifesteal_pct", On: "self"},
+					{Kind: OpHitStack,
+						Value: PerLevel{0.05, 0.05, 0.05, 0.05}, Value2: PerLevel{0.03, 0.04, 0.05, 0.06},
+						Count: PerLevel{5, 5, 5, 5}, Dur: PerLevel{12, 12, 12, 12},
+						StackBurstDamage: PerLevel{65, 105, 150, 195}, PerSP: 1},
 				},
 				TipArgs: map[string]PerLevel{
 					"damage":   PerLevel{65, 105, 150, 195},
@@ -258,11 +292,17 @@ func init() {
 				ManaCost: []int{0, 0, 0, 0}, Cooldown: []int{0, 0, 0, 0},
 				CastFx: "", CastFxDur: 0, PayloadFx: "", PayloadFxAt: "", PayloadDelay: 0,
 				BuffFx: "GayalSkill2Effect1", BuffFxOn: "self", BuffIcon: true, BuffDescVariant: "BuffTarget",
+				// «Аура погибших»: 15% chance per hit to raise a zombie («существует 15%
+				// шанс»); lifesteal applies to ALL allies around Gayal, not just himself
+				// («все союзники вокруг вампира похищают жизнь») -- a real ally aura, ticking
+				// like Arianna's «Аура стойкости».
 				Ops: []Op{
-					{Kind: OpProc, Chance: PerLevel{0.05, 0.05, 0.05, 0.05}, Ops: []Op{
-						{Kind: OpSummon, Count: PerLevel{1, 1, 1, 1}, Lifetime: PerLevel{25, 25, 25, 25}, HP: PerLevel{180, 240, 300, 360}, Dmg: PerLevel{18, 24, 30, 36}, Unit: "Mob_ZombieCrawl_01"},
+					{Kind: OpProc, OnKill: true, Chance: PerLevel{0.15, 0.15, 0.15, 0.15}, Ops: []Op{
+						{Kind: OpSummon, Count: PerLevel{1, 1, 1, 1}, Lifetime: PerLevel{25, 25, 25, 25}, HP: PerLevel{180, 240, 300, 360}, Dmg: PerLevel{18, 24, 30, 36}, HpPerSP: 1, DmgPerSP: 1, Unit: "Mob_ZombieCrawl_01"},
 					}},
-					{Kind: OpBuffStat, Value: PerLevel{0.1, 0.13, 0.16, 0.2}, Dur: PerLevel{0, 0, 0, 0}, Stat: "lifesteal_pct", On: "self"},
+					{Kind: OpAura, Radius: 8, Interval: 1, Ops: []Op{
+						{Kind: OpBuffStat, Value: PerLevel{0.1, 0.13, 0.16, 0.2}, Dur: PerLevel{1.5, 1.5, 1.5, 1.5}, Stat: "lifesteal_pct", On: "allies", Radius: 8},
+					}},
 				},
 				TipArgs: map[string]PerLevel{
 					"healthMod":      PerLevel{180, 240, 300, 360},
@@ -284,7 +324,9 @@ func init() {
 					{Kind: OpDash, Value: PerLevel{20, 20, 20, 20}},
 					// «восстанавливая себе здоровье за каждого врага на пути»: heal via per-hit lifesteal
 					// so it scales with the number of enemies the dash strikes (was a flat heal).
-					{Kind: OpLifestealHit, Value: PerLevel{55, 80, 110, 145}, Value2: PerLevel{0.4, 0.4, 0.4, 0.4}, Scale: "magic", Radius: 3, PerSP: 1},
+					// Value2 is healthAdd/aoeDamage per rank (35/55, 50/80, 65/110, 85/145) so a
+					// single hit lands exactly on the client's flat healthAdd figure.
+					{Kind: OpLifestealHit, Value: PerLevel{55, 80, 110, 145}, Value2: PerLevel{0.64, 0.63, 0.59, 0.59}, Scale: "magic", Radius: 3, PerSP: 1},
 				},
 				TipArgs: map[string]PerLevel{
 					"aoeDamage":      PerLevel{55, 80, 110, 145},
@@ -299,10 +341,12 @@ func init() {
 				ManaCost: []int{50, 55, 60, 65}, Cooldown: []int{30, 28, 26, 24},
 				CastFx: "GayalSkill4Effect3", CastFxDur: 1, PayloadFx: "", PayloadFxAt: "", PayloadDelay: 0,
 				BuffFx: "GayalSkill4Effect1", BuffFxOn: "self", BuffIcon: true, BuffDescVariant: "",
+				// «Поглощение жизни»: each tick deals/heals 5% of GAYAL'S OWN live max HP, not
+				// a flat per-rank number, so it scales with gear/level.
 				Ops: []Op{
 					{Kind: OpChannel, Dur: PerLevel{5, 6, 7, 8}, Interval: 1, Ops: []Op{
-						{Kind: OpDamage, Value: PerLevel{26, 29, 32, 35}, Scale: "magic", Radius: 4},
-						{Kind: OpHeal, Value: PerLevel{26, 29, 32, 35}},
+						{Kind: OpDamage, SelfMaxHPPct: PerLevel{0.05, 0.05, 0.05, 0.05}, Scale: "magic", Radius: 4},
+						{Kind: OpHeal, SelfMaxHPPct: PerLevel{0.05, 0.05, 0.05, 0.05}},
 					}},
 				},
 				TipArgs: map[string]PerLevel{
@@ -316,9 +360,12 @@ func init() {
 		Skills: [4]Skill{
 			{
 				Slot: 1, NameRu: "Черная месса", Type: "ACTIVE",
-				Target: "ENEMY+NOT_BUILDING", Targeting: "TARGET", Distance: 8, AoERadius: 3, AoEWidth: 0,
+				// CLIENT «наносит магический урон всем врагам на ВЫБРАННОЙ ОБЛАСТИ» -- a ground-placed
+				// AoE, not a locked single-target cast. POINT + empty Targeting gives the client the
+				// ground cursor; with no locked mob the damage centres on the click point.
+				Target: "POINT", Targeting: "", Distance: 8, AoERadius: 3, AoEWidth: 0,
 				ManaCost: []int{35, 40, 45, 50}, Cooldown: []int{10, 9, 8, 7},
-				CastFx: "GellarSkill1", CastFxDur: 0.8, PayloadFx: "GellarSkill1Effect", PayloadFxAt: "target", PayloadDelay: 0.4,
+				CastFx: "GellarSkill1", CastFxDur: 0.8, PayloadFx: "GellarSkill1Effect", PayloadFxAt: "point", PayloadDelay: 0.4,
 				BuffFx: "", BuffFxOn: "", BuffIcon: false, BuffDescVariant: "",
 				Ops: []Op{
 					{Kind: OpDamage, Value: PerLevel{70, 105, 140, 175}, Scale: "magic", Radius: 3, PerSP: 1},
@@ -372,11 +419,14 @@ func init() {
 					// scales with the remaining soul count (PerSoul).
 					{Kind: OpConsumeSouls},
 					{Kind: OpChannel, Dur: PerLevel{7, 7, 7, 7}, Interval: 1, Ops: []Op{
-						{Kind: OpDamage, Value: PerLevel{20, 35, 50, 65}, PerSoul: PerLevel{1, 2, 3, 4}, Scale: "magic", Radius: 5, PerSP: 1},
+						{Kind: OpDamage, Value: PerLevel{20, 35, 50, 65}, PerSoul: PerLevel{1, 2, 3, 4}, PerSoulSP: 0.1, Scale: "magic", Radius: 5, PerSP: 1, MaxTargets: 2, Randomize: true},
 					}},
 				},
+				// TipArgs.damage now MATCHES the Op's Value (a prior mismatch understated the
+				// tooltip by 5-20 per rank vs the real per-tick damage); PerSoulSP wires up the
+				// previously-dead damageSoulSP tip value.
 				TipArgs: map[string]PerLevel{
-					"damage":        PerLevel{15, 25, 35, 45},
+					"damage":        PerLevel{20, 35, 50, 65},
 					"damagePerSoul": PerLevel{1, 2, 3, 4},
 					"damageSP":      PerLevel{1, 1, 1, 1},
 					"damageSoulSP":  PerLevel{0.1, 0.1, 0.1, 0.1},
@@ -396,7 +446,9 @@ func init() {
 				Ops: []Op{
 					{Kind: OpStealth, Dur: PerLevel{4, 4, 4, 4}}, // «кратковременно уходит в невидимость» -- real stealth, breaks on next action
 					{Kind: OpBuffStat, Value: PerLevel{1.4, 1.4, 1.4, 1.4}, Dur: PerLevel{4, 4, 4, 4}, Stat: "move_speed_pct", On: "self"},
-					{Kind: OpBuffStat, Value: PerLevel{1.3, 1.3, 1.3, 1.3}, Dur: PerLevel{6, 6, 6, 6}, Stat: "dmg_pct", On: "self"},
+					// CLIENT «Единение с ветром»: "При выходе из невидимости базовая атака...
+					// увеличивается на 30% НА 2 СЕКУНДЫ" -- was 6s, a 3x overshoot.
+					{Kind: OpBuffStat, Value: PerLevel{1.3, 1.3, 1.3, 1.3}, Dur: PerLevel{2, 2, 2, 2}, Stat: "dmg_pct", On: "self"},
 				},
 				TipArgs: map[string]PerLevel{
 					"cooldown": PerLevel{18, 16, 14, 12},
@@ -412,10 +464,18 @@ func init() {
 					{Kind: OpDamage, Value: PerLevel{70, 105, 145, 185}, Scale: "phys", PerSP: 1},
 					{Kind: OpStun, Dur: PerLevel{0.5, 0.5, 0.5, 0.5}},
 					{Kind: OpSilence, Dur: PerLevel{2, 2, 2, 2}},
-					// Only if the throw KILLS its target: reset all cooldowns and empower.
-					{Kind: OpOnKill, Ops: []Op{
+					// CLIENT «Изощренный бросок»: "накладывая на цель эффект на 10 секунд. Если
+					// цель умрёт, НАХОДЯСЬ ПОД ЭТИМ ЭФФЕКТОМ, аватара получит..." -- an instant
+					// kill by the throw still pays off immediately (target.dead branch), but the
+					// Dur arms a 10s mark so a LATER kill by any other source still credits
+					// Lirvein (OpKillMark, honored in the mob-death branch).
+					{Kind: OpOnKill, Dur: PerLevel{10, 10, 10, 10}, Ops: []Op{
 						{Kind: OpCooldownReset},
-						{Kind: OpBuffStat, Value: PerLevel{1.3, 1.3, 1.3, 1.3}, Dur: PerLevel{5, 5, 5, 5}, Stat: "dmg_pct", On: "self"},
+						// CLIENT «...аватара получит прибавку {damageMod}+{@damageModSP} к базовой
+						// атаке» -- a FLAT bonus (matching the skill's own damageMod/damageModSP
+						// TipArgs below, same shape as its primary OpDamage) with per-rank growth
+						// and SP scaling, not a constant ×1.3 (+30%) multiplier at every rank.
+						{Kind: OpBuffStat, Value: PerLevel{15, 20, 25, 30}, PerSP: 1, Dur: PerLevel{5, 5, 5, 5}, Stat: "dmg_flat", On: "self"},
 					}},
 				},
 				TipArgs: map[string]PerLevel{
@@ -443,14 +503,22 @@ func init() {
 				},
 			},
 			{
+				// CLIENT «Вендетта»: "вызывает 10 зачарованных кинжалов вокруг себя. Кинжалы
+				// начинают атаковать ближайшую цель прямо во время движения аватары, нанося 30%
+				// от базовой атаки за каждый выстрел, а последний кинжал нанесет удвоенный
+				// урон" -- a real self-cast summon swarm (10 autonomous daggers that seek the
+				// nearest enemy on their own, per-hit damage tied to Lirvein's LIVE base
+				// attack), not a flat DoT+hit on a chosen target. Reuses the real dagger VFX
+				// prop from his own kit (VFX_Avtr_DPS_Lirvein_Skill4_Prop01).
 				Slot: 4, NameRu: "Вендетта", Type: "ACTIVE",
-				Target: "ENEMY+NOT_BUILDING", Targeting: "TARGET", Distance: 7, AoERadius: 0, AoEWidth: 0,
+				Target: "", Targeting: "SELF", Distance: 0, AoERadius: 0, AoEWidth: 0,
 				ManaCost: []int{60, 65, 70, 75}, Cooldown: []int{45, 40, 35, 30},
-				CastFx: "", CastFxDur: 0, PayloadFx: "LirveinSkill4Effect2", PayloadFxAt: "target", PayloadDelay: 0.4,
+				CastFx: "", CastFxDur: 0, PayloadFx: "LirveinSkill4Effect2", PayloadFxAt: "self", PayloadDelay: 0.4,
 				BuffFx: "LirveinSkill4Effect1", BuffFxOn: "self", BuffIcon: true, BuffDescVariant: "BuffTarget",
 				Ops: []Op{
-					{Kind: OpDot, Value: PerLevel{30, 36, 42, 48}, Dur: PerLevel{5, 5, 5, 5}, Scale: "phys"},
-					{Kind: OpDamage, Value: PerLevel{60, 75, 90, 105}, Scale: "phys"},
+					{Kind: OpSummon, Unit: "VFX_Avtr_DPS_Lirvein_Skill4_Prop01",
+						Count: PerLevel{10, 10, 10, 10}, HP: PerLevel{1, 1, 1, 1}, Lifetime: PerLevel{15, 15, 15, 15},
+						DmgPctOfAttack: 0.3, LastDouble: true},
 				},
 				TipArgs: map[string]PerLevel{
 					"cooldown": PerLevel{45, 40, 35, 30},
@@ -476,7 +544,13 @@ func init() {
 				Ops: []Op{
 					{Kind: OpDamage, Value: PerLevel{70, 105, 140, 180}, Scale: "magic"},
 					{Kind: OpKnockback, Value: PerLevel{4, 4, 4, 4}},
-					{Kind: OpStun, Dur: PerLevel{2, 2, 2, 2}},
+					// CLIENT «Выстрел бури» only says "обездвиживая" (immobilize) -- per this
+					// file's own convention a bare "обездвиживает" with no "не может
+					// использовать способности" clause is a ROOT, not a full stun. (Wilfang
+					// s1 was once cited as the precedent for this convention, but Wilfang's
+					// OWN client text turned out to say literal "оглушаются" -- a real stun,
+					// not this bare-immobilize pattern -- so it is no longer that example.)
+					{Kind: OpRoot, Dur: PerLevel{2, 2, 2, 2}},
 				},
 				TipArgs: map[string]PerLevel{
 					"damage":   PerLevel{70, 105, 140, 180},
@@ -503,7 +577,10 @@ func init() {
 				CastFx: "MiriamSkill3Effect", CastFxDur: 0.5, PayloadFx: "", PayloadFxAt: "", PayloadDelay: 0.2,
 				BuffFx: "MiriamSkill3Effect", BuffFxOn: "self", BuffIcon: true, BuffDescVariant: "BuffSelf",
 				Ops: []Op{
-					{Kind: OpBuffStat, Value: PerLevel{1.2, 1.3, 1.4, 1.5}, Dur: PerLevel{10, 11, 12, 13}, Stat: "dmg_pct", On: "self"},
+					// CLIENT «Зачарованные стрелы»: "каждый выстрел наносит дополнительный
+					// {damageMod}+{damageSP} урона и расходует {shotCost} маны за выстрел" -- a
+					// flat per-shot bonus gated on mana, not a %-damage buff.
+					{Kind: OpAttackManaBonus, Value: PerLevel{25, 40, 55, 75}, PerSP: 1, Value2: PerLevel{6, 8, 10, 12}, Dur: PerLevel{10, 11, 12, 13}},
 				},
 				TipArgs: map[string]PerLevel{
 					"damageMod": PerLevel{25, 40, 55, 75},
@@ -518,8 +595,10 @@ func init() {
 				CastFx: "MiriamSkill4", CastFxDur: 1, PayloadFx: "MiriamSkill4Effect", PayloadFxAt: "point", PayloadDelay: 0.4,
 				BuffFx: "", BuffFxOn: "", BuffIcon: false, BuffDescVariant: "",
 				Ops: []Op{
+					// CLIENT «Убийственный залп»: "каждую секунду урон... дополнительно
+					// увеличивается на {damageInc}+{damageIncSP}" -- Growth adds that much per tick.
 					{Kind: OpChannel, Dur: PerLevel{6, 6, 6, 6}, Interval: 1, Ops: []Op{
-						{Kind: OpDamage, Value: PerLevel{34, 46, 58, 72}, Scale: "magic", Radius: 4},
+						{Kind: OpDamage, Value: PerLevel{34, 46, 58, 72}, Growth: PerLevel{6, 9, 12, 16}, Scale: "magic", Radius: 4},
 					}},
 				},
 				TipArgs: map[string]PerLevel{
@@ -540,8 +619,12 @@ func init() {
 				ManaCost: []int{30, 35, 40, 45}, Cooldown: []int{9, 9, 8, 8},
 				CastFx: "NerlagSkill1", CastFxDur: 0.6, PayloadFx: "NerlagSkill1Effect", PayloadFxAt: "point", PayloadDelay: 0.4,
 				BuffFx: "", BuffFxOn: "", BuffIcon: false, BuffDescVariant: "",
+				// CLIENT «...и {*aoeDamageInc}+{*@damageIncSP} дополнительного урона каждому
+				// последующему врагу, которого они заденут»: each successive enemy the throw's
+				// line sweep hits takes MORE than the last -- the aoeDamageInc/damageIncSP
+				// numbers already sat authored, unused, in TipArgs (pass-6 audit 2026-07-20).
 				Ops: []Op{
-					{Kind: OpDamage, Value: PerLevel{60, 90, 120, 155}, Scale: "magic", Radius: 3},
+					{Kind: OpDamage, Value: PerLevel{60, 90, 120, 155}, Scale: "magic", Radius: 3, PerTargetGrowth: PerLevel{12, 18, 24, 30}, PerTargetGrowthSP: 1},
 				},
 				TipArgs: map[string]PerLevel{
 					"aoeDamage":    PerLevel{60, 90, 120, 155},
@@ -557,9 +640,12 @@ func init() {
 				CastFx: "NerlagSkill2", CastFxDur: 2, PayloadFx: "", PayloadFxAt: "", PayloadDelay: 0,
 				BuffFx: "", BuffFxOn: "", BuffIcon: false, BuffDescVariant: "",
 				Ops: []Op{
-					// «нанося магический урон» -- magic, not phys (7 hits over 2.1s).
+					// «нанося магический урон, {aoeDamageCoef}% от базовой атаки» -- magic, not
+					// phys (7 hits over 2.1s); the CLIENT ties each hit to Nerlag's LIVE base
+					// attack (PctOfAttack), not a flat baked-in number, so gear/buffs actually
+					// move the damage (pass-10 audit 2026-07-22).
 					{Kind: OpChannel, Dur: PerLevel{2.1, 2.1, 2.1, 2.1}, Interval: 0.3, Ops: []Op{
-						{Kind: OpDamage, Value: PerLevel{26, 34, 42, 52}, Scale: "magic", Radius: 4},
+						{Kind: OpDamage, PctOfAttack: PerLevel{0.5, 0.6, 0.7, 0.8}, Scale: "magic", Radius: 4},
 					}},
 				},
 				TipArgs: map[string]PerLevel{
@@ -591,11 +677,17 @@ func init() {
 				ManaCost: []int{50, 55, 60, 65}, Cooldown: []int{22, 21, 20, 19},
 				CastFx: "NerlagSkill4", CastFxDur: 0.9, PayloadFx: "NerlagSkill4Effect1", PayloadFxAt: "point", PayloadDelay: 0.5,
 				BuffFx: "NerlagSkill4Effect2", BuffFxOn: "self", BuffIcon: true, BuffDescVariant: "BuffSelf",
+				// CLIENT «...получая 5% к скорости перемещения и {*damageMod} к базовой атаке
+				// ЗА КАЖДОГО ВРАГА, попавшего в область действия»: both buffs scale per enemy
+				// the landing AoE hit (ScalePerHit, reading ctx.hitCount from the OpDamage just
+				// above), not a flat rank-scaled number regardless of how many were caught; the
+				// attack term is a flat bonus (dmg_flat, matching damageMod's units), not a %
+				// (dmg_pct) (pass-6 audit 2026-07-20).
 				Ops: []Op{
 					{Kind: OpDash, Value: PerLevel{24, 24, 24, 24}},
 					{Kind: OpDamage, Value: PerLevel{95, 140, 185, 240}, Scale: "magic", Radius: 4},
-					{Kind: OpBuffStat, Value: PerLevel{1.15, 1.2, 1.25, 1.3}, Dur: PerLevel{7, 7, 7, 7}, Stat: "move_speed_pct", On: "self"},
-					{Kind: OpBuffStat, Value: PerLevel{1.15, 1.2, 1.25, 1.3}, Dur: PerLevel{7, 7, 7, 7}, Stat: "dmg_pct", On: "self"},
+					{Kind: OpBuffStat, Value: PerLevel{1.05, 1.05, 1.05, 1.05}, Dur: PerLevel{7, 7, 7, 7}, Stat: "move_speed_pct", On: "self", ScalePerHit: true},
+					{Kind: OpBuffStat, Value: PerLevel{10, 14, 18, 24}, Dur: PerLevel{7, 7, 7, 7}, Stat: "dmg_flat", On: "self", ScalePerHit: true},
 				},
 				TipArgs: map[string]PerLevel{
 					"aoeDamage": PerLevel{95, 140, 185, 240},
@@ -625,12 +717,13 @@ func init() {
 				},
 			},
 			{
-				// «Прыжок» is a leap to a ground point that now SLAMS an AoE where it lands
-				// (user: "2 скилл должен быть не таргетным, а AOE"). It was a pure mobility +
-				// self-buff leap with no enemy effect at all; the landing damage op (Radius>0,
-				// AoERadius drawn to match) makes it hit everyone in the circle. StrikeOnArrival
-				// defers the slam+buffs to the moment the dash lands, so the damage erupts under
-				// Sandariel's feet at the destination rather than at the take-off point.
+				// «Прыжок»: client text (Name/LobbyDesc/CommonDesc/ShortDesc/LongDesc, none of
+				// which contain a damage token) is a pure mobility leap that buffs attack/move
+				// speed for Sandariel AND allies around her landing point (On:"allies", Radius 4
+				// already satisfies "AOE instead of targeted" -- no enemy-damage component is
+				// described anywhere, so the prior landing-slam OpDamage was invented). Pass-6
+				// audit 2026-07-20. StrikeOnArrival still defers the buffs to the moment the dash
+				// lands, so they apply at the destination rather than the take-off point.
 				Slot: 2, NameRu: "Прыжок", Type: "ACTIVE",
 				Target: "POINT", Targeting: "", Distance: 11, AoERadius: 4, AoEWidth: 0,
 				ManaCost: []int{30, 35, 40, 45}, Cooldown: []int{14, 13, 12, 11},
@@ -638,7 +731,6 @@ func init() {
 				BuffFx: "", BuffFxOn: "", BuffIcon: true, BuffDescVariant: "BuffSelf",
 				Ops: []Op{
 					{Kind: OpDash, Value: PerLevel{24, 24, 24, 24}, StrikeOnArrival: true},
-					{Kind: OpDamage, Value: PerLevel{60, 90, 120, 155}, Scale: "magic", Radius: 4},
 					// «у неё И СОЮЗНИКОВ вокруг» -- the +16% attack / +60% move speed land on Sandariel
 					// AND every ally in the landing circle (On:"allies"). Solo = just Sandariel.
 					{Kind: OpBuffStat, Value: PerLevel{1.16, 1.16, 1.16, 1.16}, Dur: PerLevel{5, 6, 7, 8}, Stat: "attack_speed_pct", On: "allies", Radius: 4},
@@ -646,8 +738,6 @@ func init() {
 				},
 				TipArgs: map[string]PerLevel{
 					"duration": PerLevel{5, 6, 7, 8},
-					"damage":   PerLevel{60, 90, 120, 155},
-					"damageSP": PerLevel{1, 1, 1, 1},
 				},
 			},
 			{
@@ -659,9 +749,17 @@ func init() {
 				// the buff bar, exactly like Velial's «Воля к победе» (both PASSIVE/self, no BuffFx,
 				// icon comes from SkillIconPath). It was false, so the dmg_pct buff applied
 				// invisibly -- "3 скилл не отображается как статус эффект".
+				//
+				// CLIENT «...накапливает заряд за каждые {*chargeDist} единиц пройденного пути.
+				// Заряд увеличивает урон от базовой атаки на {*chargeDamage}... сбрасывается
+				// после использования базовой атаки»: a movement-distance charge stack that
+				// buffs only the NEXT basic attack and resets, not a permanent %-damage aura
+				// (pass-6 audit 2026-07-20; OpMoveChargeAttack: Value=chargeDamage per charge,
+				// Value2=chargeDist per charge, Count=max charges -- all TipArgs numbers already
+				// authored here, just unused before).
 				BuffFx: "", BuffFxOn: "", BuffIcon: true, BuffDescVariant: "BuffSelf",
 				Ops: []Op{
-					{Kind: OpBuffStat, Value: PerLevel{1.08, 1.12, 1.16, 1.2}, Dur: PerLevel{0, 0, 0, 0}, Stat: "dmg_pct", On: "self"},
+					{Kind: OpMoveChargeAttack, Value: PerLevel{4, 6, 8, 10}, Value2: PerLevel{5, 5, 5, 5}, Count: PerLevel{5, 6, 7, 8}},
 				},
 				TipArgs: map[string]PerLevel{
 					"chargeDamage": PerLevel{4, 6, 8, 10},
@@ -670,13 +768,19 @@ func init() {
 				},
 			},
 			{
+				// CLIENT «...все союзники рядом с Сандариэль становятся невидимыми... Сандариэль
+				// остаётся видимой, но вероятность уворота повышена»: the invisibility must
+				// land on nearby ALLIES, not on Sandariel herself (she explicitly stays
+				// visible) -- the InvisibilityEffect VFX was cosmetically applied to her,
+				// inverting the described effect (pass-6 audit 2026-07-20).
 				Slot: 4, NameRu: "Сокрывающая вуаль", Type: "ACTIVE",
 				Target: "", Targeting: "SELF", Distance: 0, AoERadius: 0, AoEWidth: 0,
 				ManaCost: []int{45, 50, 55, 60}, Cooldown: []int{26, 24, 22, 20},
 				CastFx: "SandarielSkill4", CastFxDur: 0.8, PayloadFx: "SandarielSkill4Effect", PayloadFxAt: "self", PayloadDelay: 0.2,
-				BuffFx: "InvisibilityEffect", BuffFxOn: "self", BuffIcon: true, BuffDescVariant: "BuffSelf",
+				BuffFx: "", BuffFxOn: "", BuffIcon: true, BuffDescVariant: "BuffSelf",
 				Ops: []Op{
 					{Kind: OpBuffStat, Value: PerLevel{0.2, 0.25, 0.3, 0.35}, Dur: PerLevel{6, 7, 8, 9}, Stat: "dodge_pct", On: "self"},
+					{Kind: OpStealth, Dur: PerLevel{6, 7, 8, 9}, Radius: 5, On: "allies"},
 				},
 				TipArgs: map[string]PerLevel{
 					"dodgeMod": PerLevel{0.2, 0.25, 0.3, 0.35},
@@ -703,13 +807,21 @@ func init() {
 				},
 			},
 			{
+				// «Жар души»: client -- "увеличение базовой скорости атаки на {additionalSpeed}
+				// за каждые 10% отсутствующей маны" -- a LIVE bonus tied to current missing
+				// mana, not a fixed always-on buff.
 				Slot: 2, NameRu: "Жар души", Type: "PASSIVE",
 				Target: "", Targeting: "", Distance: 0, AoERadius: 0, AoEWidth: 0,
 				ManaCost: []int{0, 0, 0, 0}, Cooldown: []int{0, 0, 0, 0},
 				CastFx: "", CastFxDur: 0, PayloadFx: "", PayloadFxAt: "", PayloadDelay: 0,
+				// Buff icon: the world-build/re-instantiate loops gate purely on
+				// Type=="PASSIVE" && BuffIcon (see Velial's «Воля к победе», Sandariel's
+				// «Острие странника» -- both continuous live-formula passives with no
+				// OpBuffStat, same shape as this skill, both render fine with BuffIcon:true).
+				// The client ships a dedicated _BuffSelf_LongDesc tooltip for exactly this icon.
 				BuffFx: "", BuffFxOn: "", BuffIcon: true, BuffDescVariant: "BuffSelf",
 				Ops: []Op{
-					{Kind: OpBuffStat, Value: PerLevel{1.08, 1.12, 1.16, 1.2}, Dur: PerLevel{0, 0, 0, 0}, Stat: "attack_speed_pct", On: "self"},
+					{Kind: OpManaScaledAttackSpeed, Value: PerLevel{2, 3, 4, 5}},
 				},
 				TipArgs: map[string]PerLevel{
 					"additionalSpeed": PerLevel{2, 3, 4, 5},
@@ -717,9 +829,12 @@ func init() {
 			},
 			{
 				Slot: 3, NameRu: "Лавовые оковы", Type: "ACTIVE",
-				Target: "", Targeting: "SELF", Distance: 0, AoERadius: 3, AoEWidth: 0,
+				// CLIENT «…враждебным целям, находящимся в зоне поражения» -- a ground-placed AoE
+				// at the chosen point, not a self-centred burst. POINT + empty Targeting gives the
+				// client the ground cursor and carries px/py into the ops (centre = click point).
+				Target: "POINT", Targeting: "", Distance: 8, AoERadius: 3, AoEWidth: 0,
 				ManaCost: []int{40, 45, 50, 55}, Cooldown: []int{16, 15, 14, 13},
-				CastFx: "SharliSkill3", CastFxDur: 0.8, PayloadFx: "SharliSkill3Effect", PayloadFxAt: "self", PayloadDelay: 0.4,
+				CastFx: "SharliSkill3", CastFxDur: 0.8, PayloadFx: "SharliSkill3Effect", PayloadFxAt: "point", PayloadDelay: 0.4,
 				BuffFx: "SlowMoveEffect", BuffFxOn: "target", BuffIcon: false, BuffDescVariant: "",
 				Ops: []Op{
 					{Kind: OpDamage, Value: PerLevel{65, 95, 125, 155}, Scale: "magic", Radius: 3, PerSP: 1},
@@ -733,12 +848,15 @@ func init() {
 			},
 			{
 				Slot: 4, NameRu: "Огненный феникс", Type: "ACTIVE",
-				Target: "POINT", Targeting: "", Distance: 10, AoERadius: 3, AoEWidth: 0,
+				// CLIENT «феникс, пролетающий по области ПЕРЕД аватарой» -- a directional beam, not
+				// a circle at the point. AoEWidth>0 (radius 0) routes damageTargetsLocked through
+				// the line sweep (caster -> aim over full Distance), exactly like Velial s2 «Разлом».
+				Target: "POINT", Targeting: "", Distance: 10, AoERadius: 0, AoEWidth: 3,
 				ManaCost: []int{65, 75, 85, 95}, Cooldown: []int{45, 40, 35, 30},
 				CastFx: "SharliSkill4", CastFxDur: 0.9, PayloadFx: "SharliSkill4Effect", PayloadFxAt: "point", PayloadDelay: 0.8,
 				BuffFx: "", BuffFxOn: "", BuffIcon: false, BuffDescVariant: "",
 				Ops: []Op{
-					{Kind: OpDamage, Value: PerLevel{130, 185, 240, 295}, Scale: "magic", Radius: 3, PerSP: 1},
+					{Kind: OpDamage, Value: PerLevel{130, 185, 240, 295}, Scale: "magic", Radius: 0, PerSP: 1},
 				},
 				TipArgs: map[string]PerLevel{
 					"damage":   PerLevel{130, 185, 240, 295},
@@ -757,9 +875,13 @@ func init() {
 				CastFx: "EdiliaSkill1", CastFxDur: 0.8, PayloadFx: "EdiliaSkill1Effect1", PayloadFxAt: "self", PayloadDelay: 0.2,
 				BuffFx: "", BuffFxOn: "", BuffIcon: false, BuffDescVariant: "",
 				Ops: []Op{
-					// «Касание природы»: blink in, damage enemies AND heal allies at the landing
-					// point by the same amount (On:"allies", self included). Solo = self-heal.
-					{Kind: OpBlink},
+					// «Быстро перелетает в выбранную точку… нанося урон врагам и исцеляя союзников
+					// в точке приземления». A fast DASH, not OpBlink: the client never SNAPS to a
+					// server position (SmoothErrorCorrector caps catch-up at max_speed*dt, which
+					// decays to 0 while standing), so a vel-0 teleport barely moves the avatar --
+					// the reported desync. A dash carries real velocity so she visibly glides, and
+					// StrikeOnArrival defers the damage/heal to the landing point.
+					{Kind: OpDash, Value: PerLevel{40, 40, 40, 40}, NoClip: true, StrikeOnArrival: true},
 					{Kind: OpDamage, Value: PerLevel{55, 75, 95, 115}, Scale: "magic", Radius: 4, PerSP: 1},
 					{Kind: OpHeal, Value: PerLevel{55, 75, 95, 115}, PerSP: 1, On: "allies", Radius: 4},
 				},
@@ -788,9 +910,15 @@ func init() {
 				ManaCost: []int{0, 0, 0, 0}, Cooldown: []int{0, 0, 0, 0},
 				CastFx: "", CastFxDur: 0, PayloadFx: "", PayloadFxAt: "", PayloadDelay: 0,
 				BuffFx: "DodgeChanceEffect", BuffFxOn: "self", BuffIcon: true, BuffDescVariant: "BuffSelf",
+				// CLIENT «При получении удара... атакующий теряет скорость атаки»: the slow
+				// must fire on the STRIKING mob when EDILIA is hit (OnDamaged), gated on the
+				// already-authored cooldown, not on Edilia's own attacks with an independent
+				// 20-35% roll (pass-6 audit 2026-07-20).
 				Ops: []Op{
 					{Kind: OpBuffStat, Value: PerLevel{0.1, 0.14, 0.18, 0.22}, Dur: PerLevel{0, 0, 0, 0}, Stat: "dodge_pct", On: "self"},
-					{Kind: OpProc, Chance: PerLevel{0.2, 0.25, 0.3, 0.35}, Ops: []Op{
+					// CLIENT «При получении удара от базовой атаки...»: gated to basic attacks
+					// only, not skill damage (pass-10 audit 2026-07-22).
+					{Kind: OpProc, OnDamaged: true, BasicAttackOnly: true, Chance: PerLevel{1, 1, 1, 1}, Ops: []Op{
 						{Kind: OpAttackSlow, Value: PerLevel{0.5, 0.5, 0.5, 0.5}, Dur: PerLevel{1, 1, 1, 1}},
 					}},
 				},
@@ -863,9 +991,13 @@ func init() {
 				ManaCost: []int{40, 46, 52, 58}, Cooldown: []int{18, 16, 14, 12},
 				CastFx: "ElgormSkill3", CastFxDur: 1, PayloadFx: "", PayloadFxAt: "", PayloadDelay: 0,
 				BuffFx: "", BuffFxOn: "", BuffIcon: false, BuffDescVariant: "BuffTarget",
+				// CLIENT «...получают магический урон равный {damage%}% от своего максимального
+				// здоровья» -- the DoT is a % of the VICTIM's own max HP (punishes tanky
+				// targets harder), not the flat per-rank number it was (pass-6 audit
+				// 2026-07-20). TipArgs' 0.03-0.06 was already the real percentage, just unused.
 				Ops: []Op{
 					{Kind: OpTrap, Lifetime: PerLevel{8, 8, 8, 8}, TriggerRadius: 4, TrapFx: "ElgormSkill3Effect1", TriggerFx: "ElgormSkill3Effect2", Ops: []Op{
-						{Kind: OpDot, Value: PerLevel{5, 7, 9, 11}, Dur: PerLevel{8, 8, 8, 8}, Scale: "magic"},
+						{Kind: OpDot, VictimMaxHPPct: PerLevel{0.03, 0.04, 0.05, 0.06}, Dur: PerLevel{8, 8, 8, 8}, Scale: "magic"},
 						{Kind: OpSlow, Value: PerLevel{0.85, 0.85, 0.85, 0.85}, Dur: PerLevel{8, 8, 8, 8}},
 					}},
 				},
@@ -914,17 +1046,28 @@ func init() {
 			},
 			{
 				Slot: 2, NameRu: "Ледяной град", Type: "ACTIVE",
-				Target: "", Targeting: "SELF", Distance: 0, AoERadius: 5, AoEWidth: 0,
+				// CLIENT «Вызывает ледяной град… случайных врагов» -- a placed hail ZONE, not a
+				// self-centred burst. POINT + empty Targeting → a ground channel pinned at the
+				// clicked point (groundAnchored in tickChannelsLocked), so the hail stays put.
+				// (Pass-6 audit flagged the client's "вокруг мага" phrasing as possibly meaning
+				// self-centered instead; NOT changed here -- this engine's self/unit channels
+				// break on caster movement, so naively re-targeting SELF would make the hail
+				// vanish the instant Frost takes one step, a worse regression than the
+				// medium-confidence text read it would fix. Left as the existing ground-anchor
+				// design; only the chance-gate below (high confidence) is applied.)
+				Target: "POINT", Targeting: "", Distance: 8, AoERadius: 5, AoEWidth: 0,
 				ManaCost: []int{55, 60, 65, 70}, Cooldown: []int{20, 19, 18, 17},
 				CastFx: "FrostSkill2", CastFxDur: 1, PayloadFx: "", PayloadFxAt: "", PayloadDelay: 0,
 				BuffFx: "FrostSkill2Effect", BuffFxOn: "self", BuffIcon: true, BuffDescVariant: "BuffTarget",
 				Ops: []Op{
 					{Kind: OpChannel, Dur: PerLevel{8, 8, 8, 8}, Interval: 1, Ops: []Op{
 						{Kind: OpDamage, Value: PerLevel{15, 20, 25, 30}, Scale: "magic", Radius: 5},
-						{Kind: OpStun, Dur: PerLevel{0.3, 0.3, 0.3, 0.3}},
+						// CLIENT «...с шансом 20% оглушающий...»: was unconditional (100%), not the
+						// per-tick 20% roll the tooltip states (pass-6 audit 2026-07-20).
+						{Kind: OpStun, Dur: PerLevel{0.3, 0.3, 0.3, 0.3}, Chance: PerLevel{0.2, 0.2, 0.2, 0.2}},
 						// «Если град попадает на врага с ознобом → стан 1с + озноб снят»: OpChill
 						// re-chills fresh targets and stuns already-chilled ones each hail tick.
-						{Kind: OpChill, Dur: PerLevel{40, 40, 40, 40}, Value2: PerLevel{1, 1, 1, 1}, Radius: 5},
+						{Kind: OpChill, Dur: PerLevel{40, 40, 40, 40}, Value2: PerLevel{1, 1, 1, 1}, Radius: 5, Chance: PerLevel{0.2, 0.2, 0.2, 0.2}},
 					}},
 				},
 				TipArgs: map[string]PerLevel{
@@ -943,9 +1086,14 @@ func init() {
 					// chill, DoT, and drain life back to Frost. Ally half -- heal + a protective
 					// damage-reduction shell (armor buff).
 					{Kind: OpStun, Dur: PerLevel{3, 3, 4, 4}, TargetSide: "enemy"},
-					{Kind: OpDot, Value: PerLevel{20, 25, 30, 35}, Dur: PerLevel{3, 3, 4, 4}, Scale: "magic", TargetSide: "enemy"},
+					{Kind: OpDot, Value: PerLevel{20, 25, 30, 35}, Dur: PerLevel{3, 3, 4, 4}, Scale: "magic", TargetSide: "enemy", PerSP: 1},
 					{Kind: OpChill, Dur: PerLevel{40, 40, 40, 40}, Value2: PerLevel{1, 1, 1, 1}, TargetSide: "enemy"},
-					{Kind: OpHeal, Value: PerLevel{20, 25, 30, 35}, PerSP: 1, TargetSide: "enemy"},
+					// CLIENT text never mentions Frost gaining any health back from the enemy
+					// half -- that OpHeal was an undocumented lifesteal drain, removed. The
+					// immobilize ("не может атаковать или двигаться") applies to EITHER side, so
+					// the ally half also gets stunned/encased, not left free to act (pass-6 audit
+					// 2026-07-20).
+					{Kind: OpStun, Dur: PerLevel{3, 3, 4, 4}, TargetSide: "ally"},
 					{Kind: OpHeal, Value: PerLevel{20, 25, 30, 35}, On: "ally", PerSP: 1, TargetSide: "ally"},
 					{Kind: OpBuffStat, Value: PerLevel{2, 2, 2, 2}, Dur: PerLevel{3, 3, 4, 4}, Stat: "armor_pct", On: "ally", TargetSide: "ally"},
 				},
@@ -961,11 +1109,22 @@ func init() {
 				Slot: 4, NameRu: "Исчадие мерзлоты", Type: "ACTIVE",
 				Target: "POINT", Targeting: "", Distance: 6, AoERadius: 4, AoEWidth: 0,
 				ManaCost: []int{85, 95, 105, 115}, Cooldown: []int{70, 65, 60, 55},
-				CastFx: "FrostSkill4", CastFxDur: 1.4, PayloadFx: "FrostSkill4Effect", PayloadFxAt: "point", PayloadDelay: 0.4,
+				// The ice aura belongs to the summoned ELEMENTAL (SummonFx), not the caster: a
+				// point PayloadFx here was a SELF-baked fx that trailed Frost. No point payload now.
+				CastFx: "FrostSkill4", CastFxDur: 1.4, PayloadFx: "", PayloadFxAt: "", PayloadDelay: 0.4,
 				BuffFx: "", BuffFxOn: "", BuffIcon: false, BuffDescVariant: "",
 				Ops: []Op{
 					{Kind: OpStun, Dur: PerLevel{1, 1, 1, 1}},
-					{Kind: OpSummon, Count: PerLevel{1, 1, 1, 1}, Lifetime: PerLevel{60, 60, 60, 60}, HP: PerLevel{400, 550, 700, 850}, Dmg: PerLevel{45, 55, 65, 75}, Unit: "Avtr_Dsb_Frost_Elemental"},
+					// CLIENT «Каждая атака элементаля замедляет врага на 30% в течение 2 секунд.
+					// Если элементаль атакует врага под ознобом, враг оглушается на 1 секунду.»
+					// -- the elemental's OWN on-hit combo (Ops fires per landing attack via
+					// summonState.onHitOps), not just a flat HP/Dmg dealer (pass-6 audit
+					// 2026-07-20).
+					{Kind: OpSummon, Count: PerLevel{1, 1, 1, 1}, Lifetime: PerLevel{60, 60, 60, 60}, HP: PerLevel{400, 550, 700, 850}, Dmg: PerLevel{45, 55, 65, 75}, Unit: "Avtr_Dsb_Frost_Elemental", SummonFx: "FrostSkill4Effect",
+						Ops: []Op{
+							{Kind: OpSlow, Value: PerLevel{0.7, 0.7, 0.7, 0.7}, Dur: PerLevel{2, 2, 2, 2}},
+							{Kind: OpChill, Dur: PerLevel{40, 40, 40, 40}, Value2: PerLevel{1, 1, 1, 1}},
+						}},
 				},
 				TipArgs: map[string]PerLevel{
 					"damage": PerLevel{45, 55, 65, 75},
@@ -984,7 +1143,10 @@ func init() {
 				CastFx: "HekataSkill1", CastFxDur: 1.2, PayloadFx: "", PayloadFxAt: "", PayloadDelay: 0.4,
 				BuffFx: "HekataSkill1Effect", BuffFxOn: "target", BuffIcon: false, BuffDescVariant: "BuffTarget",
 				Ops: []Op{
-					{Kind: OpStun, Dur: PerLevel{2, 2, 3, 3}},
+					// Client: "лишается возможности применять способности" = silence (can still
+					// move/basic-attack), not a full stun; the compound effect runs the DoT's
+					// flat 5s, not the old stun-only 2-3s.
+					{Kind: OpSilence, Dur: PerLevel{5, 5, 5, 5}},
 					{Kind: OpDot, Value: PerLevel{20, 30, 40, 52}, Dur: PerLevel{5, 5, 5, 5}, Scale: "magic"},
 				},
 				TipArgs: map[string]PerLevel{
@@ -1004,7 +1166,7 @@ func init() {
 					// runs for the window; the second op opens a kill-window that adds
 					// +damagePerKill flat attack per kill (uncapped) until the buff expires.
 					{Kind: OpBuffStat, Value: PerLevel{1.3, 1.3, 1.3, 1.3}, Dur: PerLevel{10, 12, 14, 16}, Stat: "dmg_pct", On: "self"},
-					{Kind: OpOnKillStack, Value: PerLevel{4, 6, 8, 10}, Dur: PerLevel{10, 12, 14, 16}},
+					{Kind: OpOnKillStack, Value: PerLevel{4, 6, 8, 10}, Dur: PerLevel{10, 12, 14, 16}, PerSP: 1},
 				},
 				TipArgs: map[string]PerLevel{
 					"duration":      PerLevel{10, 12, 14, 16},
@@ -1019,10 +1181,12 @@ func init() {
 				CastFx: "HekataSkill3", CastFxDur: 1.2, PayloadFx: "HekataSkill3Effect2", PayloadFxAt: "target", PayloadDelay: 0.4,
 				BuffFx: "HekataSkill3Effect1", BuffFxOn: "target", BuffIcon: false, BuffDescVariant: "BuffTarget",
 				Ops: []Op{
-					// CLIENT «Выбор скверны»: speed a FRIEND or slow a FOE. Enemy half slows (and
-					// keeps a self-speed as a solo aid); ally half speeds the aimed friend.
+					// CLIENT «Выбор скверны»: speed a FRIEND or slow a FOE -- exactly two mutually
+					// exclusive branches, nothing else. Pass-7 audit removed a fabricated
+					// self-speed "solo aid" on the enemy branch: the client never mentions Hekata
+					// gaining speed when she targets a foe (same bug class already fixed on
+					// Frost s3 in pass 6).
 					{Kind: OpSlow, Value: PerLevel{0.85, 0.8, 0.75, 0.7}, Dur: PerLevel{5, 5, 5, 5}, TargetSide: "enemy"},
-					{Kind: OpBuffStat, Value: PerLevel{1.15, 1.2, 1.25, 1.3}, Dur: PerLevel{5, 5, 5, 5}, Stat: "move_speed_pct", On: "self", TargetSide: "enemy"},
 					{Kind: OpBuffStat, Value: PerLevel{1.15, 1.2, 1.25, 1.3}, Dur: PerLevel{5, 5, 5, 5}, Stat: "move_speed_pct", On: "ally", TargetSide: "ally"},
 				},
 				TipArgs: map[string]PerLevel{
@@ -1060,9 +1224,12 @@ func init() {
 				Target: "POINT", Targeting: "", Distance: 8, AoERadius: 4, AoEWidth: 0,
 				ManaCost: []int{40, 45, 50, 55}, Cooldown: []int{13, 12, 11, 10},
 				CastFx: "MorlokaySkill1", CastFxDur: 1.2, PayloadFx: "MorlokaySkill1Effect1", PayloadFxAt: "point", PayloadDelay: 0.4,
-				BuffFx: "MorlokaySkill1Effect2", BuffFxOn: "target", BuffIcon: false, BuffDescVariant: "BuffTarget",
+				// The curse visual rides the DoT (DotFx) so it attaches to EACH afflicted enemy and
+				// dies with the debuff. A skill-level BuffFxOn:"target" never rendered for this POINT
+				// cast (no locked mob) and the SELF-baked fx fell back onto the caster -- the report.
+				BuffFx: "", BuffFxOn: "", BuffIcon: false, BuffDescVariant: "BuffTarget",
 				Ops: []Op{
-					{Kind: OpDot, Value: PerLevel{20, 20, 20, 20}, Dur: PerLevel{6, 8, 10, 12}, Scale: "magic"},
+					{Kind: OpDot, Value: PerLevel{20, 20, 20, 20}, PerSP: 1, Dur: PerLevel{6, 8, 10, 12}, Scale: "magic", DotFx: "MorlokaySkill1Effect2"},
 					{Kind: OpBuffStat, Value: PerLevel{-10, -15, -20, -25}, Dur: PerLevel{6, 8, 10, 12}, Stat: "magic_armor", On: "target"},
 				},
 				TipArgs: map[string]PerLevel{
@@ -1080,8 +1247,16 @@ func init() {
 				Ops: []Op{
 					{Kind: OpRoot, Dur: PerLevel{3, 3, 4, 4}},
 					{Kind: OpSilence, Dur: PerLevel{3, 3, 4, 4}},
+					// CLIENT «...урона, возрастающего на {damageInc}+{@damageIncSP} с каждой
+					// секундой удержания на 20 единиц» -- the tick RAMPS by +20/sec from the base
+					// `damage` TipArg, not a flat per-rank number (the prior 45/50/65/70 was the
+					// arithmetic MEAN of the real ramp at this channel's tick count, not the ramp
+					// itself -- same total damage, wrong second-by-second shape).
 					{Kind: OpChannel, Dur: PerLevel{3, 3, 4, 4}, Interval: 1, Ops: []Op{
-						{Kind: OpDamage, Value: PerLevel{45, 50, 65, 70}, Scale: "magic"},
+						// CLIENT «...возрастающего на {damageInc}+{@damageIncSP}» -- the ramp itself
+						// (not just the base tick) scales with spell power (GrowthPerSP, same
+						// primitive Titanid's «Землетрясение» uses).
+						{Kind: OpDamage, Value: PerLevel{25, 30, 35, 40}, Growth: PerLevel{20, 20, 20, 20}, GrowthPerSP: 1, Scale: "magic"},
 					}},
 				},
 				TipArgs: map[string]PerLevel{
@@ -1099,7 +1274,12 @@ func init() {
 				CastFx: "", CastFxDur: 0, PayloadFx: "MorlokaySkill3Effect", PayloadFxAt: "target", PayloadDelay: 0,
 				BuffFx: "", BuffFxOn: "", BuffIcon: false, BuffDescVariant: "",
 				Ops: []Op{
-					{Kind: OpProc, Chance: PerLevel{0.25, 0.3, 0.35, 0.4}, Ops: []Op{
+					// CLIENT (all 6 locale fields): «При обычной атаке, наносит дополнительный
+					// магический урон...» -- unconditional, no chance/probability word anywhere.
+					// The prior 25-40% roll was a fabricated gate (same class of bug as Edilia's
+					// «Пыльца забвения» pass-6 fix): Chance:1 fires it on every basic attack, as
+					// literally described.
+					{Kind: OpProc, Chance: PerLevel{1, 1, 1, 1}, Ops: []Op{
 						{Kind: OpDamage, Value: PerLevel{25, 35, 45, 55}, Scale: "magic", Radius: 3},
 					}},
 				},
@@ -1115,7 +1295,13 @@ func init() {
 				CastFx: "MorlokaySkill4", CastFxDur: 1.3, PayloadFx: "", PayloadFxAt: "", PayloadDelay: 0,
 				BuffFx: "", BuffFxOn: "", BuffIcon: false, BuffDescVariant: "",
 				Ops: []Op{
-					{Kind: OpSummon, Count: PerLevel{1, 1, 1, 1}, Lifetime: PerLevel{30, 30, 30, 30}, HP: PerLevel{300, 400, 500, 600}, Dmg: PerLevel{40, 50, 60, 70}, Unit: "Avtr_Dsb_Morlokay_Skill4_prop01"},
+					// «Призывает ТОТЕМ, стреляющий молнией… случайным врагам ВОКРУГ» -- a stationary
+					// killable totem that zaps nearby enemies, not a walking summon. Stationary holds
+					// its spawn point (no seek/escort) and switches its attack to a ranged zap.
+					// CLIENT «...+{@damageSP} единиц за каждую единицу силы заклинаний» -- the
+					// totem's zap scales with the OWNER's spell power at cast time (DmgPerSP,
+					// same primitive Gayal's zombie summons use).
+					{Kind: OpSummon, Count: PerLevel{1, 1, 1, 1}, Lifetime: PerLevel{30, 30, 30, 30}, HP: PerLevel{300, 400, 500, 600}, Dmg: PerLevel{40, 50, 60, 70}, DmgPerSP: 1, Unit: "Avtr_Dsb_Morlokay_Skill4_prop01", Stationary: true},
 				},
 				TipArgs: map[string]PerLevel{
 					"damageMin": PerLevel{40, 50, 60, 70},
@@ -1130,15 +1316,19 @@ func init() {
 		Skills: [4]Skill{
 			{
 				// stats.txt: dmg 80-140/120-210/160-280/200-350/240-400 (5 ranks,
-				// "farther = more"; no distance-scaling in the engine so Value = range
-				// midpoint), cost 100 flat, cd 16 flat.
+				// "farther = more"). Reuses Op.PerTargetGrowth (Nerlag's «Метание топоров»
+				// ordinal growth, sorted nearest-to-caster-first) -- for this SELF-centered
+				// ring, nearest-to-caster IS nearest-to-epicenter, so the Nth farthest enemy
+				// caught in the ring takes progressively more, ramping from dmgMin toward
+				// dmgMax by the ~4th target (a reasonable approximation given the engine has
+				// no continuous distance-scaled damage formula).
 				Slot: 1, NameRu: "Электрошок", Type: "ACTIVE",
 				Target: "", Targeting: "SELF", Distance: 0, AoERadius: 5, AoEWidth: 0,
 				ManaCost: []int{100, 100, 100, 100, 100}, Cooldown: []int{16, 16, 16, 16, 16},
 				CastFx: "PlusMinusSkill1", CastFxDur: 0.8, PayloadFx: "PlusMinusSkill1Effect", PayloadFxAt: "self", PayloadDelay: 0.4,
 				BuffFx: "", BuffFxOn: "", BuffIcon: false, BuffDescVariant: "",
 				Ops: []Op{
-					{Kind: OpDamage, Value: PerLevel{110, 165, 220, 275, 320}, Scale: "magic", Radius: 5},
+					{Kind: OpDamage, Value: PerLevel{80, 120, 160, 200, 240}, PerTargetGrowth: PerLevel{20, 30, 40, 50, 53}, Scale: "magic", Radius: 5, PerSP: 1},
 				},
 				TipArgs: map[string]PerLevel{
 					"dmgMin":      PerLevel{80, 120, 160, 200, 240},
@@ -1169,7 +1359,9 @@ func init() {
 			},
 			{
 				// stats.txt: passive, no cost/cd, 20/30/40/50/60% chain-lightning proc.
-				// (Chain-hop with -20%/hop is not modeled; a radius-4 burst approximates.)
+				// Client: a chain hopping across EXACTLY 4 neighbouring targets, each hit
+				// 20% weaker than the last -- MaxTargets caps the hit count (nearest-first),
+				// PerTargetDecay applies the -20%/hop falloff along that same order.
 				Slot: 3, NameRu: "Сверхпроводимость", Type: "PASSIVE",
 				Target: "", Targeting: "", Distance: 0, AoERadius: 0, AoEWidth: 0,
 				ManaCost: []int{0, 0, 0, 0, 0}, Cooldown: []int{0, 0, 0, 0, 0},
@@ -1177,7 +1369,7 @@ func init() {
 				BuffFx: "", BuffFxOn: "", BuffIcon: false, BuffDescVariant: "",
 				Ops: []Op{
 					{Kind: OpProc, Chance: PerLevel{0.2, 0.3, 0.4, 0.5, 0.6}, Ops: []Op{
-						{Kind: OpDamage, Value: PerLevel{40, 60, 80, 100, 120}, Scale: "magic", Radius: 4},
+						{Kind: OpDamage, Value: PerLevel{40, 60, 80, 100, 120}, Scale: "magic", Radius: 6, MaxTargets: 4, PerTargetDecay: 0.2, ExcludeCenterTarget: true},
 					}},
 				},
 				TipArgs: map[string]PerLevel{
@@ -1187,8 +1379,9 @@ func init() {
 			{
 				// stats.txt ult (4 ranks): dmg 300/400/500/600, cost 200/240/280/320,
 				// cd 60, mana-burn 150/200/250/300 (+ slow). Unlocks at level 5 via the
-				// ult gate. Mobs have no mana, so the burn is a tooltip value; the slow
-				// is a real OpSlow.
+				// ult gate. Client explicitly burns mana in the blast radius too (ranged
+				// mobs and bosses do carry mana pools -- see mobai.go); melee trash simply
+				// has none to drain, a natural no-op, not a reason to skip the op.
 				Slot: 4, NameRu: "Шаровая молния", Type: "ACTIVE",
 				Target: "POINT", Targeting: "", Distance: 9, AoERadius: 4, AoEWidth: 0,
 				ManaCost: []int{200, 240, 280, 320}, Cooldown: []int{60, 60, 60, 60},
@@ -1197,6 +1390,7 @@ func init() {
 				Ops: []Op{
 					{Kind: OpDamage, Value: PerLevel{300, 400, 500, 600}, Scale: "magic", Radius: 4},
 					{Kind: OpSlow, Value: PerLevel{0.6, 0.6, 0.6, 0.6}, Dur: PerLevel{2, 2, 2, 2}, Radius: 4},
+					{Kind: OpManaBurnArea, Value: PerLevel{150, 200, 250, 300}, Radius: 4, PerSP: 1},
 				},
 				TipArgs: map[string]PerLevel{
 					"healthDamage":   PerLevel{300, 400, 500, 600},
@@ -1214,6 +1408,10 @@ func init() {
 				Slot: 1, NameRu: "Сокрушительный рывок", Type: "ACTIVE",
 				// Wiki: "распихивая попавшихся на пути... в радиус действия рывка" -- damage
 				// + stun are a swath ALONG the roll (AoEWidth), not a circle at the point.
+				// CLIENT LongDesc says «оглушаются на 2.15 секунды» -- literal STUN, matching
+				// this file's "оглушает" convention -- NOT root+silence (a prior pass wrongly
+				// applied the bare-"обездвиживает" convention here, but that word never
+				// appears in Wilfang's own text).
 				Target: "POINT", Targeting: "", Distance: 10, AoERadius: 3, AoEWidth: 6,
 				ManaCost: []int{35, 40, 45, 50}, Cooldown: []int{14, 13, 12, 11},
 				CastFx: "WilfangSkill1", CastFxDur: 0.9, PayloadFx: "", PayloadFxAt: "", PayloadDelay: 0,
@@ -1221,8 +1419,7 @@ func init() {
 				Ops: []Op{
 					{Kind: OpDash, Value: PerLevel{18, 18, 18, 18}},
 					{Kind: OpDamage, Value: PerLevel{65, 95, 125, 155}, Scale: "magic", Radius: 3, PerSP: 1},
-					{Kind: OpRoot, Dur: PerLevel{2.15, 2.15, 2.15, 2.15}, Radius: 3},    // «обездвиживаются» = root
-					{Kind: OpSilence, Dur: PerLevel{2.15, 2.15, 2.15, 2.15}, Radius: 3}, // «не могут использовать способности» = silence
+					{Kind: OpStun, Dur: PerLevel{2.15, 2.15, 2.15, 2.15}, Radius: 3},
 				},
 				TipArgs: map[string]PerLevel{
 					"damage":   PerLevel{65, 95, 125, 155},
@@ -1235,10 +1432,14 @@ func init() {
 				ManaCost: []int{40, 45, 50, 55}, Cooldown: []int{20, 18, 16, 14},
 				CastFx: "WilfangSkill2", CastFxDur: 0.6, PayloadFx: "WilfangSkill2Effect2", PayloadFxAt: "self", PayloadDelay: 0.4,
 				BuffFx: "WilfangSkill2Effect1", BuffFxOn: "self", BuffIcon: true, BuffDescVariant: "",
+				// «Засада»: ambush -- invisibility breaks on the next action OR on moving, and
+				// the AoE damage lands "при этом" (thereby) WHEN it breaks, not at cast (nested
+				// Ops on OpStealth arm the reveal burst). The dodge_pct self-buff had no basis
+				// in the client text and is removed.
 				Ops: []Op{
-					{Kind: OpStealth, Dur: PerLevel{6, 6, 6, 6}}, // «Засада»: real invisibility (breaks on next action)
-					{Kind: OpDamage, Value: PerLevel{75, 110, 145, 180}, Scale: "magic", Radius: 3, PerSP: 1},
-					{Kind: OpBuffStat, Value: PerLevel{1, 1, 1, 1}, Dur: PerLevel{6, 6, 6, 6}, Stat: "dodge_pct", On: "self"},
+					{Kind: OpStealth, Dur: PerLevel{6, 6, 6, 6}, BreakOnMove: true, Ops: []Op{
+						{Kind: OpDamage, Value: PerLevel{75, 110, 145, 180}, Scale: "magic", Radius: 3, PerSP: 1},
+					}},
 				},
 				TipArgs: map[string]PerLevel{
 					"damage":   PerLevel{75, 110, 145, 180},
@@ -1246,34 +1447,40 @@ func init() {
 				},
 			},
 			{
-				// «Защитный покров»: passive immunity to immobilisation/silence, consumed on
-				// the first blocking hit then unavailable for the cooldown seconds (OpImmune,
-				// honored by ccImmuneBlockLocked). Dur = recovery cooldown per rank. No mob
-				// applies player-facing CC in the PvE hunt yet, so today this is a latent
-				// (but correctly encoded) defensive passive rather than the offensive
-				// «Ядовитый укус» poison it used to be miscoded as.
-				Slot: 3, NameRu: "Защитный покров", Type: "PASSIVE",
+				// «Ядовитый укус» (NOT «Защитный покров» -- that was a prior wiki-based
+				// rewrite that swapped in a passive CC-immunity, an unrelated skill). Client
+				// Name/LongDesc: an on-hit infection that ticks for 7s; if the target dies
+				// while still poisoned, it explodes for AoE magic damage.
+				Slot: 3, NameRu: "Ядовитый укус", Type: "PASSIVE",
 				Target: "", Targeting: "", Distance: 0, AoERadius: 0, AoEWidth: 0,
 				ManaCost: []int{0, 0, 0, 0}, Cooldown: []int{0, 0, 0, 0},
 				CastFx: "", CastFxDur: 0, PayloadFx: "", PayloadFxAt: "", PayloadDelay: 0,
-				BuffFx: "", BuffFxOn: "", BuffIcon: false, BuffDescVariant: "BuffSelf",
+				BuffFx: "", BuffFxOn: "", BuffIcon: false, BuffDescVariant: "",
 				Ops: []Op{
-					{Kind: OpImmune, Dur: PerLevel{12, 10, 8, 6}, On: "self"},
+					// The "infection" ticks for NO damage of its own (no client field ever
+					// mentions periodic damage) -- it is a pure death-trigger marker for 7s.
+					// The one real, SP-scaled number is the death explosion, decoupled onto
+					// ExplodeSP so it isn't also (silently, doubly) applied to the inert tick.
+					{Kind: OpProc, Chance: PerLevel{1, 1, 1, 1}, Ops: []Op{
+						{Kind: OpDot, Value: PerLevel{0, 0, 0, 0}, Dur: PerLevel{7, 7, 7, 7}, Scale: "magic",
+							ExplodeOnDeath: true, ExplodeDamage: PerLevel{60, 80, 100, 120}, ExplodeRadius: 4, ExplodeSP: 1},
+					}},
 				},
 				TipArgs: map[string]PerLevel{
-					"cooldown": PerLevel{12, 10, 8, 6},
+					"damage":   PerLevel{60, 80, 100, 120},
+					"damageSP": PerLevel{1, 1, 1, 1},
 				},
 			},
 			{
-				Slot: 4, NameRu: "Шквал", Type: "ACTIVE",
+				// «Звериная ярость» (NOT «Шквал»): client text is a plain multi-hit tail
+				// attack on the chosen target, no CC mentioned -- the root+silence pin was
+				// undescribed.
+				Slot: 4, NameRu: "Звериная ярость", Type: "ACTIVE",
 				Target: "ENEMY+NOT_BUILDING", Targeting: "TARGET", Distance: 3, AoERadius: 0, AoEWidth: 0,
 				ManaCost: []int{55, 65, 75, 85}, Cooldown: []int{40, 36, 32, 28},
 				CastFx: "WilfangSkill4", CastFxDur: 2.5, PayloadFx: "", PayloadFxAt: "", PayloadDelay: 0,
 				BuffFx: "", BuffFxOn: "", BuffIcon: false, BuffDescVariant: "",
 				Ops: []Op{
-					// The flurry pins its single target: root + silence for the channel duration.
-					{Kind: OpRoot, Dur: PerLevel{2.2, 2.75, 3.3, 3.85}},
-					{Kind: OpSilence, Dur: PerLevel{2.2, 2.75, 3.3, 3.85}},
 					{Kind: OpChannel, Dur: PerLevel{2.2, 2.75, 3.3, 3.85}, Interval: 0.55, Ops: []Op{
 						{Kind: OpDamage, Value: PerLevel{30, 40, 50, 60}, Scale: "magic", Radius: 0, PerSP: 1},
 					}},
@@ -1299,9 +1506,13 @@ func init() {
 					{Kind: OpDamage, Value: PerLevel{70, 105, 140, 180}, Scale: "magic", PerSP: 1},
 					{Kind: OpStun, Dur: PerLevel{1, 1, 1, 1}},
 					{Kind: OpSlow, Value: PerLevel{0.83, 0.83, 0.83, 0.83}, Dur: PerLevel{5, 5, 5, 5}},
-					{Kind: OpDamage, Value: PerLevel{30, 40, 50, 60}, Scale: "pure", Apply: "self"},
+					// CLIENT «...теряет {healthcost} здоровья, которое он МОЖЕТ ВОССТАНОВИТЬ,
+					// УДАРИВ ЦЕЛЬ» -- a refundable cost, not a permanent drain (RefundIfHit skips
+					// it whenever the throw's own enemy-facing hit above actually connected). No
+					// locale field for this skill mentions lifesteal/vampirism -- the prior
+					// lifesteal_pct self-buff was fabricated and is dropped.
+					{Kind: OpDamage, Value: PerLevel{30, 40, 50, 60}, Scale: "pure", Apply: "self", RefundIfHit: true},
 					{Kind: OpBuffStat, Value: PerLevel{1.2, 1.2, 1.25, 1.25}, Dur: PerLevel{5, 5, 5, 5}, Stat: "move_speed_pct", On: "self"},
-					{Kind: OpBuffStat, Value: PerLevel{0.3, 0.3, 0.35, 0.35}, Dur: PerLevel{6, 6, 6, 6}, Stat: "lifesteal_pct", On: "self"},
 				},
 				TipArgs: map[string]PerLevel{
 					"damage":     PerLevel{70, 105, 140, 180},
@@ -1321,6 +1532,11 @@ func init() {
 				Ops: []Op{
 					{Kind: OpChannel, Dur: PerLevel{2, 2, 2, 2, 2}, Interval: 1, Ops: []Op{
 						{Kind: OpLifestealHit, Value: PerLevel{125, 150, 175, 200, 225}, Value2: PerLevel{1, 1, 1, 1, 1}, Scale: "pure"},
+						// CLIENT «у врага уменьшается количество текущего И МАКСИМАЛЬНОГО здоровья
+						// на {healthSteal}+{@damageSP} каждую секунду» -- the drain also permanently
+						// shrinks the victim's max HP each tick, not just its current HP (the prior
+						// encoding only dealt ordinary damage via OpLifestealHit).
+						{Kind: OpDrainMaxHP, Value: PerLevel{125, 150, 175, 200, 225}, PerSP: 1},
 					}},
 					{Kind: OpBuffStat, Value: PerLevel{50, 70, 90, 110, 130}, Dur: PerLevel{9, 9, 9, 9, 9}, Stat: "max_hp", On: "self"},
 				},
@@ -1336,12 +1552,15 @@ func init() {
 				CastFx: "", CastFxDur: 0, PayloadFx: "", PayloadFxAt: "", PayloadDelay: 0,
 				BuffFx: "AbominatorSkill3Effect", BuffFxOn: "self", BuffIcon: true, BuffDescVariant: "BuffSelf",
 				Ops: []Op{
-					{Kind: OpBuffStat, Value: PerLevel{1.1, 1.15, 1.2, 1.25}, Dur: PerLevel{0, 0, 0, 0}, Stat: "armor_pct", On: "self"},
-					{Kind: OpBuffStat, Value: PerLevel{2, 3, 4, 5}, Dur: PerLevel{0, 0, 0, 0}, Stat: "hp_regen", On: "self"},
+					// CLIENT «Окоченение»: "При применении негативной способности на Абоминатора,
+					// он скидывает все враждебные воздействия, наложенные на него" -- a reactive
+					// full cleanse, not a flat armor/regen buff (which the LongDesc never
+					// mentions). LATENT like Wilfang's OpImmune: no mob or avatar currently
+					// applies CC to a player avatar, so this can't fire yet in Hunt or Штурм; the
+					// primitive is real and unit-tested, waiting for a source.
+					{Kind: OpCleanseOnHit},
 				},
-				TipArgs: map[string]PerLevel{
-					"cooldown": PerLevel{20, 18, 16, 14},
-				},
+				TipArgs: map[string]PerLevel{},
 			},
 			{
 				Slot: 4, NameRu: "Трупоглот", Type: "TOGGLE",
@@ -1369,7 +1588,7 @@ func init() {
 			{
 				Slot: 1, NameRu: "Бесовский трюк", Type: "ACTIVE",
 				Target: "POINT", Targeting: "", Distance: 9, AoERadius: 3, AoEWidth: 0,
-				ManaCost: []int{45, 50, 55, 60}, Cooldown: []int{15, 15, 15, 15},
+				ManaCost: []int{135, 135, 135, 135}, Cooldown: []int{15, 15, 15, 15},
 				CastFx: "AstarotSkill1Effect", CastFxDur: 0.5, PayloadFx: "AstarotSkill1", PayloadFxAt: "point", PayloadDelay: 0.3,
 				BuffFx: "SlowMoveEffect", BuffFxOn: "target", BuffIcon: false, BuffDescVariant: "BuffTarget",
 				Ops: []Op{
@@ -1389,6 +1608,7 @@ func init() {
 				CastFx: "", CastFxDur: 0, PayloadFx: "", PayloadFxAt: "", PayloadDelay: 0,
 				BuffFx: "InvisibilityEffect", BuffFxOn: "self", BuffIcon: true, BuffDescVariant: "BuffSelf",
 				Ops: []Op{
+					{Kind: OpStealth, BreakOnMove: false},
 					{Kind: OpBuffStat, Value: PerLevel{1.2, 1.2, 1.2, 1.2}, Dur: PerLevel{0, 0, 0, 0}, Stat: "move_speed_pct", On: "self"},
 					{Kind: OpAura, TickCost: PerLevel{7, 6, 5, 4}, Radius: 0, Interval: 1},
 				},
@@ -1398,19 +1618,24 @@ func init() {
 				},
 			},
 			{
-				Slot: 3, NameRu: "Глубокие раны", Type: "PASSIVE",
+				// «Удар в спину»: NOT an always-on crit buff (a prior wiki-based pass
+				// invented that) -- client Name/LobbyDesc/LongDesc describe a flat 20%
+				// on-attack proc chance for {*damage}+{*@damageSP} bonus damage, the
+				// standard Chance-0.2 OpProc idiom used elsewhere (Vigilans's «Свидание со
+				// смертью»).
+				Slot: 3, NameRu: "Удар в спину", Type: "PASSIVE",
 				Target: "", Targeting: "", Distance: 0, AoERadius: 0, AoEWidth: 0,
 				ManaCost: []int{0, 0, 0, 0}, Cooldown: []int{0, 0, 0, 0},
 				CastFx: "", CastFxDur: 0, PayloadFx: "", PayloadFxAt: "", PayloadDelay: 0,
-				BuffFx: "", BuffFxOn: "", BuffIcon: true, BuffDescVariant: "",
+				BuffFx: "", BuffFxOn: "", BuffIcon: false, BuffDescVariant: "",
 				Ops: []Op{
-					// «Глубокие раны»: passive that raises crit CHANCE (crit magnitude added in
-					// the engine batch once a crit_dmg stat exists).
-					{Kind: OpBuffStat, Value: PerLevel{0.05, 0.08, 0.11, 0.14}, Dur: PerLevel{0, 0, 0, 0}, Stat: "crit_pct", On: "self"},
-					{Kind: OpBuffStat, Value: PerLevel{0.15, 0.25, 0.35, 0.5}, Dur: PerLevel{0, 0, 0, 0}, Stat: "crit_dmg_pct", On: "self"},
+					{Kind: OpProc, Chance: PerLevel{0.2, 0.2, 0.2, 0.2}, Ops: []Op{
+						{Kind: OpDamage, Value: PerLevel{30, 45, 60, 75}, Scale: "magic", PerSP: 1},
+					}},
 				},
 				TipArgs: map[string]PerLevel{
-					"critChance": PerLevel{5, 8, 11, 14},
+					"damage":   PerLevel{30, 45, 60, 75},
+					"damageSP": PerLevel{1, 1, 1, 1},
 				},
 			},
 			{
@@ -1490,10 +1715,11 @@ func init() {
 				CastFx: "DutnikSkill4Effect", CastFxDur: 1, PayloadFx: "", PayloadFxAt: "", PayloadDelay: 0.4,
 				BuffFx: "", BuffFxOn: "", BuffIcon: false, BuffDescVariant: "",
 				Ops: []Op{
+					// CLIENT «Взрыв»: only the AoE damage and the self-clamp-to-1HP drawback are
+					// described ("нанося урона врагам, при этом после взрыва у Дутника остается
+					// одна единица здоровья") -- no push. A prior pass added a knockback that
+					// isn't in the LongDesc; removed.
 					{Kind: OpDamage, Value: PerLevel{240, 320, 400, 480}, Scale: "magic", Radius: 5, PerSP: 1},
-					// Detonation shoves the blasted enemies away and leaves Dutnik at 1 HP
-					// (Apply:self damage clamps to 1) -- the skill's defining drawback.
-					{Kind: OpKnockback, Value: PerLevel{5, 5, 5, 5}, Radius: 5},
 					{Kind: OpDamage, Value: PerLevel{99999, 99999, 99999, 99999}, Apply: "self", Scale: "pure"},
 				},
 				TipArgs: map[string]PerLevel{
@@ -1545,9 +1771,13 @@ func init() {
 				ManaCost: []int{35, 40, 45, 50}, Cooldown: []int{25, 22, 19, 16},
 				CastFx: "", CastFxDur: 0, PayloadFx: "GrimlokSkill3Effect", PayloadFxAt: "self", PayloadDelay: 0.2,
 				BuffFx: "MovementSpeedEffect", BuffFxOn: "self", BuffIcon: true, BuffDescVariant: "BuffSelf",
+				// CLIENT «...у себя И ПРИЗВАННОГО ДИНОЗАВРА» -- the live dinosaur pet must also
+				// speed up, not just Grimlok (pass-6 audit 2026-07-20).
 				Ops: []Op{
 					{Kind: OpBuffStat, Value: PerLevel{1.15, 1.2, 1.25, 1.3}, Dur: PerLevel{10, 10, 10, 10}, Stat: "attack_speed_pct", On: "self"},
 					{Kind: OpBuffStat, Value: PerLevel{1.15, 1.2, 1.25, 1.3}, Dur: PerLevel{10, 10, 10, 10}, Stat: "move_speed_pct", On: "self"},
+					{Kind: OpBuffStat, Value: PerLevel{1.15, 1.2, 1.25, 1.3}, Dur: PerLevel{10, 10, 10, 10}, Stat: "attack_speed_pct", On: "own_summons"},
+					{Kind: OpBuffStat, Value: PerLevel{1.15, 1.2, 1.25, 1.3}, Dur: PerLevel{10, 10, 10, 10}, Stat: "move_speed_pct", On: "own_summons"},
 				},
 				TipArgs: map[string]PerLevel{
 					"coef": PerLevel{1.15, 1.2, 1.25, 1.3},
@@ -1559,10 +1789,16 @@ func init() {
 				ManaCost: []int{40, 45, 50, 55}, Cooldown: []int{12, 12, 12, 12},
 				CastFx: "", CastFxDur: 0, PayloadFx: "GrimlokSkill4Effect1", PayloadFxAt: "self", PayloadDelay: 0.2,
 				BuffFx: "GrimlokSkill4Effect3", BuffFxOn: "self", BuffIcon: true, BuffDescVariant: "BuffSelf",
+				// CLIENT «...изменяя атаку с дальней на ближнюю»: the toggle must also force
+				// melee range (OpMeleeForm) -- every other stated effect (HP/armor/self-slow/
+				// on-hit-slow) already matched, only the combat-mode switch was missing
+				// (pass-6 audit 2026-07-20; valid_prefabs.txt confirms a distinct
+				// "Avtr_HK_Grimlok_Immortal_skill4" melee-form model exists).
 				Ops: []Op{
-					{Kind: OpBuffStat, Value: PerLevel{150, 220, 290, 360}, Dur: PerLevel{0, 0, 0, 0}, Stat: "max_hp", On: "self"},
+					{Kind: OpBuffStat, Value: PerLevel{150, 220, 290, 360}, Dur: PerLevel{0, 0, 0, 0}, Stat: "max_hp", On: "self", PerSP: 1},
 					{Kind: OpBuffStat, Value: PerLevel{1.2, 1.25, 1.3, 1.35}, Dur: PerLevel{0, 0, 0, 0}, Stat: "armor_pct", On: "self"},
 					{Kind: OpBuffStat, Value: PerLevel{0.9, 0.9, 0.9, 0.9}, Dur: PerLevel{0, 0, 0, 0}, Stat: "move_speed_pct", On: "self"},
+					{Kind: OpMeleeForm},
 					{Kind: OpProc, Chance: PerLevel{1, 1, 1, 1}, Ops: []Op{
 						{Kind: OpSlow, Value: PerLevel{0.9, 0.9, 0.9, 0.9}, Dur: PerLevel{5, 5, 5, 5}},
 					}},
@@ -1585,7 +1821,7 @@ func init() {
 				CastFx: "MihalychSkill1", CastFxDur: 0.6, PayloadFx: "MihalychSkill1", PayloadFxAt: "target", PayloadDelay: 0.4,
 				BuffFx: "", BuffFxOn: "", BuffIcon: false, BuffDescVariant: "",
 				Ops: []Op{
-					{Kind: OpDamage, Value: PerLevel{70, 100, 135, 170}, Scale: "phys"},
+					{Kind: OpDamage, Value: PerLevel{70, 100, 135, 170}, Scale: "phys", PerSP: 1},
 					{Kind: OpPull},
 				},
 				TipArgs: map[string]PerLevel{
@@ -1603,7 +1839,7 @@ func init() {
 					// «Трепка»: client IDS_MihalychSkill2 -- «каждый следующий удар по одной и той
 					// же цели наносит на {damage} больше урона, чем предыдущий». A per-target
 					// consecutive-hit damage stack (OpConsecutiveHit), not a self dmg% buff.
-					{Kind: OpConsecutiveHit, Value: PerLevel{15, 22, 30, 40}},
+					{Kind: OpConsecutiveHit, Value: PerLevel{15, 22, 30, 40}, PerSP: 1},
 				},
 				TipArgs: map[string]PerLevel{
 					"damage":   PerLevel{15, 22, 30, 40},
@@ -1698,8 +1934,10 @@ func init() {
 				Ops: []Op{
 					{Kind: OpProc, Chance: PerLevel{0.3, 0.3, 0.3, 0.3}, Ops: []Op{
 						// DotFx paints the acid on the poisoned enemy (same VFX the ult
-						// consumes) -- the passive showed no visual before.
-						{Kind: OpDot, Value: PerLevel{14, 20, 26, 34}, Dur: PerLevel{10, 10, 10, 10}, Scale: "magic", DotFx: "ShinDalarSkill3Target"},
+						// consumes) -- the passive showed no visual before. CLIENT «+{@damageSP}
+						// единиц за каждую единицу силы заклинаний» -- the tick was missing PerSP
+						// (OpDot's engine now supports it), so it stayed flat regardless of SP.
+						{Kind: OpDot, Value: PerLevel{14, 20, 26, 34}, PerSP: 1, Dur: PerLevel{10, 10, 10, 10}, Scale: "magic", DotFx: "ShinDalarSkill3Target"},
 					}},
 				},
 				TipArgs: map[string]PerLevel{
@@ -1716,7 +1954,10 @@ func init() {
 				Ops: []Op{
 					{Kind: OpDash, Value: PerLevel{26, 26, 26, 26}},
 					{Kind: OpDamage, Value: PerLevel{90, 130, 170, 220}, Scale: "magic"},
-					{Kind: OpConsumeDots, Value: PerLevel{40, 55, 70, 90}, Scale: "magic"},
+					// CLIENT «+{@damagePoisonSP} за каждый эффект яда» -- the per-stack consume
+					// bonus scales with spell power (TipArgs damagePoisonSP already promised it,
+					// PerSP was simply never set).
+					{Kind: OpConsumeDots, Value: PerLevel{40, 55, 70, 90}, PerSP: 1, Scale: "magic"},
 				},
 				TipArgs: map[string]PerLevel{
 					"damage":         PerLevel{90, 130, 170, 220},
@@ -1753,8 +1994,15 @@ func init() {
 				ManaCost: []int{0, 0, 0, 0}, Cooldown: []int{0, 0, 0, 0},
 				CastFx: "", CastFxDur: 0, PayloadFx: "", PayloadFxAt: "", PayloadDelay: 0,
 				BuffFx: "", BuffFxOn: "", BuffIcon: false, BuffDescVariant: "",
+				// Client: "есть {probability}% вероятность, что Тангрен нанесёт урон своей
+				// атакой в ответ по врагу" -- a chance-gated ON-DAMAGED proc that counters with
+				// Tangren's OWN attack, not a deterministic percent-of-incoming-damage reflect
+				// (the prior thorns_pct encoding was a wrong-template copy: its Value array
+				// 0.25-0.55 didn't even match the surviving probability TipArgs 0.15-0.3).
 				Ops: []Op{
-					{Kind: OpBuffStat, Value: PerLevel{0.25, 0.35, 0.45, 0.55}, Dur: PerLevel{0, 0, 0, 0}, Stat: "thorns_pct", On: "self"},
+					{Kind: OpProc, OnDamaged: true, Chance: PerLevel{0.15, 0.2, 0.25, 0.3}, Ops: []Op{
+						{Kind: OpAttackDamage, Value: PerLevel{1, 1, 1, 1}, Scale: "phys"},
+					}},
 				},
 				TipArgs: map[string]PerLevel{
 					"probability": PerLevel{0.15, 0.2, 0.25, 0.3},
@@ -1857,9 +2105,11 @@ func init() {
 				CastFx: "TeridinSkill4", CastFxDur: 2, PayloadFx: "TeridinSkill4Effect", PayloadFxAt: "target", PayloadDelay: 2,
 				BuffFx: "", BuffFxOn: "", BuffIcon: false, BuffDescVariant: "",
 				Ops: []Op{
-					{Kind: OpChannel, Dur: PerLevel{2, 2, 2, 2}, Interval: 2, Ops: []Op{
-						{Kind: OpDamage, Value: PerLevel{150, 225, 300, 375}, Scale: "phys", PerSP: 1},
-					}},
+					// Single aimed shot -- the 2s aim delay is already gated by CastFxDur/PayloadDelay above.
+					// A previous OpChannel{Dur:2,Interval:2} wrapper double-fired this damage (Dur==Interval
+					// meant the pulse and the eviction landed on the same tick), contradicting every locale
+					// variant which describes exactly one hit.
+					{Kind: OpDamage, Value: PerLevel{150, 225, 300, 375}, Scale: "phys", PerSP: 1},
 				},
 				TipArgs: map[string]PerLevel{
 					"delay":    PerLevel{2, 2, 2, 2},
@@ -1898,8 +2148,13 @@ func init() {
 				CastFx: "", CastFxDur: 0, PayloadFx: "", PayloadFxAt: "", PayloadDelay: 0,
 				BuffFx: "", BuffFxOn: "", BuffIcon: false, BuffDescVariant: "",
 				Ops: []Op{
-					{Kind: OpProc, Chance: PerLevel{0.5, 0.5, 0.5, 0.5}, Ops: []Op{
-						{Kind: OpDamage, Value: PerLevel{25, 40, 55, 70}, Scale: "phys", PerSP: 1},
+					// «Свидание со смертью»: NOT a 50% coin-flip (the old encoding). Client:
+					// «Если цель атаки не находится рядом с союзниками, то КАЖДЫЙ удар наносит
+					// увеличенный урон». So it is a Chance-1 on-hit proc whose bonus damage is
+					// gated on the target being ISOLATED (no ally within TriggerRadius of it).
+					{Kind: OpProc, Chance: PerLevel{1, 1, 1, 1}, Ops: []Op{
+						{Kind: OpDamage, Value: PerLevel{25, 40, 55, 70}, Scale: "phys", PerSP: 1,
+							TargetIsolated: true, TriggerRadius: 6},
 					}},
 				},
 				TipArgs: map[string]PerLevel{
@@ -1978,22 +2233,29 @@ func init() {
 				ManaCost: []int{25, 30, 35, 40}, Cooldown: []int{22, 20, 18, 16},
 				CastFx: "AnhelSkill2", CastFxDur: 0.8, PayloadFx: "", PayloadFxAt: "", PayloadDelay: 0,
 				BuffFx: "AnhelSkill2Effect", BuffFxOn: "self", BuffIcon: true, BuffDescVariant: "BuffSelf",
+				// «Гнев океана»: the attack-speed buff goes to Anhel AND every clone she has
+				// out («себе, и всем своим клонам»), not just herself.
 				Ops: []Op{
 					{Kind: OpBuffStat, Value: PerLevel{1.1, 1.15, 1.2, 1.25}, Dur: PerLevel{10, 10, 10, 10}, Stat: "attack_speed_pct", On: "self"},
+					{Kind: OpBuffStat, Value: PerLevel{1.1, 1.15, 1.2, 1.25}, Dur: PerLevel{10, 10, 10, 10}, Stat: "attack_speed_pct", On: "own_summons"},
 				},
 				TipArgs: map[string]PerLevel{
 					"speedCoeff": PerLevel{10, 15, 20, 25},
 				},
 			},
 			{
+				// «Зов фантомов»: on dealing damage, chance to raise a clone with a THIRD of
+				// Anhel's OWN live HP and attack («треть жизни и силы атаки самого Анхеля»),
+				// not a static per-rank table.
 				Slot: 3, NameRu: "Зов фантомов", Type: "PASSIVE",
 				Target: "", Targeting: "", Distance: 0, AoERadius: 0, AoEWidth: 0,
 				ManaCost: []int{0, 0, 0, 0}, Cooldown: []int{0, 0, 0, 0},
 				CastFx: "", CastFxDur: 0, PayloadFx: "", PayloadFxAt: "", PayloadDelay: 0,
 				BuffFx: "", BuffFxOn: "", BuffIcon: false, BuffDescVariant: "",
 				Ops: []Op{
-					{Kind: OpProc, Chance: PerLevel{0.08, 0.11, 0.14, 0.17}, Ops: []Op{
-						{Kind: OpSummon, Count: PerLevel{1, 1, 1, 1}, Lifetime: PerLevel{15, 15, 15, 15}, HP: PerLevel{170, 190, 210, 230}, Dmg: PerLevel{16, 18, 20, 22}, Unit: "Avtr_Psh_Anhel"},
+					{Kind: OpProc, OnAnyDamage: true, Chance: PerLevel{0.08, 0.11, 0.14, 0.17}, Ops: []Op{
+						{Kind: OpSummon, Count: PerLevel{1, 1, 1, 1}, Lifetime: PerLevel{15, 15, 15, 15},
+							HpPctOfOwner: 1.0 / 3, DmgPctOfAttack: 1.0 / 3, Unit: "Avtr_Psh_Anhel"},
 					}},
 				},
 				TipArgs: map[string]PerLevel{
@@ -2001,13 +2263,15 @@ func init() {
 				},
 			},
 			{
+				// «Стражи глубин»: same "1/3 of Anhel's own HP/attack" rule as «Зов фантомов».
 				Slot: 4, NameRu: "Стражи глубин", Type: "ACTIVE",
 				Target: "", Targeting: "SELF", Distance: 0, AoERadius: 0, AoEWidth: 0,
 				ManaCost: []int{60, 70, 80, 90}, Cooldown: []int{50, 45, 40, 35},
 				CastFx: "AnhelSkill4", CastFxDur: 1, PayloadFx: "", PayloadFxAt: "", PayloadDelay: 0,
 				BuffFx: "", BuffFxOn: "", BuffIcon: false, BuffDescVariant: "",
 				Ops: []Op{
-					{Kind: OpSummon, Count: PerLevel{2, 2, 3, 3}, Lifetime: PerLevel{20, 20, 20, 20}, HP: PerLevel{180, 200, 220, 240}, Dmg: PerLevel{17, 19, 21, 23}, Unit: "Avtr_Psh_Anhel"},
+					{Kind: OpSummon, Count: PerLevel{2, 2, 3, 3}, Lifetime: PerLevel{20, 20, 20, 20},
+						HpPctOfOwner: 1.0 / 3, DmgPctOfAttack: 1.0 / 3, Unit: "Avtr_Psh_Anhel"},
 				},
 				TipArgs: map[string]PerLevel{
 					"splits":   PerLevel{2, 2, 3, 3},
@@ -2026,10 +2290,12 @@ func init() {
 				CastFx: "ArianaMeySkill1", CastFxDur: 1, PayloadFx: "", PayloadFxAt: "", PayloadDelay: 0.3,
 				BuffFx: "ArianaMeySkill1Effect", BuffFxOn: "target", BuffIcon: true, BuffDescVariant: "BuffSelf",
 				Ops: []Op{
-					// «Щит хранителя»: shield + magic protection on the aimed friendly avatar
-					// (On:"ally"); in solo (no friend picked) it lands on Ariana herself. The
-					// full magic/CC-immunity is approximated by the absorb shield + magic_armor.
-					{Kind: OpShield, Value: PerLevel{120, 160, 200, 240}, Dur: PerLevel{4, 5, 6, 7}, On: "ally"},
+					// «Щит хранителя»: «щит дает полную неуязвимость к магическому урону,
+					// оглушению и замедлению» -- GrantsCCImmune wires the stun/slow half for real
+					// (magic-damage immunity is still approximated by the absorb shield, since the
+					// engine has no true damage-type immunity); on the aimed friendly avatar
+					// (On:"ally"), or Ariana herself solo.
+					{Kind: OpShield, Value: PerLevel{120, 160, 200, 240}, Dur: PerLevel{4, 5, 6, 7}, On: "ally", GrantsCCImmune: true},
 					{Kind: OpBuffStat, Value: PerLevel{30, 40, 50, 60}, Dur: PerLevel{4, 5, 6, 7}, Stat: "magic_armor", On: "ally"},
 				},
 				TipArgs: map[string]PerLevel{
@@ -2043,7 +2309,14 @@ func init() {
 				CastFx: "", CastFxDur: 0, PayloadFx: "", PayloadFxAt: "", PayloadDelay: 0,
 				BuffFx: "ArianaMeySkill2Effect", BuffFxOn: "self", BuffIcon: true, BuffDescVariant: "BuffTarget",
 				Ops: []Op{
-					{Kind: OpBuffStat, Value: PerLevel{3, 5, 7, 9}, Dur: PerLevel{0, 0, 0, 0}, Stat: "phys_armor", On: "self"},
+					// CLIENT «Аура стойкости»: "ВСЕ ПРИСУТСТВУЮЩИЕ РЯДОМ дружественные существа
+					// получают увеличение физической брони" -- a real nearby-allies aura, not a
+					// self-only buff. Wrapped in OpAura so tickPassiveAurasLocked re-pulses it
+					// (ally branch) onto whoever is in range each second; the nested Dur (1.5s)
+					// outlives the pulse interval so it never visibly flickers.
+					{Kind: OpAura, Radius: 8, Interval: 1, Ops: []Op{
+						{Kind: OpBuffStat, Value: PerLevel{3, 5, 7, 9}, Dur: PerLevel{1.5, 1.5, 1.5, 1.5}, Stat: "phys_armor", On: "allies", Radius: 8},
+					}},
 				},
 				TipArgs: map[string]PerLevel{
 					"armour": PerLevel{3, 5, 7, 9},
@@ -2076,11 +2349,18 @@ func init() {
 				BuffFx: "ArianaMeySkill4Effect2", BuffFxOn: "target", BuffIcon: true, BuffDescVariant: "BuffTarget",
 				Ops: []Op{
 					// «Касание спасителя»: «делает ЕГО и СЕБЯ неуязвимыми» -- the absorb shield +
-					// HoT land on the aimed ally (On:"ally"; self in solo), and Ariana keeps her
-					// own regen boost (On:"self"). Full invulnerability is approximated by the shield.
+					// HoT land on the aimed ally (On:"ally"; self in solo) AND on Ariana herself
+					// (a prior pass only gave her a regen buff, missing the "и себя" half). Full
+					// invulnerability is approximated by the shield.
+					// CLIENT «...повышая скорость восстановления здоровья на {regenMod}+{@damageSP}
+					// единиц в секунду» -- «его И СЕБЯ» get the SAME regen bonus; PerSP wires up
+					// the tooltip's own damageSP term (OpHot now supports it). The prior encoding
+					// ALSO stacked a self-only hp_regen buff on top of Ariana's own OpHot, healing
+					// her at roughly double the ally's rate for the identical cast -- dropped.
 					{Kind: OpShield, Value: PerLevel{200, 260, 320, 380}, Dur: PerLevel{4, 5, 5, 6}, On: "ally"},
-					{Kind: OpHot, Value: PerLevel{10, 14, 18, 22}, Dur: PerLevel{4, 5, 5, 6}, On: "ally"},
-					{Kind: OpBuffStat, Value: PerLevel{10, 14, 18, 22}, Dur: PerLevel{4, 5, 5, 6}, Stat: "hp_regen", On: "self"},
+					{Kind: OpHot, Value: PerLevel{10, 14, 18, 22}, PerSP: 1, Dur: PerLevel{4, 5, 5, 6}, On: "ally"},
+					{Kind: OpShield, Value: PerLevel{200, 260, 320, 380}, Dur: PerLevel{4, 5, 5, 6}},
+					{Kind: OpHot, Value: PerLevel{10, 14, 18, 22}, PerSP: 1, Dur: PerLevel{4, 5, 5, 6}},
 				},
 				TipArgs: map[string]PerLevel{
 					"duration": PerLevel{4, 5, 5, 6},
@@ -2101,7 +2381,9 @@ func init() {
 				BuffFx: "", BuffFxOn: "", BuffIcon: false, BuffDescVariant: "",
 				Ops: []Op{
 					{Kind: OpDamage, Value: PerLevel{65, 90, 115, 140}, Scale: "magic", Radius: 5, PerSP: 1},
-					{Kind: OpHeal, Value: PerLevel{40, 55, 70, 85}, PerSP: 1},
+					// CLIENT «...исцеляя рядом стоящих союзников» -- the same AoE as the damage,
+					// not self-only (pass-6 audit 2026-07-20).
+					{Kind: OpHeal, Value: PerLevel{40, 55, 70, 85}, PerSP: 1, On: "allies", Radius: 5},
 				},
 				TipArgs: map[string]PerLevel{
 					"damageAmount": PerLevel{65, 90, 115, 140},
@@ -2120,7 +2402,11 @@ func init() {
 					{Kind: OpAura, TickCost: PerLevel{3, 4, 5, 6}, Radius: 5, Interval: 1, Ops: []Op{
 						{Kind: OpDamage, Value: PerLevel{12, 16, 20, 24}, Scale: "magic", Radius: 0},
 					}},
-					{Kind: OpBuffStat, Value: PerLevel{1.1, 1.15, 1.2, 1.25}, Dur: PerLevel{0, 0, 0, 0}, Stat: "armor_pct", On: "self"},
+					// CLIENT «...враги, находящиеся ВНЕ зоны действия, наносят пониженный урон»:
+					// the armor bonus is position-gated (only helps against an attacker outside
+					// the 5m aura), not the unconditional buff this was before (pass-6 audit
+					// 2026-07-20).
+					{Kind: OpZoneArmor, Value: PerLevel{1.1, 1.15, 1.2, 1.25}, Radius: 5},
 				},
 				TipArgs: map[string]PerLevel{
 					"damageCoef": PerLevel{12, 16, 20, 24},
@@ -2135,14 +2421,19 @@ func init() {
 				BuffFx: "InshariSkill3Effect1", BuffFxOn: "self", BuffIcon: true, BuffDescVariant: "BuffTarget",
 				Ops: []Op{
 					// CLIENT «Изъятие сущности»: siphon channel that drains the target's mana each
-					// second TO Inshari (OpManaBurnHit restore), while dealing contact damage. The
-					// stun is kept up-front as a proxy for the break-on-far stun (distance-tracked
-					// break deferred). Against a manaless mob only the damage + stun land.
-					{Kind: OpStun, Dur: PerLevel{1.5, 2, 2.5, 3}},
-					{Kind: OpChannel, Dur: PerLevel{5, 5, 5, 5}, Interval: 1, Ops: []Op{
-						{Kind: OpDamage, Value: PerLevel{10, 14, 18, 22}, Scale: "magic", Radius: 0, PerSP: 1},
-						{Kind: OpManaBurnHit, Value: PerLevel{10, 14, 18, 22}, Apply: "restore"},
-					}},
+					// second TO Inshari (OpManaBurnHit restore), while dealing contact damage. «При
+					// сильном отдалении контакт разорвётся, ОГЛУШАЯ цель» -- the stun fires ONLY when
+					// the target leaves TriggerRadius (leash break), NOT up front. Value2 = the
+					// break-stun seconds. If the channel runs its full duration the contact simply
+					// ends with no stun. Against a manaless mob only the contact damage + leash-stun
+					// land (no mana transferred).
+					// Pure mana-siphon + leash-break stun -- none of the 6 extracted locale
+					// fields for this skill mention any direct damage (pass-6 audit
+					// 2026-07-20 dropped the undocumented per-tick contact damage).
+					{Kind: OpChannel, Dur: PerLevel{5, 5, 5, 5}, Interval: 1,
+						TriggerRadius: 10, Value2: PerLevel{1.5, 2, 2.5, 3}, Ops: []Op{
+							{Kind: OpManaBurnHit, Value: PerLevel{10, 14, 18, 22}, Apply: "restore"},
+						}},
 				},
 				TipArgs: map[string]PerLevel{
 					"manaAmount":   PerLevel{10, 14, 18, 22},
@@ -2156,8 +2447,11 @@ func init() {
 				ManaCost: []int{55, 65, 75, 85}, Cooldown: []int{30, 28, 26, 24},
 				CastFx: "InshariSkill4", CastFxDur: 1.2, PayloadFx: "InshariSkill4Effect", PayloadFxAt: "target", PayloadDelay: 0.5,
 				BuffFx: "", BuffFxOn: "", BuffIcon: false, BuffDescVariant: "",
+				// CLIENT «Возмездие»: a true execute -- damagePerHP × missing HP, capped at
+				// damageMax(+damageSP×SP), not the flat-damage-with-mild-multiplier the old
+				// BonusMissingHP encoding gave (pass-6 audit 2026-07-20).
 				Ops: []Op{
-					{Kind: OpDamage, Value: PerLevel{60, 80, 100, 120}, BonusMissingHP: PerLevel{0.5, 0.6, 0.7, 0.8}, Scale: "magic", Radius: 0, PerSP: 1},
+					{Kind: OpDamage, MissingHPLinear: PerLevel{0.5, 0.6, 0.7, 0.8}, DamageCap: PerLevel{200, 250, 300, 350}, Scale: "magic", Radius: 0, PerSP: 1},
 				},
 				TipArgs: map[string]PerLevel{
 					"damagePerHP": PerLevel{0.5, 0.6, 0.7, 0.8},
@@ -2176,11 +2470,13 @@ func init() {
 				ManaCost: []int{30, 35, 40, 45}, Cooldown: []int{12, 11, 10, 9},
 				CastFx: "KionaSkill1", CastFxDur: 0.7, PayloadFx: "KionaSkill1Effect", PayloadFxAt: "self", PayloadDelay: 0.3,
 				BuffFx: "", BuffFxOn: "", BuffIcon: false, BuffDescVariant: "",
+				// CLIENT «Киона выпускает волну, переходящую между {steps} дружественными
+				// целями... враги, находящиеся вблизи исцеляемой цели, получают урона при
+				// каждом скачке» -- a bounded chain over Count allies (self first), not a
+				// flat AoE around Kiona with an unused "steps" number (pass-6 audit
+				// 2026-07-20).
 				Ops: []Op{
-					// «Лечебная волна»: heals all friendly avatars around Kiona (On:"allies",
-					// self included), while enemies nearby take magic damage. Solo = self-heal.
-					{Kind: OpHeal, Value: PerLevel{70, 100, 135, 175}, On: "allies", Radius: 4},
-					{Kind: OpDamage, Value: PerLevel{40, 60, 80, 105}, Scale: "magic", Radius: 4},
+					{Kind: OpChainHeal, Value: PerLevel{70, 100, 135, 175}, PerSP: 1, Value2: PerLevel{40, 60, 80, 105}, Radius: 4, Count: PerLevel{2, 3, 3, 4}},
 				},
 				TipArgs: map[string]PerLevel{
 					"healthHeal":     PerLevel{70, 100, 135, 175},
@@ -2191,16 +2487,21 @@ func init() {
 				},
 			},
 			{
+				// CLIENT «Лесной покров»: a TARGETED 10s cast on either an enemy or ally
+				// (mirrors Slot 4 «Страж леса»'s dual Target/TargetSide pattern) -- ally gets
+				// +base-attack, enemy gets -base-attack, and whichever side is marked shares
+				// healCoeff% of any damage IT takes as healing to nearby allies. Was miscoded
+				// as an untargeted flat self-shield with completely different numbers/duration
+				// (pass-6 audit 2026-07-20).
 				Slot: 2, NameRu: "Лесной покров", Type: "ACTIVE",
-				Target: "", Targeting: "SELF", Distance: 0, AoERadius: 0, AoEWidth: 0,
+				Target: "ENEMY+NOT_BUILDING+FRIEND", Targeting: "TARGET", Distance: 9, AoERadius: 0, AoEWidth: 0,
 				ManaCost: []int{30, 35, 40, 45}, Cooldown: []int{14, 13, 12, 11},
-				CastFx: "KionaSkill2", CastFxDur: 0.7, PayloadFx: "KionaSkill2BuffEffect", PayloadFxAt: "self", PayloadDelay: 0.3,
-				BuffFx: "KionaSkill2BuffEffect", BuffFxOn: "self", BuffIcon: true, BuffDescVariant: "BuffSelf",
+				CastFx: "KionaSkill2", CastFxDur: 0.7, PayloadFx: "KionaSkill2BuffEffect", PayloadFxAt: "target", PayloadDelay: 0.3,
+				BuffFx: "KionaSkill2BuffEffect", BuffFxOn: "target", BuffIcon: true, BuffDescVariant: "BuffTarget",
 				Ops: []Op{
-					// «укрывает дружественную цель защитным покровом, компенсирующим часть урона»: a
-					// damage-absorb shield. Cast on self in solo PvE (no ally to pick). Was miscoded as
-					// an enemy damage debuff + self lifesteal (wrong target class entirely).
-					{Kind: OpShield, Value: PerLevel{120, 170, 220, 280}, Dur: PerLevel{8, 8, 8, 8}},
+					{Kind: OpBuffStat, Stat: "dmg_flat", Value: PerLevel{20, 30, 40, 55}, Dur: PerLevel{10, 10, 10, 10}, On: "ally", TargetSide: "ally"},
+					{Kind: OpBuffStat, Stat: "dmg_flat", Value: PerLevel{-20, -30, -40, -55}, Dur: PerLevel{10, 10, 10, 10}, On: "target", TargetSide: "enemy"},
+					{Kind: OpDamageShare, Value: PerLevel{0.15, 0.2, 0.25, 0.3}, Dur: PerLevel{10, 10, 10, 10}, Radius: 5},
 				},
 				TipArgs: map[string]PerLevel{
 					"damageAdd": PerLevel{20, 30, 40, 55},
@@ -2215,7 +2516,10 @@ func init() {
 				CastFx: "", CastFxDur: 0, PayloadFx: "", PayloadFxAt: "", PayloadDelay: 0,
 				BuffFx: "", BuffFxOn: "", BuffIcon: false, BuffDescVariant: "",
 				Ops: []Op{
-					{Kind: OpBuffStat, Value: PerLevel{1.5, 2.5, 3.5, 5}, Dur: PerLevel{0, 0, 0, 0}, Stat: "mana_regen", On: "self"},
+					// CLIENT «За каждое убийство вражеского существа, Киона получает увеличение
+					// ТЕКУЩЕГО количества маны на {manaAmount}» -- a mana-ON-KILL siphon, not a passive
+					// mana-regen buff (which never restored anything on a kill -- the report).
+					{Kind: OpManaOnKill, Value: PerLevel{20, 30, 40, 55}, PerSP: 1},
 				},
 				TipArgs: map[string]PerLevel{
 					"damageSP":   PerLevel{1, 1, 1, 1},
@@ -2231,8 +2535,8 @@ func init() {
 				Ops: []Op{
 					// CLIENT «Страж леса»: the owl HEALS a friendly target or DAMAGES a hostile one
 					// (10s). Dual cast: enemy half is a magic DoT, ally half a heal-over-time.
-					{Kind: OpDot, Value: PerLevel{30, 42, 55, 70}, Dur: PerLevel{10, 10, 10, 10}, Scale: "magic", TargetSide: "enemy"},
-					{Kind: OpHot, Value: PerLevel{30, 42, 55, 70}, Dur: PerLevel{10, 10, 10, 10}, On: "ally", TargetSide: "ally"},
+					{Kind: OpDot, Value: PerLevel{30, 42, 55, 70}, Dur: PerLevel{10, 10, 10, 10}, Scale: "magic", TargetSide: "enemy", PerSP: 1},
+					{Kind: OpHot, Value: PerLevel{30, 42, 55, 70}, Dur: PerLevel{10, 10, 10, 10}, On: "ally", TargetSide: "ally", PerSP: 1},
 				},
 				TipArgs: map[string]PerLevel{
 					"healthHeal": PerLevel{30, 42, 55, 70},
@@ -2269,8 +2573,17 @@ func init() {
 				CastFx: "", CastFxDur: 0, PayloadFx: "", PayloadFxAt: "", PayloadDelay: 0,
 				BuffFx: "ReturnDamageEffect", BuffFxOn: "self", BuffIcon: true, BuffDescVariant: "",
 				Ops: []Op{
-					{Kind: OpBuffStat, Value: PerLevel{3, 4, 5, 6}, Dur: PerLevel{0, 0, 0, 0}, Stat: "hp_regen", On: "self"},
-					{Kind: OpBuffStat, Value: PerLevel{3, 4, 5, 6}, Dur: PerLevel{0, 0, 0, 0}, Stat: "mana_regen", On: "self"},
+					// CLIENT «Обращение энергии»: «Каждое направленное на Нейрофима заклинание,
+					// восстанавливает {hpBoost}+{damageSP} здоровья и маны и наносит столько же
+					// магического урона [вокруг него]» -- a REACTIVE proc that fires only when a
+					// mob/boss SKILL hits him (SkillOnly; a basic attack does not trigger it),
+					// not a permanent regen-rate buff (the prior encoding had no trigger at all
+					// and no damage component whatsoever).
+					{Kind: OpProc, OnDamaged: true, SkillOnly: true, Chance: PerLevel{1, 1, 1, 1}, Ops: []Op{
+						{Kind: OpHeal, Value: PerLevel{3, 4, 5, 6}, PerSP: 1},
+						{Kind: OpManaRestore, Value: PerLevel{3, 4, 5, 6}, PerSP: 1},
+						{Kind: OpDamage, Value: PerLevel{3, 4, 5, 6}, PerSP: 1, Scale: "magic", Radius: 4},
+					}},
 				},
 				TipArgs: map[string]PerLevel{
 					"hpBoost":  PerLevel{3, 4, 5, 6},
@@ -2303,10 +2616,11 @@ func init() {
 				CastFx: "NeirofimSkill4", CastFxDur: 1.5, PayloadFx: "NeirofimSkill4Effect", PayloadFxAt: "self", PayloadDelay: 1,
 				BuffFx: "SilenceEffect", BuffFxOn: "target", BuffIcon: false, BuffDescVariant: "",
 				Ops: []Op{
-					// CLIENT «Молчание»: silence EVERY enemy on the map, and drain mana from those
-					// nearby. Keeps a modest AoE burst (undescribed but aids solo PvE).
+					// CLIENT «Молчание»: silence EVERY enemy on the map and drain mana (= half the
+					// cast cost) from those nearby -- and NOTHING else. No damage component appears in
+					// any locale variant, so the previously-fabricated AoE burst (which was hitting
+					// the skeleton archer) is removed.
 					{Kind: OpSilenceAll, Dur: PerLevel{3, 4, 5, 6}, Value: PerLevel{30, 35, 40, 45}, Radius: 12},
-					{Kind: OpDamage, Value: PerLevel{30, 38, 46, 54}, Scale: "magic", Radius: 12},
 				},
 				TipArgs: map[string]PerLevel{
 					"duration": PerLevel{3, 4, 5, 6},
@@ -2326,9 +2640,11 @@ func init() {
 				Ops: []Op{
 					{Kind: OpDamage, Value: PerLevel{65, 90, 115, 140}, Scale: "phys", PerSP: 1},
 					{Kind: OpBuffStat, Value: PerLevel{-10, -14, -18, -22}, Dur: PerLevel{4, 4, 4, 4}, Stat: "phys_armor", On: "target"},
-					// «...с Гектора тоже скидывается часть брони»: Gektor's own armor drops
-					// too, so this self buff must be NEGATIVE (was mistakenly +armor).
-					{Kind: OpBuffStat, Value: PerLevel{-10, -14, -18, -22}, Dur: PerLevel{4, 4, 4, 4}, Stat: "phys_armor", On: "self"},
+					// CLIENT «Героический крик»: «...при этом ПОВЫШАЯ СЕБЕ броню на ту же
+					// величину» -- Gektor's own armor RISES by the same amount enemies lose
+					// (a prior pass inverted this from a misremembered wiki phrase not present
+					// in the actual client LongDesc; re-verified against IDS_GektorSkill1_LongDesc).
+					{Kind: OpBuffStat, Value: PerLevel{10, 14, 18, 22}, Dur: PerLevel{4, 4, 4, 4}, Stat: "phys_armor", On: "self"},
 				},
 				TipArgs: map[string]PerLevel{
 					"damage":   PerLevel{65, 90, 115, 140},
@@ -2343,9 +2659,11 @@ func init() {
 				CastFx: "", CastFxDur: 0, PayloadFx: "GektorSkill2Effect", PayloadFxAt: "self", PayloadDelay: 0,
 				BuffFx: "", BuffFxOn: "", BuffIcon: false, BuffDescVariant: "",
 				Ops: []Op{
-					// «При получении урона» -- fires when Gektor is STRUCK, not when he hits, so
-					// the counter-nova retaliates against the attacker (OnDamaged proc).
-					{Kind: OpProc, OnDamaged: true, Chance: PerLevel{0.17, 0.17, 0.17, 0.17}, Ops: []Op{
+					// «При получении урона ОТ БАЗОВОЙ АТАКИ» -- fires when Gektor is STRUCK BY A
+					// BASIC ATTACK specifically, not when he hits and not from a mob/boss SKILL
+					// (BasicAttackOnly; a prior encoding had no source gate, so a boss's spell
+					// damage also triggered the counter-nova).
+					{Kind: OpProc, OnDamaged: true, BasicAttackOnly: true, Chance: PerLevel{0.17, 0.17, 0.17, 0.17}, Ops: []Op{
 						{Kind: OpDamage, Value: PerLevel{45, 65, 85, 105}, Scale: "phys", Radius: 4, PerSP: 1},
 					}},
 				},
@@ -2422,7 +2740,11 @@ func init() {
 					{Kind: OpAura, TickCost: PerLevel{4, 4, 5, 5}, Radius: 5, Interval: 1, Ops: []Op{
 						{Kind: OpDamage, Value: PerLevel{10, 13, 16, 20}, Scale: "magic", PerSP: 1},
 					}},
-					{Kind: OpBuffStat, Value: PerLevel{1.5, 1.5, 1.5, 1.5}, Dur: PerLevel{0, 0, 0, 0}, Stat: "armor_pct", On: "self"},
+					// CLIENT «Костяной щит»: «снижающий получаемый физический урон на 50%» -- a
+					// flat, guaranteed damage-taken cut, not an armor-STAT multiplier (armor_pct
+					// fed through the shared 50/(a+50) mitigation curve can never actually net a
+					// 50% reduction; see dmg_reduction_pct's doc in hitPlayerFromLocked).
+					{Kind: OpBuffStat, Value: PerLevel{0.5, 0.5, 0.5, 0.5}, Dur: PerLevel{0, 0, 0, 0}, Stat: "dmg_reduction_pct", On: "self"},
 					// «При получении трёх ударов щит взрывается»: replaces the thorns proxy with a
 					// real explode-after-3-hits that blasts nearby enemies (explodeMin..Max,
 					// bigger the sooner it pops).
@@ -2444,8 +2766,16 @@ func init() {
 				CastFx: "RognarSkill3", CastFxDur: 1, PayloadFx: "RognarSkill3Effect1", PayloadFxAt: "target", PayloadDelay: 0.4,
 				BuffFx: "RognarSkill3Effect2", BuffFxOn: "target", BuffIcon: false, BuffDescVariant: "",
 				Ops: []Op{
-					{Kind: OpDot, Value: PerLevel{9, 12, 15, 18}, Dur: PerLevel{3, 3, 3, 3}, Scale: "magic", MaxTargets: 2},
-					{Kind: OpSlow, Value: PerLevel{0.85, 0.85, 0.85, 0.85}, Dur: PerLevel{3, 3, 3, 3}, MaxTargets: 2},
+					// CLIENT «Могильный холод»: «замедление и количество наносимого урона
+					// постепенно спадает за время действия способности» -- both the DoT and the
+					// slow decay linearly down to nothing by the time the 3s window ends. The
+					// LongDesc also names the pair «на двух СЛУЧАЙНЫХ целях» -- Randomize picks
+					// a random 2 in range instead of the 2 nearest to the cast point. (The DoT
+					// and Slow each roll their own random 2 independently -- with >2 enemies in
+					// range they can land on slightly different pairs, an accepted simplification
+					// over threading a shared per-cast target list between two ops.)
+					{Kind: OpDot, Value: PerLevel{9, 12, 15, 18}, DecayTo: PerLevel{0, 0, 0, 0}, Dur: PerLevel{3, 3, 3, 3}, Scale: "magic", MaxTargets: 2, Randomize: true},
+					{Kind: OpSlow, Value: PerLevel{0.85, 0.85, 0.85, 0.85}, DecayTo: PerLevel{1, 1, 1, 1}, Dur: PerLevel{3, 3, 3, 3}, MaxTargets: 2, Randomize: true},
 				},
 				TipArgs: map[string]PerLevel{
 					"aoeDPS":   PerLevel{9, 12, 15, 18},
@@ -2454,15 +2784,19 @@ func init() {
 			},
 			{
 				Slot: 4, NameRu: "Канал смерти", Type: "ACTIVE",
-				Target: "ENEMY+NOT_BUILDING", Targeting: "TARGET", Distance: 8, AoERadius: 0, AoEWidth: 0,
+				// CLIENT «Канал смерти»: «...с выбранной ДРУЖЕСТВЕННОЙ ИЛИ ВРАЖДЕБНОЙ целью...
+				// нанося урона ИЛИ исцеляя цель». A real dual enemy/ally cast (Frost's «Гробница
+				// холода» pattern): FRIEND added to the mask, TargetSide splits damage vs heal.
+				Target: "ENEMY+NOT_BUILDING+FRIEND", Targeting: "TARGET", Distance: 8, AoERadius: 0, AoEWidth: 0,
 				ManaCost: []int{50, 55, 60, 65}, Cooldown: []int{45, 42, 39, 36},
 				CastFx: "RognarSkill4", CastFxDur: 1.2, PayloadFx: "RognarSkill4Effect2", PayloadFxAt: "target", PayloadDelay: 0.5,
 				BuffFx: "RognarSkill4Effect1", BuffFxOn: "self", BuffIcon: true, BuffDescVariant: "BuffTarget",
 				Ops: []Op{
-					{Kind: OpDamage, Value: PerLevel{130, 170, 215, 260}, Scale: "magic", PerSP: 1},
-					{Kind: OpDot, Value: PerLevel{10, 13, 16, 20}, Dur: PerLevel{10, 10, 10, 10}, Scale: "magic"},
+					{Kind: OpDamage, Value: PerLevel{130, 170, 215, 260}, Scale: "magic", PerSP: 1, TargetSide: "enemy"},
+					{Kind: OpHeal, Value: PerLevel{130, 170, 215, 260}, PerSP: 1, On: "ally", TargetSide: "ally"},
 					// CLIENT «Канал смерти»: «30% урона, получаемого Рогнаром, наносится цели» (or
 					// heals a friendly link) while the channel holds. Value2 = redirect fraction.
+					// Fires regardless of side -- OpDeathLink resolves ally-vs-enemy itself.
 					{Kind: OpDeathLink, Dur: PerLevel{10, 10, 10, 10}, Value2: PerLevel{0.3, 0.3, 0.3, 0.3}},
 				},
 				TipArgs: map[string]PerLevel{
@@ -2512,7 +2846,10 @@ func init() {
 				CastFx: "", CastFxDur: 0, PayloadFx: "", PayloadFxAt: "", PayloadDelay: 0,
 				BuffFx: "", BuffFxOn: "", BuffIcon: false, BuffDescVariant: "",
 				Ops: []Op{
-					{Kind: OpBuffStat, Value: PerLevel{80, 120, 160, 200}, Dur: PerLevel{0, 0, 0, 0}, Stat: "max_hp", On: "self"},
+					// CLIENT «Несокрушимость»: «на {hpBoost}+{@damageSP} единиц» -- the flat HP
+					// bonus scales with spell power (TipArgs already declared damageSP; PerSP
+					// was missing so the tooltip's own promised term never actually applied).
+					{Kind: OpBuffStat, Value: PerLevel{80, 120, 160, 200}, PerSP: 1, Dur: PerLevel{0, 0, 0, 0}, Stat: "max_hp", On: "self"},
 				},
 				TipArgs: map[string]PerLevel{
 					"hpBoost":  PerLevel{80, 120, 160, 200},
@@ -2527,10 +2864,14 @@ func init() {
 				BuffFx: "SigilionSkill4Effect", BuffFxOn: "self", BuffIcon: true, BuffDescVariant: "BuffSelf",
 				Ops: []Op{
 					{Kind: OpBuffStat, Value: PerLevel{1.5, 1.6, 1.7, 1.8}, Dur: PerLevel{20, 20, 20, 20}, Stat: "dmg_pct", On: "self"},
-					{Kind: OpBuffStat, Value: PerLevel{-12, -15, -17, -19}, Dur: PerLevel{20, 20, 20, 20}, Stat: "hp_regen", On: "self"},
+					// CLIENT «Мощь берсерка»: "ранит себя на 50% от увеличенного [урона от атак]" --
+					// a PER-ATTACK self-hit proportional to the LIVE dmg_pct bonus, not a flat
+					// hp_regen debuff (a prior pass's tooltip numbers didn't match the real
+					// dmg_pct value either -- both fixed together).
+					{Kind: OpSelfRecoil, Value: PerLevel{0.5, 0.5, 0.5, 0.5}, Dur: PerLevel{20, 20, 20, 20}},
 				},
 				TipArgs: map[string]PerLevel{
-					"dmgBoost": PerLevel{25, 30, 35, 40},
+					"dmgBoost": PerLevel{50, 60, 70, 80},
 					"damageSP": PerLevel{1, 1, 1, 1},
 				},
 			},
@@ -2545,10 +2886,13 @@ func init() {
 				ManaCost: []int{40, 45, 50, 55}, Cooldown: []int{16, 15, 14, 13},
 				CastFx: "TitanidSkill1", CastFxDur: 2.4, PayloadFx: "TitanidSkill1Effect1", PayloadFxAt: "point", PayloadDelay: 0.4,
 				BuffFx: "", BuffFxOn: "", BuffIcon: false, BuffDescVariant: "",
+				// «Землетрясение» hits in 3 escalating waves: each wave deals more damage
+				// (aoeDamage + aoeDamageInc×wave), stuns 0.2s longer (1.0/1.2/1.4s), and is
+				// wider than the last («каждая следующая волна шире, чем предыдущая»).
 				Ops: []Op{
 					{Kind: OpChannel, Dur: PerLevel{2.4, 2.4, 2.4, 2.4}, Interval: 0.8, Ops: []Op{
-						{Kind: OpDamage, Value: PerLevel{50, 69, 88, 107}, Scale: "magic", Radius: 5, PerSP: 1},
-						{Kind: OpStun, Dur: PerLevel{1.2, 1.2, 1.2, 1.2}},
+						{Kind: OpDamage, Value: PerLevel{40, 55, 70, 85}, Growth: PerLevel{10, 14, 18, 22}, GrowthPerSP: 1, Scale: "magic", Radius: 5, RadiusGrowth: 1, PerSP: 1},
+						{Kind: OpStun, Dur: PerLevel{1.0, 1.0, 1.0, 1.0}, Growth: PerLevel{0.2, 0.2, 0.2, 0.2}},
 					}},
 				},
 				TipArgs: map[string]PerLevel{
@@ -2564,21 +2908,20 @@ func init() {
 				ManaCost: []int{30, 35, 40, 45}, Cooldown: []int{12, 11, 10, 9},
 				CastFx: "TitanidSkill2", CastFxDur: 1.2, PayloadFx: "TitanidSkill2Effect", PayloadFxAt: "target", PayloadDelay: 0.4,
 				BuffFx: "", BuffFxOn: "", BuffIcon: false, BuffDescVariant: "",
-				// «Ударная волна»: single-target hit, then the nearby OTHER enemies are
-				// immobilised (root) and silenced -- not merely slowed. Root+silence share
-				// the r4 splash so they catch the same ring as the aoe damage.
+				// «Ударная волна»: single-target hit; the nearby OTHER enemies take a
+				// portion of the damage and are SLOWED 25% for 3s («замедляются на 25% в
+				// течение 3 секунд») -- client text names neither root nor silence.
 				Ops: []Op{
 					{Kind: OpDamage, Value: PerLevel{90, 125, 160, 195}, Scale: "magic", Radius: 0, PerSP: 1},
-					{Kind: OpDamage, Value: PerLevel{45, 62, 80, 97}, Scale: "magic", Radius: 4},
-					{Kind: OpRoot, Dur: PerLevel{2, 2, 2, 2}, Radius: 4},
-					{Kind: OpSilence, Dur: PerLevel{2, 2, 2, 2}, Radius: 4},
+					{Kind: OpDamage, Value: PerLevel{45, 62, 80, 97}, Scale: "magic", Radius: 4, PerSP: 0.5, ExcludeCenterTarget: true},
+					{Kind: OpSlow, Value: PerLevel{0.75, 0.75, 0.75, 0.75}, Dur: PerLevel{3, 3, 3, 3}, Radius: 4, ExcludeCenterTarget: true},
 				},
 				TipArgs: map[string]PerLevel{
 					"damage":      PerLevel{90, 125, 160, 195},
 					"aoeDamage":   PerLevel{45, 62, 80, 97},
 					"damageSP":    PerLevel{1, 1, 1, 1},
 					"damageAoeSP": PerLevel{0.5, 0.5, 0.5, 0.5},
-					"rootTime":    PerLevel{2, 2, 2, 2},
+					"rootTime":    PerLevel{3, 3, 3, 3},
 				},
 			},
 			{
@@ -2590,7 +2933,8 @@ func init() {
 				Ops: []Op{
 					// «Каменная кожа» hardens each time Titanid is STRUCK (OnDamaged proc).
 					{Kind: OpProc, OnDamaged: true, Chance: PerLevel{1, 1, 1, 1}, Ops: []Op{
-						{Kind: OpBuffStat, Value: PerLevel{3, 4, 5, 6}, Dur: PerLevel{5, 5, 5, 5}, Stat: "phys_armor", On: "self"},
+						{Kind: OpBuffStat, Value: PerLevel{3, 4, 5, 6}, Dur: PerLevel{5, 5, 5, 5}, Stat: "phys_armor", On: "self",
+							StackCap: PerLevel{12, 16, 20, 24}},
 					}},
 				},
 				TipArgs: map[string]PerLevel{
@@ -2611,6 +2955,7 @@ func init() {
 					{Kind: OpBuffStat, Value: PerLevel{1.1, 1.15, 1.2, 1.25}, Dur: PerLevel{0, 0, 0, 0}, Stat: "dmg_pct", On: "self"},
 					{Kind: OpBuffStat, Value: PerLevel{1.06, 1.08, 1.1, 1.12}, Dur: PerLevel{0, 0, 0, 0}, Stat: "move_speed_pct", On: "self"},
 					{Kind: OpBuffStat, Value: PerLevel{0.95, 0.94, 0.93, 0.92}, Dur: PerLevel{0, 0, 0, 0}, Stat: "attack_speed_pct", On: "self"},
+					{Kind: OpBuffStat, Value: PerLevel{0, 0, 0, 0}, Dur: PerLevel{0, 0, 0, 0}, Stat: "dmg_flat", On: "self", PerSP: 1},
 				},
 				TipArgs: map[string]PerLevel{
 					"damageMod": PerLevel{10, 15, 20, 25},
@@ -2625,27 +2970,25 @@ func init() {
 		Prefab: "Avtr_Tank_Urg", AttackProjectile: false,
 		Skills: [4]Skill{
 			{
+				// «Древесный камуфляж» (client: "Ург превращает союзного аватара в дерево. При
+				// движении, он выходит из формы дерева, нанося магический урон и запрещая
+				// применение способностей."). NOT an instant burst: it turns the ally (self in
+				// solo) INTO A TREE — break-on-move stealth + the tree disguise prop — and the
+				// magic-damage + silence burst fires only WHEN they leave tree form (moving,
+				// acting, or expiry). The prior encoding fired the burst on cast and added a
+				// slow + two armor buffs that the client text does not mention.
 				Slot: 1, NameRu: "Древесный камуфляж", Type: "ACTIVE",
 				Target: "FRIEND", Targeting: "TARGET", Distance: 8, AoERadius: 4, AoEWidth: 0,
 				ManaCost: []int{30, 35, 40, 45}, Cooldown: []int{20, 18, 16, 14},
 				CastFx: "UrgSkill1", CastFxDur: 1.2, PayloadFx: "", PayloadFxAt: "", PayloadDelay: 0.3,
-				BuffFx: "UrgSkill1Effect", BuffFxOn: "target", BuffIcon: true, BuffDescVariant: "BuffTarget",
+				BuffFx: "UrgSkill1Effect", BuffFxOn: "target", BuffIcon: false, BuffDescVariant: "BuffTarget",
 				Ops: []Op{
-					{Kind: OpDamage, Value: PerLevel{70, 95, 120, 145}, Scale: "magic", Radius: 4},
-					// On reveal the tree burst adds a SLOW alongside its damage + silence
-					// (the wiki lists all three; the slow was missing). Radius 4 = AoERadius.
-					{Kind: OpSlow, Value: PerLevel{0.7, 0.7, 0.7, 0.7}, Dur: PerLevel{3, 3, 4, 4}, Radius: 4},
-					// Radius 4: the silence belongs to the BURST, like the damage and slow
-					// above it. Without a radius an op falls into damageTargetsLocked's
-					// single-target arm, which returns ctx.target verbatim -- and this
-					// skill's target is the friendly unit being camouflaged, so the burst's
-					// silence was landing on the ally it was protecting (plus the 0.1x
-					// attack-slow OpSilence carries) while the enemies around it went
-					// untouched. The two armor buffs below are correctly radius-less: those
-					// ARE meant for the ally.
-					{Kind: OpSilence, Dur: PerLevel{3, 3, 3, 3}, Radius: 4},
-					{Kind: OpBuffStat, Value: PerLevel{10, 14, 18, 22}, Dur: PerLevel{8, 10, 12, 14}, Stat: "phys_armor", On: "target"},
-					{Kind: OpBuffStat, Value: PerLevel{10, 14, 18, 22}, Dur: PerLevel{8, 10, 12, 14}, Stat: "magic_armor", On: "target"},
+					{Kind: OpTreeForm, Dur: PerLevel{8, 10, 12, 14}, BreakOnMove: true,
+						Unit: "Avtr_Tank_Urg_Tree_prop01", Radius: 4,
+						Ops: []Op{
+							{Kind: OpDamage, Value: PerLevel{70, 95, 120, 145}, Scale: "magic", Radius: 4},
+							{Kind: OpSilence, Dur: PerLevel{3, 3, 3, 3}, Radius: 4},
+						}},
 				},
 				TipArgs: map[string]PerLevel{
 					"duration":  PerLevel{8, 10, 12, 14},
@@ -2653,30 +2996,40 @@ func init() {
 				},
 			},
 			{
+				// «Росток» (client: "Ург высаживает на землю деревце, невидимое для врагов, на 15
+				// минут. Деревце открывает обзор вокруг себя и позволяет видеть невидимых
+				// врагов."). A pure vision utility: no damage, no CC. The scout stands 15 minutes
+				// (900s) and uses its OWN prop (the totem) — DISTINCT from slot 1's disguise tree,
+				// so the two are never confused for one another.
 				Slot: 2, NameRu: "Росток", Type: "ACTIVE",
 				Target: "POINT", Targeting: "", Distance: 7, AoERadius: 3, AoEWidth: 0,
 				ManaCost: []int{25, 25, 25, 25}, Cooldown: []int{30, 27, 24, 21},
 				CastFx: "UrgSkill2", CastFxDur: 1, PayloadFx: "", PayloadFxAt: "", PayloadDelay: 0.3,
 				BuffFx: "", BuffFxOn: "", BuffIcon: false, BuffDescVariant: "",
 				Ops: []Op{
-					{Kind: OpTrap, Lifetime: PerLevel{900, 900, 900, 900}, TriggerRadius: 3, TrapFx: "RuneRegenerateEffect1", TriggerFx: "RevelationEffect", Ops: []Op{}},
+					{Kind: OpVisionWard, Unit: "Avtr_Tank_Urg_Totem_prop01",
+						Lifetime: PerLevel{900, 900, 900, 900}, Radius: 35, TrapFx: "RuneRegenerateEffect1"},
 				},
 				TipArgs: map[string]PerLevel{
 					"cooldown": PerLevel{30, 27, 24, 21},
 				},
 			},
 			{
-				// «Древняя кора»: an always-on defensive PASSIVE (reduces damage taken), not an
-				// ACTIVE ally-cast buff. Self armor/regen are permanent (Dur 0, On self).
-				Slot: 3, NameRu: "Дубовая кора", Type: "PASSIVE",
+				// «Дубовая кора» (client: "Увеличивает вероятность блока на 40%, а также размер
+				// блока и скорость восстановления здоровья у выбранной дружественной цели в
+				// течение 40 секунд."). An ACTIVE ally buff (self in solo), NOT a passive: block
+				// (armor_pct +40%), block size (phys_armor) and HP regen for 40s. On:"ally" aims
+				// it at the picked friend. (A prior audit trusted a wiki "passive" line that does
+				// not exist in the client locale; the client text is unambiguously this active.)
+				Slot: 3, NameRu: "Дубовая кора", Type: "ACTIVE",
 				Target: "FRIEND", Targeting: "TARGET", Distance: 8, AoERadius: 0, AoEWidth: 0,
-				ManaCost: []int{0, 0, 0, 0}, Cooldown: []int{0, 0, 0, 0},
+				ManaCost: []int{30, 35, 40, 45}, Cooldown: []int{25, 22, 20, 18},
 				CastFx: "UrgSkill3", CastFxDur: 1.2, PayloadFx: "", PayloadFxAt: "", PayloadDelay: 0.3,
-				BuffFx: "UrgSkill3Effect", BuffFxOn: "target", BuffIcon: true, BuffDescVariant: "BuffTarget",
+				BuffFx: "UrgSkill3Effect", BuffFxOn: "self", BuffIcon: true, BuffDescVariant: "BuffTarget",
 				Ops: []Op{
-					{Kind: OpBuffStat, Value: PerLevel{1.4, 1.4, 1.4, 1.4}, Dur: PerLevel{0, 0, 0, 0}, Stat: "armor_pct", On: "self"},
-					{Kind: OpBuffStat, Value: PerLevel{8, 12, 16, 20}, Dur: PerLevel{0, 0, 0, 0}, Stat: "phys_armor", On: "self"},
-					{Kind: OpBuffStat, Value: PerLevel{3, 4, 5, 6}, Dur: PerLevel{0, 0, 0, 0}, Stat: "hp_regen", On: "self"},
+					{Kind: OpBuffStat, Value: PerLevel{1.4, 1.4, 1.4, 1.4}, Dur: PerLevel{40, 40, 40, 40}, Stat: "armor_pct", On: "ally"},
+					{Kind: OpBuffStat, Value: PerLevel{8, 12, 16, 20}, Dur: PerLevel{40, 40, 40, 40}, Stat: "phys_armor", On: "ally"},
+					{Kind: OpBuffStat, Value: PerLevel{3, 4, 5, 6}, Dur: PerLevel{40, 40, 40, 40}, Stat: "hp_regen", On: "ally"},
 				},
 				TipArgs: map[string]PerLevel{
 					"addSize":   PerLevel{8, 12, 16, 20},
@@ -2684,16 +3037,24 @@ func init() {
 				},
 			},
 			{
+				// «Непроглядные дебри» (client: "Вокруг Урга вырастает кольцо из деревьев, внутри
+				// которого враги не могут применять способности. Когда деревья исчезнут, все враги
+				// внутри получат магический урон."). A ring of trees grows around Urg: while it
+				// stands, enemies inside are SILENCED; when the trees FALL (Dur elapses) everyone
+				// still inside takes the magic burst. The prior encoding rooted+slowed and dealt
+				// the damage instantly, and no trees were ever spawned.
 				Slot: 4, NameRu: "Непроглядные дебри", Type: "ACTIVE",
 				Target: "", Targeting: "SELF", Distance: 0, AoERadius: 6, AoEWidth: 0,
 				ManaCost: []int{60, 70, 80, 90}, Cooldown: []int{60, 55, 50, 45},
 				CastFx: "UrgSkill4", CastFxDur: 1.5, PayloadFx: "UrgSkill4Effect2", PayloadFxAt: "self", PayloadDelay: 0.5,
 				BuffFx: "UrgSkill4Effect1", BuffFxOn: "self", BuffIcon: false, BuffDescVariant: "",
 				Ops: []Op{
-					{Kind: OpRoot, Dur: PerLevel{4, 5, 6, 7}, Radius: 6},
-					{Kind: OpDamage, Value: PerLevel{100, 140, 190, 240}, Scale: "magic", Radius: 6, PerSP: 1},
-					// When the trees fall they also SLOW the enemies they release («замедляя их»).
-					{Kind: OpSlow, Value: PerLevel{0.5, 0.5, 0.5, 0.5}, Dur: PerLevel{3, 3, 4, 4}, Radius: 6},
+					{Kind: OpSilence, Dur: PerLevel{4, 5, 6, 7}, Radius: 6},
+					{Kind: OpGrove, Dur: PerLevel{4, 5, 6, 7}, Radius: 6, Count: PerLevel{8, 8, 8, 8},
+						Unit: "VFX_Avtr_Tank_Urg_skill4_prop01",
+						Ops: []Op{
+							{Kind: OpDamage, Value: PerLevel{100, 140, 190, 240}, Scale: "magic", Radius: 6, PerSP: 1},
+						}},
 				},
 				TipArgs: map[string]PerLevel{
 					"duration":  PerLevel{4, 5, 6, 7},
@@ -2748,7 +3109,7 @@ func init() {
 				// exactly what the observed values show. Rank 5 holds at 100 (not extrapolated).
 				Ops: []Op{
 					{Kind: OpProc, Chance: PerLevel{1, 1, 1, 1}, Ops: []Op{
-						{Kind: OpDamage, CasterMissingHP: PerLevel{40, 60, 80, 100, 100}, Scale: "phys"},
+						{Kind: OpDamage, CasterMissingHP: PerLevel{40, 60, 80, 100, 100}, Scale: "phys", PerSP: 1},
 					}},
 				},
 				TipArgs: map[string]PerLevel{
@@ -2762,8 +3123,13 @@ func init() {
 				ManaCost: []int{40, 45, 50, 55}, Cooldown: []int{45, 40, 35, 30},
 				CastFx: "VelialSkill4", CastFxDur: 1.3, PayloadFx: "", PayloadFxAt: "", PayloadDelay: 0.4,
 				BuffFx: "VelialSkill4Effect", BuffFxOn: "target", BuffIcon: true, BuffDescVariant: "BuffTarget",
+				// CLIENT «...цель становится видна в невидимости для всех членов союзной
+				// команды»: the armor debuff was only half the ability -- the marked target
+				// also stays fully revealed to the whole team for the duration (pass-6 audit
+				// 2026-07-20).
 				Ops: []Op{
 					{Kind: OpBuffStat, Value: PerLevel{-12, -16, -20, -24}, Dur: PerLevel{30, 30, 30, 30}, Stat: "phys_armor", On: "target"},
+					{Kind: OpRevealTarget, Dur: PerLevel{30, 30, 30, 30}},
 				},
 				TipArgs: map[string]PerLevel{
 					"armourDebuff": PerLevel{12, 16, 20, 24},
@@ -2811,7 +3177,9 @@ func init() {
 				CastFx: "", CastFxDur: 0, PayloadFx: "", PayloadFxAt: "", PayloadDelay: 0,
 				BuffFx: "", BuffFxOn: "", BuffIcon: false, BuffDescVariant: "",
 				Ops: []Op{
-					{Kind: OpBuffStat, Value: PerLevel{2, 3, 4, 5}, Dur: PerLevel{0, 0, 0, 0}, Stat: "hp_regen", On: "self"},
+					// Client: "скорости восстановления здоровья на {hpInc}+{damageSP}" -- the
+					// regen term scales with spell power like Skill1's damage; armor stays flat.
+					{Kind: OpBuffStat, Value: PerLevel{2, 3, 4, 5}, Dur: PerLevel{0, 0, 0, 0}, Stat: "hp_regen", On: "self", PerSP: 1},
 					{Kind: OpBuffStat, Value: PerLevel{8, 12, 16, 20}, Dur: PerLevel{0, 0, 0, 0}, Stat: "phys_armor", On: "self"},
 				},
 				TipArgs: map[string]PerLevel{
@@ -2827,9 +3195,20 @@ func init() {
 				CastFx: "", CastFxDur: 0, PayloadFx: "", PayloadFxAt: "", PayloadDelay: 0,
 				BuffFx: "VeritasSkill4Self", BuffFxOn: "self", BuffIcon: true, BuffDescVariant: "",
 				Ops: []Op{
-					{Kind: OpBuffStat, Value: PerLevel{150, 200, 250, 300}, Dur: PerLevel{20, 20, 20, 20}, Stat: "max_hp", On: "self"},
-					{Kind: OpBuffStat, Value: PerLevel{1.4, 1.5, 1.6, 1.7}, Dur: PerLevel{20, 20, 20, 20}, Stat: "dmg_pct", On: "self"},
+					// Client: "жизни на {hpBoost}+{damagehpBoostSP} единиц" / "повреждения на
+					// {damageBoost}+{damageSP} единиц" -- BOTH bonuses are flat additive "units"
+					// (same construction as Skill1's flat magic damage), each with its own SP
+					// scaling. The prior dmg_pct encoding (1.4-1.7) was a 40-70% TOTAL-damage
+					// MULTIPLIER, a different and far stronger mechanic than the surviving
+					// damageBoost TipArgs (20/25/30/35) ever described. Neither move-speed nor
+					// view-radius carries its own numeric placeholder in the locale text, so
+					// both reuse the same modest 15-20% figure (pass-11 audit: view_radius_pct
+					// now has a real hook -- Штурм's fog-of-war sync AND Hunt's interest-
+					// management reveal/hide distance both read it; previously neither did).
+					{Kind: OpBuffStat, Value: PerLevel{150, 200, 250, 300}, Dur: PerLevel{20, 20, 20, 20}, Stat: "max_hp", On: "self", PerSP: 1},
+					{Kind: OpBuffStat, Value: PerLevel{20, 25, 30, 35}, Dur: PerLevel{20, 20, 20, 20}, Stat: "dmg_flat", On: "self", PerSP: 1},
 					{Kind: OpBuffStat, Value: PerLevel{1.15, 1.15, 1.2, 1.2}, Dur: PerLevel{20, 20, 20, 20}, Stat: "move_speed_pct", On: "self"},
+					{Kind: OpBuffStat, Value: PerLevel{1.15, 1.15, 1.2, 1.2}, Dur: PerLevel{20, 20, 20, 20}, Stat: "view_radius_pct", On: "self"},
 				},
 				TipArgs: map[string]PerLevel{
 					"hpBoost":         PerLevel{150, 200, 250, 300},
@@ -2850,7 +3229,12 @@ func init() {
 				CastFx: "ZamaranSkill1", CastFxDur: 0.6, PayloadFx: "ZamaranSkill1", PayloadFxAt: "point", PayloadDelay: 0.2,
 				BuffFx: "", BuffFxOn: "", BuffIcon: false, BuffDescVariant: "",
 				Ops: []Op{
-					{Kind: OpDash, Value: PerLevel{22, 22, 22, 22}},
+					// Client: "бросается в выбранную точку, отпихивая всех врагов в стороны.
+					// Добежав до точки, Зараман замедляет... и наносит... урона" -- TWO separate
+					// effects: enemies along the charge's PATH get shoved aside (PushAside, no
+					// numeric value given), while the slow+AoE land upon ARRIVAL, not at cast
+					// (StrikeOnArrival defers them) (pass-11 audit).
+					{Kind: OpDash, Value: PerLevel{22, 22, 22, 22}, StrikeOnArrival: true, PushAside: 3},
 					{Kind: OpDamage, Value: PerLevel{70, 100, 135, 175}, Scale: "magic", Radius: 4},
 					{Kind: OpSlow, Value: PerLevel{0.8, 0.8, 0.8, 0.8}, Dur: PerLevel{5, 5, 5, 5}, Radius: 4},
 				},
@@ -2888,7 +3272,10 @@ func init() {
 				BuffFx: "", BuffFxOn: "", BuffIcon: false, BuffDescVariant: "BuffTarget",
 				Ops: []Op{
 					{Kind: OpProc, Chance: PerLevel{0.3, 0.3, 0.3, 0.3}, Ops: []Op{
-						{Kind: OpBuffStat, Value: PerLevel{-3, -5, -7, -10}, Dur: PerLevel{10, 10, 10, 10}, Stat: "phys_armor", On: "target"},
+						// Client «понизится физическая броня на {coef%}%»: a PERCENTAGE reduction
+					// (matches the coef TipArgs, 10-25%), not a flat armor-point subtraction --
+					// armor_pct is the multiplicative stat, phys_armor is raw points (pass-11 audit).
+					{Kind: OpBuffStat, Value: PerLevel{0.9, 0.85, 0.8, 0.75}, Dur: PerLevel{10, 10, 10, 10}, Stat: "armor_pct", On: "target"},
 					}},
 				},
 				TipArgs: map[string]PerLevel{

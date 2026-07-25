@@ -1,5 +1,7 @@
 package battleserver
 
+import "tanatserver/internal/gamedata"
+
 // Status-effect state shared by the player avatar, mobs and summons. All
 // timestamps are battle-time seconds (Server.battleTime). Mutations happen
 // under conn.mvMu; the combat tick expires entries and reverses their
@@ -41,6 +43,32 @@ type overTime struct {
 	nextTick float64
 	srcObj   int32 // damager object id for RECEIVE_HIT (DoT)
 	fxUID    int32
+
+	// perSecEnd/startAt implement Op.DecayTo: the tick magnitude interpolates linearly
+	// from perSec (at startAt) to perSecEnd (at until). Left equal to perSec (the
+	// default when no decay was authored) this is a no-op fast path -- see currentPerSec.
+	perSecEnd float64
+	startAt   float64
+}
+
+// currentPerSec returns this stream's tick magnitude at `now`, linearly interpolated
+// between perSec (at startAt) and perSecEnd (at until) when they differ (Op.DecayTo);
+// a flat (non-decaying) stream has perSecEnd == perSec and this returns perSec as-is.
+func (o overTime) currentPerSec(now float64) float64 {
+	if o.perSecEnd == o.perSec {
+		return o.perSec
+	}
+	span := o.until - o.startAt
+	if span <= 0 {
+		return o.perSec
+	}
+	frac := (now - o.startAt) / span
+	if frac < 0 {
+		frac = 0
+	} else if frac > 1 {
+		frac = 1
+	}
+	return o.perSec + (o.perSecEnd-o.perSec)*frac
 }
 
 // unitStatus aggregates every timed effect on one unit.
@@ -51,9 +79,55 @@ type unitStatus struct {
 
 	slowUntil  float64
 	slowFactor float64 // move speed ×factor while slowed (e.g. 0.85)
+	// slowFactorEnd/slowStart implement Op.DecayTo on a slow: the effective factor
+	// interpolates linearly from slowFactor (at slowStart) to slowFactorEnd (at
+	// slowUntil). Left equal to slowFactor (the no-decay default) this is a no-op --
+	// see moveFactor.
+	slowFactorEnd float64
+	slowStart     float64
 
 	atkSlowUntil  float64
 	atkSlowFactor float64
+
+	// killMarkUntil/killMarkOwner/killMarkOps/killMarkLevel implement Op.KillMark
+	// (Lirvein's «Изощренный бросок»): if THIS unit dies from any source before
+	// killMarkUntil, the mob-death branch fires killMarkOps for killMarkOwner instead
+	// of requiring an instant kill by the marking cast.
+	killMarkUntil float64
+	killMarkOwner int32
+	killMarkOps   []gamedata.Op
+	killMarkLevel int
+	killMarkSlot  int
+
+	// castMarkUntil/castMarkDmg/castMarkOwner implement Op.CastMark (Einzenhaim's
+	// «Изгнание колдовства»): if THIS unit casts a skill before castMarkUntil, it takes
+	// castMarkDmg extra damage credited to castMarkOwner. Honored in tryBossSkillLocked
+	// (only bosses actually cast).
+	castMarkUntil float64
+	castMarkDmg   float64
+	castMarkOwner int32
+
+	// poisonExplode* implement Op.ExplodeOnDeath (Wilfang's «Ядовитый укус»): if this unit
+	// dies before poisonExplodeUntil, the mob-death branch detonates an AoE magic burst of
+	// poisonExplodeDmg over poisonExplodeRadius, credited to poisonExplodeOwner.
+	poisonExplodeUntil  float64
+	poisonExplodeOwner  int32
+	poisonExplodeDmg    float64
+	poisonExplodeRadius float64
+
+	// cloak* implement Op.DamageShare (Kiona's «Лесной покров»): while this unit (an enemy
+	// mob OR an ally player -- unitStatus is shared by both) is marked, cloakHealCoeff
+	// fraction of any damage IT takes also heals every living ally within cloakRadius of
+	// it, credited to cloakOwner. Honored in hitMobFlagsLocked/hitPlayerFromLocked.
+	cloakUntil     float64
+	cloakOwner     int32
+	cloakHealCoeff float64
+	cloakRadius    float64
+
+	// revealUntil implements Op.RevealTarget (Velial's «Трибунал»): while live, this mob
+	// stays fully revealed to the marking caster's team regardless of the normal distance-
+	// based fog/hide radius (mobViewDistLocked).
+	revealUntil float64
 
 	// chillUntil is the Frost «озноб» window: re-chilling an already-chilled unit stuns it
 	// (OpChill). Purely a marker for the combo -- it carries no movement penalty of its own
@@ -89,7 +163,20 @@ func (st *unitStatus) silenced(now float64) bool { return now < st.silenceUntil 
 func (st *unitStatus) moveFactor(now float64) float64 {
 	f := 1.0
 	if now < st.slowUntil {
-		f *= st.slowFactor
+		factor := st.slowFactor
+		if st.slowFactorEnd != st.slowFactor {
+			span := st.slowUntil - st.slowStart
+			if span > 0 {
+				frac := (now - st.slowStart) / span
+				if frac < 0 {
+					frac = 0
+				} else if frac > 1 {
+					frac = 1
+				}
+				factor = st.slowFactor + (st.slowFactorEnd-st.slowFactor)*frac
+			}
+		}
+		f *= factor
 	}
 	for _, m := range st.mods {
 		if m.stat == "move_speed_pct" && (m.until == 0 || now < m.until) {
