@@ -139,6 +139,11 @@ type PendingBattle struct {
 	// alternates joiners across the two bases. Carried from Ctrl so the pre-battle
 	// «match found» roster and the actual in-battle side agree.
 	Team int32
+	// CastleID is nonzero when this launch is a «Битва за замок» siege (fought on the
+	// same map/team machinery as «Штурм», see battleserver/castle.go): it tells the
+	// Battle instance which castle to transfer ownership of and pay CastleReward for
+	// when the match ends. Zero for every other mode, including a plain «Штурм» match.
+	CastleID int32
 }
 
 type Store struct {
@@ -153,6 +158,8 @@ type Store struct {
 	clansByID    map[int32]*Clan          // clanID -> clan header (roster derived from heroes' ClanID)
 	clanInvites  map[int32]clanInvite     // invitee userID -> the one pending clan invite for them (transient)
 	clanInviteCD map[int32]int64          // invitee userID -> earliest unix time a new invite may be sent
+	castleOwner  map[int32]castleOwnerRec // castleID -> owning clan (see castle.go)
+	castleLog    map[int32][]CastleBattleRecord
 	nextClanID   int32
 	nextUserID   int32
 	path         string  // SQLite database file; "" = in-memory only
@@ -171,6 +178,8 @@ func NewStore() *Store {
 		clansByID:    map[int32]*Clan{},
 		clanInvites:  map[int32]clanInvite{},
 		clanInviteCD: map[int32]int64{},
+		castleOwner:  map[int32]castleOwnerRec{},
+		castleLog:    map[int32][]CastleBattleRecord{},
 		nextClanID:   1,
 		nextUserID:   1,
 	}
@@ -204,6 +213,10 @@ func (s *Store) LoginOrRegister(email, password string) (u *User, key string, ok
 	}
 	key = newToken()
 	s.sessions[key] = &Session{Key: key, UserID: u.ID}
+	// Persisted, so a server restart does not silently invalidate a key the client is
+	// still holding -- otherwise its next broadcast-server login is rejected and the
+	// player sees «Не удалось подключиться к серверу рассылок» on a healthy server.
+	s.saveSessionLocked(key, u.ID)
 	return u, key, true
 }
 

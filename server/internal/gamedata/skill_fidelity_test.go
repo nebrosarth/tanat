@@ -42,8 +42,12 @@ func TestOnDamagedProcsFlagged(t *testing.T) {
 		"Avtr_HK_Dutnik":       3, // «Детонация»
 		"Avtr_DPS_Nerlag":      3, // «Прилив крови»
 		"Avtr_DPS_BlackDragon": 3, // «Кровь дракона»
-		"Avtr_Dsb_Edilia":      3, // «Пыльца забвения»: slow fires on the STRIKING mob
-		"Avtr_HK_Tangren":      2, // «Контратака»: pass-7, chance-gated own-attack counter
+		// Edilia's «Пыльца забвения» used to be listed here. It is no longer an OpProc at
+		// all: the client text is one sentence («Эдилия не получает урона. При этом
+		// атакующий теряет скорость атаки»), so the block and the slow are now a single
+		// OpBlockHit -- which is on-damaged and basic-attack-only by construction. See
+		// TestEdiliaForgetfulPollenBlocksAndSlows.
+		"Avtr_HK_Tangren": 2, // «Контратака»: pass-7, chance-gated own-attack counter
 		"Avtr_Sp_Neirofim":     2, // «Обращение энергии»: pass-8, SkillOnly reactive heal+mana+nova
 	}
 	for prefab, slot := range want {
@@ -422,11 +426,16 @@ func TestRognarRemakes(t *testing.T) {
 	}
 }
 
-// TestGellarArmySouls: «Армия душ» halves souls on cast and scales its waves with soul count.
+// TestGellarArmySouls: «Армия душ» keeps its original timed volley cadence (the hit count
+// is unchanged) and scales each strike's damage with the live soul count (PerSoul). The
+// short/lobby description never mentions spending any souls to cast it, so it does not (no
+// OpConsumeSouls): the army is released, not paid for. How many soul PARTICLES the client
+// draws per burst is a separate, purely visual concern (the EFFECT_START "counter" arg --
+// see fxStartCounterLocked), not the hit count.
 func TestGellarArmySouls(t *testing.T) {
 	sk := skillOf(t, "Avtr_DPS_Gellar", 4)
-	if !anyOp(sk.Ops, func(o Op) bool { return o.Kind == OpConsumeSouls }) {
-		t.Error("Gellar «Армия душ» must spend (halve) souls on cast (OpConsumeSouls)")
+	if anyOp(sk.Ops, func(o Op) bool { return o.Kind == OpConsumeSouls }) {
+		t.Error("Gellar «Армия душ» must not spend/halve souls to cast -- the card never says it does")
 	}
 	if !anyOp(sk.Ops, func(o Op) bool { return o.Kind == OpDamage && o.PerSoul.At(1) > 0 }) {
 		t.Error("Gellar «Армия душ» damage must scale with soul count (PerSoul)")
@@ -975,12 +984,34 @@ func TestWilfangPoisonBiteTickIsInertExplosionScalesWithSP(t *testing.T) {
 	}
 }
 
-// TestPlusMinusElectricShockGrowsWithDistance: the ring nova must deal MORE damage to
-// farther enemies (Op.PerTargetGrowth), not a single flat number for everyone in radius.
+// TestPlusMinusElectricShockGrowsWithDistance: «Чем дальше находится враг от эпицентра,
+// тем больший урон он получает» -- a CONTINUOUS function of each target's own distance
+// (Op.EdgeValue), not an ordinal per-target-index bonus (Op.PerTargetGrowth borrowed from
+// Nerlag's throw): two enemies standing at the same spot must take the SAME damage no
+// matter how many others the blast also caught.
 func TestPlusMinusElectricShockGrowsWithDistance(t *testing.T) {
 	sk := skillOf(t, "Avtr_Dsb_PlusMinus", 1)
-	if !anyOp(sk.Ops, func(o Op) bool { return o.Kind == OpDamage && o.PerTargetGrowth.At(0) > 0 }) {
-		t.Error("PlusMinus «Электрошок» must carry PerTargetGrowth>0 (farther enemy = more damage)")
+	if !anyOp(sk.Ops, func(o Op) bool { return o.Kind == OpDamage && len(o.EdgeValue) > 0 }) {
+		t.Error("PlusMinus «Электрошок» must carry EdgeValue (continuous distance-based growth)")
+	}
+	if anyOp(sk.Ops, func(o Op) bool { return o.Kind == OpDamage && o.PerTargetGrowth.At(0) > 0 }) {
+		t.Error("PlusMinus «Электрошок» must not use ordinal PerTargetGrowth: same spot, same damage, regardless of who else got hit")
+	}
+	// The edge must exceed the center, and both ends must match the card's own numbers.
+	sk1 := skillOf(t, "Avtr_Dsb_PlusMinus", 1)
+	for _, o := range sk1.Ops {
+		if o.Kind != OpDamage {
+			continue
+		}
+		if o.EdgeValue.At(1) <= o.Value.At(1) {
+			t.Errorf("edge damage %g must exceed center damage %g", o.EdgeValue.At(1), o.Value.At(1))
+		}
+		if o.Value.At(1) != 80 || o.EdgeValue.At(1) != 140 {
+			t.Errorf("rank 1: center=%g edge=%g, want the card's 80..140", o.Value.At(1), o.EdgeValue.At(1))
+		}
+		if o.PerSP != 1 || o.EdgeValueSP != 1 {
+			t.Errorf("spell-power coefficients = %g..%g, want the card's 1x..1x at both ends", o.PerSP, o.EdgeValueSP)
+		}
 	}
 }
 
@@ -1066,13 +1097,32 @@ func TestVelialCrueltyDamageScalesWithSP(t *testing.T) {
 	}
 }
 
-// TestEdiliaForgetfulPollenSlowIsBasicAttackOnly: client's «При получении удара от базовой
-// атаки» scopes the retaliation slow to basic attacks - it must not fire off arbitrary skill
-// damage landing on Edilia.
-func TestEdiliaForgetfulPollenSlowIsBasicAttackOnly(t *testing.T) {
+// TestEdiliaForgetfulPollenBlocksAndSlows: the client's «При получении удара от базовой
+// атаки, Эдилия не получает урона. При этом атакующий теряет скорость атаки на 50% в
+// течение 1 секунды» is ONE mechanic -- a guaranteed block of a basic attack that also
+// slows whoever threw it, gated by the card's only number, «{cooldown} время перезарядки».
+// It was previously modelled as a dodge CHANCE plus a separate retaliation proc, which is
+// how the cooldown could burn on hits that were never actually blocked.
+func TestEdiliaForgetfulPollenBlocksAndSlows(t *testing.T) {
 	sk := skillOf(t, "Avtr_Dsb_Edilia", 3)
-	if !anyOp(sk.Ops, func(o Op) bool { return o.Kind == OpProc && o.OnDamaged && o.BasicAttackOnly }) {
-		t.Error("Edilia «Пыльца забвения» retaliation-slow proc must carry BasicAttackOnly:true")
+	var block *Op
+	for i := range sk.Ops {
+		if sk.Ops[i].Kind == OpBlockHit {
+			block = &sk.Ops[i]
+		}
+	}
+	if block == nil {
+		t.Fatal("Edilia «Пыльца забвения» must negate the hit outright (OpBlockHit)")
+	}
+	if block.Dur.At(1) <= 0 {
+		t.Error("the block needs an internal cooldown, or it would stop every attack forever")
+	}
+	if !anyOp(block.Ops, func(o Op) bool { return o.Kind == OpAttackSlow }) {
+		t.Error("the block must also slow the attacker («атакующий теряет скорость атаки»)")
+	}
+	// No leftover dodge chance: the client text names no percentage anywhere.
+	if anyOp(sk.Ops, func(o Op) bool { return o.Kind == OpBuffStat && o.Stat == "dodge_pct" }) {
+		t.Error("«Пыльца забвения» must not also grant a dodge chance -- the client text has none")
 	}
 }
 

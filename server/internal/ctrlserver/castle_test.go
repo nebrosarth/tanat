@@ -1,6 +1,7 @@
 package ctrlserver
 
 import (
+	"net"
 	"net/http/httptest"
 	"strconv"
 	"testing"
@@ -8,6 +9,7 @@ import (
 	"tanatserver/internal/amf"
 	"tanatserver/internal/ctrlproto"
 	"tanatserver/internal/gamedata"
+	"tanatserver/internal/mpd"
 )
 
 func castlePost(t *testing.T, url, sess, action string, params *amf.MixedArray, counter int32) *amf.MixedArray {
@@ -44,8 +46,8 @@ func TestCastleListShape(t *testing.T) {
 	if !ok {
 		t.Fatalf("castles not keyed by id string %d", first.ID)
 	}
-	if name, _ := entry.GetString("name"); name != first.Name {
-		t.Errorf("castle name = %q, want %q", name, first.Name)
+	if name, _ := entry.GetString("name"); name != first.NameKey {
+		t.Errorf("castle name = %q, want locale key %q", name, first.NameKey)
 	}
 	if _, ok := entry.GetInt("start_time"); !ok {
 		t.Error("castle entry missing start_time")
@@ -144,6 +146,149 @@ func TestCastleEnrollDesert(t *testing.T) {
 	fmap2, _ := fr2.GetArray("fighters")
 	if _, ok := fmap2.GetInt(strconv.Itoa(int(id))); ok {
 		t.Error("fighter still enrolled after desert")
+	}
+}
+
+// TestCastleBattleWindowDraftAndLaunch drives the full scheduler-fired flow over HTTP +
+// MPD: a fighter enrolls, the scheduler is fast-forwarded to fire the battle window,
+// the fighter receives castle|start_request + select_avatar_timer, picks an avatar,
+// readies, and gets castle|launch backed by a PendingBattle tagged with the castle.
+func TestCastleBattleWindowDraftAndLaunch(t *testing.T) {
+	srv := New()
+	hub := mpd.NewHub(srv.Store)
+	srv.MPD = hub
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { ln.Close() })
+	go hub.Serve(ln)
+	mpdAddr := ln.Addr().String()
+
+	ts := httptest.NewServer(srv.Handler())
+	defer ts.Close()
+	url := ts.URL + "/entry_point.php"
+
+	id, sid := clanLogin(t, url, "besieger@example.com", 1)
+	u, _ := srv.Store.ByID(id)
+	srv.Store.CreateHero(u, 1, false, 0, 0, 0, 0, 0)
+
+	fighters := amf.NewArray().Set(strconv.Itoa(int(id)), int32(1))
+	castlePost(t, url, sid, "set_fighters",
+		amf.NewArray().Set("castle_id", int32(1)).Set("fighters", fighters), 2)
+
+	_, br := dialMPD(t, mpdAddr, id, sid)
+
+	// Fast-forward the scheduler well past castle 1's countdown.
+	srv.tickCastles(999999)
+
+	sr := readPushArgs(t, br, "castle|start_request")
+	if cid, _ := sr.GetInt("castle_id"); cid != 1 {
+		t.Errorf("start_request castle_id = %d, want 1", cid)
+	}
+	fmap, ok := sr.GetArray("fighters")
+	if !ok {
+		t.Fatal("start_request missing fighters")
+	}
+	if _, ok := fmap.GetArray(strconv.Itoa(int(id))); !ok {
+		t.Error("start_request fighters missing the enrolled fighter")
+	}
+	timerArgs := readPushArgs(t, br, "castle|select_avatar_timer")
+	if tm, _ := timerArgs.GetInt("time"); tm != castleSelectTimeoutSec {
+		t.Errorf("select_avatar_timer time = %d, want %d", tm, castleSelectTimeoutSec)
+	}
+
+	if !srv.castleInProgress(1) {
+		t.Error("castle 1 should show in_progress once the window has fired")
+	}
+
+	// Pick an avatar.
+	av := gamedata.Avatars()[0]
+	sa, _ := castlePost(t, url, sid, "select_avatar", amf.NewArray().Set("avatar_id", av.ID), 3).
+		GetArray(ctrlproto.CmdKey("castle", "select_avatar"))
+	if st, _ := sa.GetInt("status"); st != ctrlproto.StatusOK {
+		t.Fatalf("select_avatar status = %d", st)
+	}
+	readPushArgs(t, br, "castle|select_avatar") // roster-tile broadcast
+
+	// Ready -> launch.
+	rd, _ := castlePost(t, url, sid, "ready", amf.NewArray(), 4).
+		GetArray(ctrlproto.CmdKey("castle", "ready"))
+	if st, _ := rd.GetInt("status"); st != ctrlproto.StatusOK {
+		t.Fatalf("ready status = %d", st)
+	}
+	readPushArgs(t, br, "castle|ready")
+	c1 := gamedata.Castles()[0]
+	launch := readPushArgs(t, br, "castle|launch")
+	if mid, _ := launch.GetInt("map_id"); mid != c1.MapID {
+		t.Errorf("launch map_id = %d, want %d", mid, c1.MapID)
+	}
+	if scene, _ := launch.GetString("scene"); scene != c1.Scene {
+		t.Errorf("launch scene = %q, want %q", scene, c1.Scene)
+	}
+
+	pb, ok := srv.Store.TakePendingBattle(id)
+	if !ok {
+		t.Fatal("no PendingBattle stored after castle|ready")
+	}
+	if pb.CastleID != 1 {
+		t.Errorf("PendingBattle.CastleID = %d, want 1", pb.CastleID)
+	}
+	if pb.AvatarID != av.ID {
+		t.Errorf("PendingBattle.AvatarID = %d, want %d", pb.AvatarID, av.ID)
+	}
+
+	if srv.castleInProgress(1) {
+		t.Error("castle 1 should no longer be in_progress once the only fighter has readied")
+	}
+}
+
+// TestCastleDesertBattleLeavesDraft: castle|desert_battle clears the in-flight
+// selection without touching the (separate) registration roster.
+func TestCastleDesertBattleLeavesDraft(t *testing.T) {
+	srv := New()
+	ts := httptest.NewServer(srv.Handler())
+	defer ts.Close()
+	url := ts.URL + "/entry_point.php"
+
+	id, sid := clanLogin(t, url, "waverer@example.com", 1)
+	u, _ := srv.Store.ByID(id)
+	srv.Store.CreateHero(u, 1, false, 0, 0, 0, 0, 0)
+	fighters := amf.NewArray().Set(strconv.Itoa(int(id)), int32(1))
+	castlePost(t, url, sid, "set_fighters",
+		amf.NewArray().Set("castle_id", int32(1)).Set("fighters", fighters), 2)
+
+	srv.tickCastles(999999)
+	if !srv.castleInProgress(1) {
+		t.Fatal("window did not fire")
+	}
+
+	db, _ := castlePost(t, url, sid, "desert_battle", amf.NewArray(), 3).
+		GetArray(ctrlproto.CmdKey("castle", "desert_battle"))
+	if st, _ := db.GetInt("status"); st != ctrlproto.StatusOK {
+		t.Fatalf("desert_battle status = %d", st)
+	}
+	if srv.castleInProgress(1) {
+		t.Error("desert_battle should clear the draft selection")
+	}
+	// The registration roster itself is untouched by desert_battle.
+	if !srv.castleContains(1, id) {
+		t.Error("desert_battle should not remove the fighter from the registration roster")
+	}
+}
+
+// TestCastleWindowWithNoFightersResetsQuietly: an empty roster lets the battle window
+// pass with no draft and no crash; the countdown still resets for the next window.
+func TestCastleWindowWithNoFightersResetsQuietly(t *testing.T) {
+	srv := New()
+	before := srv.castleCountdownRemaining(gamedata.Castles()[0])
+	srv.tickCastles(before + 1)
+	if srv.castleInProgress(1) {
+		t.Error("an empty roster should never start a draft")
+	}
+	after := srv.castleCountdownRemaining(gamedata.Castles()[0])
+	if after <= 0 {
+		t.Errorf("countdown after an empty window = %d, want it reset to a positive CycleSec", after)
 	}
 }
 

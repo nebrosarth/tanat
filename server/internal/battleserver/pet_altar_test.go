@@ -326,7 +326,8 @@ func TestPetTickIgnoresEnemiesAndDoesNotEscort(t *testing.T) {
 
 	// Positive control: ordered onto that same enemy, it fights through the same tick.
 	s.orderPetsAttackLocked(c, enemy.id)
-	s.tickSummonsLocked(c, now+0.1)
+	s.tickSummonsLocked(c, now+0.1)                        // swing starts
+	s.tickSummonsLocked(c, now+0.1+summonStrikeFrac+0.01)  // ...and connects late in it
 	if enemy.hp >= 500 {
 		t.Errorf("an ORDERED pet did not attack (hp %g) -- the test above proves nothing", enemy.hp)
 	}

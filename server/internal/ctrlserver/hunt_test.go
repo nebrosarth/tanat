@@ -36,14 +36,22 @@ func TestHuntMatchmakingFlow(t *testing.T) {
 	// arena|get_maps_info must list every hunt map (type_id 4) AND every «Штурм»
 	// (DOTA, type_id 1) AND every «Арена» (DM, type_id 0) map -- FightHelper.FindMapById
 	// needs all of them so JoinBattle can route by mType, and a mode whose maps are
-	// missing here shows an EMPTY tab in the start-battle menu.
+	// missing here shows an EMPTY tab in the start-battle menu. CastleOnly maps
+	// (map_6_0, «Битва за замок») are the one exception: reachable only through
+	// castle|ready's scheduled window, never through this general menu.
 	mi, _ := postEnvelope(t, url, mkReq("arena", "get_maps_info", amf.NewArray(), 2)).
 		GetArray(ctrlproto.CmdKey("arena", "get_maps_info"))
 	if mi == nil {
 		t.Fatal("no arena|get_maps_info response")
 	}
 	maps, ok := mi.GetArray("maps_info")
-	wantMaps := len(gamedata.HuntMaps()) + len(gamedata.DotaMaps()) + len(gamedata.ArenaMaps())
+	dotaMenuMaps := 0
+	for _, m := range gamedata.DotaMaps() {
+		if !m.CastleOnly {
+			dotaMenuMaps++
+		}
+	}
+	wantMaps := len(gamedata.HuntMaps()) + dotaMenuMaps + len(gamedata.ArenaMaps())
 	if !ok || len(maps.Dense) != wantMaps {
 		t.Fatalf("maps_info: want %d dense entries, got %#v", wantMaps, mi.Assoc)
 	}

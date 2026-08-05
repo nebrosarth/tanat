@@ -124,6 +124,7 @@ func (s *Store) SetBanned(userID int32, banned bool) bool {
 		for k, sess := range s.sessions {
 			if sess.UserID == userID {
 				delete(s.sessions, k)
+				s.dropSessionLocked(k) // ...and from the DB, or a restart would revive it
 			}
 		}
 	}
@@ -146,6 +147,7 @@ func (s *Store) InvalidateSession(key string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	delete(s.sessions, key)
+	s.dropSessionLocked(key)
 }
 
 // DeleteAccount permanently removes an account: one DELETE FROM users cascades to

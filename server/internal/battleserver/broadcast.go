@@ -166,11 +166,17 @@ func (s *Server) pushAvatarAllLocked(c *conn, cmd battleproto.CmdID, args *amf.M
 // all clients. Returns the id (0 if fx is empty). Outside an instance it falls
 // back to the per-connection path (owner-only), identical to fxStartLocked.
 func (s *Server) worldFxStartLocked(c *conn, fx string, owner, target int32, hasPos bool, px, py float32) int32 {
+	return s.worldFxStartCounterLocked(c, fx, owner, target, hasPos, px, py, 0)
+}
+
+// worldFxStartCounterLocked is worldFxStartLocked plus a "counter" wire arg -- see
+// fxStartCounterLocked's doc comment for what the client does with it.
+func (s *Server) worldFxStartCounterLocked(c *conn, fx string, owner, target int32, hasPos bool, px, py float32, counter int32) int32 {
 	if fx == "" {
 		return 0
 	}
 	if c.inst == nil {
-		return s.fxStartLocked(c, fx, owner, target, hasPos, px, py)
+		return s.fxStartCounterLocked(c, fx, owner, target, hasPos, px, py, counter)
 	}
 	c.inst.nextFxUID++
 	uid := c.inst.nextFxUID
@@ -180,6 +186,9 @@ func (s *Server) worldFxStartLocked(c *conn, fx string, owner, target int32, has
 	}
 	if hasPos {
 		args.Set("targetPos", amf.NewArray().Set("x", float64(px)).Set("y", float64(py)))
+	}
+	if counter > 1 {
+		args.Set("counter", counter)
 	}
 	p := amf.NewArray().Set("effect", uid).Set("owner", owner).Set("fx", fx).Set("args", args)
 	for _, mem := range c.members() {

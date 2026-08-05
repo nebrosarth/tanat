@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"encoding/hex"
 	"log"
+	"os"
 	"strconv"
 
 	"tanatserver/internal/amf"
@@ -12,6 +13,19 @@ import (
 	"tanatserver/internal/gamedata"
 	"tanatserver/internal/session"
 )
+
+// castleTestMapExposed is a manual-testing escape hatch: with TANAT_CASTLE_TEST_MAP=1
+// set, gamedata.DotaMap.CastleOnly maps (map_6_0, «Битва за замок») are shown under
+// the «Штурм» tab and joinable via fight|join like any other map -- so the siege
+// mechanics (structures, navmesh, gun-siege win check) can be exercised solo/on demand
+// instead of waiting for castle|ready's scheduled window. OFF by default: a normal
+// server run keeps the map reachable only through the real castle flow, which is what
+// wires up team/ownership/reward. Read fresh (not cached) so tests can toggle it with
+// t.Setenv, matching the env-var-gated debug aids in battleserver (HUNT_CALIBRATE,
+// TANAT_HUNT_START_LEVEL) -- this project's established pattern for "for test" toggles.
+func castleTestMapExposed() bool {
+	return os.Getenv("TANAT_CASTLE_TEST_MAP") == "1"
+}
 
 // This file implements the "Охота" (Hunt, MapType=4) matchmaking flow -- the
 // only game mode that runs entirely over the Ctrl channel, with no MPD push
@@ -50,6 +64,9 @@ func (s *Server) handleArenaMapsInfoReal(req ctrlproto.Request, resp *ctrlproto.
 	// accept in fight|join, and its mType (=type_id) is what routes JoinBattle down
 	// the fight|* (not hunt|*) path.
 	for _, m := range gamedata.DotaMaps() {
+		if m.CastleOnly && !castleTestMapExposed() {
+			continue // «Битва за замок» is reached only via castle|ready's scheduled window, never this menu
+		}
 		maps.Add(amf.NewArray().
 			Set("id", m.ID).
 			Set("type_id", gamedata.MapTypeDota).
@@ -121,6 +138,9 @@ func (s *Server) handleArenaGetMaps(req ctrlproto.Request, resp *ctrlproto.Respo
 	}
 	if mapType == gamedata.MapTypeDota {
 		for _, m := range gamedata.DotaMaps() {
+			if m.CastleOnly && !castleTestMapExposed() {
+				continue
+			}
 			maps.Set(strconv.Itoa(int(m.ID)), amf.NewArray().
 				Set("name", m.Name).
 				Set("scene", m.Scene).

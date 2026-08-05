@@ -94,6 +94,13 @@ type dotaState struct {
 
 	ended  bool
 	winner int32
+
+	// castleID is nonzero when this «Штурм»-shaped match is actually a «Битва за
+	// замок» siege (PendingBattle.CastleID, set by ctrlserver's castle scheduler --
+	// see castle.go). Everything else about the instance (structures, teams, win
+	// check) is identical to a plain «Штурм» match; this field is only consulted at
+	// the very end, in dotaEndLocked, to run the castle-specific payout.
+	castleID int32
 }
 
 // teamForSide maps a baked map side to its ABSOLUTE in-battle team: Human -> team 1,
@@ -223,6 +230,16 @@ func newDotaInstance(s *Server, id, mapID int32) *huntInstance {
 			d.nextWave[ms.id] = float64(s.battleTime()) + gamedata.CreepFirstWave
 		}
 	}
+	// Give every standalone creep camp the same first-wave grace as a barracks --
+	// without this, an un-seeded d.nextWave key defaults to zero and the camp's very
+	// first wave fires on tick 1 instead of after CreepFirstWave.
+	for i := range dm.CreepCamps {
+		d.nextWave[dotaCampWaveIDBase+int32(i)] = float64(s.battleTime()) + gamedata.CreepFirstWave
+	}
+	if dm.Boss != nil {
+		boss := newDotaBossGuard(*dm.Boss)
+		inst.mobs[boss.id] = boss
+	}
 	d.instMobs = inst.mobs
 	// Resolve each altar's base-cannon guard set from the map geometry, keyed by object id so
 	// altarVulnerableLocked never has to re-derive it. The altar opens once these -- and only
@@ -282,6 +299,50 @@ func newDotaStructure(sc gamedata.DotaStructure, team int32) *mobState {
 		hasProj: sc.Role == gamedata.DotaGun,
 	}
 	return m
+}
+
+// dotaBossID is the object id for a DotaMap.Boss guardian (one per map today --
+// map_6_0's Cerber). Clear of structures (dotaStructIDBase 50000+, well under a
+// hundred of them) and creeps (dotaCreepIDBase 60000+).
+const dotaBossID int32 = 70000
+
+// newDotaBossGuard builds the mobState for a DotaMap.Boss: a hand-tuned mob-roster
+// entry (bosses are exempt from level scaling -- Health/damage/XP/coins are used
+// exactly as authored) planted at a fixed point. Routed through the STATIONARY
+// attacker pipeline (dotaStructCombatLocked, via structure=true) rather than the
+// creep chase/march pipeline: the DOTA tick has no leash-to-home logic for a roaming
+// unit, so a planted guard is the reliable path -- identical machinery to a cannon.
+// dotaRole is DotaGenerator (not DotaGun), so he is never counted by
+// castleCheckWinLocked -- a bonus target, never a gate on the win condition.
+func newDotaBossGuard(b gamedata.DotaBossSpawn) *mobState {
+	mob := gamedata.MobByIndex(b.MobIdx)
+	mob.Stationary = true
+	if mob.AttackRange <= 0 {
+		// A melee boss (Cerber has none baked -- the roster's AttackRange field is only
+		// set for ranged mobs) needs SOME reach for the structure pipeline to ever pick
+		// a target: dotaStructCombatLocked's acquire radius is m.mob.AttackRange
+		// directly, with no melee fallback of its own (every real gun/tower already
+		// bakes a real range). Boss-sized melee reach, matching his CollisionRadius.
+		mob.AttackRange = 3.0
+	}
+	return &mobState{
+		id: dotaBossID, mobIdx: b.MobIdx, mob: mob,
+		x: float32(b.X), y: float32(b.Z),
+		spawnX: float32(b.X), spawnY: float32(b.Z),
+		homed: false, // never moves in the first place -- see the routing note above
+		hp:    mob.Health, maxHP: mob.Health,
+		dmgMin: float64(mob.DmgMin), dmgMax: float64(mob.DmgMax),
+		// mobState.xpReward/coinReward fall back to these (not m.mob.XP/Coins) once
+		// maxHP > 0 -- unlike newDotaStructure's guns/altars (which leave them at zero,
+		// so a Штурм structure kill currently pays nothing), the boss is meant to be a
+		// real bounty target, so they're set explicitly, exactly like a creep spawn.
+		xp: mob.XP, coins: mob.Coins,
+		team: teamForSide(b.Side), structure: true,
+		dotaRole: gamedata.DotaGenerator, dotaPrefab: mob.Prefab,
+		// Cerber is melee; a ranged DotaBossSpawn would need hasProj wired to whatever
+		// projectile pool its prefab ships -- not needed yet, only Cerber exists.
+		hasProj: false,
+	}
 }
 
 // dotaWorldSetupLocked registers the DOTA object prototypes on the joining member and
@@ -557,15 +618,23 @@ func (s *Server) dotaLandHitLocked(rep *conn, m *mobState, now float64) {
 // (the end screen colours team 1 blue, team 2 red). Sends BATTLE_END once to everyone.
 func (s *Server) dotaCheckWinLocked(rep *conn, now float64) {
 	var humanAltar, elfAltar *mobState
+	anyAltar := false
 	for _, m := range rep.inst.mobs {
 		if !m.structure || !m.altar {
 			continue
 		}
+		anyAltar = true
 		if m.team == dotaTeamElf {
 			elfAltar = m
 		} else {
 			humanAltar = m
 		}
+	}
+	if !anyAltar {
+		// «Битва за замок» (map_6_0): no altar exists on this map at all -- the win
+		// condition is "every defending gun destroyed" instead. See castle.go.
+		s.castleCheckWinLocked(rep, now)
+		return
 	}
 	switch {
 	case humanAltar == nil || humanAltar.dead:
@@ -587,10 +656,20 @@ func (s *Server) dotaEndLocked(rep *conn, winner int32, now float64) {
 	for _, mem := range rep.inst.members {
 		s.push(mem, battleproto.CmdBattleEnd, amf.NewArray().Set("id", winner))
 	}
+	if d.castleID != 0 {
+		s.settleCastleBattleLocked(rep.inst, d.castleID, winner)
+	}
 }
 
-// dotaSpawnWavesLocked releases a creep wave from each live BARRACKS on its cadence.
-// A dead barracks stops its lane -- the reason the map places one per lane.
+// dotaCampWaveIDBase is the d.nextWave key space for standalone DotaCreepCamps
+// (map_6_0), clear of every real structure's mobState id (dotaStructIDBase 50000 +
+// at most a few dozen) and the creep id counter (dotaCreepIDBase 60000+).
+const dotaCampWaveIDBase int32 = 90000
+
+// dotaSpawnWavesLocked releases a creep wave from each live BARRACKS on its cadence
+// (a dead barracks stops its lane -- the reason the map places one per lane), plus
+// every standalone DotaCreepCamp (map_6_0's un-structured creep spawns -- these have
+// no structure to kill, so they fire on the same cadence for the whole match).
 func (s *Server) dotaSpawnWavesLocked(rep *conn, now float64) {
 	d := rep.inst.dota
 	for _, sc := range d.m.Structures {
@@ -606,6 +685,14 @@ func (s *Server) dotaSpawnWavesLocked(rep *conn, now float64) {
 		}
 		d.nextWave[bar.id] = now + gamedata.CreepWaveInterval
 		s.dotaSpawnCreepWaveLocked(rep, sc, now)
+	}
+	for i, camp := range d.m.CreepCamps {
+		key := dotaCampWaveIDBase + int32(i)
+		if now < d.nextWave[key] {
+			continue
+		}
+		d.nextWave[key] = now + gamedata.CreepWaveInterval
+		s.dotaSpawnCreepWaveFromCampLocked(rep, camp, now)
 	}
 }
 
@@ -662,14 +749,33 @@ func (s *Server) dotaSpawnCreepWaveLocked(rep *conn, bar gamedata.DotaStructure,
 		log.Printf("battle: «Штурм» barracks %d (%s) matches no lane, wave skipped", bar.ID, bar.Prefab)
 		return
 	}
+	s.spawnCreepWaveLocked(rep, bar.X, bar.Z, bar.Side, li, now)
+}
+
+// dotaSpawnCreepWaveFromCampLocked spawns one un-structured DotaCreepCamp's wave
+// (map_6_0) -- the same marching squad, just anchored to a bare point instead of a
+// killable barracks.
+func (s *Server) dotaSpawnCreepWaveFromCampLocked(rep *conn, camp gamedata.DotaCreepCamp, now float64) {
+	if camp.Lane < 0 || camp.Lane >= len(rep.inst.dota.m.Lanes) {
+		log.Printf("battle: castle creep camp at (%.1f,%.1f) matches no lane, wave skipped", camp.X, camp.Z)
+		return
+	}
+	s.spawnCreepWaveLocked(rep, camp.X, camp.Z, camp.Side, camp.Lane, now)
+}
+
+// spawnCreepWaveLocked is the shared squad-spawn core for both a barracks wave and a
+// castle creep-camp wave: CreepsPerWave troops onto lane index li, marching in side's
+// direction from (x,z), then rendered on every member's client.
+func (s *Server) spawnCreepWaveLocked(rep *conn, x, z float64, side gamedata.DotaSide, li int, now float64) {
+	d := rep.inst.dota
 	lane := d.m.Lanes[li]
-	melee, ranged := d.m.CreepMobIdx(bar.Side)
-	team := teamForSide(bar.Side)
-	fwd := bar.Side == gamedata.DotaSideHuman // human marches lane forward, elf reverses
-	entry := laneEntryIdx(lane, bar.X, bar.Z, fwd)
+	melee, ranged := d.m.CreepMobIdx(side)
+	team := teamForSide(side)
+	fwd := side == gamedata.DotaSideHuman // human marches lane forward, elf reverses
+	entry := laneEntryIdx(lane, x, z, fwd)
 	for i := 0; i < gamedata.CreepsPerWave; i++ {
 		// Mostly melee with an archer in the ranks; the lane and parity terms rotate which
-		// slot he is, so the three lanes don't leave in lockstep formation.
+		// slot he is, so repeated waves don't leave in lockstep formation.
 		idx := melee
 		if (i+li+d.waveParity)%archerEveryNth == archerEveryNth-1 {
 			idx = ranged
@@ -678,11 +784,11 @@ func (s *Server) dotaSpawnCreepWaveLocked(rep *conn, bar gamedata.DotaStructure,
 		d.nextCreep++
 		// Fan the spawn a touch so they don't stack on one point.
 		off := float32(i) * 0.8
-		px, py := float32(bar.X)+off, float32(bar.Z)-off
+		px, py := float32(x)+off, float32(z)-off
 		cm := &mobState{
 			id: d.nextCreep, mobIdx: idx, mob: mob,
 			x: px, y: py,
-			// A creep is HOMELESS: a barracks produced it, it marches a one-way lane and
+			// A creep is HOMELESS: its spawn produced it, it marches a one-way lane and
 			// it is deleted on death -- it never leashes, is never evicted and never
 			// respawns. spawnX/spawnY are still filled in so that no shared Hunt pass that
 			// reaches for a home can read the zero value and fling it to the map origin,

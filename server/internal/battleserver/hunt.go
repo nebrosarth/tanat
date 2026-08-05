@@ -564,6 +564,13 @@ type huntState struct {
 	toggleFx        [4]int32
 	toggleNextPulse [4]float64
 
+	// castFx[slot-1] collects the client effect uids the CURRENT cast of that slot
+	// started (its cast fx and its payload fx). Only a channel reads them, and only to
+	// end them when the channel breaks early -- the client's looping cast animation and
+	// its shot spawner keep running until an EFFECT_END arrives. Reset at each cast, so
+	// a stale uid from a previous cast can never be ended.
+	castFx [4][]int32
+
 	// growFx[slot-1] is the live EFFECT_START uid of a passive's per-level model-
 	// grow VFX (Titanid "Гигантизм"); ended and restarted a size up on upgrade.
 	growFx [4]int32
@@ -601,6 +608,13 @@ type huntState struct {
 	reviveReadyAt   float64
 	ccImmuneSlot    int
 	ccImmuneReadyAt float64
+	// blockHitSlot is the 1-based slot of a learned PASSIVE carrying an OpBlockHit
+	// (Edilia's «Пыльца забвения»), 0 = none. blockHitReadyAt is when it can block again.
+	// Honored at the TOP of hitPlayerFromLocked -- the one place both a melee swing and an
+	// arriving projectile pass through -- so the negation covers every basic attack, not
+	// just the melee arm.
+	blockHitSlot    int
+	blockHitReadyAt float64
 	// tempCCImmuneUntil is a battle-time deadline for a CAST-GRANTED (not passive) window of
 	// full CC immunity -- Arianna's «Щит хранителя»: «щит дает полную неуязвимость к
 	// магическому урону, оглушению и замедлению». Unlike ccImmuneSlot's consume-then-cooldown
@@ -685,10 +699,15 @@ type huntState struct {
 	recoilUntil float64
 	// manaShot* implement Op.AttackManaBonus (Miriam's «Зачарованные стрелы»): while
 	// now < manaShotUntil, a swing that can afford manaShotCost mana instead deals
-	// manaShotDmg extra flat damage, consuming that mana.
+	// manaShotDmg extra flat damage, consuming that mana. It is a TOGGLE («При действии
+	// навыка...» -- the client text never gives a duration, only a per-shot mana cost),
+	// so manaShotUntil is armed to a far horizon on toggle-on and manaShotSlot remembers
+	// which slot owns it, so toggle-off (player click, mana starvation, death) can zero it
+	// immediately instead of it running out on its own.
 	manaShotUntil float64
 	manaShotCost  float64
 	manaShotDmg   float64
+	manaShotSlot  int
 	// hitStack* implement Op.HitStack (Gayal's «Меч жажды»): while now < hitStackUntil,
 	// each landing basic attack adds a stack (+hitStackLSPer lifesteal_pct, +hitStackSpdPer
 	// attack_speed_pct, both reflected live via a refreshed statMod), up to hitStackCap; on
@@ -1225,6 +1244,9 @@ func (s *Server) sendHuntWorldState(c *conn, name string) {
 		hs.team = teamForSide(side)
 		dx, dy := c.inst.dota.sideSpawn(side)
 		c.x, c.y = float32(dx), float32(dy)
+		if pb.CastleID != 0 {
+			c.inst.dota.castleID = pb.CastleID // «Битва за замок»: settle on this room at match end
+		}
 	}
 	sx, sy := c.x, c.y
 	// Start checkpoint = the battle-start Reborn_point (the spawn). The first tick
@@ -1411,6 +1433,8 @@ func (s *Server) sendHuntWorldState(c *conn, name string) {
 				}
 			case gamedata.OpRevive:
 				hs.reviveSlot = i + 1
+			case gamedata.OpBlockHit:
+				hs.blockHitSlot = i + 1
 			case gamedata.OpImmune:
 				hs.ccImmuneSlot = i + 1
 			case gamedata.OpCleanseOnHit:
@@ -2692,15 +2716,22 @@ func (s *Server) hitMobFlagsLocked(c *conn, ms *mobState, dmg float64, damager i
 		ms.st.killMarkUntil, ms.st.killMarkOwner, ms.st.killMarkOps, ms.st.killMarkLevel, ms.st.killMarkSlot
 	// Op.ExplodeOnDeath (Wilfang's «Ядовитый укус»): read the poison-explosion state
 	// before ms.st is wiped below.
-	poisonExplodeUntil, poisonExplodeOwner, poisonExplodeDmg, poisonExplodeRadius :=
-		ms.st.poisonExplodeUntil, ms.st.poisonExplodeOwner, ms.st.poisonExplodeDmg, ms.st.poisonExplodeRadius
+	poisonExplodeUntil, poisonExplodeOwner, poisonExplodeDmg, poisonExplodeRadius, poisonExplodeFx :=
+		ms.st.poisonExplodeUntil, ms.st.poisonExplodeOwner, ms.st.poisonExplodeDmg, ms.st.poisonExplodeRadius, ms.st.poisonExplodeFx
+	// Clear status fx on the corpse (world-scoped -> ended on every viewer) BEFORE the
+	// kill is announced. Order matters for anything that suppresses the body's animation:
+	// Frost's ice block carries a FreezeEffect, which DISABLES the encased unit's
+	// Animation component in Start() and only re-enables it in OnDisable(). Announce the
+	// kill first and the client asks a frozen model to play its death clip -- it cannot,
+	// so the corpse just stands there until the block is torn down and the body is
+	// reaped, which is exactly the «стоят на месте, затем исчезают» report.
+	for _, uid := range []int32{ms.st.stunFx, ms.st.rootFx, ms.st.slowFx, ms.st.atkSlowFx, ms.st.silenceFx, ms.st.dotFx, ms.st.riderFx} {
+		s.worldFxEndLocked(c, uid)
+	}
+	ms.st.riderFx = 0
 	s.broadcastObjLocked(c, ms.id, battleproto.CmdOnKill, amf.NewArray().
 		Set("killer", killer.objID).Set("id", ms.id))
 	s.syncMobHealthLocked(c, ms)
-	// Clear any status fx on the corpse (world-scoped -> ended on every viewer).
-	for _, uid := range []int32{ms.st.stunFx, ms.st.rootFx, ms.st.slowFx, ms.st.atkSlowFx, ms.st.silenceFx, ms.st.dotFx} {
-		s.worldFxEndLocked(c, uid)
-	}
 	// A ground-anchored barrier parented to this body must keep its anchor: hold the
 	// corpse until the barrier expires (read before st is wiped).
 	anchorUntil := ms.st.anchorFxUntil
@@ -2716,6 +2747,18 @@ func (s *Server) hitMobFlagsLocked(c *conn, ms *mobState, dmg float64, damager i
 		if owner := s.creditConnLocked(c, poisonExplodeOwner); owner != nil {
 			for _, m2 := range c.mobsWithinLocked(ms.x, ms.y, poisonExplodeRadius) {
 				s.hitMobLocked(c, m2, poisonExplodeDmg, owner.objID)
+			}
+			// The detonation itself was invisible: damage landed with no gfx/sfx behind it
+			// at all. WilfangSkill3Effect's gfx is baked SELF, so owning it to the corpse
+			// (not the caster) parents the burst where the body actually died; the corpse
+			// outlives it by corpseDeleteDelay (4s) regardless, so no extra linger is needed.
+			// The registry marks this gfx stop_on_done=false, so the client never stores a
+			// stoppable handle for it (same shape as Morlokai's curse circle) -- the client's
+			// own one-shot, non-looping VisualEffect self-destroys on its own timing once it
+			// finishes playing, and the immediate EFFECT_END here is only bookkeeping symmetry
+			// with fxStartLocked, not something the render depends on.
+			if poisonExplodeFx != "" {
+				s.fxEndLocked(c, s.fxStartLocked(c, poisonExplodeFx, ms.id, 0, false, 0, 0))
 			}
 		}
 	}

@@ -380,7 +380,8 @@ func TestSummonStillFightsHuntMobs(t *testing.T) {
 	hs.mobs[mob.id] = mob
 
 	c.mvMu.Lock()
-	s.tickSummonsLocked(c, now)
+	s.tickSummonsLocked(c, now)                        // starts the swing
+	s.tickSummonsLocked(c, now+summonStrikeFrac+0.01)  // ...which connects late in it
 	c.mvMu.Unlock()
 
 	if mob.hp >= 500 {

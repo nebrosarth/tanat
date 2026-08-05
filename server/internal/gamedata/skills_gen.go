@@ -86,9 +86,18 @@ func init() {
 				ManaCost: []int{50, 55, 60, 65}, Cooldown: []int{24, 23, 22, 21},
 				CastFx: "BlackDragonSkill4", CastFxDur: 1, PayloadFx: "BlackDragonSkill4Effect1", PayloadFxAt: "self", PayloadDelay: 0.2,
 				BuffFx: "BlackDragonSkill4Effect2", BuffFxOn: "self", BuffIcon: true, BuffDescVariant: "BuffTarget",
+				// The card's dps is delivered in 5 pulses/sec (0.2s interval) instead of one
+				// per second: same total per second, split fine enough to read as smooth and
+				// frequent rather than a once-a-second thump -- explicitly requested over the
+				// card's own literal "каждую секунду" wording. Each pulse carries dps/5, and
+				// an explicit PerSP of 1/5 so five pulses still sum to exactly 1x spell power
+				// per second (a magic-scale op with no PerSP would otherwise add the FULL
+				// spell power on every one of the five pulses instead of a fifth of it). The
+				// slow's own magnitude/duration are not split -- they are a status refresh,
+				// not a per-tick accumulating quantity -- only reapplied more often now.
 				Ops: []Op{
-					{Kind: OpChannel, Dur: PerLevel{8, 8, 8, 8}, Interval: 1, Ops: []Op{
-						{Kind: OpDamage, Value: PerLevel{30, 42, 54, 68}, Scale: "magic", Radius: 5},
+					{Kind: OpChannel, Dur: PerLevel{8, 8, 8, 8}, Interval: 0.2, Ops: []Op{
+						{Kind: OpDamage, Value: PerLevel{6, 8.4, 10.8, 13.6}, PerSP: 0.2, Scale: "magic", Radius: 5},
 						{Kind: OpSlow, Value: PerLevel{0.7, 0.7, 0.7, 0.7}, Dur: PerLevel{1.5, 1.5, 1.5, 1.5}, Radius: 5},
 					}},
 				},
@@ -195,15 +204,31 @@ func init() {
 				Slot: 2, NameRu: "Пальба навскидку", Type: "ACTIVE",
 				Target: "ENEMY+NOT_BUILDING", Targeting: "TARGET", Distance: 9, AoERadius: 0, AoEWidth: 0,
 				ManaCost: []int{30, 35, 40, 45}, Cooldown: []int{11, 10, 9, 8},
-				CastFx: "EinzenhaimSkill2", CastFxDur: 0.8, PayloadFx: "EinzenhaimSkill2", PayloadFxAt: "target", PayloadDelay: 0.3,
+				// The VOLLEY IS THE CLIENT'S. VFX_Avtr_DPS_Einzenhaim_skill2_prop01 carries a
+				// PrefabTimeSpawn with m_SpawnTime=0.3 and a looping VisualEffect: once started,
+				// the effect spawns one Einzenhaim_skill2 shot every 0.3s until an EFFECT_END
+				// arrives, and the holder's Cast02 clip is mLoopAnimation. So the server does not
+				// author the shots -- it decides how long that spawner lives, and lands one damage
+				// tick per spawn.
+				//
+				// Two bugs came out of ignoring that. PayloadFx used to be "EinzenhaimSkill2"
+				// as well, i.e. the SAME effect started a second time 0.3s later: two spawners
+				// running out of phase, which is the doubled, unevenly-spaced ~7 shots that were
+				// reported. And the cast fx was ended at CastFxDur (0.8s) regardless of rank.
+				// One effect now, ended with the channel (castSkillLocked extends a channel
+				// skill's cast fx to PayloadDelay+channel duration).
+				CastFx: "EinzenhaimSkill2", CastFxDur: 0.8, PayloadFx: "", PayloadFxAt: "", PayloadDelay: 0.3,
 				BuffFx: "", BuffFxOn: "", BuffIcon: false, BuffDescVariant: "",
 				Ops: []Op{
 					// CLIENT «Пальба навскидку»: "делает {shots} быстрых выстрелов... нанося
-					// {*damage}+{*@damageSP} урона ЗА КАЖДЫЙ выстрел" -- a real N-shot volley
-					// (OpChannel at a rapid cadence), not one lump hit. shots = 3/4/4/5; the
-					// channel's Dur is set to land exactly that many 0.25s pulses.
+					// {*damage}+{*@damageSP} урона ЗА КАЖДЫЙ выстрел" -- a real N-shot volley.
+					// shots = 3/4/4/5, and Count says exactly that instead of hoping the tick
+					// grid divides Dur the intended way (it did not: the authored 0.25s interval
+					// was floored to 0.4s by the channel tick and landed 2 hits at every rank).
+					// PayloadDelay 0.3 puts the first tick on the first VISIBLE shot -- the
+					// client's spawner fires at 0.3, not at 0 -- and 0.3 keeps them in step.
 					{Kind: OpSlow, Value: PerLevel{0.75, 0.7, 0.65, 0.6}, Dur: PerLevel{3, 3, 4, 4}},
-					{Kind: OpChannel, Dur: PerLevel{0.55, 0.8, 0.8, 1.05}, Interval: 0.25, Ops: []Op{
+					{Kind: OpChannel, Count: PerLevel{3, 4, 4, 5}, Dur: PerLevel{0.65, 0.95, 0.95, 1.25}, Interval: 0.3, Ops: []Op{
 						{Kind: OpDamage, Value: PerLevel{20, 28, 36, 46}, Scale: "magic"},
 					}},
 				},
@@ -221,10 +246,24 @@ func init() {
 				BuffFx: "", BuffFxOn: "", BuffIcon: false, BuffDescVariant: "BuffTarget",
 				Ops: []Op{
 					// CLIENT «Выстрел с отдачей»: "игнорируя любую защиту" -- unmitigated (pure)
-					// damage, not a normal magic hit. The caster's own recoil ("аватар отлетает
-					// назад") is a purely cosmetic self-displacement with no stated distance;
-					// OpKnockback only pushes the ENEMY target, so it is left as a client-side
-					// animation detail, not modeled server-side.
+					// damage, not a normal magic hit.
+					//
+					// The recoil is real, not decoration: «В момент выстрела аватар отлетает
+					// назад из-за отдачи» appears in all three locale variants. It was previously
+					// left to the client on the assumption it was an animation detail -- it is
+					// not. EinzenhaimSkill3's baked holder has only the Cast03 clip and a
+					// SELF_TO_TARGET beam, and the legacy Animation component never moves a
+					// transform the server owns. So nothing moved the avatar at all.
+					// Apply:"self" turns the knockback around onto the caster. The locale states
+					// no distance, so 4 units: a shove you can see, short enough not to be an
+					// escape tool.
+					//
+					// ONE shot, deliberately. A split into two half-damage barrels with a kick
+					// each was tried and reverted: the client gives nothing to time it against
+					// (the Cast03 clip is 0.8s and its 51 bone curves hold exactly one motion --
+					// the arm raises over 0..0.15s and then holds -- with no animation events),
+					// so the gap between the barrels would have been invented, not measured.
+					{Kind: OpKnockback, Apply: "self", Value: PerLevel{4, 4, 4, 4}},
 					{Kind: OpDamage, Value: PerLevel{85, 120, 160, 205}, Scale: "pure"},
 					{Kind: OpStun, Dur: PerLevel{1.5, 2, 2, 2.5}},
 				},
@@ -238,7 +277,22 @@ func init() {
 				Slot: 4, NameRu: "Изгнание колдовства", Type: "ACTIVE",
 				Target: "POINT", Targeting: "", Distance: 9, AoERadius: 4, AoEWidth: 0,
 				ManaCost: []int{50, 55, 60, 65}, Cooldown: []int{22, 21, 20, 19},
-				CastFx: "EinzenhaimSkill4", CastFxDur: 1, PayloadFx: "EinzenhaimSkill4Effect1", PayloadFxAt: "point", PayloadDelay: 0.4,
+				// A THROWN bottle of holy water, in three client effects the server has to play
+				// in order -- all three are in the baked registry and only the first was used:
+				//
+				//	EinzenhaimSkill4Effect1  prop01 SELF_TO_TARGET (the bottle: a SmoothMove with
+				//	                         a trail, spinning at 800°/s, its `_Parent` carrying
+				//	                         TimeDestroy 0.65) + prop02 SELF (the throwing hand)
+				//	EinzenhaimSkill4Effect2  prop03 "Explosion" at the landing point + the
+				//	                         Einzenhaim_skill4_2 impact sound
+				//	EinzenhaimSkill4Effect3  prop04, a LOOPING smoke ring -- the lingering spray
+				//
+				// So the bottle's flight is 0.65s, measured from the client's own prefab, and
+				// the damage may not land before it. PayloadFxAt:"throw" also fixes why the
+				// bottle never appeared: prop01 is SELF_TO_TARGET and a POINT cast gave it no
+				// target object to fly to, so it silently rendered nothing.
+				CastFx: "EinzenhaimSkill4", CastFxDur: 1, PayloadFx: "EinzenhaimSkill4Effect1", PayloadFxAt: "throw", PayloadDelay: 0.4,
+				PayloadFlight: 0.65, ImpactFx: "EinzenhaimSkill4Effect2", LingerFx: "EinzenhaimSkill4Effect3",
 				BuffFx: "", BuffFxOn: "", BuffIcon: false, BuffDescVariant: "BuffTarget",
 				Ops: []Op{
 					// CLIENT «Изгнание колдовства»: sprayed enemies also take {*castDamage} extra
@@ -413,11 +467,20 @@ func init() {
 				ManaCost: []int{65, 75, 85, 95}, Cooldown: []int{50, 45, 40, 35},
 				CastFx: "GellarSkill4", CastFxDur: 1, PayloadFx: "", PayloadFxAt: "", PayloadDelay: 0,
 				BuffFx: "GellarSkill4Effect", BuffFxOn: "self", BuffIcon: true, BuffDescVariant: "BuffTarget",
+				// «Геллар выпускает пойманные души» -- the HIT COUNT/cadence is the original
+				// timed volley (7s, once/sec), unchanged; what scales with the soul count is
+				// the DAMAGE (PerSoul, matching «...магического урона в секунду за каждую
+				// порабощенную душу») and, visually, how many soul particles the client draws
+				// per burst (the EFFECT_START "counter" arg on GellarSkill4Effect, set to
+				// hs.soulStacks in execCastLocked -- see fxStartCounterLocked). The short/
+				// lobby description never mentions losing any souls to cast it -- only the
+				// (inconsistent) long description did -- so OpConsumeSouls stays dropped: the
+				// army is released, not spent.
+				//
+				// Not a channel the player has to sustain: the souls are already loosed the
+				// instant this is cast, so movement and stuns do not interrupt the volley
+				// (channelSustainsThroughDisruption).
 				Ops: []Op{
-					// CLIENT «Армия душ»: «{damage} + {damagePerSoul} за каждую порабощённую душу...
-					// При применении теряет половину душ». Halve souls on cast, then the wave damage
-					// scales with the remaining soul count (PerSoul).
-					{Kind: OpConsumeSouls},
 					{Kind: OpChannel, Dur: PerLevel{7, 7, 7, 7}, Interval: 1, Ops: []Op{
 						{Kind: OpDamage, Value: PerLevel{20, 35, 50, 65}, PerSoul: PerLevel{1, 2, 3, 4}, PerSoulSP: 0.1, Scale: "magic", Radius: 5, PerSP: 1, MaxTargets: 2, Randomize: true},
 					}},
@@ -571,16 +634,24 @@ func init() {
 				},
 			},
 			{
-				Slot: 3, NameRu: "Зачарованные стрелы", Type: "ACTIVE",
+				// A TOGGLE, not a timed active. CLIENT, all six locale fields, «ПРИ ДЕЙСТВИИ
+				// НАВЫКА каждый выстрел... наносит дополнительный урон и потребляет ману» --
+				// no field, anywhere, ever gives this a duration; the only number besides the
+				// damage bonus is the PER-SHOT mana cost. A fixed 10-13s window (with its own
+				// separate upfront ManaCost+Cooldown) was invented on top of that -- exactly
+				// the shape of a stance you switch on and pay for per arrow, drained by mana,
+				// not a short buff you recast.
+				Slot: 3, NameRu: "Зачарованные стрелы", Type: "TOGGLE",
 				Target: "", Targeting: "SELF", Distance: 0, AoERadius: 0, AoEWidth: 0,
 				ManaCost: []int{40, 45, 50, 55}, Cooldown: []int{16, 15, 14, 13},
 				CastFx: "MiriamSkill3Effect", CastFxDur: 0.5, PayloadFx: "", PayloadFxAt: "", PayloadDelay: 0.2,
 				BuffFx: "MiriamSkill3Effect", BuffFxOn: "self", BuffIcon: true, BuffDescVariant: "BuffSelf",
 				Ops: []Op{
-					// CLIENT «Зачарованные стрелы»: "каждый выстрел наносит дополнительный
-					// {damageMod}+{damageSP} урона и расходует {shotCost} маны за выстрел" -- a
-					// flat per-shot bonus gated on mana, not a %-damage buff.
-					{Kind: OpAttackManaBonus, Value: PerLevel{25, 40, 55, 75}, PerSP: 1, Value2: PerLevel{6, 8, 10, 12}, Dur: PerLevel{10, 11, 12, 13}},
+					// «...каждый выстрел наносит дополнительный {damageMod}+{damageSP} урона и
+					// расходует {shotCost} маны за выстрел» -- a flat per-shot bonus gated on
+					// mana, not a %-damage buff. Dur is unused by the toggle path (armed/
+					// disarmed in toggleSkillLocked/toggleOffLocked instead).
+					{Kind: OpAttackManaBonus, Value: PerLevel{25, 40, 55, 75}, PerSP: 1, Value2: PerLevel{6, 8, 10, 12}},
 				},
 				TipArgs: map[string]PerLevel{
 					"damageMod": PerLevel{25, 40, 55, 75},
@@ -853,7 +924,19 @@ func init() {
 				// the line sweep (caster -> aim over full Distance), exactly like Velial s2 «Разлом».
 				Target: "POINT", Targeting: "", Distance: 10, AoERadius: 0, AoEWidth: 3,
 				ManaCost: []int{65, 75, 85, 95}, Cooldown: []int{45, 40, 35, 30},
-				CastFx: "SharliSkill4", CastFxDur: 0.9, PayloadFx: "SharliSkill4Effect", PayloadFxAt: "point", PayloadDelay: 0.8,
+				// The phoenix (VFX_Avtr_DPS_Sharli_skill4_prop01) is a FlyEffect: it always
+				// covers a fixed 30 units at 20 units/sec (both read off the prefab, neither
+				// tied to where the player actually clicked) -- a real 1.5s flight. At the
+				// old PayloadDelay of 0.8s, on a 0.9s cast, the bird didn't even spawn until
+				// the swing was basically over, so both the creature and its damage (and the
+				// sound baked into the SAME effect holder) landed at the tail end instead of
+				// up front -- «должен создавать феникса и наносить урон в начале анимации, а
+				// не в конце». 0.2 releases it early in the cast, the same convention used for
+				// Elgorm's skull throw and every other early-release wind-up in this file.
+				// Damage is NOT deferred to the end of the 1.5s flight: like every other line-
+				// sweep skill (Elgorm/Velial), it lands on the swath at once -- the bird is
+				// the visual, not a projectile the hit waits on.
+				CastFx: "SharliSkill4", CastFxDur: 0.9, PayloadFx: "SharliSkill4Effect", PayloadFxAt: "point", PayloadDelay: 0.2,
 				BuffFx: "", BuffFxOn: "", BuffIcon: false, BuffDescVariant: "",
 				Ops: []Op{
 					{Kind: OpDamage, Value: PerLevel{130, 185, 240, 295}, Scale: "magic", Radius: 0, PerSP: 1},
@@ -915,10 +998,23 @@ func init() {
 				// already-authored cooldown, not on Edilia's own attacks with an independent
 				// 20-35% roll (pass-6 audit 2026-07-20).
 				Ops: []Op{
-					{Kind: OpBuffStat, Value: PerLevel{0.1, 0.14, 0.18, 0.22}, Dur: PerLevel{0, 0, 0, 0}, Stat: "dodge_pct", On: "self"},
-					// CLIENT «При получении удара от базовой атаки...»: gated to basic attacks
-					// only, not skill damage (pass-10 audit 2026-07-22).
-					{Kind: OpProc, OnDamaged: true, BasicAttackOnly: true, Chance: PerLevel{1, 1, 1, 1}, Ops: []Op{
+					// CLIENT, all three description fields, word for word: «При получении удара
+					// от базовой атаки, Эдилия НЕ ПОЛУЧАЕТ УРОНА. При этом атакующий теряет
+					// скорость атаки на 50% в течение 1 секунды» -- and the buff line is
+					// «Неуязвимость к урону от базовых атак». One mechanic, not two: a
+					// guaranteed negation of the FIRST basic attack, then the internal
+					// cooldown, which is the ONLY number the card carries («{cooldown} время
+					// перезарядки»).
+					//
+					// It used to be a dodge_pct CHANCE of 10-22% plus a separate OnDamaged proc
+					// for the attacker-slow. Nothing in the client text mentions a chance, and
+					// the split is what produced the report «уходит на перезарядку, но не
+					// блокирует урон»: the proc fired and greyed the button on essentially every
+					// hit while the block itself almost never rolled. It also could not block a
+					// RANGED attack at all in practice for the same reason. OpBlockHit sits in
+					// the shared incoming-damage path, so melee swings and arriving projectiles
+					// are treated alike.
+					{Kind: OpBlockHit, Dur: PerLevel{12, 10, 8, 6}, Ops: []Op{
 						{Kind: OpAttackSlow, Value: PerLevel{0.5, 0.5, 0.5, 0.5}, Dur: PerLevel{1, 1, 1, 1}},
 					}},
 				},
@@ -928,7 +1024,15 @@ func init() {
 			},
 			{
 				Slot: 4, NameRu: "Дерево жизни", Type: "ACTIVE",
-				Target: "POINT", Targeting: "", Distance: 8, AoERadius: 4, AoEWidth: 0,
+				// AoERadius is what arms the client's ground cursor (attribs "aoeRadius"), so it
+				// has to agree with the glade the client actually plants. Measured off
+				// VFX_Avtr_Dsb_Edilia_Skill_04_prop01: its "Forest" node is scaled 1.7, and the
+				// tree/fairy placement points sit on an outer ring whose radii run 3.3..8.3 with
+				// a median of 5.4. The authored 4 drew a cursor visibly smaller than the grove --
+				// the reported mismatch. 6 covers the grove's body without chasing the outermost
+				// branch tips, and the ops below use the same number so the cursor does not
+				// promise reach the damage/heal will not deliver.
+				Target: "POINT", Targeting: "", Distance: 8, AoERadius: 6, AoEWidth: 0,
 				ManaCost: []int{70, 80, 90, 100}, Cooldown: []int{50, 46, 42, 38},
 				CastFx: "EdiliaSkill4", CastFxDur: 1.2, PayloadFx: "EdiliaSkill4Effect1", PayloadFxAt: "point", PayloadDelay: 0.4,
 				BuffFx: "EdiliaSkill4Effect2", BuffFxOn: "self", BuffIcon: true, BuffDescVariant: "BuffTarget",
@@ -939,8 +1043,9 @@ func init() {
 					// (the true zone-exit trigger is still deferred).
 					{Kind: OpSilence, Dur: PerLevel{3, 3, 3, 3}},
 					{Kind: OpChannel, Dur: PerLevel{5, 5, 5, 5}, Interval: 1, Ops: []Op{
-						{Kind: OpDamage, Value: PerLevel{28, 36, 44, 52}, Scale: "magic", Radius: 4, PerSP: 1},
-						{Kind: OpHeal, Value: PerLevel{28, 36, 44, 52}, PerSP: 1, On: "allies", Radius: 4},
+						// Radius matches AoERadius above -- the grove's measured footprint.
+						{Kind: OpDamage, Value: PerLevel{28, 36, 44, 52}, Scale: "magic", Radius: 6, PerSP: 1},
+						{Kind: OpHeal, Value: PerLevel{28, 36, 44, 52}, PerSP: 1, On: "allies", Radius: 6},
 					}},
 				},
 				TipArgs: map[string]PerLevel{
@@ -1030,7 +1135,12 @@ func init() {
 				Slot: 1, NameRu: "Стужа", Type: "ACTIVE",
 				Target: "ENEMY+NOT_BUILDING", Targeting: "TARGET", Distance: 8, AoERadius: 0, AoEWidth: 0,
 				ManaCost: []int{35, 40, 45, 50}, Cooldown: []int{11, 10, 9, 8},
+				// The payload is a real flying bolt: VFX_Avtr_Dsb_Frost_skill1_prop01 carries a
+				// SmoothMove with mBySpeed=true and mSpeed=35, so the client flies it at 35
+				// units/sec. The damage used to land the moment the bolt was spawned, i.e.
+				// before it arrived; PayloadFlightSpeed holds the ops back by distance/35.
 				CastFx: "FrostSkill1", CastFxDur: 1.2, PayloadFx: "FrostSkill1Effect1", PayloadFxAt: "target", PayloadDelay: 0.5,
+				PayloadFlightSpeed: 35,
 				BuffFx: "FrostSkill1Effect3", BuffFxOn: "target", BuffIcon: false, BuffDescVariant: "Buff1Target",
 				Ops: []Op{
 					{Kind: OpDamage, Value: PerLevel{70, 105, 140, 175}, Scale: "magic", PerSP: 1},
@@ -1046,28 +1156,40 @@ func init() {
 			},
 			{
 				Slot: 2, NameRu: "Ледяной град", Type: "ACTIVE",
-				// CLIENT «Вызывает ледяной град… случайных врагов» -- a placed hail ZONE, not a
-				// self-centred burst. POINT + empty Targeting → a ground channel pinned at the
-				// clicked point (groundAnchored in tickChannelsLocked), so the hail stays put.
-				// (Pass-6 audit flagged the client's "вокруг мага" phrasing as possibly meaning
-				// self-centered instead; NOT changed here -- this engine's self/unit channels
-				// break on caster movement, so naively re-targeting SELF would make the hail
-				// vanish the instant Frost takes one step, a worse regression than the
-				// medium-confidence text read it would fix. Left as the existing ground-anchor
-				// design; only the chance-gate below (high confidence) is applied.)
-				Target: "POINT", Targeting: "", Distance: 8, AoERadius: 5, AoEWidth: 0,
+				// SHAPE, finally settled from the prefab instead of from the phrasing. An
+				// earlier pass read «случайных врагов ВОКРУГ МАГА» as possibly self-centred but
+				// left it as a placed POINT zone, on the grounds that a self channel would
+				// vanish the moment Frost stepped. VFX_Avtr_Dsb_Frost_skill2_prop02 decides it:
+				// it is a PrefabTimeSpawn dropping an ice shard every 0.07s with
+				// m_SpawnRadius=6.5, mGround=true, m_UseParentTransorm=FALSE -- i.e. hail
+				// raining around wherever the effect object stands -- and the prefab is baked
+				// SELF, so it parents to its owner and travels with them. The hail is centred
+				// on THE MAGE, exactly as the text says.
+				//
+				// It is therefore a CHANNEL, and the client agrees: FrostSkill2's holder plays
+				// Cast02 with mLoopAnimation, a sustained pose that only an EFFECT_END stops.
+				// In short, Crystal Maiden's Freezing Field: stand still, hail falls around
+				// you, step and it stops.
+				// Self-targeted, so moving or being stunned breaks it -- which is the point,
+				// and which fixes «при движении анимация каста не сбрасывается»: the looping
+				// pose and the hail cloud are the channel's own fx and die with it.
+				//
+				// Radius follows the prefab too: 6.5, not the authored 5, so the damage covers
+				// the ground the shards visibly land on (same class of mismatch as Edilia's
+				// grove). A SELF cast emits no ground cursor, so there is nothing to disagree.
+				Target: "", Targeting: "SELF", Distance: 0, AoERadius: 0, AoEWidth: 0,
 				ManaCost: []int{55, 60, 65, 70}, Cooldown: []int{20, 19, 18, 17},
-				CastFx: "FrostSkill2", CastFxDur: 1, PayloadFx: "", PayloadFxAt: "", PayloadDelay: 0,
-				BuffFx: "FrostSkill2Effect", BuffFxOn: "self", BuffIcon: true, BuffDescVariant: "BuffTarget",
+				CastFx: "FrostSkill2", CastFxDur: 1, PayloadFx: "FrostSkill2Effect", PayloadFxAt: "self", PayloadDelay: 0,
+				BuffFx: "", BuffFxOn: "", BuffIcon: false, BuffDescVariant: "BuffTarget",
 				Ops: []Op{
 					{Kind: OpChannel, Dur: PerLevel{8, 8, 8, 8}, Interval: 1, Ops: []Op{
-						{Kind: OpDamage, Value: PerLevel{15, 20, 25, 30}, Scale: "magic", Radius: 5},
+						{Kind: OpDamage, Value: PerLevel{15, 20, 25, 30}, Scale: "magic", Radius: 6.5},
 						// CLIENT «...с шансом 20% оглушающий...»: was unconditional (100%), not the
 						// per-tick 20% roll the tooltip states (pass-6 audit 2026-07-20).
-						{Kind: OpStun, Dur: PerLevel{0.3, 0.3, 0.3, 0.3}, Chance: PerLevel{0.2, 0.2, 0.2, 0.2}},
+						{Kind: OpStun, Dur: PerLevel{0.3, 0.3, 0.3, 0.3}, Radius: 6.5, Chance: PerLevel{0.2, 0.2, 0.2, 0.2}},
 						// «Если град попадает на врага с ознобом → стан 1с + озноб снят»: OpChill
 						// re-chills fresh targets and stuns already-chilled ones each hail tick.
-						{Kind: OpChill, Dur: PerLevel{40, 40, 40, 40}, Value2: PerLevel{1, 1, 1, 1}, Radius: 5, Chance: PerLevel{0.2, 0.2, 0.2, 0.2}},
+						{Kind: OpChill, Dur: PerLevel{40, 40, 40, 40}, Value2: PerLevel{1, 1, 1, 1}, Radius: 6.5, Chance: PerLevel{0.2, 0.2, 0.2, 0.2}},
 					}},
 				},
 				TipArgs: map[string]PerLevel{
@@ -1079,8 +1201,33 @@ func init() {
 				Slot: 3, NameRu: "Гробница холода", Type: "ACTIVE",
 				Target: "ENEMY+NOT_BUILDING+FRIEND", Targeting: "TARGET", Distance: 7, AoERadius: 0, AoEWidth: 0,
 				ManaCost: []int{45, 50, 55, 60}, Cooldown: []int{16, 15, 14, 13},
-				CastFx: "FrostSkill3", CastFxDur: 1.2, PayloadFx: "FrostSkill3Effect2", PayloadFxAt: "target", PayloadDelay: 0.3,
-				BuffFx: "FrostSkill3Effect1", BuffFxOn: "target", BuffIcon: false, BuffDescVariant: "BuffTarget",
+				// SHAPE, settled from the client text rather than guessed: «Заковывает врага
+				// ИЛИ союзника в ледяную глыбу на {duration} секунд. ЦЕЛЬ не может атаковать
+				// или двигаться...» -- one unit, chosen by the player. Not an area, not a ring
+				// around the caster, and not a channel: the ice stands for its own duration
+				// whatever Frost does next.
+				//
+				// THREE effects, and which is which had to be read off the prefabs -- ALL of
+				// them contain an IceCube mesh, so the names alone are misleading:
+				//	FrostSkill3Effect1  prop01 -- FreezeEffect + a ground Projector + 0.1-0.2s
+				//	                    particle bursts, whole thing 0.3s: the ice FORMING
+				//	FrostSkill3Effect2  prop02 -- FreezeEffect + VisualEffect{loop:true} + the
+				//	                    IceCube: THE BLOCK ITSELF, standing until stopped
+				//	FrostSkill3Effect3  prop03 -- 2s one-shot + Frost_skill3_break: it SHATTERS
+				//
+				// The block is the BuffFx, pinned to the encased unit for the encasement. It
+				// never appeared at all («не создаётся prop») because targetBuffTTL only
+				// measured OpBuffStat On:"target", and this skill's only stat-buff is on the
+				// ALLY half -- so the TTL came out 0. It now measures the encasement itself
+				// (the OpStun both halves carry), and the buff-fx path handles an ally target
+				// too, so the ice shows on a frozen friend as well.
+				//
+				// Both prop01 and prop02 are baked SELF, i.e. they parent to whatever object
+				// OWNS them -- which is why aiming them at the caster put the ice cube on
+				// Frost. payloadTargetFxOwnedToTarget hands the formation flash to the victim.
+				CastFx: "FrostSkill3", CastFxDur: 1.2, PayloadFx: "FrostSkill3Effect1", PayloadFxAt: "target", PayloadDelay: 0.3,
+				BuffFx: "FrostSkill3Effect2", BuffFxOn: "target", BuffIcon: false, BuffDescVariant: "BuffTarget",
+				TargetFxEnd: "FrostSkill3Effect3",
 				Ops: []Op{
 					// CLIENT «Гробница холода»: encase a FOE or FRIEND in ice. Enemy half -- stun,
 					// chill, DoT, and drain life back to Frost. Ally half -- heal + a protective
@@ -1123,7 +1270,12 @@ func init() {
 					{Kind: OpSummon, Count: PerLevel{1, 1, 1, 1}, Lifetime: PerLevel{60, 60, 60, 60}, HP: PerLevel{400, 550, 700, 850}, Dmg: PerLevel{45, 55, 65, 75}, Unit: "Avtr_Dsb_Frost_Elemental", SummonFx: "FrostSkill4Effect",
 						Ops: []Op{
 							{Kind: OpSlow, Value: PerLevel{0.7, 0.7, 0.7, 0.7}, Dur: PerLevel{2, 2, 2, 2}},
-							{Kind: OpChill, Dur: PerLevel{40, 40, 40, 40}, Value2: PerLevel{1, 1, 1, 1}},
+							// OnlyIfChilled: the card gives the elemental a slow, and a stun
+							// «если элементаль атакует врага ПОД ОЗНОБОМ» -- it punishes a chill
+							// Frost already laid down. It never says the elemental APPLIES chill,
+							// and a plain OpChill did, quietly handing her a second, permanent
+							// chill applicator that outsourced her signature combo to the pet.
+							{Kind: OpChill, OnlyIfChilled: true, Dur: PerLevel{40, 40, 40, 40}, Value2: PerLevel{1, 1, 1, 1}},
 						}},
 				},
 				TipArgs: map[string]PerLevel{
@@ -1286,6 +1438,17 @@ func init() {
 				TipArgs: map[string]PerLevel{
 					"aoeDamage": PerLevel{25, 35, 45, 55},
 					"damageSP":  PerLevel{1, 1, 1, 1},
+					// INTERNAL COOLDOWN -- and the one number here NOT taken from the client.
+					// Neither the locale (all six fields say only «При обычной атаке, наносит
+					// дополнительный магический урон») nor the baked data carries a cooldown or a
+					// chance, so an ungated Chance:1 fired the AoE burst -- and its
+					// MorlokaySkill3Effect sound -- on literally every swing. Gating it by time
+					// rather than inventing a proc chance keeps the "on a normal attack" wording
+					// true, and the client greys the passive's button while it recharges
+					// (pushPassiveProcCooldownLocked), so the state is visible. The ramp follows
+					// the house style of every other passive cooldown in this file; the values
+					// themselves are a judgement call and safe to retune.
+					"cooldown": PerLevel{5, 4, 3, 2},
 				},
 			},
 			{
@@ -1315,20 +1478,35 @@ func init() {
 		Prefab: "Avtr_Dsb_PlusMinus", AttackProjectile: false,
 		Skills: [4]Skill{
 			{
-				// stats.txt: dmg 80-140/120-210/160-280/200-350/240-400 (5 ranks,
-				// "farther = more"). Reuses Op.PerTargetGrowth (Nerlag's «Метание топоров»
-				// ordinal growth, sorted nearest-to-caster-first) -- for this SELF-centered
-				// ring, nearest-to-caster IS nearest-to-epicenter, so the Nth farthest enemy
-				// caught in the ring takes progressively more, ramping from dmgMin toward
-				// dmgMax by the ~4th target (a reasonable approximation given the engine has
-				// no continuous distance-scaled damage formula).
+				// CLIENT, LongDesc, word for word: «Плюс-Минус выпускает кольцо электричества
+				// вокруг себя, которое расширяется, а затем возвращается назад, нанося от
+				// {*dmgMin}+{*@damageMinSP} до {*dmgMax}+{*@damageMaxSP} магического урона
+				// всем задетым врагам. Чем дальше находится враг от эпицентра, тем больший
+				// урон он получает.» -- a ring that expands from Plus-Minus and then pulls
+				// back, damage a function of a target's OWN DISTANCE from the epicenter, full
+				// stop. Nothing in the text depends on how many enemies the ring catches or
+				// what order they stand in.
+				//
+				// A previous pass read stats.txt's per-rank range (80-140 at rank 1) as
+				// "farther target = more" and modelled it with PerTargetGrowth: a flat bonus
+				// PER ORDINAL RANK among the hit enemies (Nerlag's «Метание топоров» throw
+				// primitive, reused here). That is a different shape than the client
+				// describes and breaks on its own terms -- two enemies standing at the exact
+				// same spot take DIFFERENT damage depending on how many OTHERS happened to be
+				// caught in the same blast, which is not "в зависимости от их положения".
+				//
+				// EdgeValue is the client's actual mechanic: linear interpolation from
+				// dmgMin/damageMinSP at the epicenter (distance 0) to dmgMax/damageMaxSP at
+				// the ring's own edge (distance == Radius), by each target's real distance.
 				Slot: 1, NameRu: "Электрошок", Type: "ACTIVE",
 				Target: "", Targeting: "SELF", Distance: 0, AoERadius: 5, AoEWidth: 0,
 				ManaCost: []int{100, 100, 100, 100, 100}, Cooldown: []int{16, 16, 16, 16, 16},
 				CastFx: "PlusMinusSkill1", CastFxDur: 0.8, PayloadFx: "PlusMinusSkill1Effect", PayloadFxAt: "self", PayloadDelay: 0.4,
 				BuffFx: "", BuffFxOn: "", BuffIcon: false, BuffDescVariant: "",
 				Ops: []Op{
-					{Kind: OpDamage, Value: PerLevel{80, 120, 160, 200, 240}, PerTargetGrowth: PerLevel{20, 30, 40, 50, 53}, Scale: "magic", Radius: 5, PerSP: 1},
+					{Kind: OpDamage, Value: PerLevel{80, 120, 160, 200, 240}, PerSP: 1,
+						EdgeValue: PerLevel{140, 210, 280, 350, 400}, EdgeValueSP: 1,
+						Scale: "magic", Radius: 5},
 				},
 				TipArgs: map[string]PerLevel{
 					"dmgMin":      PerLevel{80, 120, 160, 200, 240},
@@ -1345,11 +1523,42 @@ func init() {
 				ManaCost: []int{100, 110, 120, 130, 140}, Cooldown: []int{20, 20, 20, 20, 20},
 				CastFx: "PlusMinusSkill2", CastFxDur: 0.8, PayloadFx: "PlusMinusSkill2Effect", PayloadFxAt: "target", PayloadDelay: 0.3,
 				BuffFx: "", BuffFxOn: "", BuffIcon: false, BuffDescVariant: "",
+				// A CHANNELLED beam, in the Shadow-Shaman-Shackles sense, and the client says
+				// so plainly: PlusMinusSkill2's holder plays Cast02 with mLoopAnimation, and its
+				// payload is a SELF_TO_TARGET Lightning + LineRenderer that has to be sustained
+				// from one end to the other. It was authored as an instant lump of damage plus a
+				// fire-and-forget root, so nothing could interrupt it: the caster could cast and
+				// walk away while the victim stayed pinned, and the looping beam kept playing.
+				//
+				// Now the hold IS the channel. Walking, being stunned, dying, or the victim
+				// dying all break it, which ends the beam and releases the grip
+				// (skillHoldsTarget).
+				//
+				// The damage is delivered GRADUALLY along the beam, so an interrupted channel
+				// deals proportionally less -- that is what channelling means, and it is what
+				// the beam looks like. The card's {*damage} is the TOTAL, split into 5 equal
+				// pulses at every rank:
+				//
+				//	rank 1:  5 × 15 = 75    over 2.5s (a pulse every 0.5s)
+				//	rank 2:  5 × 25 = 125   over 3.0s (0.6s)
+				//	rank 3:  5 × 35 = 175   over 3.5s (0.7s)
+				//	rank 4:  5 × 45 = 225   over 4.0s (0.8s)
+				//	rank 5:  5 × 55 = 275   over 4.5s (0.9s)
+				//
+				// The pulse COUNT is deliberately constant while the cadence scales with rank
+				// (Op.Intervals). A Scale:"magic" op with no explicit PerSP takes the caster's
+				// WHOLE spell power on every application, so PerSP is set to the per-pulse
+				// share 0.2 -- five pulses then add up to exactly the 1×SP the card promises,
+				// and it stays 1× at every rank because the count never changes.
 				Ops: []Op{
-					{Kind: OpDamage, Value: PerLevel{75, 125, 175, 225, 275}, Scale: "magic"},
-					// «не позволяющий цели двигаться и использовать способности» = root+silence.
+					// «не позволяющий цели двигаться и использовать способности» = root+silence,
+					// for the beam's full nominal duration -- cut short with it if it breaks.
 					{Kind: OpRoot, Dur: PerLevel{2.5, 3, 3.5, 4, 4.5}},
 					{Kind: OpSilence, Dur: PerLevel{2.5, 3, 3.5, 4, 4.5}},
+					{Kind: OpChannel, Count: PerLevel{5, 5, 5, 5, 5}, Dur: PerLevel{2.5, 3, 3.5, 4, 4.5},
+						Intervals: PerLevel{0.5, 0.6, 0.7, 0.8, 0.9}, Ops: []Op{
+							{Kind: OpDamage, Value: PerLevel{15, 25, 35, 45, 55}, Scale: "magic", PerSP: 0.2},
+						}},
 				},
 				TipArgs: map[string]PerLevel{
 					"damage":   PerLevel{75, 125, 175, 225, 275},
@@ -1385,7 +1594,28 @@ func init() {
 				Slot: 4, NameRu: "Шаровая молния", Type: "ACTIVE",
 				Target: "POINT", Targeting: "", Distance: 9, AoERadius: 4, AoEWidth: 0,
 				ManaCost: []int{200, 240, 280, 320}, Cooldown: []int{60, 60, 60, 60},
-				CastFx: "PlusMinusSkill4Effect", CastFxDur: 0.8, PayloadFx: "PlusMinusSkill4BombEffect", PayloadFxAt: "point", PayloadDelay: 3,
+				// The two client effects were used the wrong way round, and their names are the
+				// trap: "…Skill4Effect" is not the cast, it is the EXPLOSION, and
+				// "…Skill4BombEffect" is the ball itself. Read off the prefabs:
+				//
+				//	VFX_Avtr_PlusMinus_Skill4_prop01 (BombEffect) -- a sphere spun by
+				//	  ObjectRotate at -1000°/s with a TrailRenderer and four LOOPING particle
+				//	  systems (mMaxDuration 0): something that hangs there indefinitely.
+				//	VFX_Avtr_PlusMinus_Skill4_prop02 (Skill4Effect) -- a Billboard mesh with a
+				//	  RefractionEffect shockwave and one-shot bursts of 0.51/2.01s: a detonation.
+				//
+				// So the old mapping played the explosion at cast and grew the ball three
+				// seconds later, both of them ON THE AVATAR: each prefab is baked SELF, and a
+				// SELF fx parents to its owner object, which was the caster.
+				//
+				// Correct order, and it is what the card describes: «создает НА ЗЕМЛЕ шаровую
+				// молнию, которая взрывается ЧЕРЕЗ 3 СЕКУНДЫ». The ball is planted at the cast
+				// point on an invisible anchor (so it stays put), burns its 3s fuse, and is
+				// then replaced by the explosion at the same spot, which is when the damage,
+				// slow and mana burn land. PayloadDelay is 0 -- the 3s is the FUSE, not a
+				// wind-up, and the ball must be visible for all of it.
+				CastFx: "", CastFxDur: 0, PayloadFx: "PlusMinusSkill4BombEffect", PayloadFxAt: "point", PayloadDelay: 0,
+				PayloadFlight: 3, ImpactFx: "PlusMinusSkill4Effect",
 				BuffFx: "", BuffFxOn: "", BuffIcon: false, BuffDescVariant: "",
 				Ops: []Op{
 					{Kind: OpDamage, Value: PerLevel{300, 400, 500, 600}, Scale: "magic", Radius: 4},
@@ -1463,7 +1693,11 @@ func init() {
 					// ExplodeSP so it isn't also (silently, doubly) applied to the inert tick.
 					{Kind: OpProc, Chance: PerLevel{1, 1, 1, 1}, Ops: []Op{
 						{Kind: OpDot, Value: PerLevel{0, 0, 0, 0}, Dur: PerLevel{7, 7, 7, 7}, Scale: "magic",
-							ExplodeOnDeath: true, ExplodeDamage: PerLevel{60, 80, 100, 120}, ExplodeRadius: 4, ExplodeSP: 1},
+							ExplodeOnDeath: true, ExplodeDamage: PerLevel{60, 80, 100, 120}, ExplodeRadius: 4, ExplodeSP: 1,
+							// The detonation was dealing damage with nothing shown for it --
+							// «враги не имеют визуального эффекта взрыва от яда». The client's
+							// registry carries a real gfx+sfx pair for exactly this moment.
+							ExplodeFx: "WilfangSkill3Effect"},
 					}},
 				},
 				TipArgs: map[string]PerLevel{

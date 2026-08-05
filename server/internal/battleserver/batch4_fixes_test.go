@@ -238,25 +238,24 @@ func TestKionaCloakSharesDamageAsAllyHeal(t *testing.T) {
 // ---- Edilia ----
 
 // TestEdiliaPollenSlowsAttackerNotSelf: «Пыльца забвения» must slow the STRIKING mob when
-// Edilia is hit (OnDamaged), never the mob Edilia herself attacks.
+// Edilia is hit, never the mob Edilia herself attacks. The slow now rides the block itself
+// (OpBlockHit's nested ops) rather than a separate OnDamaged proc -- the two were one
+// sentence in the client text all along («Эдилия не получает урона. ПРИ ЭТОМ атакующий
+// теряет скорость атаки»), and splitting them is what let the cooldown burn without the
+// damage ever being stopped.
 func TestEdiliaPollenSlowsAttackerNotSelf(t *testing.T) {
 	s, c, cleanup := newHuntConn(t, "Avtr_Dsb_Edilia")
 	defer cleanup()
 	hs := c.huntState
 	hs.skillLevel[2] = 1 // «Пыльца забвения» learned
-	sk := gamedata.SkillsFor(hs.av).Skills[2]
-	for _, op := range sk.Ops {
-		if op.Kind == gamedata.OpProc {
-			hs.defenseProcs = append(hs.defenseProcs, procState{slot: 3, chance: op.Chance, ops: op.Ops, cd: sk.TipArgs["cooldown"]})
-		}
-	}
+	hs.blockHitSlot = 3  // registered at world build; a bare test conn skips that
 	now := float64(s.battleTime())
 	attacker := mkMob(t, 4460, 1, 0)
 
 	c.mvMu.Lock()
 	hs.mobs[attacker.id] = attacker
 	hs.tr.add(attacker.id)
-	s.runDefenseProcsLocked(c, attacker, 10, now)
+	s.hitPlayerFromLocked(c, attacker.id, 10, now, attacker, nil)
 	c.mvMu.Unlock()
 
 	if attacker.st.atkSlowUntil <= now {
@@ -537,17 +536,25 @@ func TestFrostElementalSlowsAndStunsOnHit(t *testing.T) {
 	hs.tr.add(target.id)
 	s.applySummonOnHitOpsLocked(c, sm, target, now)
 	firstSlow := target.st.slowUntil
-	chillUntil := target.st.chillUntil
-	s.applySummonOnHitOpsLocked(c, sm, target, now) // second hit while still chilled
+	chilledByPet := target.st.chillUntil
+	// Now let FROST chill it, and hit it again: the pet punishes an existing chill.
+	target.st.chillUntil = now + 40
+	s.applySummonOnHitOpsLocked(c, sm, target, now)
 	c.mvMu.Unlock()
 
 	if firstSlow <= now {
 		t.Error("elemental's first hit must slow the target")
 	}
-	if chillUntil <= now {
-		t.Error("elemental's first hit must chill the target")
+	// The card gives the elemental a slow and a stun-on-chilled; it never says the
+	// elemental LAYS chill, and letting it do so handed Frost a second, permanent chill
+	// applicator that outsourced her signature combo to the pet.
+	if chilledByPet > now {
+		t.Error("the elemental must not apply chill itself -- only punish one already there")
 	}
 	if target.st.stunUntil <= now {
-		t.Error("elemental's second hit on an already-chilled target must stun it")
+		t.Error("elemental's hit on an already-chilled target must stun it")
+	}
+	if target.st.chillUntil > now {
+		t.Error("punishing a chill must also clear it")
 	}
 }

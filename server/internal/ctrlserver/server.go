@@ -64,11 +64,20 @@ type Server struct {
 	dotaQueue    map[int32][]int32
 	nextDotaRoom int32
 
-	// castleMu guards castleRosters: the in-memory fighter enrollment per castle (castleID
-	// -> roster) backing the castle-siege registration screens. The live siege battle is
-	// deferred; this only records who signed up. Lazily created. See castle.go.
-	castleMu      sync.Mutex
-	castleRosters map[int32]*castleRoster
+	// castleMu guards every «Битва за замок» matchmaking/scheduling field below. See
+	// castle.go: castleRosters is the in-memory fighter enrollment per castle;
+	// castleCountdown is the live seconds-remaining until each castle's next battle
+	// window (decremented by the scheduler goroutine, castle|list/info read it instead
+	// of the static gamedata seed once running); castleSel is the in-flight draft
+	// choice per user (mirrors fightSel) held between the scheduler's start_request_mpd
+	// and the arg-less castle|ready; nextCastleRoom hands each fired battle window a
+	// unique shared-world room id.
+	castleMu        sync.Mutex
+	castleRosters   map[int32]*castleRoster
+	castleCountdown map[int32]int32
+	castleSel       map[int32]castleSelection
+	nextCastleRoom  int32
+	castleStop      chan struct{} // closed by StopCastleScheduler; nil until StartCastleScheduler runs
 }
 
 func New() *Server {
@@ -477,6 +486,12 @@ func (s *Server) dispatch(req ctrlproto.Request, resp *ctrlproto.Response) {
 		s.handleCastleDesert(req, resp)
 	case ctrlproto.CmdKey("castle", "battle_info"):
 		s.handleCastleBattleInfo(req, resp)
+	case ctrlproto.CmdKey("castle", "select_avatar"):
+		s.handleCastleSelectAvatar(req, resp)
+	case ctrlproto.CmdKey("castle", "ready"):
+		s.handleCastleReady(req, resp)
+	case ctrlproto.CmdKey("castle", "desert_battle"):
+		s.handleCastleDesertBattle(req, resp)
 	case ctrlproto.CmdKey("clan", "create"):
 		s.handleClanCreate(req, resp)
 	case ctrlproto.CmdKey("clan", "info"):

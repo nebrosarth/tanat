@@ -186,9 +186,10 @@ func (s *Server) handleFightJoin(req ctrlproto.Request, resp *ctrlproto.Response
 
 // fightSceneForMap resolves the scene bundle for a fight|join / fight|ready map id,
 // accepting both «Штурм» (DOTA) and «Арена» (DM) maps -- the two modes matched through
-// this same queue. Returns ("", false) for anything else.
+// this same queue. Returns ("", false) for anything else. A CastleOnly map (map_6_0)
+// is rejected here UNLESS castleTestMapExposed() -- see its doc comment in hunt.go.
 func fightSceneForMap(mapID int32) (string, bool) {
-	if dm, ok := gamedata.DotaMapByID(mapID); ok {
+	if dm, ok := gamedata.DotaMapByID(mapID); ok && (!dm.CastleOnly || castleTestMapExposed()) {
 		return dm.Scene, true
 	}
 	if am, ok := gamedata.ArenaMapByID(mapID); ok {

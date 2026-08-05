@@ -5,9 +5,10 @@ package session
 // pointer keeps working), and write-through-persists each mutated account to a
 // single SQLite database via saveUserLocked. Only PERSISTENT state lives in the
 // DB: accounts, heroes, bags, owned/dressed gear, quests, and the social lists.
-// Transient state (sessions, pending battles, lobby area, parties, friend
-// REQUESTS) stays in memory and is intentionally not persisted -- clients
-// re-login and rejoin.
+// Transient state (pending battles, lobby area, parties, friend REQUESTS) stays in
+// memory and is intentionally not persisted -- clients rejoin. SESSION KEYS are the one
+// exception: they are persisted so that restarting the server does not silently
+// invalidate the key a logged-in client is still holding (see the sessions table).
 //
 // The driver is modernc.org/sqlite (pure Go, no cgo) so the server stays a
 // plain `go build` with no C toolchain, and the DB links statically into the
@@ -20,6 +21,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"time"
 
 	_ "modernc.org/sqlite" // registers the "sqlite" database/sql driver
 )
@@ -116,9 +118,43 @@ var schemaStmts = []string{
 		head_user_id INTEGER NOT NULL DEFAULT 0,
 		created_at   INTEGER NOT NULL DEFAULT 0
 	)`,
+	// sessions survive a server restart. They used to live only in memory, so restarting
+	// invalidated every logged-in client's session key -- and the client does NOT know
+	// that. It reconnects to the broadcast server (mpd) with the key it still holds, the
+	// server cannot find it and rejects the login, and the player gets «Не удалось
+	// подключиться к серверу рассылок» plus a reconnect box, on a server that is up and
+	// otherwise working. Keeping the keys means a restart is invisible to a client that
+	// was already logged in.
+	`CREATE TABLE IF NOT EXISTS sessions (
+		key        TEXT PRIMARY KEY,
+		user_id    INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+		created_at INTEGER NOT NULL DEFAULT 0
+	)`,
+	// «Битва за замок»: which clan currently holds each castle (gamedata.Castles() is
+	// the static seed of WHAT castles exist; this is the runtime ownership state).
+	`CREATE TABLE IF NOT EXISTS castle_owners (
+		castle_id INTEGER PRIMARY KEY,
+		clan_id   INTEGER NOT NULL DEFAULT 0,
+		clan_name TEXT NOT NULL DEFAULT ''
+	)`,
+	// One row per finished siege, oldest first (id autoincrements) -- the castle|history
+	// screen's log. clan_name is denormalized so history still reads correctly after a
+	// clan is later disbanded/renamed.
+	`CREATE TABLE IF NOT EXISTS castle_history (
+		id                INTEGER PRIMARY KEY AUTOINCREMENT,
+		castle_id         INTEGER NOT NULL,
+		winner_clan_id    INTEGER NOT NULL,
+		winner_clan_name  TEXT NOT NULL DEFAULT '',
+		ended_at          INTEGER NOT NULL DEFAULT 0
+	)`,
 	`INSERT INTO meta(key, value) VALUES('schema_version', '1')
 		ON CONFLICT(key) DO NOTHING`,
 }
+
+// sessionTTL bounds how long a stored session key stays valid across restarts. Long
+// enough that a restart mid-session is seamless, short enough that the table does not
+// accumulate keys from every login ever made.
+const sessionTTL = 7 * 24 * time.Hour
 
 // NewPersistentStore opens (creating if absent) the SQLite database at path,
 // loads every account into memory, and -- on a brand-new DB with a legacy
@@ -429,6 +465,15 @@ func (s *Store) loadAllLocked() error {
 		return err
 	}
 
+	if err := s.loadCastlesLocked(); err != nil {
+		return err
+	}
+
+	// Last: session keys reference accounts, so the users must already be in memory.
+	if err := s.loadSessionsLocked(); err != nil {
+		return err
+	}
+
 	return nil
 }
 
@@ -438,6 +483,52 @@ func (s *Store) heroOf(uid int32) *Hero {
 		return u.Hero
 	}
 	return nil
+}
+
+// saveSessionLocked persists a freshly issued session key. Best-effort: a write failure
+// only means this key will not survive a restart, which is the behaviour we had before.
+func (s *Store) saveSessionLocked(key string, userID int32) {
+	if s.db == nil {
+		return
+	}
+	if _, err := s.db.Exec(`INSERT INTO sessions(key, user_id, created_at) VALUES(?,?,?)
+		ON CONFLICT(key) DO UPDATE SET user_id=excluded.user_id, created_at=excluded.created_at`,
+		key, userID, time.Now().Unix()); err != nil {
+		log.Printf("session: could not persist session key: %v", err)
+	}
+}
+
+// dropSessionLocked forgets a key (logout), so a stale key cannot be replayed later.
+func (s *Store) dropSessionLocked(key string) {
+	if s.db == nil {
+		return
+	}
+	if _, err := s.db.Exec(`DELETE FROM sessions WHERE key=?`, key); err != nil {
+		log.Printf("session: could not delete session key: %v", err)
+	}
+}
+
+// loadSessionsLocked restores session keys after a restart, dropping expired ones and any
+// whose account is gone. Called from loadAllLocked once the users are in memory.
+func (s *Store) loadSessionsLocked() error {
+	if s.db == nil {
+		return nil
+	}
+	cutoff := time.Now().Add(-sessionTTL).Unix()
+	if _, err := s.db.Exec(`DELETE FROM sessions WHERE created_at < ?`, cutoff); err != nil {
+		return err
+	}
+	return s.loadChild(`SELECT key, user_id FROM sessions`, func(rows *sql.Rows) error {
+		var key string
+		var uid int32
+		if err := rows.Scan(&key, &uid); err != nil {
+			return err
+		}
+		if s.usersByID[uid] != nil {
+			s.sessions[key] = &Session{Key: key, UserID: uid}
+		}
+		return nil
+	})
 }
 
 // loadChild runs query and hands each row to apply, which scans it directly

@@ -1,2 +1,10 @@
 /server/*.log
+/server/*.log.prev
+/server/*.log.prev10
 /server/*.err
+/server/*.exe
+/server/*.db
+/server/*.db-shm
+/server/*.db-wal
+/server/accounts.json.imported
+/_decompiled/

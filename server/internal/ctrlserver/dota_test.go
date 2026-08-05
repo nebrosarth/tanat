@@ -256,3 +256,118 @@ func TestArenaTabListAndMatchmaking(t *testing.T) {
 		t.Errorf("PendingBattle = {map=%d scene=%q}, want {map=%d scene=%q}", pb.MapID, pb.Scene, am.ID, am.Scene)
 	}
 }
+
+// TestFightJoinRejectsCastleOnlyMap: map_6_0 («Битва за замок») must NOT be enterable
+// through the general fight|join queue -- only through castle|ready's scheduled
+// window (see gamedata.DotaMap.CastleOnly) -- because that queue skips the castle's
+// team/ownership/reward wiring entirely.
+func TestFightJoinRejectsCastleOnlyMap(t *testing.T) {
+	srv := New()
+	ts := httptest.NewServer(srv.Handler())
+	defer ts.Close()
+	url := ts.URL + "/entry_point.php"
+
+	login := postEnvelope(t, url, loginEnvelope("sneak@example.com", "pw", "1.11", "0", "", 1))
+	lr, _ := login.GetArray(ctrlproto.CmdKey("user", "login"))
+	sessKey, _ := lr.GetString("sess_key")
+	userID, _ := lr.GetInt("id")
+
+	var castleMapID int32
+	for _, m := range gamedata.DotaMaps() {
+		if m.CastleOnly {
+			castleMapID = m.ID
+		}
+	}
+	if castleMapID == 0 {
+		t.Fatal("no CastleOnly DotaMap seeded -- test premise broken")
+	}
+
+	req := amf.NewArray().Set("object", "fight").Set("action", "join").
+		Set("params", amf.NewArray().Set("map_id", castleMapID)).
+		Set("sess_uid", userID).Set("sess_key", sessKey).Set("counter", 2)
+	resp, _ := postEnvelope(t, url, req).GetArray(ctrlproto.CmdKey("fight", "join"))
+	if resp == nil {
+		t.Fatal("no fight|join response")
+	}
+	if errc, ok := resp.GetInt("error"); !ok || errc == 0 {
+		t.Errorf("fight|join on the castle-only map = %#v, want an error", resp.Assoc)
+	}
+	if _, ok := srv.getFightSel(userID); ok {
+		t.Error("fight|join on the castle-only map recorded a selection -- it should have been rejected outright")
+	}
+}
+
+// TestCastleTestMapEnvVarExposesItUnderFightTab: with TANAT_CASTLE_TEST_MAP=1 set,
+// map_6_0 shows up in arena|get_maps_info under the «Штурм» type and fight|join/
+// fight|ready launch onto it directly -- a manual-testing shortcut for exercising the
+// siege mechanics without running the whole castle draft/schedule flow.
+func TestCastleTestMapEnvVarExposesItUnderFightTab(t *testing.T) {
+	t.Setenv("TANAT_CASTLE_TEST_MAP", "1")
+
+	srv := New()
+	srv.BattleHost = "127.0.0.1"
+	srv.BattlePorts = []int32{9339}
+	ts := httptest.NewServer(srv.Handler())
+	defer ts.Close()
+	url := ts.URL + "/entry_point.php"
+
+	login := postEnvelope(t, url, loginEnvelope("tester@example.com", "pw", "1.11", "0", "", 1))
+	lr, _ := login.GetArray(ctrlproto.CmdKey("user", "login"))
+	sessKey, _ := lr.GetString("sess_key")
+	userID, _ := lr.GetInt("id")
+	mkReq := func(obj, action string, params *amf.MixedArray, counter int32) *amf.MixedArray {
+		return amf.NewArray().Set("object", obj).Set("action", action).
+			Set("params", params).
+			Set("sess_uid", userID).Set("sess_key", sessKey).Set("counter", counter)
+	}
+
+	var castleMap gamedata.DotaMap
+	for _, m := range gamedata.DotaMaps() {
+		if m.CastleOnly {
+			castleMap = m
+		}
+	}
+	if castleMap.ID == 0 {
+		t.Fatal("no CastleOnly DotaMap seeded -- test premise broken")
+	}
+
+	mi, _ := postEnvelope(t, url, mkReq("arena", "get_maps_info", amf.NewArray(), 2)).
+		GetArray(ctrlproto.CmdKey("arena", "get_maps_info"))
+	maps, _ := mi.GetArray("maps_info")
+	var found *amf.MixedArray
+	for _, e := range maps.Dense {
+		m, _ := e.(*amf.MixedArray)
+		if m == nil {
+			continue
+		}
+		if id, _ := m.GetInt("id"); id == castleMap.ID {
+			found = m
+		}
+	}
+	if found == nil {
+		t.Fatal("castle map not listed in arena|get_maps_info under TANAT_CASTLE_TEST_MAP=1")
+	}
+	if typ, _ := found.GetInt("type_id"); typ != gamedata.MapTypeDota {
+		t.Errorf("castle map type_id = %d, want %d (Штурм tab)", typ, gamedata.MapTypeDota)
+	}
+	if name, _ := found.GetString("name"); name != "Castle_War_Text" {
+		t.Errorf("castle map name = %q, want a real locale key", name)
+	}
+
+	postEnvelope(t, url, mkReq("fight", "join", amf.NewArray().Set("map_id", castleMap.ID), 3))
+	if _, ok := srv.getFightSel(userID); !ok {
+		t.Fatal("fight|join on the exposed castle map did not record a selection")
+	}
+	postEnvelope(t, url, mkReq("fight", "ready", amf.NewArray(), 4))
+	pb, ok := srv.Store.TakePendingBattle(userID)
+	if !ok {
+		t.Fatal("fight|ready on the exposed castle map recorded no PendingBattle")
+	}
+	if pb.MapID != castleMap.ID || pb.Scene != castleMap.Scene {
+		t.Errorf("PendingBattle = {map=%d scene=%q}, want {map=%d scene=%q}",
+			pb.MapID, pb.Scene, castleMap.ID, castleMap.Scene)
+	}
+	if pb.CastleID != 0 {
+		t.Error("a fight|* launch onto the castle map must NOT carry a CastleID -- it bypasses the castle flow's ownership/reward wiring by design (test path only)")
+	}
+}

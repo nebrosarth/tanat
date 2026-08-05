@@ -114,6 +114,7 @@ type unitStatus struct {
 	poisonExplodeOwner  int32
 	poisonExplodeDmg    float64
 	poisonExplodeRadius float64
+	poisonExplodeFx     string
 
 	// cloak* implement Op.DamageShare (Kiona's «Лесной покров»): while this unit (an enemy
 	// mob OR an ally player -- unitStatus is shared by both) is marked, cloakHealCoeff
@@ -148,6 +149,12 @@ type unitStatus struct {
 	// active on the unit (started by the first DoT carrying an Op.DotFx, ended when
 	// the last DoT clears). One shared visual so re-procs don't stack copies.
 	dotFx int32
+	// riderFx is a skill visual PARENTED to this unit for the life of the effect it
+	// represents (Kiona's «Страж леса» owl watching over its charge). It is not a status
+	// icon, so no timer expires it -- it is ended when the effect's own window closes, or
+	// early when the body it rides dies: a guardian owl circling a corpse, or hanging in
+	// the air after one is deleted, is the report this exists for.
+	riderFx int32
 	// anchorFxUntil is set when a ground-anchored player buff VFX (e.g. Vigilans'
 	// ult barrier) is parented to THIS mob. If the ult then kills it, the corpse
 	// must linger until this time so the SELF-mode barrier keeps its stationary

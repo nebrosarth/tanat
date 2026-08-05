@@ -99,6 +99,9 @@ func TestMapCardsResolve(t *testing.T) {
 		check(m.Scene, "WinDesc", m.WinDesc)
 	}
 	for _, m := range DotaMaps() {
+		if m.CastleOnly {
+			continue // never rendered as a card -- castle|list sends the CASTLE's own NameKey instead
+		}
 		check(m.Scene, "Name", m.Name)
 		check(m.Scene, "Desc", m.Desc)
 		check(m.Scene, "WinDesc", m.WinDesc)

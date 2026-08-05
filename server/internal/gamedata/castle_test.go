@@ -11,14 +11,17 @@ func TestCastleRegistry(t *testing.T) {
 	seen := map[int32]bool{}
 	for _, c := range cs {
 		if c.ID == 0 {
-			t.Errorf("castle %q has id 0 (reserved)", c.Name)
+			t.Errorf("castle %q has id 0 (reserved)", c.NameKey)
 		}
 		if seen[c.ID] {
 			t.Errorf("duplicate castle id %d", c.ID)
 		}
 		seen[c.ID] = true
-		if c.Name == "" {
-			t.Errorf("castle %d has no name", c.ID)
+		if c.NameKey == "" {
+			t.Errorf("castle %d has no name key", c.ID)
+		}
+		if _, ok := DotaMapByID(c.MapID); !ok {
+			t.Errorf("castle %d MapID %d does not resolve to a DotaMap", c.ID, c.MapID)
 		}
 		if c.LevelMin > c.LevelMax {
 			t.Errorf("castle %d level range inverted: %d..%d", c.ID, c.LevelMin, c.LevelMax)

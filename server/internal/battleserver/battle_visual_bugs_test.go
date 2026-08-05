@@ -131,6 +131,11 @@ func TestSummonSwingSchedulesAndClosesActionDone(t *testing.T) {
 	if sm.swingDoneAt == 0 {
 		t.Fatal("summon swing did not schedule an ACTION_DONE close-out")
 	}
+	if mob.hp != 170 {
+		t.Fatalf("the blow landed at the START of the swing (mob hp %.0f)", mob.hp)
+	}
+	// The blow connects late in the swing, not the instant it starts.
+	s.tickSummonsLocked(c, 10.0+summonStrikeFrac)
 	if mob.hp >= 170 {
 		t.Fatalf("summon swing dealt no damage (mob hp %.0f)", mob.hp)
 	}

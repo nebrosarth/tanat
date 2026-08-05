@@ -102,6 +102,9 @@ func main() {
 			log.Fatalf("battle server: %v", err)
 		}
 	}()
+	// «Битва за замок»: the background scheduler that fires each castle's battle
+	// window once its countdown elapses (see ctrlserver/castle.go).
+	srv.StartCastleScheduler()
 	go func() {
 		if err := hub.ListenAndServe(*mpdAddr); err != nil {
 			log.Fatalf("mpd server: %v", err)

@@ -62,6 +62,20 @@ const (
 	// (ccImmuneBlockLocked); no mob applies player-facing CC today, so it is latent
 	// until such a source exists. Not run through applyOpsLocked.
 	OpImmune OpKind = "immune"
+	// OpBlockHit is a PASSIVE that fully NEGATES an incoming BASIC ATTACK -- Edilia's
+	// «Пыльца забвения»: «При получении удара от базовой атаки, Эдилия не получает урона»,
+	// and the buff's own line reads «Неуязвимость к урону от базовых атак». It blocks the
+	// FIRST such hit, then goes on its internal cooldown (Dur seconds), so the next few
+	// attacks land normally -- the card's only number is «{cooldown} время перезарядки».
+	//
+	// It replaces a dodge_pct CHANCE that was never in the client text: at 10-22% the
+	// block essentially never happened, while the paired attacker-slow proc DID fire and
+	// grey the button -- «уходит на перезарядку, но не блокирует урон».
+	//
+	// Nested Ops run against the ATTACKER at the moment of the block (the -50% attack
+	// speed for 1s). Registered at world-build (blockHitSlot) and honored at the top of
+	// hitPlayerFromLocked; not run through applyOpsLocked.
+	OpBlockHit OpKind = "block_hit"
 	// OpHealOnKill is a PASSIVE heal-on-kill (Cerber's «Кровавый пир»): whenever the
 	// caster kills an enemy, heal for Value × the KILLED target's max HP, capped at
 	// Value2. Registered at world-build (healOnKillSlot) and honored in the mob-death
@@ -373,6 +387,13 @@ type Op struct {
 	// «волны холода на двух СЛУЧАЙНЫХ целях» -- explicitly random, not nearest-first).
 	// Ignored when MaxTargets==0. false = nearest-first (back-compat default).
 	Randomize bool
+	// OnlyIfChilled restricts an OpChill to targets that are ALREADY chilled -- it punishes
+	// an existing chill (stun + clear) but never applies a fresh one. Frost's ice elemental
+	// needs exactly this: the card grants it a slow and «Если элементаль атакует врага ПОД
+	// ОЗНОБОМ, враг оглушается на 1 секунду», and says nothing about the elemental laying
+	// chill down itself -- which a plain OpChill did, handing Frost a free permanent chill
+	// applicator. false = the normal chill-or-punish behaviour.
+	OnlyIfChilled bool
 	// ExcludeCenterTarget drops the AoE's own center target (ctx.target, when the center is
 	// a struck/aimed unit rather than a point) from this op's candidate list before
 	// MaxTargets/PerTargetDecay apply (Titanid's «Ударная волна»: «все ДРУГИЕ враги вокруг
@@ -504,6 +525,11 @@ type Op struct {
 	// skill's one real, SP-scaled number. 0 = the explosion has no SP term of its own
 	// (back-compat default).
 	ExplodeSP float64
+	// ExplodeFx is the client effect key played AT THE CORPSE the instant it detonates
+	// (Wilfang's «Ядовитый укус»: WilfangSkill3Effect, a real gfx+sfx pair in the client's
+	// registry). "" = no visual, which is what this silently was before -- the damage
+	// applied with nothing shown for it.
+	ExplodeFx string
 
 	// MeleeOnly restricts an OnDamaged OpProc to fire only when the STRIKING mob is a
 	// MELEE attacker (AttackRange <= 0) -- BlackDragon's «Кровь дракона»: «При ближней
@@ -566,6 +592,14 @@ type Op struct {
 	// trap / channel / aura
 	TriggerRadius float64
 	Interval      float64
+	// Intervals is a PER-RANK channel cadence, overriding Interval when non-empty. It
+	// exists because a channel that must deliver a FIXED number of pulses across a
+	// per-rank duration needs the gap between them to scale with the rank (PlusMinus's
+	// «Короткое замыкание»: 5 pulses spread over 2.5..4.5s). Keeping the pulse COUNT
+	// constant is what lets a per-pulse PerSP share stay exact -- a Scale:"magic" op with
+	// no PerSP takes the caster's whole spell power on every application, so a rank-varying
+	// count would silently scale the spell-power term with rank.
+	Intervals PerLevel
 	TickCost      PerLevel
 	TrapFx        string
 	TriggerFx     string
@@ -599,6 +633,27 @@ type Op struct {
 	// nearest-to-CASTER first (a beam/line hit's natural "first, second, third..." order).
 	PerTargetGrowth   PerLevel
 	PerTargetGrowthSP float64
+
+	// EdgeValue turns an OpDamage's Value into the CENTER (distance-0) end of a linear
+	// interpolation across its own Radius, with EdgeValue the amount at distance==Radius --
+	// a target's SHARE OF THE RADIUS decides its damage, continuously, not how many other
+	// targets got hit or which rank they came in at. PlusMinus's «Электрошок» is the case:
+	// «...нанося урон всем задетым врагам В ЗАВИСИМОСТИ ОТ ИХ ПОЛОЖЕНИЯ. Чем дальше
+	// находится враг от эпицентра, тем больший урон он получает» -- literally a function of
+	// each target's own position, nothing else. It was previously modelled with
+	// PerTargetGrowth (an ordinal per-target-index bonus borrowed from Nerlag's throw),
+	// which the client text does not support and which is wrong on its face: two enemies
+	// standing at the exact same spot would take DIFFERENT damage depending on how many
+	// OTHER enemies happened to be caught in the blast that cast, which is not "in
+	// zависимости от их положения" at all.
+	//
+	// EdgeValueSP is the same idea for the SP contribution: the client's «...от
+	// {*damageMinSP} до {*damageMaxSP} единиц за каждую единицу силы заклинаний» says the
+	// spell-power coefficient ALSO interpolates from PerSP (center) to EdgeValueSP (edge),
+	// not just the flat damage. Empty EdgeValue = flat damage to every target at Value
+	// (back-compat default, e.g. Nerlag's cleave/burst hits).
+	EdgeValue   PerLevel
+	EdgeValueSP float64
 
 	// VictimMaxHPPct makes an OpDot's per-second magnitude a fraction of the TARGET's own
 	// live max HP instead of a flat per-rank table (Elgorm's «Оскверненная почва»: «получают
@@ -641,10 +696,46 @@ type Skill struct {
 	CastFx       string
 	CastFxDur    float64
 	PayloadFx    string
-	PayloadFxAt  string // "target" | "point" | "self"
+	PayloadFxAt  string // "target" | "point" | "self" | "throw"
 	PayloadDelay float64
+	// PayloadFlight models a THROWN payload: the projectile leaves the caster at
+	// PayloadDelay and only ARRIVES PayloadFlight seconds later, which is when the ops
+	// run and ImpactFx plays. Used with PayloadFxAt:"throw", which pins an invisible
+	// anchor at the aim point and starts the payload fx as caster->anchor, so the
+	// client's SELF_TO_TARGET mover actually has somewhere to fly to.
+	//
+	// Einzenhaim's «Изгнание колдовства» is the case this exists for, and the flight time
+	// is not invented: the thrown bottle in VFX_Avtr_DPS_Einzenhaim_skill4_prop01 hangs
+	// off a `_Parent` carrying TimeDestroy(0.65), i.e. the client's own bottle lives
+	// exactly 0.65s before it is destroyed at the landing point. 0 = instant payload (the
+	// default every other skill keeps).
+	PayloadFlight float64
+	// PayloadFlightSpeed is the same idea for a TARGET-mode projectile whose travel time
+	// depends on how far the victim is: the ops are held back by distance/speed after the
+	// bolt is loosed. Frost's «Стужа» is the case -- its
+	// VFX_Avtr_Dsb_Frost_skill1_prop01 carries a SmoothMove with mBySpeed=true and
+	// mSpeed=35, so the client flies it at 35 units/sec and the damage may not beat it
+	// there. 0 = the ops land with the fx (every other targeted skill).
+	//
+	// Reading that number needs care: SmoothMove derives from MultiTargetsEffect, whose
+	// public `bool mDone` serializes FIRST, so a parse that starts at mSpeed is shifted by
+	// one field. With mDone accounted for, Elgorm's skull prop reads mSpeed=15 -- matching
+	// the value skullMoverSpeed has been using all along, which is the positive control.
+	PayloadFlightSpeed float64
+	// ImpactFx plays at the moment a thrown payload lands, owned by the anchor at the aim
+	// point (Einzenhaim's EinzenhaimSkill4Effect2: the explosion plus the Einzenhaim_skill4_2
+	// impact sound). "" = no separate impact visual.
+	ImpactFx string
+	// LingerFx is a ground effect left AT the impact point for as long as the skill's
+	// channel runs (Einzenhaim's EinzenhaimSkill4Effect3 -- a looping smoke ring, so it
+	// needs an explicit end). "" = nothing lingers.
+	LingerFx string
 	BuffFx       string
 	BuffFxOn     string // "self" | "target"
+	// TargetFxEnd is what a target-mode BuffFx turns INTO when its window closes -- Frost's
+	// «Гробница холода» ice block shattering (FrostSkill3Effect3, with its own
+	// Frost_skill3_break sound). "" = the visual simply ends.
+	TargetFxEnd string
 	// GrowFx is a per-level self VFX base name for a passive that enlarges the
 	// model (Titanid's "Гигантизм"): the client's MorphEffect on the fx prefab
 	// scales the parented avatar root, and each level uses a progressively larger

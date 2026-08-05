@@ -60,12 +60,12 @@ const (
 	// mob's own AttackRange replaces this base.
 	meleeReach = 0.6
 
-	summonSeek        = 12.0 // summons pick fights inside this radius
-	stationaryTurretRange = 8.0 // a stationary summon (Morlokai's totem) zaps enemies inside this
-	summonRing        = 2.8  // escort radius: summons hold a ring slot AROUND the follow point
-	summonSpawnRadius = 1.2  // tighter ring the burst spawns on, around its cast point
-	summonSlotTol     = 0.6  // deadband: don't re-issue a follow until this far off the slot
-	summonRadius      = 0.5  // body radius of a summoned crawler (has no gamedata.Mob entry)
+	summonSeek            = 12.0 // summons pick fights inside this radius
+	stationaryTurretRange = 8.0  // a stationary summon (Morlokai's totem) zaps enemies inside this
+	summonRing            = 2.8  // escort radius: summons hold a ring slot AROUND the follow point
+	summonSpawnRadius     = 1.2  // tighter ring the burst spawns on, around its cast point
+	summonSlotTol         = 0.6  // deadband: don't re-issue a follow until this far off the slot
+	summonRadius          = 0.5  // body radius of a summoned crawler (has no gamedata.Mob entry)
 	// summonSpeed is the summon's run speed. Deliberately above the avatar's
 	// lobbyMoveSpeed (4.0) and on par with a normal mob (~4.2-4.6) so a pet can
 	// actually catch up to and keep pace with its moving owner and its prey.
@@ -194,6 +194,26 @@ type channelState struct {
 	// of the pulse's centre. 0 = no occupancy scaling (back-compat default).
 	growthPerEnemy float64
 	growthRadius   float64
+	// pulsesLeft implements Op.Count on a channel: an exact number of pulses (Einzenhaim's
+	// «Пальба навскидку» -- the client's own tooltip counts them, «{shots} выстрелов»).
+	// Counting is what the skill IS; deriving the count from Dur/Interval leaves it at the
+	// mercy of where the 0.2s tick grid happens to fall. 0 = duration-bounded (the default
+	// every other channel keeps).
+	pulsesLeft int
+	// fxUIDs are the live client effects this channel owns (its cast fx and payload fx).
+	// A channel's visual does NOT self-terminate: the client's baked prefabs for these
+	// skills carry mLoopAnimation and a looping VisualEffect (Einzenhaim's Cast02 plus a
+	// PrefabTimeSpawn that keeps spawning shots; Morlokai's Cast02 plus the SELF_TO_TARGET
+	// beam), so they run until an EFFECT_END arrives. When a channel BREAKS early -- the
+	// caster walks off or is stunned -- the server must send those ends, or the animation
+	// and the shots keep playing with no damage behind them.
+	fxUIDs []int32
+	// holdsTarget marks a channel whose ROOT/SILENCE on its target is the channel itself
+	// (Morlokai's «Кабала»: «Удерживает цель с помощью магии... в течение {duration} секунд»).
+	// Those are applied once at cast with their full duration, so without this an
+	// interrupted hold kept the victim pinned for the rest of the nominal window while the
+	// caster had already walked away. Breaking the channel releases the grip.
+	holdsTarget bool
 }
 
 // summonState is one allied summoned unit. In a shared world it is rendered by
@@ -266,8 +286,53 @@ type summonState struct {
 	// Copied from the spawning Op.Ops at cast time; nil = a plain damage-only summon.
 	onHitOps []gamedata.Op
 
+	// ranged marks a summon whose CLIENT prefab carries a projectile, so its attack must be
+	// announced with SET_PROJECTILE (VisualBattle.OnSetProjectile -> VisualEffectOptions.
+	// ShotProjectile) instead of resolving silently. Without it the model plays its swing
+	// and the victim just loses health -- the «электро шар не имеет анимации атаки» report:
+	// the totem's bolt, and its sound, live entirely on that projectile prefab.
+	// projHitAt/projTarget are the committed arrival of a bolt already in flight.
+	ranged     bool
+	projHitAt  float64
+	projTarget int32
+	// swingHitAt/swingTarget are the COMMITTED end of a wind-up: a summon used to connect
+	// the instant its swing started, so the victim lost health while the model was still
+	// raising its arm. The strike now lands (or, for a shooter, the bolt is loosed) near
+	// the end of the swing, the way a mob's melee connects mid-swing rather than at once.
+	swingHitAt  float64
+	swingTarget int32
+
 	pf pathState // routed chase waypoints when the straight line is wall-blocked
 }
+
+// summonRangedPrefabs are the summonable unit prefabs whose VisualEffectOptions declares a
+// non-empty mProjectiles array -- read straight out of the shipped bundles, not guessed:
+//
+//	Avtr_Dsb_Morlokay_Skill4_prop01  LIGHTNING2      Avtr_Dsb_Morlokay_projectile_prop02
+//	Avtr_Dsb_Frost_Elemental         PhysiqueDamage  Avtr_Dsb_Frost_projectile_prop01
+//	Avtr_Psh_Anhel                   LIGHTNING       VFX_Avtr_Psh_Anhel_Attack_prop01
+//
+// Every other summonable prefab (Urg's totem and tree, the dinosaur, the zombie crawler,
+// Lirvein's trap) has an empty projectile list and stays a silent melee striker.
+var summonRangedPrefabs = map[string]bool{
+	"Avtr_Dsb_Morlokay_Skill4_prop01": true,
+	"Avtr_Dsb_Frost_Elemental":        true,
+	"Avtr_Psh_Anhel":                  true,
+}
+
+// summonBoltSpeed is how fast a summon's projectile flies (world units/sec), matching the
+// avatar bolt cadence in scheduleProjectileLocked (gap/24 + 0.1). The client needs the hit
+// time to be strictly in the FUTURE -- OnSetProjectile drops the shot when
+// mHitTime <= battle time -- so the floor is what guarantees the bolt is ever drawn.
+const (
+	summonBoltSpeed     = 24.0
+	summonBoltMinFlight = 0.12
+	// summonStrikeFrac is where in the swing CYCLE the blow actually connects, as a
+	// fraction of the period. 0.7 puts it late in the animation -- «в конце анимации» --
+	// while still landing before the ACTION_DONE that closes the swing at 0.9s, so the
+	// next swing can re-trigger cleanly.
+	summonStrikeFrac = 0.7
+)
 
 // pathState caches an A* route a tick-driven chaser (mob/summon) is following:
 // the remaining waypoints, the cursor into them, the anchor of the current leg
@@ -378,6 +443,12 @@ func (s *Server) memberTickLocked(c *conn, now float64) {
 			continue
 		}
 		s.fxEndLocked(c, f.uid)
+		// What it turns into when it lapses (Frost's ice block shattering, with its own
+		// Frost_skill3_break sound), on the same owner and at the same instant.
+		if f.then != "" && f.thenOwner != 0 {
+			endUID := s.fxStartLocked(c, f.then, f.thenOwner, 0, false, 0, 0)
+			hs.scheduleFxEnd(endUID, now+2.0)
+		}
 	}
 	hs.fxEnds = fxKeep
 
@@ -746,9 +817,18 @@ func (s *Server) tickChannelsLocked(c *conn, now float64) {
 		// A self/unit channel, OR an interruptible ground channel (a caster-sustained
 		// one like Elgorm's arrow rain), ends the moment the caster moves or is
 		// stunned. A plain fire-and-forget ground channel (Titanid's quake) keeps
-		// erupting regardless.
-		if !groundAnchored || ch.interruptible {
+		// erupting regardless -- and so does a self-buff pulse explicitly marked as one
+		// (BlackDragon's «Взмах погибели»: channelSustainsThroughDisruption).
+		if (!groundAnchored || ch.interruptible) && !channelSustainsThroughDisruption(hs.av.Prefab, ch.slot) {
 			broken = broken || hs.st.stunned(now) || c.hasDest
+		}
+		// A channel held ON a unit ends when that unit dies. Nothing is being channelled
+		// into a corpse -- and for a grip like «Короткое замыкание» or «Кабала» the beam
+		// would otherwise keep firing at a body for the rest of its nominal duration.
+		if ch.target > 0 {
+			if ms := hs.mobs[ch.target]; ms == nil || ms.dead {
+				broken = true
+			}
 		}
 		// Leash break (Inshari's siphon): if the tethered target strays past breakDist the
 		// contact snaps, stunning it -- «при сильном отдалении контакт разорвётся, оглушая
@@ -765,6 +845,24 @@ func (s *Server) tickChannelsLocked(c *conn, now float64) {
 			}
 		}
 		if broken || now > ch.until {
+			// An early BREAK kills the visual with the mechanic. A natural end does not:
+			// the fx already has its own scheduled end (fxLife covers the whole channel),
+			// and cutting it here would clip the last spawned shot/arrow mid-flight.
+			if broken {
+				for _, uid := range ch.fxUIDs {
+					s.fxEndLocked(c, uid)
+				}
+				// ...and lets go of a held victim. The status tick ends the matching
+				// StunEffect/SilenceEffect visuals on the next pass, once the timers read
+				// expired, so no fx teardown is needed here.
+				if ch.holdsTarget && ch.target > 0 {
+					if ms := hs.mobs[ch.target]; ms != nil && !ms.dead {
+						ms.st.rootUntil = math.Min(ms.st.rootUntil, now)
+						ms.st.silenceUntil = math.Min(ms.st.silenceUntil, now)
+						ms.st.atkSlowUntil = math.Min(ms.st.atkSlowUntil, now)
+					}
+				}
+			}
 			continue
 		}
 		if now >= ch.nextPulse {
@@ -774,7 +872,19 @@ func (s *Server) tickChannelsLocked(c *conn, now float64) {
 			// and loses pulses (Elgorm's arrow rain dropped from 9 ticks to ~7).
 			// Accumulating keeps the ideal schedule (0.2, 0.66, 1.12, ...) so each pulse
 			// fires on the first tick at/after its ideal time -> the full 9 ticks land.
-			ch.nextPulse += math.Max(ch.interval, 0.4)
+			//
+			// The step is the AUTHORED interval. It used to be floored at 0.4s, which
+			// silently rewrote every faster cadence in the specs -- Einzenhaim's 0.25s
+			// volley became 0.4s and landed 2 hits instead of 3-5, and three other
+			// channels (0.3/0.3/0.55) were quietly stretched too. Accumulating already
+			// makes a sub-tick cadence work out: a 0.3s step on the 0.2s grid fires at
+			// 0, 0.4, 0.6, 1.0, 1.2 -- individual gaps alternate, but no pulse is lost.
+			// Only a non-positive interval needs a floor (it would re-fire every tick).
+			step := ch.interval
+			if step <= 0 {
+				step = 0.4
+			}
+			ch.nextPulse += step
 			var ms *mobState
 			if ch.target > 0 {
 				ms = hs.mobs[ch.target]
@@ -800,6 +910,14 @@ func (s *Server) tickChannelsLocked(c *conn, now float64) {
 				radiusBonus: ch.radiusGrowth * float64(ch.pulseCount)}
 			s.applyOpsLocked(c, ch.ops, ctx, now)
 			ch.pulseCount++
+			// Op.Count channel: stop the moment the authored number of pulses has been
+			// delivered, without waiting for the duration to lapse.
+			if ch.pulsesLeft > 0 {
+				ch.pulsesLeft--
+				if ch.pulsesLeft == 0 {
+					continue
+				}
+			}
 		}
 		keep = append(keep, ch)
 	}
@@ -1089,6 +1207,8 @@ func (s *Server) summonLocked(c *conn, op gamedata.Op, ctx opCtx, now float64) {
 			until: now + op.Lifetime.At(ctx.level),
 			pet:   op.Pet, slot: ctx.slot,
 			stationary: op.Stationary,
+			// Shoots instead of swinging, if its client prefab carries a projectile.
+			ranged: summonRangedPrefabs[op.Unit],
 			// Frost's «Исчадие мерзлоты»: the elemental's own on-hit slow/chill-stun combo.
 			onHitOps: op.Ops,
 		}
@@ -1242,6 +1362,11 @@ func (s *Server) tickSummonsLocked(c *conn, now float64) {
 			s.removeSummonFromClientsLocked(c, sm, now)
 			continue
 		}
+		// Resolve COMMITTED actions BEFORE any gate below can skip this summon: a wind-up
+		// that has finished connects, and a bolt already drawn on every client lands
+		// (mirrors the mob arm, which resolves its promises ahead of its own gates).
+		s.resolveSummonSwingLocked(c, sm, now)
+		s.resolveSummonBoltLocked(c, sm, now)
 		// Close out a finished swing so the client drops the attack-action overlay
 		// and the next DO_ACTION can re-trigger the WrapMode.Once attack clip.
 		// Without this ACTION_DONE the summon swings exactly once then never
@@ -1280,8 +1405,7 @@ func (s *Server) tickSummonsLocked(c *conn, now float64) {
 					newActionArgs(sm.id, summonAttackProtoID, tgt.id, now,
 						amf.NewArray().Set("x", 0.0).Set("y", 0.0)))
 				sm.swingDoneAt = now + 0.9
-				s.hitMobLocked(c, tgt, sm.dmg, sm.id)
-				s.applySummonOnHitOpsLocked(c, sm, tgt, now)
+				s.strikeSummonLocked(c, sm, tgt, now)
 			}
 			continue
 		}
@@ -1370,11 +1494,66 @@ func (s *Server) tickSummonsLocked(c *conn, now float64) {
 			// Close the swing a hair before the next one so a continuous attacker
 			// re-triggers cleanly (mirrors the mob path).
 			sm.swingDoneAt = now + 0.9
-			s.hitMobLocked(c, target, sm.dmg, sm.id)
-			s.applySummonOnHitOpsLocked(c, sm, target, now)
+			s.strikeSummonLocked(c, sm, target, now)
 		}
 		s.moveSummonLocked(c, sm, 0, 0, false, now)
 	}
+}
+
+// strikeSummonLocked resolves one summon swing. A MELEE summon connects at once, as it
+// always has. A RANGED one (its client prefab carries a projectile) instead looses a bolt:
+// SET_PROJECTILE tells every client to fly the prefab -- which is what draws Morlokai's
+// lightning and plays its sound -- and the damage is committed to land on arrival, so the
+// health drop and the visible impact happen at the same moment instead of the health
+// dropping while nothing is drawn at all.
+func (s *Server) strikeSummonLocked(c *conn, sm *summonState, target *mobState, now float64) {
+	sm.swingHitAt = now + summonStrikeFrac/summonAttackSpeedMulLocked(sm, now)
+	sm.swingTarget = target.id
+}
+
+// resolveSummonSwingLocked fires a wind-up that has run its course: a melee summon
+// connects, a shooter looses its bolt (which then lands on arrival). The blow is
+// COMMITTED at this point -- it connects even if the target has since moved -- but a
+// target that died in the meantime is simply dropped.
+func (s *Server) resolveSummonSwingLocked(c *conn, sm *summonState, now float64) {
+	if sm.swingHitAt == 0 || now < sm.swingHitAt {
+		return
+	}
+	sm.swingHitAt = 0
+	target := c.huntState.mobs[sm.swingTarget]
+	sm.swingTarget = 0
+	if target == nil || target.dead {
+		return
+	}
+	if !sm.ranged {
+		s.hitMobLocked(c, target, sm.dmg, sm.id)
+		s.applySummonOnHitOpsLocked(c, sm, target, now)
+		return
+	}
+	flight := math.Hypot(float64(target.x-sm.x), float64(target.y-sm.y))/summonBoltSpeed + summonBoltMinFlight
+	sm.projHitAt = now + flight
+	sm.projTarget = target.id
+	s.broadcastObjLocked(c, sm.id, battleproto.CmdSetProjectile, amf.NewArray().
+		Set("source", sm.id).
+		Set("target", target.id).
+		Set("hit_at", sm.projHitAt))
+}
+
+// resolveSummonBoltLocked lands a bolt that has arrived. Like every other committed
+// projectile in the engine the hit is a promise already made: it connects even if the
+// target has since moved, and it is dropped only if the target is gone.
+func (s *Server) resolveSummonBoltLocked(c *conn, sm *summonState, now float64) {
+	if sm.projHitAt == 0 || now < sm.projHitAt {
+		return
+	}
+	sm.projHitAt = 0
+	tgt := c.huntState.mobs[sm.projTarget]
+	sm.projTarget = 0
+	if tgt == nil || tgt.dead {
+		return
+	}
+	s.hitMobLocked(c, tgt, sm.dmg, sm.id)
+	s.applySummonOnHitOpsLocked(c, sm, tgt, now)
 }
 
 // ringPoint returns this summon's formation slot: the point at its fixed angle on
@@ -2704,6 +2883,56 @@ func (s *Server) hitPlayerLocked(c *conn, m *mobState, dmg float64, now float64)
 	s.hitPlayerFromLocked(c, m.id, dmg, now, m, nil)
 }
 
+// blockIncomingHitLocked consumes a learned OpBlockHit passive against an incoming BASIC
+// attack, negating it completely and starting the passive's internal cooldown. Reports
+// whether the blow was swallowed.
+//
+// It reads hs.lastDamageWasSkill WITHOUT clearing it: the flag belongs to
+// runDefenseProcsLocked, which consumes it on the same hit -- and which never runs when
+// the hit is blocked, since the caller returns.
+func (s *Server) blockIncomingHitLocked(c *conn, damagerID int32, now float64, attacker *mobState) bool {
+	hs := c.huntState
+	slot := hs.blockHitSlot
+	if slot < 1 || now < hs.blockHitReadyAt {
+		return false
+	}
+	level := int(hs.skillLevel[slot-1])
+	if level < 1 {
+		return false // passive not learned yet
+	}
+	if hs.lastDamageWasSkill {
+		return false // «от базовой атаки» -- a mob/boss SKILL is not blocked
+	}
+	var op *gamedata.Op
+	for i := range hs.kit.Skills[slot-1].Ops {
+		if hs.kit.Skills[slot-1].Ops[i].Kind == gamedata.OpBlockHit {
+			op = &hs.kit.Skills[slot-1].Ops[i]
+			break
+		}
+	}
+	if op == nil {
+		return false
+	}
+	// Tell the client the hit was absorbed: flags 1 / damage 0 is the same wire shape the
+	// dodge path uses, so the "no damage" popup and the animation match.
+	s.broadcastAvatarObjLocked(c, battleproto.CmdReceiveHit, amf.NewArray().
+		Set("object", c.objID).
+		Set("damager", damagerID).
+		Set("flags", int32(1)).
+		Set("damage", 0.0))
+	// Punish the attacker («атакующий теряет скорость атаки на 50% в течение 1 секунды»).
+	if len(op.Ops) > 0 && attacker != nil {
+		px, py := c.posAtLocked(float32(now))
+		s.applyOpsLocked(c, op.Ops, opCtx{slot: slot, level: level, target: attacker,
+			px: px, py: py, hasPos: true}, now)
+	}
+	if cd := op.Dur.At(level); cd > 0 {
+		hs.blockHitReadyAt = now + cd
+		s.pushPassiveProcCooldownLocked(c, slot, hs.blockHitReadyAt)
+	}
+	return true
+}
+
 // hitPlayerFromLocked applies incoming damage to player c and, on a lethal blow, kills
 // it. The attacker is identified two ways: damagerID is the wire id shown on the
 // RECEIVE_HIT / ON_KILL (a mob id or an enemy avatar's objID), while thornsMob XOR
@@ -2713,6 +2942,13 @@ func (s *Server) hitPlayerLocked(c *conn, m *mobState, dmg float64, now float64)
 func (s *Server) hitPlayerFromLocked(c *conn, damagerID int32, dmg float64, now float64, thornsMob *mobState, pvpAttacker *conn) {
 	hs := c.huntState
 	if hs.deadUntil > 0 {
+		return
+	}
+	// Block the whole blow? (Edilia's «Пыльца забвения».) This sits ABOVE armor and
+	// absorb because the skill negates the hit rather than reducing it, and above the
+	// dodge roll because it is not a roll at all. Basic attacks only, so a boss skill
+	// still connects.
+	if s.blockIncomingHitLocked(c, damagerID, now, thornsMob) {
 		return
 	}
 	// Dodge?

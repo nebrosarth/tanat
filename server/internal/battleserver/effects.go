@@ -40,11 +40,22 @@ import (
 // the per-connection path below, byte-for-byte identical. worldFxStartLocked falls
 // back here when c.inst == nil, so the two never recurse.
 func (s *Server) fxStartLocked(c *conn, fx string, owner, target int32, hasPos bool, px, py float32) int32 {
+	return s.fxStartCounterLocked(c, fx, owner, target, hasPos, px, py, 0)
+}
+
+// fxStartCounterLocked is fxStartLocked plus a "counter" wire arg -- the client's
+// VisualEffectHolder.Init only applies it when > 1 (VisualEffect.SetEffectCounter ->
+// ParticlesMgr.SetCounter, which multiplies the effect's OWN particle emitter's
+// minEmission/maxEmission by it, confirmed straight off the decompiled client). It is how
+// a server-side COUNT (Gellar's banked souls) becomes a visually proportional number of
+// "soul" particles in one EFFECT_START, rather than one EFFECT_START per soul. counter<=1
+// omits the arg entirely, identical to plain fxStartLocked.
+func (s *Server) fxStartCounterLocked(c *conn, fx string, owner, target int32, hasPos bool, px, py float32, counter int32) int32 {
 	if fx == "" {
 		return 0
 	}
 	if c.inst != nil {
-		return s.worldFxStartLocked(c, fx, owner, target, hasPos, px, py)
+		return s.worldFxStartCounterLocked(c, fx, owner, target, hasPos, px, py, counter)
 	}
 	hs := c.huntState
 	hs.nextFxUID++
@@ -55,6 +66,9 @@ func (s *Server) fxStartLocked(c *conn, fx string, owner, target int32, hasPos b
 	}
 	if hasPos {
 		args.Set("targetPos", amf.NewArray().Set("x", float64(px)).Set("y", float64(py)))
+	}
+	if counter > 1 {
+		args.Set("counter", counter)
 	}
 	s.push(c, battleproto.CmdEffectStart, amf.NewArray().
 		Set("effect", uid).
@@ -79,18 +93,48 @@ func (s *Server) fxEndLocked(c *conn, uid int32) {
 	s.push(c, battleproto.CmdEffectEnd, amf.NewArray().Set("id", uid))
 }
 
+// noteCastFxLocked records an fx uid as belonging to the current cast of a slot, and
+// resets the list first when this is the cast's own opening effect. See huntState.castFx.
+func (hs *huntState) noteCastFxLocked(slot int, uid int32, first bool) {
+	if slot < 1 || slot > len(hs.castFx) {
+		return
+	}
+	if first {
+		hs.castFx[slot-1] = hs.castFx[slot-1][:0]
+	}
+	if uid != 0 {
+		hs.castFx[slot-1] = append(hs.castFx[slot-1], uid)
+	}
+}
+
+// liveCastFxLocked returns a copy of the current cast's fx uids for a slot.
+func (hs *huntState) liveCastFxLocked(slot int) []int32 {
+	if slot < 1 || slot > len(hs.castFx) || len(hs.castFx[slot-1]) == 0 {
+		return nil
+	}
+	return append([]int32(nil), hs.castFx[slot-1]...)
+}
+
 // scheduleFxEnd ends a cast fx after d seconds of battle time (via the tick
 // loop's timed queue, so it survives bursts and honors mvMu).
 func (hs *huntState) scheduleFxEnd(uid int32, at float64) {
+	hs.scheduleFxEndThen(uid, at, "", 0)
+}
+
+// scheduleFxEndThen additionally starts `then` on `thenOwner` at the same moment the uid
+// ends -- what the effect turns INTO when it lapses (Frost's ice block shattering).
+func (hs *huntState) scheduleFxEndThen(uid int32, at float64, then string, thenOwner int32) {
 	if uid == 0 {
 		return
 	}
-	hs.fxEnds = append(hs.fxEnds, fxEnd{uid: uid, at: at})
+	hs.fxEnds = append(hs.fxEnds, fxEnd{uid: uid, at: at, then: then, thenOwner: thenOwner})
 }
 
 type fxEnd struct {
-	uid int32
-	at  float64
+	uid       int32
+	at        float64
+	then      string
+	thenOwner int32
 }
 
 // ---- orders (approach-then-cast) ----
@@ -296,6 +340,23 @@ func channelInterruptible(prefab string, slot int) bool {
 		(prefab == "Avtr_Dsb_Morlokay" && slot == 2)
 }
 
+// channelSustainsThroughDisruption reports whether a SELF-only channel (no ground point,
+// no held unit) keeps ticking through movement and stuns instead of breaking, like a
+// ground-anchored channel does. Every self/unit channel breaks on move/stun by default
+// (Abominator's «Пожирание» drain is the model this defaults to: it needs the caster to
+// keep concentrating). BlackDragon's «Взмах погибели» is a different shape -- a self-buff
+// rage that flaps and pulses AoE damage around him for its own 8s window, not something
+// that requires him to stand still or go uninterrupted; nothing in this file's engine
+// distinguished "a buff that happens to tick" from "a channel you must actively sustain"
+// until this flag existed. Hand-maintained, keyed by prefab+slot like channelInterruptible.
+func channelSustainsThroughDisruption(prefab string, slot int) bool {
+	// Gellar's «Армия душ»: the souls are already loosed the instant it is cast (each
+	// pulse is one banked soul being spent, not the caster actively sustaining a beam/
+	// hold), so it is not something walking or being stunned should be able to cut off.
+	return (prefab == "Avtr_DPS_BlackDragon" && slot == 4) ||
+		(prefab == "Avtr_DPS_Gellar" && slot == 4)
+}
+
 // channelPulseDelay is the lead-in before a channel's FIRST damage pulse, matching
 // the client payload fx's own start delay so the server ticks land in step with the
 // visual. Elgorm's «Стрелы Аркана» arrow burst (ProjectileBurst on
@@ -305,6 +366,17 @@ func channelInterruptible(prefab string, slot int) bool {
 func channelPulseDelay(prefab string, slot int) float64 {
 	if prefab == "Avtr_Dsb_Elgorm" && slot == 4 {
 		return 0.2
+	}
+	// Miriam's «Убийственный залп» (slot 4): the arrow rain is a spawner-of-spawners --
+	// MiriamSkill4Effect's PrefabTimeSpawn only starts dropping arrows at m_SpawnTime=1.0
+	// (matching this skill's own Interval:1), and each arrow then falls for a further,
+	// unmeasured stretch before its own TimeDestroy(1.5) despawns it -- no SmoothMove/
+	// velocity field on the arrow prefab gives an exact fall speed the way Frost's bolt
+	// did. What IS hard data is the floor: damage cannot land before the FIRST arrow even
+	// exists, so the channel's first tick moves from t=0 (instant, before any arrow had
+	// spawned -- «урон наносится сразу») to t=1.0, in step with every following tick.
+	if prefab == "Avtr_DPS_Miriam" && slot == 4 {
+		return 1.0
 	}
 	return 0
 }
@@ -323,6 +395,69 @@ func skillChannelDur(def gamedata.Skill, level int) float64 {
 		}
 	}
 	return d
+}
+
+// skillOverTimeDur returns the longest DoT/HoT duration a skill applies at the given rank
+// (0 if it applies none) -- how long an effect that RIDES a unit is actually meant to last.
+func skillOverTimeDur(def gamedata.Skill, level int) float64 {
+	var d float64
+	for _, op := range def.Ops {
+		switch op.Kind {
+		case gamedata.OpDot, gamedata.OpHot:
+			if v := op.Dur.At(level); v > d {
+				d = v
+			}
+		}
+	}
+	return d
+}
+
+// skillHasAnyBuffStat reports whether a skill applies an OpBuffStat anywhere -- at the top
+// level or nested one level inside another op (a channel's per-tick ops, a proc's, ...).
+// Used to tell a channel that IS a stat buff (Hekata's «Пепельный смерч», which gets its
+// self BuffFx from its own nested OpBuffStat re-applying every tick) from a channel that
+// has no stat mod to ride at all (BlackDragon/Gayal/Gellar's ults), which otherwise never
+// starts its BuffFx.
+func skillHasAnyBuffStat(def gamedata.Skill) bool {
+	for _, op := range def.Ops {
+		if op.Kind == gamedata.OpBuffStat {
+			return true
+		}
+		for _, nested := range op.Ops {
+			if nested.Kind == gamedata.OpBuffStat {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// skillHoldsTarget reports whether a skill both CHANNELS and pins its victim with a
+// root/silence -- i.e. the channel is a GRIP, and the crowd control is that grip made
+// visible rather than an independent debuff that should outlive it.
+func skillHoldsTarget(def gamedata.Skill) bool {
+	var channels, holds bool
+	for _, op := range def.Ops {
+		switch op.Kind {
+		case gamedata.OpChannel:
+			channels = true
+		case gamedata.OpRoot, gamedata.OpSilence:
+			holds = true
+		}
+	}
+	return channels && holds
+}
+
+// skillStealthsCaster reports whether casting this skill makes the CASTER invisible --
+// On:"allies" is excluded, since that cloaks OTHERS while the caster (Sandariel's
+// «Сокрывающая вуаль») explicitly stays visible and should resume auto-attacking normally.
+func skillStealthsCaster(def gamedata.Skill) bool {
+	for _, op := range def.Ops {
+		if op.Kind == gamedata.OpStealth && op.On != "allies" {
+			return true
+		}
+	}
+	return false
 }
 
 // skillHasChannel reports whether a skill's ops include an OpChannel (a sustained
@@ -427,7 +562,19 @@ func (s *Server) execCastLocked(c *conn, slot int, ms *mobState, px, py float32,
 	if castDur <= 0 {
 		castDur = 2.0
 	}
+	// A CHANNEL's cast fx carries the sustained pose: the client's baked holder for these
+	// skills sets mLoopAnimation on the Cast clip, so the loop runs until EFFECT_END. Its
+	// natural end is the end of the CHANNEL, not the authored one-shot CastFxDur -- which
+	// is sized for a normal cast and would drop the pose (and, for Einzenhaim's volley, the
+	// shot spawner riding the same effect) part-way through. The channel itself starts at
+	// the payload, hence the +PayloadDelay.
+	if d := skillChannelDur(def, level); d > 0 {
+		if full := def.PayloadDelay + d; full > castDur {
+			castDur = full
+		}
+	}
 	hs.scheduleFxEnd(castUID, now+castDur)
+	hs.noteCastFxLocked(slot, castUID, true)
 
 	// Payload: fx at the victim/point + the actual ops.
 	delay := def.PayloadDelay
@@ -456,8 +603,13 @@ func (s *Server) execCastLocked(c *conn, slot int, ms *mobState, px, py float32,
 		resumeTarget: resumeTarget,
 		// A channel skill holds the caster in place sustaining it; do NOT roll into
 		// auto-attack when the cast action closes (that would visually break the
-		// channel pose and start swinging mid-channel).
-		noResume: skillHasChannel(def),
+		// channel pose and start swinging mid-channel). A skill that cloaks the CASTER
+		// (not Sandariel's «Сокрывающая вуаль», which stealths allies while she explicitly
+		// stays visible) must not roll into auto-attack either -- the whole point of going
+		// invisible is not immediately undone by the engine itself swinging at the nearest
+		// enemy the instant the cast closes (Wilfang's «Засада»: "аватар не должен
+		// переключаться на автоатаку после применения этой способности").
+		noResume: skillHasChannel(def) || skillStealthsCaster(def),
 	})
 
 	// Root the avatar for the cast's committed motion only: the wind-up
@@ -494,6 +646,10 @@ type payload struct {
 	// auto-attack once the charge lands. The action-done's own resume attempt fires
 	// mid-dash (hasDest set) and bails, so the charge needs its own post-arrival one.
 	resume bool
+	// anchor, on the ARRIVAL half of a thrown payload (Skill.PayloadFlight), is the
+	// invisible object standing at the aim point: the impact and linger fx are owned to
+	// it so they play THERE and not on the caster.
+	anchor int32
 }
 
 type actionDone struct {
@@ -558,10 +714,19 @@ func lineFxEndpoint(cx, cy, px, py float32, sk gamedata.Skill) (float32, float32
 func targetBuffTTL(def gamedata.Skill, level int) float64 {
 	var ttl float64
 	for _, op := range def.Ops {
-		if op.Kind == gamedata.OpBuffStat && op.On == "target" {
-			if d := op.Dur.At(level); d > ttl {
-				ttl = d
-			}
+		// A target stat-buff, as before -- and also the CROWD CONTROL a skill pins on its
+		// target, which is how long a visual REPRESENTING that state should stand. Frost's
+		// «Гробница холода» is the case: the ice block IS its BuffFx, but the skill's only
+		// OpBuffStat targets an ALLY, so the TTL came out 0 and the block was never shown
+		// at all -- «не создаётся prop». The encasement itself is an OpStun (both halves of
+		// the dual cast carry one), and that is exactly how long the ice should stand.
+		buff := op.Kind == gamedata.OpBuffStat && op.On == "target"
+		encase := op.Kind == gamedata.OpStun || op.Kind == gamedata.OpRoot
+		if !buff && !encase {
+			continue
+		}
+		if d := op.Dur.At(level); d > ttl {
+			ttl = d
 		}
 	}
 	return ttl
@@ -605,29 +770,104 @@ func (s *Server) firePayloadLocked(c *conn, p payload, now float64) {
 			}
 			// A SELF-baked target-mode fx follows its OWNER; for those skills own it to the
 			// struck enemy so the visual lands on the victim, not the caster (Sharli s1).
+			// A friend-or-foe cast (Kiona's «Страж леса») may have been aimed at an ALLY
+			// instead, in which case the ally's object -- not the mob slot -- is the thing to
+			// hang it on; otherwise the owl fell back to the caster.
 			fxOwner := c.objID
-			if tid != 0 && payloadTargetFxOwnedToTarget(hs.av.Prefab, p.slot) {
-				fxOwner = tid
+			if payloadTargetFxOwnedToTarget(hs.av.Prefab, p.slot) {
+				switch {
+				case p.allyObj != 0:
+					fxOwner, tid = p.allyObj, p.allyObj
+				case tid != 0:
+					fxOwner = tid
+				}
+				// A visual pinned to its charge must last as long as the thing it
+				// represents: the owl guards its target for the full 10s of the
+				// heal/damage over time, not the default one-shot window.
+				if d := skillOverTimeDur(def, p.level); d > fxLife {
+					fxLife = d
+				}
 			}
 			uid := s.fxStartLocked(c, def.PayloadFx, fxOwner, tid, p.hasPos, fpx, fpy)
 			hs.scheduleFxEnd(uid, now+fxLife)
+			hs.noteCastFxLocked(p.slot, uid, false)
+			// A visual RIDING a mob dies with the mob. Remember it on the body so the
+			// death branch can end it: the scheduled end is minutes of game-time away in
+			// owl terms, and a guardian left circling a corpse (or orphaned when the body
+			// is deleted) is exactly what the player sees.
+			if ms != nil && fxOwner == ms.id {
+				s.worldFxEndLocked(c, ms.st.riderFx) // a re-cast replaces the old one
+				ms.st.riderFx = uid
+			}
+			// A projectile the CLIENT flies at a fixed speed: hold the ops back until it
+			// actually arrives, or the victim loses health before anything reaches them.
+			if def.PayloadFlightSpeed > 0 && ms != nil {
+				cx, cy := c.posAtLocked(float32(now))
+				flight := math.Hypot(float64(ms.x-cx), float64(ms.y-cy)) / def.PayloadFlightSpeed
+				if flight > 0.02 {
+					hs.payloads = append(hs.payloads, payload{
+						at: now + flight, slot: p.slot, level: p.level,
+						target: p.target, allyObj: p.allyObj,
+						px: p.px, py: p.py, hasPos: p.hasPos, ops: def.Ops,
+					})
+					return
+				}
+			}
 		case "point":
 			// A SELF-baked ground fx trails the caster; for a skill whose point payload
 			// is SELF-mode (Titanid's «Землетрясение» quake) pin it to an invisible
 			// stationary anchor at the point instead of owning it to the moving avatar.
+			// A DELAYED ground payload (PlusMinus's ball lightning, which sits on the
+			// ground and detonates later) always needs one: the thing it plants has to
+			// stay where it was planted for the whole fuse, whatever the caster does.
 			fxOwner, anchor := c.objID, int32(0)
-			if payloadFxUsesAnchor(hs.av.Prefab, p.slot) {
+			if payloadFxUsesAnchor(hs.av.Prefab, p.slot) || def.PayloadFlight > 0 {
 				anchor = s.spawnTrapAnchorLocked(c, fpx, fpy, now)
 				fxOwner = anchor
 			}
+			// A fused payload's fx is the FUSE: it ends when the thing goes off, and the
+			// ops (plus ImpactFx) are re-scheduled for that moment.
+			life := fxLife
+			if def.PayloadFlight > 0 {
+				life = def.PayloadFlight
+			}
 			uid := s.fxStartLocked(c, def.PayloadFx, fxOwner, 0, true, fpx, fpy)
-			hs.scheduleFxEnd(uid, now+fxLife)
+			hs.scheduleFxEnd(uid, now+life)
+			hs.noteCastFxLocked(p.slot, uid, false)
+			if def.PayloadFlight > 0 {
+				hs.payloads = append(hs.payloads, payload{
+					at: now + def.PayloadFlight, slot: p.slot, level: p.level,
+					target: p.target, allyObj: p.allyObj,
+					px: p.px, py: p.py, hasPos: p.hasPos,
+					ops: def.Ops, anchor: anchor,
+				})
+				return // the arrival half removes the anchor
+			}
 			if anchor != 0 {
 				hs.anchorEnds = append(hs.anchorEnds, anchorEnd{id: anchor, at: now + fxLife + 0.3})
 			}
 		case "self":
 			uid := s.fxStartLocked(c, def.PayloadFx, c.objID, 0, false, 0, 0)
 			hs.scheduleFxEnd(uid, now+fxLife)
+			hs.noteCastFxLocked(p.slot, uid, false)
+		case "throw":
+			// A THROWN payload. The client's prefab for it is SELF_TO_TARGET -- it flies
+			// from the caster to a target OBJECT -- so a bare point cast gives it nothing to
+			// aim at and it silently never renders. Pin an invisible anchor at the aim point
+			// and fly to that. The ops do NOT run here: they are re-scheduled for the moment
+			// the throw lands (PayloadFlight), which is the whole point -- «бутылка должна
+			// лететь и приземляться».
+			anchor := s.spawnTrapAnchorLocked(c, fpx, fpy, now)
+			flight := def.PayloadFlight
+			uid := s.fxStartLocked(c, def.PayloadFx, c.objID, anchor, true, fpx, fpy)
+			hs.scheduleFxEnd(uid, now+flight+0.3)
+			hs.payloads = append(hs.payloads, payload{
+				at: now + flight, slot: p.slot, level: p.level,
+				target: p.target, allyObj: p.allyObj,
+				px: p.px, py: p.py, hasPos: p.hasPos,
+				ops: def.Ops, anchor: anchor,
+			})
+			return
 		}
 		// Target-mode BuffFx: a persistent debuff/buff visual pinned ON the primary
 		// victim for the effect's own duration -- e.g. Velial's «Трибунал» armor-break
@@ -638,13 +878,52 @@ func (s *Server) firePayloadLocked(c *conn, p payload, now float64) {
 		// self-ends after the buff's own TTL. World-scoped (fxStartLocked -> instance),
 		// so every party member sees the debuffed mob. Parented to the mob (owner=ms.id),
 		// so it dies with the body if the mob is killed before the TTL elapses.
-		if ms != nil && def.BuffFxOn == "target" && def.BuffFx != "" {
-			if ttl := targetBuffTTL(def, p.level); ttl > 0 {
-				uid := s.fxStartLocked(c, def.BuffFx, ms.id, 0, false, 0, 0)
-				hs.scheduleFxEnd(uid, now+ttl)
+		//
+		// It also covers an ALLY-side cast. Frost's «Гробница холода» encases «врага ИЛИ
+		// союзника», and the ice block is this very BuffFx -- owned to a mob it never even
+		// appeared when the ice was cast on a friend.
+		if def.BuffFxOn == "target" && def.BuffFx != "" {
+			owner := int32(0)
+			switch {
+			case ms != nil:
+				owner = ms.id
+			case p.allyObj != 0:
+				owner = p.allyObj
+			}
+			if ttl := targetBuffTTL(def, p.level); ttl > 0 && owner != 0 {
+				uid := s.fxStartLocked(c, def.BuffFx, owner, 0, false, 0, 0)
+				// TargetFxEnd is what the visual turns INTO when it lapses (Frost's ice block
+				// SHATTERING, sound and all): started on the same owner at the same moment.
+				hs.scheduleFxEndThen(uid, now+ttl, def.TargetFxEnd, owner)
+				if ms != nil {
+					s.worldFxEndLocked(c, ms.st.riderFx)
+					ms.st.riderFx = uid
+				}
 			}
 		}
 	}
+	// ARRIVAL of a thrown payload: the explosion and the lingering ground effect, both
+	// owned by the anchor so they play at the landing point rather than on the caster.
+	// Started BEFORE the ops so a channel created below picks them up as its own fx (and
+	// therefore ends them if it breaks early).
+	if p.anchor != 0 {
+		lingerLife := skillChannelDur(def, p.level)
+		if lingerLife <= 0 {
+			lingerLife = 3.0
+		}
+		if def.ImpactFx != "" {
+			uid := s.fxStartLocked(c, def.ImpactFx, p.anchor, 0, false, 0, 0)
+			hs.scheduleFxEnd(uid, now+3.0)
+		}
+		if def.LingerFx != "" {
+			uid := s.fxStartLocked(c, def.LingerFx, p.anchor, 0, false, 0, 0)
+			hs.scheduleFxEnd(uid, now+lingerLife)
+			hs.noteCastFxLocked(p.slot, uid, false)
+		}
+		// The anchor must outlive every fx parented to it, or they are torn down with it.
+		hs.anchorEnds = append(hs.anchorEnds, anchorEnd{id: p.anchor, at: now + math.Max(lingerLife, 3.0) + 0.3})
+	}
+
 	ops := def.Ops
 	if p.ops != nil {
 		ops = p.ops
@@ -729,6 +1008,18 @@ func (s *Server) toggleSkillLocked(c *conn, slot int) {
 			hs.toggleStealthSlot = slot
 			s.applySkillStealthLocked(c, 1.0, op.BreakOnMove, now)
 		}
+		if op.Kind == gamedata.OpAttackManaBonus {
+			// Miriam's «Зачарованные стрелы»: arm the mana-fueled attack window for as long
+			// as the toggle stays on -- a far horizon here, cleared explicitly in
+			// toggleOffLocked, rather than the op's own (unused for a toggle) Dur.
+			hs.manaShotSlot = slot
+			hs.manaShotDmg = op.Value.At(level)
+			if op.PerSP > 0 {
+				hs.manaShotDmg += hs.spellPowerLocked(now) * op.PerSP
+			}
+			hs.manaShotCost = op.Value2.At(level)
+			hs.manaShotUntil = now + 1e9
+		}
 	}
 }
 
@@ -754,6 +1045,10 @@ func (s *Server) toggleOffLocked(c *conn, slot int, now float64, byUser bool) {
 	if hs.toggleStealthSlot == slot {
 		hs.toggleStealthSlot = 0
 		s.breakInvisibilityLocked(c, now)
+	}
+	if hs.manaShotSlot == slot {
+		hs.manaShotSlot = 0
+		hs.manaShotUntil = 0
 	}
 	s.fxEndLocked(c, hs.toggleFx[slot-1])
 	hs.toggleFx[slot-1] = 0
@@ -1254,7 +1549,27 @@ func (s *Server) applyOpsLocked(c *conn, ops []gamedata.Op, ctx opCtx, now float
 			}
 			targets := s.opTargetsLocked(c, ctx, op)
 			for i, m := range targets {
-				dmg := s.skillDamageLocked(c, op, ctx, m) + ctx.dmgBonus
+				dmg := s.skillDamageLocked(c, op, ctx, m)
+				// EdgeValue (PlusMinus's «Электрошок»): damage is a function of the TARGET'S
+				// OWN DISTANCE from the epicenter, continuously -- «в зависимости от их
+				// положения. Чем дальше находится враг от эпицентра, тем больший урон он
+				// получает» -- not of how many other targets this cast happened to catch or
+				// what rank they came in at. skillDamageLocked already gave the CENTER end
+				// (Value+PerSP); interpolate it toward the EDGE end (EdgeValue+EdgeValueSP) by
+				// how far out of Radius this target actually stands.
+				if len(op.EdgeValue) > 0 {
+					cx, cy := s.centerLocked(c, ctx)
+					frac := 1.0
+					if op.Radius > 0 {
+						frac = math.Min(1, math.Hypot(float64(m.x-cx), float64(m.y-cy))/op.Radius)
+					}
+					edge := op.EdgeValue.At(ctx.level) * hs.powerMul()
+					if op.EdgeValueSP > 0 {
+						edge += hs.spellPowerLocked(now) * op.EdgeValueSP
+					}
+					dmg = dmg*(1-frac) + edge*frac
+				}
+				dmg += ctx.dmgBonus
 				if pct := op.SelfMaxHPPct.At(ctx.level); pct > 0 {
 					dmg = pct * hs.maxHPLocked(now)
 				}
@@ -1413,7 +1728,7 @@ func (s *Server) applyOpsLocked(c *conn, ops []gamedata.Op, ctx opCtx, now float
 						s.worldFxEndLocked(c, m.st.chillFx)
 						m.st.chillFx = 0
 					}
-				} else {
+				} else if !op.OnlyIfChilled {
 					m.st.chillUntil = now + op.Dur.At(ctx.level)
 					s.ensureMobStatusFxLocked(c, m, &m.st.chillFx, "FrozenEffect")
 				}
@@ -1563,6 +1878,7 @@ func (s *Server) applyOpsLocked(c *conn, ops []gamedata.Op, ctx opCtx, now float
 					m.st.poisonExplodeOwner = c.objID
 					m.st.poisonExplodeDmg = dmg
 					m.st.poisonExplodeRadius = op.ExplodeRadius
+					m.st.poisonExplodeFx = op.ExplodeFx
 				}
 			}
 
@@ -1870,6 +2186,13 @@ func (s *Server) applyOpsLocked(c *conn, ops []gamedata.Op, ctx opCtx, now float
 			}
 
 		case gamedata.OpKnockback:
+			// Apply:"self" makes it RECOIL -- the caster is thrown, not the enemy
+			// (Einzenhaim's «Выстрел с отдачей»). Same field Apply already uses to point a
+			// damage op at the caster.
+			if op.Apply == "self" {
+				s.recoilSelfLocked(c, ctx, op.Value.At(ctx.level), now)
+				break
+			}
 			for _, m := range s.opTargetsLocked(c, ctx, op) {
 				s.knockbackMobLocked(c, m, op.Value.At(ctx.level), now)
 			}
@@ -1982,13 +2305,72 @@ func (s *Server) applyOpsLocked(c *conn, ops []gamedata.Op, ctx opCtx, now float
 					growthRadius = nested.Radius
 				}
 			}
+			// Op.Count on a channel = an exact pulse count (Einzenhaim's «{shots} выстрелов»).
+			// Its `until` still bounds the channel, sized generously from the count so the
+			// counter -- not tick rounding -- is what ends it.
+			until := now + op.Dur.At(ctx.level)
+			pulses := int(op.Count.At(ctx.level))
+			interval := op.Interval
+			if len(op.Intervals) > 0 {
+				interval = op.Intervals.At(ctx.level)
+			}
+			// firstPulse/fired: a counted channel delivers pulse #1 right here, so both its
+			// schedule and its growth index start one ahead.
+			firstPulse, fired := now+channelPulseDelay(hs.av.Prefab, ctx.slot), 0
+			if pulses > 0 {
+				if end := now + interval*float64(pulses) + 0.2; end > until {
+					until = end
+				}
+				// A COUNTED channel is "N shots starting NOW", not "a stream over N seconds":
+				// fire shot 1 here rather than on the next tick. The tick runs on a 0.2s grid,
+				// so waiting for it would push every shot up to a fifth of a second late --
+				// enough to visibly lag the client's own muzzle flashes, which are what the
+				// player is watching. Duration-bounded channels keep their old lead-in.
+				s.applyOpsLocked(c, op.Ops, ctx, now)
+				pulses--
+				fired = 1
+				if pulses == 0 {
+					continue // a one-shot "volley" is just the shot; nothing to sustain
+				}
+				firstPulse = now + interval
+			}
+			// A SELF-only channel whose ONLY mechanic is the channel itself (no OpBuffStat
+			// anywhere to ride) never gets its BuffFx started: the sole two places that ever
+			// start a "self" BuffFx are addPlayerModLocked (fires when a stat MOD is applied)
+			// and the toggle path -- neither of which this shape ever reaches. BlackDragon's
+			// «Взмах погибели», Gayal's «Поглощение жизни» and Gellar's «Армия душ» are all
+			// exactly this shape (OpChannel wrapping only OpDamage/OpSlow/OpHeal), and all
+			// three silently show nothing but the opening cast flourish -- «не создаёт никаких
+			// эффектов». Hekata's «Пепельный смерч» is NOT this shape (its channel's own
+			// nested OpBuffStat legitimately re-triggers the fx every tick) and must be left
+			// alone, hence the skillHasAnyBuffStat guard.
+			fxUIDs := hs.liveCastFxLocked(ctx.slot)
+			if chDef := hs.skillDef(ctx.slot); chDef.BuffFx != "" && chDef.BuffFxOn == "self" &&
+				ctx.target == nil && !ctx.toggle && !skillHasAnyBuffStat(chDef) {
+				// hs.soulStacks is Gellar-only state (0 for every other avatar, since nothing
+				// else ever sets it), so passing it here unconditionally is harmless for
+				// BlackDragon/Gayal: fxStartCounterLocked omits the counter arg entirely at
+				// <=1. For Gellar's «Армия душ» it is how many "soul" particles
+				// GellarSkill4Effect visibly bursts out -- «визуально количество душ,
+				// вылетающих равное накопленным стакам» -- via the client's own
+				// ParticlesMgr.SetCounter (confirmed off the decompiled VisualEffectHolder/
+				// ParticlesMgr: it multiplies the effect's particle emitter's min/maxEmission).
+				buffUID := s.fxStartCounterLocked(c, chDef.BuffFx, c.objID, 0, false, 0, 0, int32(hs.soulStacks))
+				hs.scheduleFxEnd(buffUID, until)
+				fxUIDs = append(fxUIDs, buffUID)
+			}
 			hs.channels = append(hs.channels, channelState{
 				slot: ctx.slot, level: ctx.level,
-				until: now + op.Dur.At(ctx.level), interval: op.Interval,
+				until: until, interval: interval, pulsesLeft: pulses, pulseCount: fired,
+				// The caster's live skill visuals, so an early break can end them.
+				fxUIDs: fxUIDs,
+				// A channel cast alongside a root/silence on the same victim IS the grip
+				// holding them (Morlokai's «Кабала»); breaking it must let them go.
+				holdsTarget: skillHoldsTarget(hs.skillDef(ctx.slot)),
 				// Delay the FIRST pulse by the client fx's own lead-in so the damage
 				// ticks land in step with the visual (Elgorm's arrow rain waits 0.2s
 				// before its first arrow); every other channel starts immediately.
-				nextPulse: now + channelPulseDelay(hs.av.Prefab, ctx.slot),
+				nextPulse: firstPulse,
 				target:    mobID(ctx.target),
 				px:        ctx.px, py: ctx.py, hasPos: ctx.hasPos, ops: op.Ops,
 				interruptible: channelInterruptible(hs.av.Prefab, ctx.slot),
@@ -2213,8 +2595,12 @@ func (s *Server) pushPlayerStatsLocked(c *conn, now float64) {
 	// dmgMul is the buff multiplier; pMul is the per-level power multiplier -- both
 	// apply to the displayed basic-attack damage (matching the real hit calc).
 	dmgMul := st.modMul(now, "dmg_pct") * hs.powerMul()
-	// Flat basic-attack bonuses from avatar tree items (DamageMin/AttackSpeed).
-	dmgFlat := st.modSum(now, "dmg_flat")
+	// Flat basic-attack bonuses from avatar tree items (DamageMin/AttackSpeed), plus any
+	// banked on-kill attack (Gellar's souls / Hekata's kill-window) -- it grows the base
+	// attack floor exactly like gear does in the REAL hit formula (scheduleHitAfterLocked),
+	// but was missing here, so the character card showed plain base damage while actual
+	// swings already carried the soul bonus.
+	dmgFlat := st.modSum(now, "dmg_flat") + s.killAttackBonusLocked(hs, now)
 	// Velial's «Воля к победе» adds a flat, post-multiplier bonus scaling with his own missing
 	// HP. Fold it into the DISPLAYED damage so the avatar card shows it added to the attack
 	// (it tracks HP live via refreshPassiveBuffCountersLocked, which re-pushes these stats).
@@ -2322,6 +2708,54 @@ func (s *Server) dashLocked(c *conn, ctx opCtx, speed float64, now float64, noCl
 	hs.dashSpeed = speed
 	hs.dashUntil = now + dist/speed + 0.05
 	c.moveStraightExLocked(s, tx, ty, !noClip)
+}
+
+// recoilSelfLocked shoves the CASTER straight backwards, away from what they just shot
+// at -- Einzenhaim's «Выстрел с отдачей»: «В момент выстрела аватар отлетает назад из-за
+// отдачи». Nothing in the client does this on its own: the baked holder for
+// EinzenhaimSkill3 carries only the Cast03 clip and a SELF_TO_TARGET beam, and the legacy
+// Animation component never moves the transform (the server owns position). So the recoil
+// has to be a real server-side displacement or it does not exist at all.
+//
+// Implemented as a reversed dash rather than a teleport: the same lunge machinery every
+// dash skill uses, so the client dead-reckons a fast glide backwards instead of the
+// avatar blinking. Clipped to walkable ground, so recoiling into a wall simply stops
+// short. The locale gives no distance ("отлетает назад", no number), so the caller
+// passes one.
+func (s *Server) recoilSelfLocked(c *conn, ctx opCtx, dist float64, now float64) {
+	if dist <= 0 {
+		return
+	}
+	hs := c.huntState
+	cx, cy := c.posAtLocked(float32(now))
+	// Direction: from the target (or aim point) back through the caster.
+	var ax, ay float32
+	switch {
+	case ctx.target != nil:
+		ax, ay = ctx.target.x, ctx.target.y
+	case ctx.hasPos:
+		ax, ay = ctx.px, ctx.py
+	default:
+		return
+	}
+	dx, dy := float64(cx-ax), float64(cy-ay)
+	d := math.Hypot(dx, dy)
+	if d < 1e-6 {
+		return // standing exactly on the target: no meaningful "backwards"
+	}
+	tx := cx + float32(dx/d*dist)
+	ty := cy + float32(dy/d*dist)
+	if c.nav != nil {
+		nx, ny := c.nav.Clip(float64(cx), float64(cy), float64(tx), float64(ty))
+		tx, ty = float32(nx), float32(ny)
+	}
+	travel := math.Hypot(float64(tx-cx), float64(ty-cy))
+	if travel < 1e-3 {
+		return // backed against a wall: nowhere to be thrown
+	}
+	hs.dashSpeed = knockbackSpeed
+	hs.dashUntil = now + travel/knockbackSpeed + 0.05
+	c.moveStraightExLocked(s, tx, ty, true)
 }
 
 // knockbackSpeed is how fast a shoved mob slides to its landing spot (world units/sec):

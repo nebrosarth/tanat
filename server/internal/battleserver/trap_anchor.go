@@ -46,8 +46,31 @@ func payloadFxUsesAnchor(prefab string, slot int) bool {
 	// Titanid's «Землетрясение» (slot 1) quake fx; Edilia's «Дерево жизни» (slot 4) tree --
 	// both are SELF-mode ground fx that would otherwise trail the caster instead of standing
 	// at the cast point (the tree "follows Edilia" report).
+	//
+	// Miriam's «Убийственный залп» (slot 4) is the same shape: MiriamSkill4Effect's gfx
+	// (VFX_Avtr_DPS_Miriam_skill4_prop01, a PrefabTimeSpawn dropping arrows every 1s with
+	// m_UseParentTransorm=false) is baked SELF, so its whole arrow-spawner -- and every
+	// arrow it drops -- rained down wherever Miriam stood instead of the clicked area.
+	//
+	// Morlokai's «Проклятие Вуду» (slot 1) is the same shape and then some. Its
+	// MorlokaySkill1Effect1 gfx is the ground decal VFX_Avtr_Dsb_Morlokay_Skill1_prop01 --
+	// a Projector under a VisualEffect with mMaxDuration=0 and mLoopEffect=true, so it
+	// never expires on its own, AND the registry marks that gfx stop_on_done=false, which
+	// means Skill.StartEffects never records a handle for it and EFFECT_END physically
+	// cannot stop it. Owned to the caster it therefore did exactly what was reported:
+	// followed Morlokai forever. Pinning it to an anchor fixes both halves at once -- the
+	// circle stands where it was cast, and deleting the anchor (anchorEnds, below) takes
+	// the parented decal with it, which is the only lever the server has over an
+	// unstoppable looping fx.
+	// Sharli's «Лавовые оковы» (slot 3): SharliSkill3Effect's gfx VFX_Avtr_DPS_Sharli_
+	// skill3_prop01 is a SELF-baked ground Projector + falling-hammer mesh (its own
+	// VisualEffectTargets carries no targets), so it parented to the caster instead of
+	// landing at the clicked point -- «молот создаётся не в точке каста, а на аватаре».
 	return (prefab == "Avtr_Tank_Titanid" && slot == 1) ||
-		(prefab == "Avtr_Dsb_Edilia" && slot == 4)
+		(prefab == "Avtr_Dsb_Edilia" && slot == 4) ||
+		(prefab == "Avtr_Dsb_Morlokay" && slot == 1) ||
+		(prefab == "Avtr_DPS_Sharli" && slot == 3) ||
+		(prefab == "Avtr_DPS_Miriam" && slot == 4)
 }
 
 // payloadTargetFxOwnedToTarget reports whether a skill's target-mode payload fx is a
@@ -57,7 +80,16 @@ func payloadFxUsesAnchor(prefab string, slot int) bool {
 // narrow prefab+slot allowlist so genuine caster-anchored or TARGET-baked payloads are
 // untouched.
 func payloadTargetFxOwnedToTarget(prefab string, slot int) bool {
-	return prefab == "Avtr_DPS_Sharli" && slot == 1
+	// Kiona's «Страж леса» (slot 4) is the same shape: KionaSkill4Effect's gfx
+	// VFX_Avtr_SP_Kiona_Skill4_prop01 is baked SELF, so owning it to the caster parented
+	// the guardian owl to KIONA -- it followed her around instead of watching over the
+	// unit she cast it on, for the whole 10s the buff/DoT runs.
+	// Frost's «Гробница холода» (slot 3): FrostSkill3Effect1 is the ice FORMING over the
+	// victim -- a SELF-baked FreezeEffect with a ground projector -- so owned to the caster
+	// it froze Frost instead of whoever she aimed at.
+	return (prefab == "Avtr_DPS_Sharli" && slot == 1) ||
+		(prefab == "Avtr_Sp_Kiona" && slot == 4) ||
+		(prefab == "Avtr_Dsb_Frost" && slot == 3)
 }
 
 // allocAnchorID hands out a party-wide anchor object id (instance space) or a per-conn

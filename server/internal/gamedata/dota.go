@@ -130,6 +130,43 @@ type DotaMap struct {
 	// same contract HuntMap.Nav has. Its Spawn() is NOT used: «Штурм» starts each
 	// player at their own base, so the spawn comes from the side, not from the grid.
 	Nav Nav
+
+	// CastleOnly marks a map that is reachable ONLY through castle|ready's scheduled
+	// battle window (gamedata.Castles()[i].MapID), never through the general
+	// arena|get_maps*/fight|join path: it has no card locale keys of its own (map_6_0
+	// ships none), and letting a stray fight|join queue into it would bypass the
+	// castle's team/ownership/reward wiring entirely. Filtered out in
+	// ctrlserver/hunt.go's arena menu handlers and dota.go's fightSceneForMap.
+	CastleOnly bool
+
+	// CreepCamps are wave-spawn points NOT tied to a killable DotaCreepTower --
+	// map_6_0's GA_CreepSpawn_Empty_prop01 markers have no structure of their own (see
+	// map60's doc comment), so unlike a barracks a camp can never be silenced; it
+	// fires on the same CreepWaveInterval cadence for the whole match.
+	CreepCamps []DotaCreepCamp
+
+	// Boss is an optional hand-tuned guardian (see gamedata's mobs slice) planted at a
+	// fixed point -- map_6_0's GA_BossSpawn_Empty_prop01. nil for every map without one
+	// (e.g. map10).
+	Boss *DotaBossSpawn
+}
+
+// DotaCreepCamp is one un-structured creep-wave spawn point (see DotaMap.CreepCamps).
+type DotaCreepCamp struct {
+	X, Z float64
+	Side DotaSide // whose forces this camp reinforces
+	Lane int      // index into DotaMap.Lanes
+}
+
+// DotaBossSpawn places one hand-tuned boss-tier mob (gamedata's mobs slice, exempt
+// from level scaling) as a stationary guardian at a fixed point. MobIdx is a mob
+// roster index (e.g. mobBossCerber) -- kept as a plain int so the battleserver
+// package, which builds the actual mobState, doesn't need this package's unexported
+// mob-index constants.
+type DotaBossSpawn struct {
+	MobIdx int
+	Side   DotaSide
+	X, Z   float64
 }
 
 // map10 is the map_1_0 «Штурм» layout, ids/positions from the bundle extraction.
@@ -237,7 +274,111 @@ var map10 = DotaMap{
 	},
 }
 
-var dotaMaps = []DotaMap{map10}
+// map60 is «Битва за замок»'s OWN dedicated scene, map_6_0.unity3d (built
+// 2011-10-27, the newest scene bundle in the client -- not a copy of map_1_0/
+// map_0_0, distinct MD5). Its own PassibilityData is self-contained and usable as-is
+// (unlike map_4_0's, it is not shuffled to a sibling bundle): navGrid60 rasterises it
+// directly.
+//
+// Shape is deliberately NOT a mirrored two-altar «Штурм» base: extraction
+// (UnityPy over the bundle) found no second altar-equivalent at all. The "Castle"
+// GameObject at the map's centre (174.5, -8, 103.5) is confirmed PURE static level
+// geometry -- a Transform with 279 children (walls/gates/interior dressing) and no
+// MonoBehaviour/Collider/ExportObjectData marker of its own -- so it is scenery, not
+// a spawnable combat object with a stat block. The only real spawnable combat objects
+// on the map are 5 `GA_ClanWars_Gun_prop01` cannons (same mIsCannon=1 archetype as
+// «Штурм»'s guns; DotaGun's stats are reused for them, unconfirmed but the closest
+// evidenced analogue) guarding the approach. So the win condition modelled here is
+// "every defending gun destroyed" (castleCheckWinLocked in battleserver/dota.go),
+// not an altar fall -- see DotaRole's doc: a DotaMap with zero DotaAltar structures
+// is what selects that check.
+//
+// GA_BossSpawn_Empty_prop01 (396, 20, 68) and two GA_CreepSpawn_Empty_prop01 markers
+// (55/47, 20, 52/68) exist in the bundle too -- a boss defender and NPC creep
+// reinforcements were clearly part of the original design. Neither carries any stat
+// data (both are bare "Empty" Transforms, no MonoBehaviour) -- confirmed by a second
+// pass specifically hunting for a spawner class or a scoring/XP system tied to this
+// mode: none exists anywhere in the 748-file decompile. This is not a gap in the
+// research, it's the actual ceiling of what the client ships: exactly the same
+// situation «Штурм»'s own creep waves were already in (dota.go's CreepWaveInterval/
+// CreepsPerWave are server-tuned, not client data), so the same recipe applies here:
+// - CreepCamps: both markers reinforce the ATTACKER (they sit right by the attacker's
+//   own entry corridor) marching the map's one lane toward the guns, using the SAME
+//   racial-troop roster «Штурм» already uses (mobHumanCreepMelee/Range) rather than
+//   inventing a new unit.
+// - Boss: Cerber (mobBossCerber, an existing hand-tuned Hunt boss -- 10000 HP, 48-66
+//   dmg, 294 coins/3000 XP, exempt from level scaling) planted at the boss-spawn point
+//   on the DEFENDER side. He is NOT a structure in the simulation sense but is
+//   modelled through the stationary-attacker pipeline a cannon uses (see
+//   battleserver's newDotaBossGuard) -- the DOTA tick has no leash/homing logic for a
+//   roaming melee unit, so "planted guard" is the reliable path. He sits at the FAR
+//   east end near the defender rally, well clear of the gun cluster (x=186-356), so he
+//   is a rich optional risk/reward target, never a gate on the win condition (only the
+//   5 guns are checked by castleCheckWinLocked).
+//
+// Spawns: the map's single corridor carries 5 Reborn_point_protection/_place pairs
+// spanning x=30.8 (west) to x=434.1 (east, just past the walkable boundary -- the
+// "place" partner at x=418.8 is used instead). The attacker enters from the west
+// (near the unused creep spawns); the defender's rally point is the easternmost one,
+// nearest the boss spawn.
+var map60 = DotaMap{
+	ID: 102,
+	// No baked "Map_6_0_Name/_Desc/_WinDesc" locale keys exist (checked against the
+	// client's own key list) -- unlike every other map, castle|list doesn't put this
+	// map on a card at all (it sends the CASTLE's own NameKey, e.g. "Castle_1_Name";
+	// see gamedata/castle.go). CastleOnly keeps it out of the generic arena|get_maps*
+	// card path that would need one -- EXCEPT the TANAT_CASTLE_TEST_MAP=1 escape hatch
+	// (ctrlserver/hunt.go), which exposes it under the «Штурм» tab for testing the
+	// siege mechanics without running the whole castle draft/schedule flow. For THAT
+	// path to render a real card (not "EMPTY!") these three are filled with real baked
+	// keys -- Name is the genuine castle-mode header text; Desc/WinDesc have no
+	// map_6_0-specific baked text at all, so «Штурм»'s own (a fair description: this
+	// map's mechanics ARE a reduced «Штурм» -- destroy the enemy's structures) are
+	// reused rather than invented.
+	Name:       "Castle_War_Text", // «Битва за замок»
+	Desc:       "Map_1_0_Desc",    // borrowed -- no map_6_0-specific text is baked
+	WinDesc:    "Map_1_0_WinDesc", // borrowed -- ditto
+	Scene:      "map_6_0",
+	LevelMin:   1,
+	LevelMax:   30,
+	MinPlayers: 1,
+	MaxPlayers: 16,
+	CastleOnly: true,
+	SpawnHuman: Vec2{X: 30.831, Y: 54.806},  // attacker (team 1 / challenger) rally, west end
+	SpawnElf:   Vec2{X: 418.755, Y: 67.574}, // defender (team 2 / owner) rally, east end near the boss spawn
+	Nav:        navGrid60,
+	// Racial troop roster reused verbatim from «Штурм» (map10) -- these camps
+	// reinforce the attacker, so they're the SAME "generic human trooper" archetype,
+	// not a new unit.
+	HumanCreepMelee: mobHumanCreepMelee, HumanCreepRange: mobHumanCreepRange,
+	// One lane: the corridor the guns/Reborn points already sit on, west entry to east
+	// end. Waypoints are real evidenced coordinates (creep-spawn area, then each
+	// gun/Reborn cluster in turn, then the boss spawn and the defender rally) --
+	// nothing here is a guessed detour off the map's own established line.
+	Lanes: [][]Vec2{
+		{
+			{X: 30.831, Y: 54.806}, {X: 51.058, Y: 60.185}, {X: 187.147, Y: 65.267},
+			{X: 287.088, Y: 66.635}, {X: 355.989, Y: 65.867}, {X: 396.079, Y: 67.560},
+			{X: 418.755, Y: 67.574},
+		},
+	},
+	CreepCamps: []DotaCreepCamp{
+		{X: 55.213, Z: 52.263, Side: DotaSideHuman, Lane: 0},
+		{X: 46.903, Z: 68.098, Side: DotaSideHuman, Lane: 0},
+	},
+	Boss: &DotaBossSpawn{MobIdx: mobBossCerber, Side: DotaSideElf, X: 396.079, Z: 67.560},
+	Structures: []DotaStructure{
+		// The 5 defending cannons -- the whole objective. All on the defender side; there
+		// is no attacker-side structure (no mirrored base on this map).
+		{ID: 14, Role: DotaGun, Side: DotaSideElf, X: 286.808, Z: 54.266, Prefab: "GA_ClanWars_Gun_prop01"},
+		{ID: 15, Role: DotaGun, Side: DotaSideElf, X: 187.033, Z: 101.995, Prefab: "GA_ClanWars_Gun_prop01"},
+		{ID: 16, Role: DotaGun, Side: DotaSideElf, X: 355.904, Z: 65.870, Prefab: "GA_ClanWars_Gun_prop01"},
+		{ID: 17, Role: DotaGun, Side: DotaSideElf, X: 186.420, Z: 41.421, Prefab: "GA_ClanWars_Gun_prop01"},
+		{ID: 18, Role: DotaGun, Side: DotaSideElf, X: 286.859, Z: 78.789, Prefab: "GA_ClanWars_Gun_prop01"},
+	},
+}
+
+var dotaMaps = []DotaMap{map10, map60}
 
 // DotaMaps returns the «Штурм» arenas.
 func DotaMaps() []DotaMap { return dotaMaps }
