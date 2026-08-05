@@ -728,8 +728,12 @@ type huntState struct {
 	// cleanseSlot is the 1-based slot of a learned PASSIVE carrying an OpCleanseOnHit
 	// (Abominator's «Окоченение»), 0 = none. Honored by the (currently unreached, no
 	// avatar-vs-avatar CC path exists yet) player-facing-debuff-apply gate, mirroring
-	// ccImmuneSlot's documented latency.
-	cleanseSlot int
+	// ccImmuneSlot's documented latency. cleanseReadyAt mirrors ccImmuneReadyAt: the
+	// battle-time the proc can fire again after consuming it (0 = ready now) -- added
+	// in the PVP balance pass so that once a player-facing CC source exists, this
+	// can't shed every debuff on every single hit with no internal cooldown.
+	cleanseSlot    int
+	cleanseReadyAt float64
 	// deathLink* is Rognar's «Канал смерти»: while deathLinkUntil is in the future, a share
 	// of every blow the caster takes is forwarded to deathLinkObj (a mob id) as magic damage,
 	// or heals it when deathLinkAlly.
@@ -2339,17 +2343,28 @@ func (s *Server) consecutiveHitBonusLocked(hs *huntState, targetID int32) float6
 	if level < 1 {
 		return 0
 	}
-	var per float64
+	var per, stackCap float64
 	for _, op := range hs.kit.Skills[slot-1].Ops {
 		if op.Kind == gamedata.OpConsecutiveHit {
 			per = op.Value.At(level)
 			if op.PerSP > 0 {
 				per += hs.spellPowerLocked(float64(s.battleTime())) * op.PerSP
 			}
+			stackCap = op.Value2.At(level)
 			break
 		}
 	}
-	return float64(hs.hitStreak) * per * hs.powerMul()
+	// Mirrors OpAttackSpeedStreak's cap (attackSpeedStreakBonusLocked above): an
+	// uninterrupted streak on one target otherwise grows without bound, and against
+	// the compressed PVP HP pool (420-525) that turns Mihalych's pull+stun engage
+	// into a guaranteed burst kill (pass-N PVP balance audit). 0 = uncapped.
+	bonus := float64(hs.hitStreak) * per * hs.powerMul()
+	if stackCap > 0 {
+		if scaled := stackCap * hs.powerMul(); bonus > scaled {
+			bonus = scaled
+		}
+	}
+	return bonus
 }
 
 // applyHitStackLocked advances Gayal's «Меч жажды» stacking window on a landing basic

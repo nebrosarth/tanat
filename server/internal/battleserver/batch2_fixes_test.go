@@ -280,6 +280,28 @@ func TestAbominatorCleansePassiveShedsDebuffs(t *testing.T) {
 		t.Fatalf("debuffs not fully shed: stun=%g root=%g slow=%g dots=%d",
 			hs.st.stunUntil, hs.st.rootUntil, hs.st.slowUntil, len(hs.st.dots))
 	}
+
+	// PVP balance pass: a second hit landing immediately after must NOT re-cleanse --
+	// with no internal cooldown this would hard-counter every CC-based kit in the
+	// roster the moment a live player-facing CC source exists.
+	hs.st.stunUntil = now + 5
+	c.mvMu.Lock()
+	ok2 := s.cleansePlayerDebuffsLocked(c, now)
+	c.mvMu.Unlock()
+	if ok2 {
+		t.Fatal("cleanse fired again with no cooldown elapsed -- OpCleanseOnHit's Dur gate is missing")
+	}
+	if hs.st.stunUntil == 0 {
+		t.Fatal("stun was cleared even though cleanse reported not firing")
+	}
+
+	// After the 8s cooldown elapses it can fire again.
+	c.mvMu.Lock()
+	ok3 := s.cleansePlayerDebuffsLocked(c, now+8)
+	c.mvMu.Unlock()
+	if !ok3 {
+		t.Fatal("cleanse did not re-arm after its cooldown elapsed")
+	}
 }
 
 // TestChannelGrowthRampsDamage: Op.Growth (Miriam's «Убийственный залп») makes each

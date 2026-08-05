@@ -390,6 +390,50 @@ func TestSummonStillFightsHuntMobs(t *testing.T) {
 	}
 }
 
+// TestVelialLifestealCappedAtMaxTargets: «Удар изверга» (PVP balance pass) may only
+// heal Velial off the 3 nearest enemies it strikes, not every enemy caught in its
+// radius -- uncapped, standing in a 5v5 clump let one 40-mana cast return over a
+// third of his own HP pool, making him nearly unkillable in a sustained teamfight.
+func TestVelialLifestealCappedAtMaxTargets(t *testing.T) {
+	s, c, cleanup := newHuntConn(t, "Avtr_Tank_Velial")
+	defer cleanup()
+	hs := c.huntState
+	hs.hp = 100 // well under max, so the heal is never clipped by the HP ceiling
+
+	skel := gamedata.Mobs()[0]
+	for i, dx := range []float32{0.5, 1, 1.5, 2, 2.5} { // 5 enemies, all inside radius 4
+		m := &mobState{id: int32(4000 + i), mobIdx: 0, mob: skel, x: dx, y: 0, hp: 500, maxHP: 500}
+		hs.mobs[m.id] = m
+	}
+
+	op := gamedata.SkillsFor(hs.av).Skills[0].Ops[0] // «Удар изверга»
+	if op.Kind != gamedata.OpLifestealHit {
+		t.Fatalf("Velial skill 1 op[0] should be OpLifestealHit, got %q", op.Kind)
+	}
+	if op.MaxTargets != 3 {
+		t.Fatalf("OpLifestealHit MaxTargets = %d, want 3", op.MaxTargets)
+	}
+
+	c.mvMu.Lock()
+	now := float64(s.battleTime())
+	s.applyOpsLocked(c, []gamedata.Op{op}, opCtx{slot: 1, level: 1, hasPos: true, px: 0, py: 0}, now)
+	c.mvMu.Unlock()
+
+	hit := 0
+	for _, id := range []int32{4000, 4001, 4002, 4003, 4004} {
+		if hs.mobs[id].hp < 500 {
+			hit++
+		}
+	}
+	if hit != 3 {
+		t.Fatalf("cast struck %d of the 5 enemies in range, want exactly 3 (MaxTargets)", hit)
+	}
+	// rank 1: 75 magic dmg x 0.3 lifesteal = 22.5 per target, capped at 3 targets = 67.5.
+	if want := 100 + 3*75*0.3; hs.hp != want {
+		t.Fatalf("Velial hp after cast = %.1f, want %.1f (3 targets healed, not 5)", hs.hp, want)
+	}
+}
+
 // --- Bug 4: Miriam's «Выстрел бури» does not knock back ---
 
 // TestMiriamStormShotDataKnocksBack pins the DATA: the shipped client description

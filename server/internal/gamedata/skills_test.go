@@ -299,3 +299,36 @@ func TestPerLevelAt(t *testing.T) {
 		}
 	}
 }
+
+// TestPvpBalanceAuditFixes pins the numeric fixes from the independent 5v5 «Штурм»
+// balance audit: three near-permanent-uptime/uncapped abilities that read fine in
+// isolation but broke down against the compressed 420-525 HP PVP roster. Each is a
+// pure numbers change -- none of the underlying mechanics (client-verified) moved.
+func TestPvpBalanceAuditFixes(t *testing.T) {
+	sigilion := SkillsFor(avatarByPrefabT(t,"Avtr_Tank_Sigilion"))
+	// «Сотрясающий топот»: a self-centered AoE r5 hard stun. At the old {14,13,12,11}
+	// CD, its 3s max-rank stun was up again in 11s -- a near-permanent team lockdown
+	// on a non-ultimate slot.
+	if cd := sigilion.Skills[0].Cooldown; cd[len(cd)-1] < 15 {
+		t.Errorf("Sigilion S1 max-rank cooldown = %d, want >= 15 (was 11, near-permanent AoE stun uptime)", cd[len(cd)-1])
+	}
+
+	dragon := SkillsFor(avatarByPrefabT(t,"Avtr_DPS_BlackDragon"))
+	// «Неистовство»: CD must never be shorter than its own 20s buff/debuff duration,
+	// or the +attack-speed/cleave and the +20%-damage-taken downside both become a
+	// permanent state instead of a timing decision.
+	for lvl, cd := range dragon.Skills[0].Cooldown {
+		if float64(cd) < dragon.Skills[0].Ops[0].Dur.At(lvl+1) {
+			t.Errorf("BlackDragon S1 rank %d cooldown (%d) is shorter than its own buff duration (%g)",
+				lvl+1, cd, dragon.Skills[0].Ops[0].Dur.At(lvl+1))
+		}
+	}
+
+	neirofim := SkillsFor(avatarByPrefabT(t,"Avtr_Sp_Neirofim"))
+	// «Молчание»: a map-wide silence on every enemy with no positional counterplay.
+	// At the old {45,42,39,36} CD it was back well under a minute; raised so a
+	// team-wide hard-CC with no counterplay isn't available almost every fight.
+	if cd := neirofim.Skills[3].Cooldown; cd[len(cd)-1] < 45 {
+		t.Errorf("Neirofim S4 max-rank cooldown = %d, want >= 45 (was 36)", cd[len(cd)-1])
+	}
+}

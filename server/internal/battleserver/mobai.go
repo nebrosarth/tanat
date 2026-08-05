@@ -3194,12 +3194,26 @@ func (s *Server) ccImmuneBlockLocked(c *conn, now float64) bool {
 // currently on them (stun/root/silence/slow/DoTs and any negative stat mod) in
 // response to one just landing. Like ccImmuneBlockLocked, no mob or avatar applies
 // player-facing CC/debuffs today, so this gate is latent until such a source exists;
-// it is exercised directly by unit tests.
+// it is exercised directly by unit tests. Gated by cleanseReadyAt (PVP balance pass,
+// mirroring ccImmuneBlockLocked's own readyAt gate) so that once a live source does
+// exist, this can't shed the whole debuff stack on every single hit -- an unlimited,
+// cooldown-free full cleanse would hard-counter every CC-based kit in the roster.
 func (s *Server) cleansePlayerDebuffsLocked(c *conn, now float64) bool {
 	hs := c.huntState
 	slot := hs.cleanseSlot
 	if slot == 0 || int(hs.skillLevel[slot-1]) < 1 {
 		return false
+	}
+	if now < hs.cleanseReadyAt {
+		return false
+	}
+	level := int(hs.skillLevel[slot-1])
+	def := hs.skillDef(slot)
+	for _, op := range def.Ops {
+		if op.Kind == gamedata.OpCleanseOnHit {
+			hs.cleanseReadyAt = now + op.Dur.At(level)
+			break
+		}
 	}
 	hs.st.stunUntil = 0
 	hs.st.rootUntil = 0

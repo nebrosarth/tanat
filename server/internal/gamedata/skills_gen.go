@@ -15,7 +15,14 @@ func init() {
 			{
 				Slot: 1, NameRu: "Неистовство", Type: "ACTIVE",
 				Target: "", Targeting: "SELF", Distance: 0, AoERadius: 0, AoEWidth: 0,
-				ManaCost: []int{35, 40, 45, 50}, Cooldown: []int{22, 21, 20, 19},
+				ManaCost: []int{35, 40, 45, 50},
+				// CD raised from {22,21,20,19} (which normalizeKit extends to a 5th rank via
+				// linear extrapolation, landing at 18 -- PVP balance pass). At the old rank-4
+				// CD (19s) was SHORTER than the buff's own 20s duration, so with mana available
+				// the +55% attack speed / cleave / +20% damage-taken state never actually
+				// lapsed -- a timing bug, not a deliberate near-permanent uptime. Written out to
+				// all 5 ranks explicitly, each comfortably above the flat 20s buff duration.
+				Cooldown: []int{26, 25, 24, 23, 22},
 				CastFx: "BlackDragonSkill1", CastFxDur: 0.8, PayloadFx: "BlackDragonSkill1Effect", PayloadFxAt: "self", PayloadDelay: 0.2,
 				BuffFx: "BlackDragonSkill1Effect", BuffFxOn: "self", BuffIcon: true, BuffDescVariant: "BuffSelf",
 				// «Неистовство»: client text ALSO makes attacks hit multiple targets
@@ -1792,7 +1799,10 @@ func init() {
 					// mentions). LATENT like Wilfang's OpImmune: no mob or avatar currently
 					// applies CC to a player avatar, so this can't fire yet in Hunt or Штурм; the
 					// primitive is real and unit-tested, waiting for a source.
-					{Kind: OpCleanseOnHit},
+					// Dur is an internal cooldown on the proc itself (PVP balance pass, mirrors
+					// Wilfang's OpImmune Dur) -- without it, once a live CC source exists this
+					// sheds the whole debuff stack on every single hit with no rate limit.
+					{Kind: OpCleanseOnHit, Dur: PerLevel{8, 8, 8, 8}},
 				},
 				TipArgs: map[string]PerLevel{},
 			},
@@ -2073,7 +2083,11 @@ func init() {
 					// «Трепка»: client IDS_MihalychSkill2 -- «каждый следующий удар по одной и той
 					// же цели наносит на {damage} больше урона, чем предыдущий». A per-target
 					// consecutive-hit damage stack (OpConsecutiveHit), not a self dmg% buff.
-					{Kind: OpConsecutiveHit, Value: PerLevel{15, 22, 30, 40}, PerSP: 1},
+					// Value2 caps the stack at 6 hits (PVP balance pass): uncapped, this plus
+					// S1's guaranteed pull and S4's 2s AoE stun chains into a burst kill on any
+					// 420-525 HP target within 4-5 unanswered autoattacks -- mirrors the cap
+					// OpAttackSpeedStreak already carries on the same hitStreak mechanic.
+					{Kind: OpConsecutiveHit, Value: PerLevel{15, 22, 30, 40}, Value2: PerLevel{90, 132, 180, 240}, PerSP: 1},
 				},
 				TipArgs: map[string]PerLevel{
 					"damage":   PerLevel{15, 22, 30, 40},
@@ -2846,7 +2860,12 @@ func init() {
 			{
 				Slot: 4, NameRu: "Молчание", Type: "ACTIVE",
 				Target: "", Targeting: "", Distance: 0, AoERadius: 12, AoEWidth: 0,
-				ManaCost: []int{60, 70, 80, 90}, Cooldown: []int{45, 42, 39, 36},
+				ManaCost: []int{60, 70, 80, 90},
+				// CD raised from {45,42,39,36} (PVP balance pass): the CLIENT mechanic itself
+				// (silence every enemy, map-wide) is untouched -- only the cadence. A team-wide
+				// hard-CC with no positional counterplay at a sub-45s max-rank CD was coming
+				// back almost every fight in a 5v5 «Штурм» match.
+				Cooldown: []int{75, 65, 55, 48},
 				CastFx: "NeirofimSkill4", CastFxDur: 1.5, PayloadFx: "NeirofimSkill4Effect", PayloadFxAt: "self", PayloadDelay: 1,
 				BuffFx: "SilenceEffect", BuffFxOn: "target", BuffIcon: false, BuffDescVariant: "",
 				Ops: []Op{
@@ -3047,7 +3066,15 @@ func init() {
 			{
 				Slot: 1, NameRu: "Сотрясающий топот", Type: "ACTIVE",
 				Target: "", Targeting: "", Distance: 0, AoERadius: 5, AoEWidth: 0,
-				ManaCost: []int{35, 40, 45, 50}, Cooldown: []int{14, 13, 12, 11},
+				ManaCost: []int{35, 40, 45, 50},
+				// CD raised from {14,13,12,11} (which normalizeKit extends to a 5th rank via
+				// linear extrapolation, landing at 10 -- PVP balance pass). This is a
+				// self-centered AoE r5 hard stun (radius falls back to AoERadius when the op has
+				// none, see damageTargetsLocked), i.e. a near-team-wide lockdown on a
+				// non-ultimate slot -- at the old CD it was up again before a 5v5 clump could
+				// reposition. Written out to all 5 ranks explicitly so the max-rank value is
+				// exact, not another extrapolation.
+				Cooldown: []int{24, 21, 19, 17, 15},
 				CastFx: "SigilionSkill1", CastFxDur: 1, PayloadFx: "", PayloadFxAt: "", PayloadDelay: 0,
 				BuffFx: "StunEffect", BuffFxOn: "target", BuffIcon: false, BuffDescVariant: "",
 				Ops: []Op{
@@ -3308,7 +3335,13 @@ func init() {
 				CastFx: "VelialSkill1", CastFxDur: 1.2, PayloadFx: "VelialSkill1Effect", PayloadFxAt: "self", PayloadDelay: 0.4,
 				BuffFx: "", BuffFxOn: "", BuffIcon: false, BuffDescVariant: "",
 				Ops: []Op{
-					{Kind: OpLifestealHit, Value: PerLevel{75, 105, 140, 175}, Value2: PerLevel{0.3, 0.3, 0.3, 0.3}, Scale: "magic", Radius: 4},
+					// MaxTargets 3 (PVP balance pass): OpLifestealHit heals Velial once PER
+					// enemy the AoE connects with, uncapped -- in the 5v5 clumps this radius is
+					// built for, that turned a single 40-mana/7s-cd cast into 150-260+ self-heal
+					// (up to half his 520 HP pool at once), making him nearly unkillable in a
+					// sustained teamfight against the compressed 420-525 HP roster. Capped like
+					// Rognar's «Могильный холод» caps its own multi-target op.
+					{Kind: OpLifestealHit, Value: PerLevel{75, 105, 140, 175}, Value2: PerLevel{0.3, 0.3, 0.3, 0.3}, Scale: "magic", Radius: 4, MaxTargets: 3},
 				},
 				TipArgs: map[string]PerLevel{
 					"damage":   PerLevel{75, 105, 140, 175},

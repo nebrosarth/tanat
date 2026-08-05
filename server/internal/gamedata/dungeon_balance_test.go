@@ -484,3 +484,60 @@ func TestBossBeatabilityLadder(t *testing.T) {
 		t.Errorf("Hekata level-1 TTK %.0fs not far worse than level-20 TTK %.0fs", slow, fast)
 	}
 }
+
+// TestPvpBalancePassAvatarStats pins the second balance-pass roster: the six
+// avatars stats.txt gives no "после релиза" line for (Ariana/Neirofim's HP+mana
+// come from their never-superseded "closed beta" line; BlackDragon's likewise;
+// Tangren/Abominator/PlusMinus have no stats.txt base line at all and are
+// designed fresh). See the per-avatar comments in buildAvatars for the
+// reasoning; this test just guards the numbers from drifting.
+func TestPvpBalancePassAvatarStats(t *testing.T) {
+	for _, tc := range []struct {
+		id         int32
+		name       string
+		hp, mana   float64
+		hReg, mReg float64
+	}{
+		{38, "ArianaMey", 450, 200, 1.0, 1.0},
+		{36, "Neirofim", 500, 200, 1.0, 1.0},
+		{23, "BlackDragon", 440, 200, 1.0, 1.0},
+		{18, "Tangren", 460, 200, 1.0, 1.0},
+		{22, "Abominator", 480, 220, 1.0, 1.0},
+		{35, "PlusMinus", 480, 400, 1.0, 1.3},
+	} {
+		a, ok := AvatarByID(tc.id)
+		if !ok {
+			t.Errorf("%s (id %d) not in roster", tc.name, tc.id)
+			continue
+		}
+		if a.Health != tc.hp || a.Mana != tc.mana {
+			t.Errorf("%s HP/Mana = %g/%g, want %g/%g", tc.name, a.Health, a.Mana, tc.hp, tc.mana)
+		}
+		if a.HealthRegen != tc.hReg || a.ManaRegen != tc.mReg {
+			t.Errorf("%s HealthRegen/ManaRegen = %g/%g, want %g/%g", tc.name, a.HealthRegen, a.ManaRegen, tc.hReg, tc.mReg)
+		}
+	}
+}
+
+// TestKnownAvatarHPBandStaysTight checks the eleven avatars stats.txt informs
+// (directly or via a same-class sibling anchor) all sit within a single, tight
+// HP/mana band instead of drifting back toward the much larger untuned class
+// templates (Killer 580hp/260mana, Support 520/420, Mage 540/400) -- the whole
+// point of a per-avatar balance pass is that these heroes read as one roster,
+// not five different games.
+func TestKnownAvatarHPBandStaysTight(t *testing.T) {
+	ids := []int32{17, 8, 7, 10, 13, 38, 36, 23, 18, 22} // Teridin, Mihalych, Astarot, Sigilion, Velial, Ariana, Neirofim, BlackDragon, Tangren, Abominator (PlusMinus excluded: mana deliberately off-band)
+	const minHP, maxHP float64 = 420, 525
+	for _, id := range ids {
+		a, ok := AvatarByID(id)
+		if !ok {
+			t.Fatalf("avatar id %d not in roster", id)
+		}
+		if a.Health < minHP || a.Health > maxHP {
+			t.Errorf("%s HP = %g, outside the tuned-roster band [%g, %g]", a.ShortName, a.Health, minHP, maxHP)
+		}
+		if a.Mana < 180 || a.Mana > 225 {
+			t.Errorf("%s Mana = %g, outside the tuned-roster band [180, 225]", a.ShortName, a.Mana)
+		}
+	}
+}

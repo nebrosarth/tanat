@@ -262,6 +262,43 @@ func buildAvatars() []Avatar {
 	// data/resources.xml and the embedded locale.
 	for i := range list {
 		switch list[i].Prefab {
+		case "Avtr_DPS_BlackDragon":
+			// stats.txt "closed beta" line: 440 HP, 200 mana -- never superseded by a
+			// later "после релиза" line the way Astarot/Mihalych/Sigilion's were, and it
+			// slots cleanly into the same real-avatar band their release numbers landed
+			// in (423-495 HP, 184-214 mana for KILLER-class heroes), unlike the untuned
+			// class template (580/260). Regen/dmg/armor not stated -> see the HealthRegen/
+			// ManaRegen=1.0 note below; Dmg/Armor stay on the Killer template.
+			list[i].Health = 440
+			list[i].Mana = 200
+			list[i].HealthRegen = 1.0
+			list[i].ManaRegen = 1.0
+		case "Avtr_HK_Abominator":
+			// No stats.txt HP/mana line for Abominator -- designed fresh, anchored to the
+			// same real-avatar KILLER band as Astarot/Mihalych/Teridin/BlackDragon
+			// (423-495 HP), placed toward the top as a bruiser/lifedrain hero. Mana is
+			// nudged above that band's 184-214 to 220: his signature «Пожирание» costs a
+			// FLAT 180 at every rank (stats.txt), unlike every scaling-cost skill in the
+			// game -- a pool right at 184-214 would leave him unable to also fire his 25-40
+			// cost basics afterward, so 220 keeps that big commitment affordable without
+			// trivializing it (still empties most of the bar in one cast).
+			list[i].Health = 480
+			list[i].Mana = 220
+			list[i].HealthRegen = 1.0
+			list[i].ManaRegen = 1.0
+		case "Avtr_Dsb_PlusMinus":
+			// No stats.txt HP/mana line either, but his kit's OWN costs are a strong
+			// signal: «Электрошок»/«Короткое замыкание» run 100+ flat, and «Шаровая
+			// молния» scales to 320 -- a pool sized like the other real avatars' 184-214
+			// would let him cast his ultimate maybe once. Mana stays on the Mage
+			// template (400) deliberately, matching what his own kit was built against.
+			// HP is set BELOW the Mage template (540) for a glass-cannon nuker identity
+			// (he has the single highest burst numbers of any reviewed kit: 400 edge-hit
+			// on rank-5 Электрошок, 600 on the ult). ManaRegen also stays on the Mage
+			// template (1.3, higher than the 1.0 every other tuned avatar converges on)
+			// for the same reason -- his kit needs the sustain.
+			list[i].Health = 480
+			list[i].HealthRegen = 1.0
 		case "Avtr_DPS_Einzenhaim":
 			// Requested ranged: attack from range instead of the Killer template's 2.5
 			// melee reach. His client model has NO basic-attack projectile pool
@@ -287,6 +324,14 @@ func buildAvatars() []Avatar {
 			// shipped as Avtr_Sp_Nerofim_skill<n> (no i), so the generated
 			// Neirofim path resolves to no texture and the icons stay blank.
 			list[i].skillIconBase = "Avtr_Sp_Nerofim"
+			// stats.txt "closed beta" line: 500 HP, 200 mana -- like BlackDragon's, never
+			// superseded by a later line, and it fits the same real-avatar band the
+			// SUPPORT-class Ariana also lands in below. Regen not stated -> the
+			// HealthRegen/ManaRegen=1.0 every other tuned avatar converges on.
+			list[i].Health = 500
+			list[i].Mana = 200
+			list[i].HealthRegen = 1.0
+			list[i].ManaRegen = 1.0
 		case "Avtr_HK_Teridin":
 			// GUI skill icons shipped under the DPS_ class prefix (the HK_ set is
 			// incomplete: only Skill1/Skill4 exist, and with a capital "Skill").
@@ -305,6 +350,16 @@ func buildAvatars() []Avatar {
 		case "Avtr_HK_Tangren":
 			// GUI skill icons shipped under the Dsb_ class prefix.
 			list[i].skillIconBase = "Avtr_Dsb_Tangren"
+			// No stats.txt HP/mana line -- designed fresh, anchored to the same
+			// real-avatar KILLER band as Astarot/Mihalych/Teridin/BlackDragon (423-495
+			// HP, 184-214/200 mana), placed mid-band since his kit (counter-attack
+			// passive + healing totem + bounce ultimate) isn't clearly a glass cannon or
+			// a bruiser. Mana matches BlackDragon/Velial's 200 -- his own costs (totem
+			// tops out at 65, ultimate at 90) fit comfortably inside it.
+			list[i].Health = 460
+			list[i].Mana = 200
+			list[i].HealthRegen = 1.0
+			list[i].ManaRegen = 1.0
 		case "Avtr_Sp_Arianna":
 			// Model bundle is "Arianna" (two n); name key AND portrait icons are
 			// "Ariana" (one n) -- IDS_Avtr_Sp_Ariana_Name + Avtr_Sp_Ariana_01..04.
@@ -314,6 +369,14 @@ func buildAvatars() []Avatar {
 			// stays on the prefab.
 			list[i].localeBase = "Avtr_Sp_Ariana"
 			list[i].iconBase = "Avtr_Sp_Ariana"
+			// stats.txt "closed beta" line: 450 HP, 200 mana -- never superseded, and it
+			// fits the same real-avatar band Neirofim's (also SUPPORT-class) closed-beta
+			// line lands in. Regen not stated -> the HealthRegen/ManaRegen=1.0 every
+			// other tuned avatar converges on.
+			list[i].Health = 450
+			list[i].Mana = 200
+			list[i].HealthRegen = 1.0
+			list[i].ManaRegen = 1.0
 		case "Avtr_HK_Mihalych":
 			// "После релиза" stat line (base_balance/stats.txt): 472 HP, 1 HP/s,
 			// 214 mana, 1 mana/s, 39 dmg, 1s attack interval (=> AttackSpeed 1.0).

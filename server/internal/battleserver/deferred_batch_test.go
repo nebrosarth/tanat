@@ -188,6 +188,37 @@ func TestConsecutiveHitStreak(t *testing.T) {
 	}
 }
 
+// TestConsecutiveHitStreakCapped: «Трепка» (PVP balance pass) must stop growing at
+// its Value2 stack cap instead of scaling forever -- an uncapped streak plus
+// Mihalych's pull+stun engage was a guaranteed burst kill on the compressed
+// 420-525 HP PVP roster.
+func TestConsecutiveHitStreakCapped(t *testing.T) {
+	s, c, cleanup := newHuntConn(t, "Avtr_HK_Mihalych")
+	defer cleanup()
+	hs := c.huntState
+	for i := range hs.skillLevel {
+		hs.skillLevel[i] = 1
+	}
+	for i, sk := range hs.kit.Skills {
+		for _, op := range sk.Ops {
+			if op.Kind == gamedata.OpConsecutiveHit {
+				hs.consecutiveHitSlot = i + 1
+			}
+		}
+	}
+	const per, stackCap = 15.0, 90.0 // rank-1 «Трепка»: +15/stack, capped at 90 (6 stacks)
+	var last float64
+	for i := 0; i < 10; i++ {
+		last = s.consecutiveHitBonusLocked(hs, 500)
+	}
+	if last != stackCap {
+		t.Errorf("bonus after 10 same-target hits = %.0f, want it clamped to the cap %.0f", last, stackCap)
+	}
+	if want := 9 * per; want <= stackCap {
+		t.Fatalf("test premise broken: 9 uncapped stacks (%.0f) must exceed the cap (%.0f)", want, stackCap)
+	}
+}
+
 // TestSoulStacksGrowAttack: Gellar's «Порабощение» banks +2 base attack per kill up to the
 // rank cap, and a death halves the banked souls.
 func TestSoulStacksGrowAttack(t *testing.T) {
