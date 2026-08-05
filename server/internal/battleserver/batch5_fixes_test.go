@@ -38,7 +38,7 @@ func TestTeridinSniperShotHitsOnce(t *testing.T) {
 	if nChannels != 0 {
 		t.Fatalf("Teridin «Снайперский выстрел» must not open a channel, got %d live channels", nChannels)
 	}
-	if want := 150 + sp; dmgAfterCast != want { // rank-1 Value + PerSP, no double-hit
+	if want := 130 + sp; dmgAfterCast != want { // rank-1 Value + PerSP, no double-hit (PVP balance redesign round 2, was 150 -> 160 -> 130)
 		t.Fatalf("Teridin «Снайперский выстрел» dealt %g damage on a single application, want exactly %g (rank-1, no double-hit)", dmgAfterCast, want)
 	}
 }

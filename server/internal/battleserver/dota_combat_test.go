@@ -428,8 +428,9 @@ func TestVelialLifestealCappedAtMaxTargets(t *testing.T) {
 	if hit != 3 {
 		t.Fatalf("cast struck %d of the 5 enemies in range, want exactly 3 (MaxTargets)", hit)
 	}
-	// rank 1: 75 magic dmg x 0.3 lifesteal = 22.5 per target, capped at 3 targets = 67.5.
-	if want := 100 + 3*75*0.3; hs.hp != want {
+	// rank 1: 40 magic dmg x 0.3 lifesteal = 12 per target, capped at 3 targets = 36.
+	// (PVP balance redesign round 2, rank-1 dmg was 75 -> 55 -> 40; lifesteal coefficient unchanged.)
+	if want := 100 + 3*40*0.3; hs.hp != want {
 		t.Fatalf("Velial hp after cast = %.1f, want %.1f (3 targets healed, not 5)", hs.hp, want)
 	}
 }

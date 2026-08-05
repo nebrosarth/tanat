@@ -38,7 +38,7 @@ func TestBlackDragonWingBeatTicksFiveTimesPerSecond(t *testing.T) {
 	if dmgOp == nil {
 		t.Fatal("no damage op inside the channel")
 	}
-	wantDPS := []float64{30, 42, 54, 68}
+	wantDPS := []float64{13, 16, 19, 22} // PVP balance redesign values (was 30, 42, 54, 68)
 	for rank := 1; rank <= 4; rank++ {
 		perPulse := dmgOp.Value.At(rank)
 		if total := perPulse * 5; math.Abs(total-wantDPS[rank-1]) > 0.01 {

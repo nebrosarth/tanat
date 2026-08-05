@@ -444,9 +444,13 @@ func TestBestiaryLocaleAndTiering(t *testing.T) {
 }
 
 // TestBossBeatabilityLadder is the design guard: a simplified Velial DPS model
-// shows each boss is beatable in a sane window (~40-90s) at its INTENDED level
+// shows each boss is beatable in a sane window (~40-100s) at its INTENDED level
 // (Elgorm 5, Velial 10, Cerber 15, Hekata 20), and that the same boss is a hard
 // slog if you show up badly under-levelled -- i.e. leveling actually matters.
+// Upper bound widened from 95 to 100s after the PVP balance redesign trimmed
+// Velial's S1/S2 damage (a necessary PVP change -- Hunt/Штурм share the same
+// ability numbers) -- solo TTK against the two toughest bosses grew a few
+// seconds; still comfortably killable, especially co-op.
 func TestBossBeatabilityLadder(t *testing.T) {
 	v, _ := AvatarByID(13) // Velial avatar
 	kit := SkillsFor(v)
@@ -467,8 +471,8 @@ func TestBossBeatabilityLadder(t *testing.T) {
 	} {
 		hp := Mobs()[e.boss].Health
 		ttk := hp / dps(e.dispLvl-1) // 0-based level = displayed-1
-		if ttk < 40 || ttk > 95 {
-			t.Errorf("boss %d at level %d: TTK %.0fs out of the 40-95s band (hp %g dps %.1f)",
+		if ttk < 40 || ttk > 100 {
+			t.Errorf("boss %d at level %d: TTK %.0fs out of the 40-100s band (hp %g dps %.1f)",
 				e.boss, e.dispLvl, ttk, hp, dps(e.dispLvl-1))
 		}
 		// Leveling never makes a fight slower (monotonic power curve).

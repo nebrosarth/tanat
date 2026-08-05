@@ -172,7 +172,7 @@ func TestConsecutiveHitStreak(t *testing.T) {
 	if hs.consecutiveHitSlot == 0 {
 		t.Fatal("Mihalych should carry an OpConsecutiveHit passive")
 	}
-	per := 15.0 // rank-1 «Трепка» bonus per stack
+	per := 14.0 // rank-1 «Трепка» bonus per stack (PVP balance redesign, was 15)
 
 	if b := s.consecutiveHitBonusLocked(hs, 500); b != 0 {
 		t.Errorf("first hit bonus = %.0f, want 0", b)
@@ -206,7 +206,7 @@ func TestConsecutiveHitStreakCapped(t *testing.T) {
 			}
 		}
 	}
-	const per, stackCap = 15.0, 90.0 // rank-1 «Трепка»: +15/stack, capped at 90 (6 stacks)
+	const per, stackCap = 14.0, 84.0 // rank-1 «Трепка»: +14/stack, capped at 84 (6 stacks) -- PVP balance redesign, was 15/90
 	var last float64
 	for i := 0; i < 10; i++ {
 		last = s.consecutiveHitBonusLocked(hs, 500)

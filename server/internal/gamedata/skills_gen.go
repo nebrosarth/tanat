@@ -13,23 +13,19 @@ func init() {
 		Prefab: "Avtr_DPS_BlackDragon", AttackProjectile: false,
 		Skills: [4]Skill{
 			{
+				// PVP balance redesign (full pass, supersedes the earlier CD-only patch): mana
+				// rises, cd kept comfortably above the 20s buff duration at every rank (the
+				// original bug this was fixing) without the earlier patch's extra 5th rank.
 				Slot: 1, NameRu: "Неистовство", Type: "ACTIVE",
 				Target: "", Targeting: "SELF", Distance: 0, AoERadius: 0, AoEWidth: 0,
-				ManaCost: []int{35, 40, 45, 50},
-				// CD raised from {22,21,20,19} (which normalizeKit extends to a 5th rank via
-				// linear extrapolation, landing at 18 -- PVP balance pass). At the old rank-4
-				// CD (19s) was SHORTER than the buff's own 20s duration, so with mana available
-				// the +55% attack speed / cleave / +20% damage-taken state never actually
-				// lapsed -- a timing bug, not a deliberate near-permanent uptime. Written out to
-				// all 5 ranks explicitly, each comfortably above the flat 20s buff duration.
-				Cooldown: []int{26, 25, 24, 23, 22},
+				ManaCost: []int{30, 35, 40, 45}, Cooldown: []int{24, 23, 22, 21},
 				CastFx: "BlackDragonSkill1", CastFxDur: 0.8, PayloadFx: "BlackDragonSkill1Effect", PayloadFxAt: "self", PayloadDelay: 0.2,
 				BuffFx: "BlackDragonSkill1Effect", BuffFxOn: "self", BuffIcon: true, BuffDescVariant: "BuffSelf",
 				// «Неистовство»: client text ALSO makes attacks hit multiple targets
 				// («нанесение урона нескольким целям» / «наносить ей урон по области») --
 				// missing before, now a real cleave via OpAttackCleave.
 				Ops: []Op{
-					{Kind: OpBuffStat, Value: PerLevel{1.25, 1.35, 1.45, 1.55}, Dur: PerLevel{20, 20, 20, 20}, Stat: "attack_speed_pct", On: "self"},
+					{Kind: OpBuffStat, Value: PerLevel{1.2, 1.3, 1.4, 1.5}, Dur: PerLevel{20, 20, 20, 20}, Stat: "attack_speed_pct", On: "self"},
 					{Kind: OpAttackCleave, Dur: PerLevel{20, 20, 20, 20}, Radius: 4},
 					// Downside: while enraged the dragon takes a flat, rank-CONSTANT +20% more
 					// damage (client: literal "20%" at every rank, no per-rank placeholder) --
@@ -39,7 +35,7 @@ func init() {
 					{Kind: OpBuffStat, Value: PerLevel{-0.2, -0.2, -0.2, -0.2}, Dur: PerLevel{20, 20, 20, 20}, Stat: "dmg_reduction_pct", On: "self"},
 				},
 				TipArgs: map[string]PerLevel{
-					"speedCoef": PerLevel{1.25, 1.35, 1.45, 1.55},
+					"speedCoef": PerLevel{1.2, 1.3, 1.4, 1.5},
 				},
 			},
 			{
@@ -88,9 +84,14 @@ func init() {
 				},
 			},
 			{
+				// PVP balance redesign: total channel damage was running at ~5.4-10.9 dmg/mana
+				// (240-544 total for 35-50 mana) -- far outside every other ability's ratio in
+				// this pass (~1.5-3.5) and, at the top end, more damage than a 420 HP squishy's
+				// entire pool from one ability. Retuned to ~2.0-2.5 total dmg/mana, still a
+				// strong ultimate-tier channel, cd raised slightly for the lower output.
 				Slot: 4, NameRu: "Взмах погибели", Type: "ACTIVE",
 				Target: "", Targeting: "SELF", Distance: 0, AoERadius: 5, AoEWidth: 0,
-				ManaCost: []int{50, 55, 60, 65}, Cooldown: []int{24, 23, 22, 21},
+				ManaCost: []int{45, 52, 59, 66}, Cooldown: []int{28, 26, 24, 22},
 				CastFx: "BlackDragonSkill4", CastFxDur: 1, PayloadFx: "BlackDragonSkill4Effect1", PayloadFxAt: "self", PayloadDelay: 0.2,
 				BuffFx: "BlackDragonSkill4Effect2", BuffFxOn: "self", BuffIcon: true, BuffDescVariant: "BuffTarget",
 				// The card's dps is delivered in 5 pulses/sec (0.2s interval) instead of one
@@ -104,13 +105,13 @@ func init() {
 				// not a per-tick accumulating quantity -- only reapplied more often now.
 				Ops: []Op{
 					{Kind: OpChannel, Dur: PerLevel{8, 8, 8, 8}, Interval: 0.2, Ops: []Op{
-						{Kind: OpDamage, Value: PerLevel{6, 8.4, 10.8, 13.6}, PerSP: 0.2, Scale: "magic", Radius: 5},
+						{Kind: OpDamage, Value: PerLevel{2.6, 3.2, 3.8, 4.4}, PerSP: 0.2, Scale: "magic", Radius: 5},
 						{Kind: OpSlow, Value: PerLevel{0.7, 0.7, 0.7, 0.7}, Dur: PerLevel{1.5, 1.5, 1.5, 1.5}, Radius: 5},
 					}},
 				},
 				TipArgs: map[string]PerLevel{
 					"damageSP": PerLevel{1, 1, 1, 1},
-					"dps":      PerLevel{30, 42, 54, 68},
+					"dps":      PerLevel{13, 16, 19, 22},
 				},
 			},
 		},
@@ -1738,13 +1739,16 @@ func init() {
 		Prefab: "Avtr_HK_Abominator", AttackProjectile: false,
 		Skills: [4]Skill{
 			{
+				// PVP balance redesign: mana rises, cd flat-ish, dmg/mana at a single-target
+				// burst+stun rate. Self-cost (refundable on hit) and the movespeed burst are
+				// pure risk/reward flavor and kept unchanged.
 				Slot: 1, NameRu: "Бросок плоти", Type: "ACTIVE",
 				Target: "ENEMY+NOT_BUILDING", Targeting: "TARGET", Distance: 10, AoERadius: 0, AoEWidth: 0,
-				ManaCost: []int{25, 30, 35, 40}, Cooldown: []int{10, 9, 9, 8},
+				ManaCost: []int{24, 29, 34, 39}, Cooldown: []int{9, 9, 8, 8},
 				CastFx: "AbominatorSkill1", CastFxDur: 0.8, PayloadFx: "AbominatorSkill1Effect1", PayloadFxAt: "target", PayloadDelay: 0.6,
 				BuffFx: "AbominatorSkill1Effect2", BuffFxOn: "self", BuffIcon: true, BuffDescVariant: "BuffSelf",
 				Ops: []Op{
-					{Kind: OpDamage, Value: PerLevel{70, 105, 140, 180}, Scale: "magic", PerSP: 1},
+					{Kind: OpDamage, Value: PerLevel{65, 80, 95, 118}, Scale: "magic", PerSP: 1},
 					{Kind: OpStun, Dur: PerLevel{1, 1, 1, 1}},
 					{Kind: OpSlow, Value: PerLevel{0.83, 0.83, 0.83, 0.83}, Dur: PerLevel{5, 5, 5, 5}},
 					// CLIENT «...теряет {healthcost} здоровья, которое он МОЖЕТ ВОССТАНОВИТЬ,
@@ -1756,7 +1760,7 @@ func init() {
 					{Kind: OpBuffStat, Value: PerLevel{1.2, 1.2, 1.25, 1.25}, Dur: PerLevel{5, 5, 5, 5}, Stat: "move_speed_pct", On: "self"},
 				},
 				TipArgs: map[string]PerLevel{
-					"damage":     PerLevel{70, 105, 140, 180},
+					"damage":     PerLevel{65, 80, 95, 118},
 					"damageSP":   PerLevel{1, 1, 1, 1},
 					"healthcost": PerLevel{30, 40, 50, 60},
 				},
@@ -1807,19 +1811,22 @@ func init() {
 				TipArgs: map[string]PerLevel{},
 			},
 			{
+				// PVP balance redesign: on-cost rises modestly, cd tightened slightly. Aura DPS
+				// brought down a touch -- this stacks with a redesigned S1's own damage in an
+				// extended trade, so it doesn't need to hit as hard on its own.
 				Slot: 4, NameRu: "Трупоглот", Type: "TOGGLE",
 				Target: "", Targeting: "SELF", Distance: 0, AoERadius: 4, AoEWidth: 0,
-				ManaCost: []int{30, 30, 30, 30}, Cooldown: []int{25, 24, 22, 20},
+				ManaCost: []int{26, 28, 30, 32}, Cooldown: []int{20, 19, 18, 17},
 				CastFx: "AbominatorSkill4Effect2", CastFxDur: 0.5, PayloadFx: "", PayloadFxAt: "", PayloadDelay: 0,
 				BuffFx: "AbominatorSkill4Effect1", BuffFxOn: "self", BuffIcon: true, BuffDescVariant: "BuffSelf",
 				Ops: []Op{
 					{Kind: OpAura, TickCost: PerLevel{0, 0, 0, 0}, Radius: 4, Interval: 1, Ops: []Op{
-						{Kind: OpDamage, Value: PerLevel{25, 35, 45, 55}, Scale: "magic", PerSP: 1},
+						{Kind: OpDamage, Value: PerLevel{22, 32, 42, 52}, Scale: "magic", PerSP: 1},
 					}},
 					{Kind: OpBuffStat, Value: PerLevel{-8, -10, -12, -14}, Dur: PerLevel{0, 0, 0, 0}, Stat: "hp_regen", On: "self"},
 				},
 				TipArgs: map[string]PerLevel{
-					"damage":   PerLevel{25, 35, 45, 55},
+					"damage":   PerLevel{22, 32, 42, 52},
 					"damageSP": PerLevel{1, 1, 1, 1},
 					"hpCost":   PerLevel{8, 10, 12, 14},
 				},
@@ -1830,6 +1837,11 @@ func init() {
 		Prefab: "Avtr_HK_Astarot", AttackProjectile: false,
 		Skills: [4]Skill{
 			{
+				// Mana cost is CLIENT-anchored (locale literally states "Стоимость 135 маны",
+				// flat across ranks -- see TestAstarotDevilTrickManaCostIsFlat) and left
+				// untouched despite being a heavy 73% of his 184 pool: that IS the design, a
+				// single heavy-commitment engage tool, not an estimate to recalibrate. Cooldown
+				// (also CLIENT-flat at 15s -- untouched) stays as-is too; only damage is redesigned.
 				Slot: 1, NameRu: "Бесовский трюк", Type: "ACTIVE",
 				Target: "POINT", Targeting: "", Distance: 9, AoERadius: 3, AoEWidth: 0,
 				ManaCost: []int{135, 135, 135, 135}, Cooldown: []int{15, 15, 15, 15},
@@ -1837,11 +1849,11 @@ func init() {
 				BuffFx: "SlowMoveEffect", BuffFxOn: "target", BuffIcon: false, BuffDescVariant: "BuffTarget",
 				Ops: []Op{
 					{Kind: OpBlink},
-					{Kind: OpDamage, Value: PerLevel{60, 90, 120, 155}, Scale: "magic", Radius: 3, PerSP: 1},
+					{Kind: OpDamage, Value: PerLevel{135, 150, 170, 190}, Scale: "magic", Radius: 3, PerSP: 1},
 					{Kind: OpSlow, Value: PerLevel{0.7, 0.7, 0.7, 0.7}, Dur: PerLevel{3, 3, 3, 3}, Radius: 3},
 				},
 				TipArgs: map[string]PerLevel{
-					"aoeDamage": PerLevel{60, 90, 120, 155},
+					"aoeDamage": PerLevel{135, 150, 170, 190},
 					"damageSP":  PerLevel{1, 1, 1, 1},
 				},
 			},
@@ -1883,9 +1895,11 @@ func init() {
 				},
 			},
 			{
+				// PVP balance redesign: cd tapers a bit tighter (was 40-34) so the sustain/DPS
+				// steroid keeps decent uptime alongside a now-more-reasonably-priced S1.
 				Slot: 4, NameRu: "Безумие", Type: "ACTIVE",
 				Target: "", Targeting: "SELF", Distance: 0, AoERadius: 0, AoEWidth: 0,
-				ManaCost: []int{50, 55, 60, 65}, Cooldown: []int{40, 38, 36, 34},
+				ManaCost: []int{45, 52, 59, 66}, Cooldown: []int{34, 32, 30, 28},
 				CastFx: "AstarotSkill4", CastFxDur: 0.5, PayloadFx: "", PayloadFxAt: "", PayloadDelay: 0,
 				BuffFx: "AstarotSkill4Effect", BuffFxOn: "self", BuffIcon: true, BuffDescVariant: "BuffSelf",
 				Ops: []Op{
@@ -1893,7 +1907,7 @@ func init() {
 					{Kind: OpBuffStat, Value: PerLevel{0.25, 0.3, 0.35, 0.4}, Dur: PerLevel{20, 20, 20, 20}, Stat: "lifesteal_pct", On: "self"},
 				},
 				TipArgs: map[string]PerLevel{
-					"speedCoef": PerLevel{0.3, 0.4, 0.5, 0.6},
+					"speedCoef": PerLevel{0.2, 0.3, 0.4, 0.5},
 					"dmgCoef":   PerLevel{0.25, 0.3, 0.35, 0.4},
 				},
 			},
@@ -2059,17 +2073,20 @@ func init() {
 		Prefab: "Avtr_HK_Mihalych", AttackProjectile: false,
 		Skills: [4]Skill{
 			{
+				// PVP balance redesign: mana rises, cd flat-ish (matches the evidenced pattern);
+				// dmg/mana at a single-target-CC rate. Kept moderate on purpose -- this chains
+				// into S2's stacking passive and S4's AoE stun, so the opener itself stays modest.
 				Slot: 1, NameRu: "Медвежий капкан", Type: "ACTIVE",
 				Target: "ENEMY+NOT_BUILDING", Targeting: "TARGET", Distance: 9, AoERadius: 0, AoEWidth: 0,
-				ManaCost: []int{25, 30, 35, 40}, Cooldown: []int{11, 10, 9, 8},
+				ManaCost: []int{24, 28, 32, 36}, Cooldown: []int{9, 9, 8, 8},
 				CastFx: "MihalychSkill1", CastFxDur: 0.6, PayloadFx: "MihalychSkill1", PayloadFxAt: "target", PayloadDelay: 0.4,
 				BuffFx: "", BuffFxOn: "", BuffIcon: false, BuffDescVariant: "",
 				Ops: []Op{
-					{Kind: OpDamage, Value: PerLevel{70, 100, 135, 170}, Scale: "phys", PerSP: 1},
+					{Kind: OpDamage, Value: PerLevel{60, 78, 92, 108}, Scale: "phys", PerSP: 1},
 					{Kind: OpPull},
 				},
 				TipArgs: map[string]PerLevel{
-					"damage":   PerLevel{70, 100, 135, 170},
+					"damage":   PerLevel{60, 78, 92, 108},
 					"damageSP": PerLevel{1, 1, 1, 1},
 				},
 			},
@@ -2086,40 +2103,52 @@ func init() {
 					// Value2 caps the stack at 6 hits (PVP balance pass): uncapped, this plus
 					// S1's guaranteed pull and S4's 2s AoE stun chains into a burst kill on any
 					// 420-525 HP target within 4-5 unanswered autoattacks -- mirrors the cap
-					// OpAttackSpeedStreak already carries on the same hitStreak mechanic.
-					{Kind: OpConsecutiveHit, Value: PerLevel{15, 22, 30, 40}, Value2: PerLevel{90, 132, 180, 240}, PerSP: 1},
+					// OpAttackSpeedStreak already carries on the same hitStreak mechanic. Per-hit
+					// value redesigned alongside the rest of the kit; the cap holds at 6 stacks.
+					{Kind: OpConsecutiveHit, Value: PerLevel{14, 20, 27, 35}, Value2: PerLevel{84, 120, 162, 210}, PerSP: 1},
 				},
 				TipArgs: map[string]PerLevel{
-					"damage":   PerLevel{15, 22, 30, 40},
+					"damage":   PerLevel{14, 20, 27, 35},
 					"damageSP": PerLevel{1, 1, 1, 1},
 				},
 			},
 			{
+				// PVP balance redesign: a placed, avoidable trap earns a better dmg/mana rate
+				// than a targeted cast (mana rises, cd flat-ish); slow/duration flavor unchanged.
 				Slot: 3, NameRu: "Западня", Type: "ACTIVE",
 				Target: "POINT", Targeting: "", Distance: 6, AoERadius: 0, AoEWidth: 0,
-				ManaCost: []int{30, 35, 40, 45}, Cooldown: []int{14, 13, 12, 11},
+				ManaCost: []int{26, 30, 34, 38}, Cooldown: []int{12, 12, 11, 11},
 				CastFx: "MihalychSkill3", CastFxDur: 0.8, PayloadFx: "", PayloadFxAt: "", PayloadDelay: 0.3,
 				BuffFx: "", BuffFxOn: "", BuffIcon: false, BuffDescVariant: "",
 				Ops: []Op{
 					{Kind: OpTrap, Lifetime: PerLevel{300, 300, 300, 300}, TriggerRadius: 2, TrapFx: "MihalychSkill3TrapEffect", TriggerFx: "MihalychSkill3TrapTriggeredEffect", Ops: []Op{
-						{Kind: OpDamage, Value: PerLevel{80, 115, 150, 190}, Scale: "phys"},
+						// PerSP added (verification audit): TipArgs already promised "damageSP" but
+						// Scale:"phys" gets no implicit SP fallback (unlike "magic"), so this stayed
+						// flat all match regardless of spell power -- a pre-existing gap surfaced
+						// while reviewing the redesigned numbers, not introduced by the redesign.
+						{Kind: OpDamage, Value: PerLevel{70, 88, 105, 122}, Scale: "phys", PerSP: 1},
 						{Kind: OpSlow, Value: PerLevel{0.6, 0.6, 0.6, 0.6}, Dur: PerLevel{3, 4, 5, 6}},
 					}},
 				},
 				TipArgs: map[string]PerLevel{
-					"damage":   PerLevel{80, 115, 150, 190},
+					"damage":   PerLevel{70, 88, 105, 122},
 					"damageSP": PerLevel{1, 1, 1, 1},
 					"duration": PerLevel{3, 4, 5, 6},
 				},
 			},
 			{
+				// PVP balance redesign: this ult stacks with S1's guaranteed pull and S2's
+				// consecutive-hit passive (the exact combo the balance audit flagged as a burst
+				// risk), so its OWN damage is kept deliberately modest -- the 2s AoE stun + 10s
+				// slow duo is the payoff, not a third source of big raw damage. Mana rises
+				// steeply (ult-tier commitment); cd tapers mildly.
 				Slot: 4, NameRu: "Звериный рев", Type: "ACTIVE",
 				Target: "", Targeting: "SELF", Distance: 0, AoERadius: 5, AoEWidth: 0,
-				ManaCost: []int{55, 60, 65, 70}, Cooldown: []int{24, 22, 20, 18},
+				ManaCost: []int{50, 58, 66, 74}, Cooldown: []int{26, 24, 22, 20},
 				CastFx: "MihalychSkill4", CastFxDur: 1, PayloadFx: "MihalychSkill4Effect", PayloadFxAt: "self", PayloadDelay: 0.3,
 				BuffFx: "", BuffFxOn: "", BuffIcon: false, BuffDescVariant: "BuffTarget",
 				Ops: []Op{
-					{Kind: OpDamage, Value: PerLevel{110, 155, 205, 265}, Scale: "magic", Radius: 5},
+					{Kind: OpDamage, Value: PerLevel{85, 100, 120, 140}, Scale: "magic", Radius: 5},
 					// Client IDS_MihalychSkill4: enemies are STUNNED 2s, «а затем» slowed for 10s.
 					// The stun was missing; the 2s stun overlaps the front of the 10s slow, so the
 					// felt sequence is "frozen 2s, then hobbled" without needing a delayed slow.
@@ -2128,7 +2157,7 @@ func init() {
 					{Kind: OpAttackSlow, Value: PerLevel{0.6, 0.6, 0.6, 0.6}, Dur: PerLevel{10, 10, 10, 10}, Radius: 5},
 				},
 				TipArgs: map[string]PerLevel{
-					"damage":   PerLevel{110, 155, 205, 265},
+					"damage":   PerLevel{85, 100, 120, 140},
 					"damageSP": PerLevel{1, 1, 1, 1},
 				},
 			},
@@ -2220,19 +2249,23 @@ func init() {
 		Prefab: "Avtr_HK_Tangren", AttackProjectile: false,
 		Skills: [4]Skill{
 			{
+				// PVP balance redesign (round 2, per verification audit): round-1 total dmg/mana
+				// (2.19-3.4) still exceeded even the channel band (0.75-2.0) on every rank BEFORE
+				// counting the 5s of bundled near-total magic immunity at all. Per-tick damage
+				// cut further to land the total near the top of the channel band.
 				Slot: 1, NameRu: "Стальной ураган", Type: "ACTIVE",
 				Target: "", Targeting: "", Distance: 0, AoERadius: 3, AoEWidth: 0,
-				ManaCost: []int{40, 45, 50, 55}, Cooldown: []int{18, 16, 14, 12},
+				ManaCost: []int{32, 38, 44, 50}, Cooldown: []int{16, 15, 14, 13},
 				CastFx: "TangrenSkill1Effect", CastFxDur: 5, PayloadFx: "", PayloadFxAt: "", PayloadDelay: 0,
 				BuffFx: "", BuffFxOn: "", BuffIcon: true, BuffDescVariant: "",
 				Ops: []Op{
 					{Kind: OpBuffStat, Value: PerLevel{1000, 1000, 1000, 1000}, Dur: PerLevel{5, 5, 5, 5}, Stat: "magic_armor", On: "self"},
 					{Kind: OpChannel, Dur: PerLevel{5, 5, 5, 5}, Interval: 1, Ops: []Op{
-						{Kind: OpDamage, Value: PerLevel{22, 38, 54, 70}, Scale: "magic", Radius: 3, PerSP: 1},
+						{Kind: OpDamage, Value: PerLevel{13, 15, 18, 20}, Scale: "magic", Radius: 3, PerSP: 1},
 					}},
 				},
 				TipArgs: map[string]PerLevel{
-					"aoeDamage": PerLevel{22, 38, 54, 70},
+					"aoeDamage": PerLevel{13, 15, 18, 20},
 					"damageSP":  PerLevel{1, 1, 1, 1},
 				},
 			},
@@ -2257,10 +2290,17 @@ func init() {
 				},
 			},
 			{
-				// stats.txt: healing totem, heals allies 4/8/12/16/20 per tick.
+				// stats.txt: healing totem, heals allies 4/8/12/16/20 per tick (kept exactly).
+				// Cost/cd redesigned: a sustained, positional HoT earns a cheaper mana rate than
+				// an instant heal per the calibration model. CD raised back at ranks 4-5 (round
+				// 2, per verification audit): it had dipped BELOW the totem's own 25s HoT
+				// duration, so addAllyHotLocked's append-not-refresh behavior let a recast stack
+				// a second HoT on top of the still-ticking one, doubling effective heal/sec --
+				// cd now stays >= duration at every rank so a recast always lands after the old
+				// tick expires, not on top of it.
 				Slot: 3, NameRu: "Целительный тотем", Type: "ACTIVE",
 				Target: "", Targeting: "", Distance: 0, AoERadius: 0, AoEWidth: 0,
-				ManaCost: []int{45, 50, 55, 60, 65}, Cooldown: []int{40, 36, 32, 28, 24},
+				ManaCost: []int{35, 40, 45, 50, 55}, Cooldown: []int{32, 30, 28, 27, 26},
 				CastFx: "TangrenSkill3", CastFxDur: 1.2, PayloadFx: "TangrenSkill3Effect1", PayloadFxAt: "self", PayloadDelay: 0.4,
 				BuffFx: "TangrenSkill3Effect2", BuffFxOn: "self", BuffIcon: true, BuffDescVariant: "BuffTarget",
 				Ops: []Op{
@@ -2280,9 +2320,22 @@ func init() {
 				// clicked enemy, then 4 random hops (Count 5 = 5 total impacts), 150/200/250/300
 				// phys per hit. Unlocks at level 5 via the ult gate. (A targeted first hop mirrors
 				// Elgorm's «Блуждающий ужас»; a self/no-target bounce can't resolve its origin.)
+				// Damage 150/200/250/300 kept exactly (stats.txt). Cost/cd redesigned twice:
+				// round 1 assumed an isolated target only ever takes one hit (true when exactly
+				// ONE enemy is in range -- randomMobInRangeLocked excludes only the just-struck
+				// mob, so the search comes up empty and the chain fizzles). Round 2 (verification
+				// audit, confirmed against elgorm_skill_test.go's own asserted behavior for the
+				// SAME shared OpBounce primitive) caught the case that reading missed: with
+				// EXACTLY TWO enemies in range -- a common 5v5 skirmish shape -- the hop
+				// deterministically ping-pongs A-B-A-B-A, landing 3 of 5 hits (900 dmg at max
+				// rank) on the first target. That revisit-when-only-two-remain behavior is a
+				// DELIBERATE, tested feature of the shared primitive (Elgorm's «Блуждающий
+				// ужас» relies on the identical mechanic), so it isn't touched here -- cost/cd
+				// instead pulled back most of the way toward the pre-redesign values to price in
+				// the realistic worst case, not just the best case.
 				Slot: 4, NameRu: "Танец смерти", Type: "ACTIVE",
 				Target: "ENEMY+NOT_BUILDING", Targeting: "TARGET", Distance: 10, AoERadius: 0, AoEWidth: 0,
-				ManaCost: []int{60, 70, 80, 90}, Cooldown: []int{60, 55, 50, 45},
+				ManaCost: []int{60, 70, 80, 90}, Cooldown: []int{58, 54, 50, 46},
 				CastFx: "TangrenSkill4", CastFxDur: 2, PayloadFx: "TangrenSkill4Effect", PayloadFxAt: "target", PayloadDelay: 0.2,
 				BuffFx: "", BuffFxOn: "", BuffIcon: false, BuffDescVariant: "",
 				Ops: []Op{
@@ -2301,35 +2354,43 @@ func init() {
 		Prefab: "Avtr_HK_Teridin", AttackProjectile: true,
 		Skills: [4]Skill{
 			{
+				// PVP balance redesign: cost/damage/cd recalibrated against the stats.txt
+				// anchors (PlusMinus S1/S2, Ariana S3, Velial S2 all run FLAT cooldown across
+				// ranks, mana rising instead -- the evidenced pattern for this game, not the
+				// decreasing-CD MOBA default the earlier estimate used). Slow left as-is.
 				Slot: 1, NameRu: "Град стрел", Type: "ACTIVE",
 				Target: "ENEMY+NOT_BUILDING", Targeting: "TARGET", Distance: 12, AoERadius: 3, AoEWidth: 0,
-				ManaCost: []int{30, 35, 40, 45}, Cooldown: []int{11, 10, 9, 8},
+				ManaCost: []int{28, 32, 36, 40}, Cooldown: []int{10, 9, 9, 8},
 				CastFx: "TeridinSkill1", CastFxDur: 1.3, PayloadFx: "", PayloadFxAt: "", PayloadDelay: 1.3,
 				BuffFx: "SlowMoveEffect", BuffFxOn: "target", BuffIcon: false, BuffDescVariant: "",
 				Ops: []Op{
-					{Kind: OpDamage, Value: PerLevel{65, 105, 145, 185}, Scale: "phys", Radius: 3, PerSP: 1},
+					{Kind: OpDamage, Value: PerLevel{55, 68, 80, 92}, Scale: "phys", Radius: 3, PerSP: 1},
 					{Kind: OpSlow, Value: PerLevel{0.85, 0.85, 0.85, 0.85}, Dur: PerLevel{4, 4, 4, 4}},
 				},
 				TipArgs: map[string]PerLevel{
-					"aoeDamage": PerLevel{65, 105, 145, 185},
+					"aoeDamage": PerLevel{55, 68, 80, 92},
 					"damageSP":  PerLevel{1, 1, 1, 1},
 				},
 			},
 			{
+				// PVP balance redesign: a free passive has no mana anchor, so it is sized
+				// against Teridin's own basic attack (40-46 dmg) -- "sometimes your shot hits
+				// twice as hard and clips the target's aim", not a second full nuke stapled to
+				// every crit-roll autoattack.
 				Slot: 2, NameRu: "Выстрел в голову", Type: "PASSIVE",
 				Target: "", Targeting: "", Distance: 0, AoERadius: 0, AoEWidth: 0,
 				ManaCost: []int{0, 0, 0, 0}, Cooldown: []int{0, 0, 0, 0},
 				CastFx: "", CastFxDur: 0, PayloadFx: "", PayloadFxAt: "", PayloadDelay: 0,
 				BuffFx: "", BuffFxOn: "", BuffIcon: false, BuffDescVariant: "",
 				Ops: []Op{
-					{Kind: OpProc, Chance: PerLevel{0.1, 0.15, 0.2, 0.25}, Ops: []Op{
-						{Kind: OpDamage, Value: PerLevel{40, 65, 90, 115}, Scale: "phys", PerSP: 1},
+					{Kind: OpProc, Chance: PerLevel{0.12, 0.17, 0.22, 0.27}, Ops: []Op{
+						{Kind: OpDamage, Value: PerLevel{35, 55, 75, 95}, Scale: "phys", PerSP: 1},
 						{Kind: OpStun, Dur: PerLevel{0.1, 0.1, 0.1, 0.1}},
 					}},
 				},
 				TipArgs: map[string]PerLevel{
-					"probability": PerLevel{0.1, 0.15, 0.2, 0.25},
-					"damage":      PerLevel{40, 65, 90, 115},
+					"probability": PerLevel{0.12, 0.17, 0.22, 0.27},
+					"damage":      PerLevel{35, 55, 75, 95},
 					"damageSP":    PerLevel{1, 1, 1, 1},
 				},
 			},
@@ -2347,9 +2408,13 @@ func init() {
 				},
 			},
 			{
+				// PVP balance redesign (round 2, per verification audit): the round-1 dmg/mana
+				// (3.56-4.2) exceeded even the single-target+CC band (2.4-3.4) despite this
+				// ability having no real CC -- only a 2s telegraph as counterplay. Brought down
+				// to ~2.9-3.1, still a premium single-target rate given the telegraph+long CD.
 				Slot: 4, NameRu: "Снайперский выстрел", Type: "ACTIVE",
 				Target: "ENEMY+NOT_BUILDING", Targeting: "TARGET", Distance: 18, AoERadius: 0, AoEWidth: 0,
-				ManaCost: []int{50, 60, 70, 80}, Cooldown: []int{50, 45, 40, 35},
+				ManaCost: []int{45, 55, 65, 75}, Cooldown: []int{40, 36, 33, 30},
 				CastFx: "TeridinSkill4", CastFxDur: 2, PayloadFx: "TeridinSkill4Effect", PayloadFxAt: "target", PayloadDelay: 2,
 				BuffFx: "", BuffFxOn: "", BuffIcon: false, BuffDescVariant: "",
 				Ops: []Op{
@@ -2357,11 +2422,11 @@ func init() {
 					// A previous OpChannel{Dur:2,Interval:2} wrapper double-fired this damage (Dur==Interval
 					// meant the pulse and the eviction landed on the same tick), contradicting every locale
 					// variant which describes exactly one hit.
-					{Kind: OpDamage, Value: PerLevel{150, 225, 300, 375}, Scale: "phys", PerSP: 1},
+					{Kind: OpDamage, Value: PerLevel{130, 160, 195, 230}, Scale: "phys", PerSP: 1},
 				},
 				TipArgs: map[string]PerLevel{
 					"delay":    PerLevel{2, 2, 2, 2},
-					"damage":   PerLevel{150, 225, 300, 375},
+					"damage":   PerLevel{130, 160, 195, 230},
 					"damageSP": PerLevel{1, 1, 1, 1},
 				},
 			},
@@ -2532,9 +2597,14 @@ func init() {
 		Prefab: "Avtr_Sp_Arianna", AttackProjectile: false,
 		Skills: [4]Skill{
 			{
+				// PVP balance redesign (round 2, per verification audit): cd is now genuinely
+				// flat (was tapering 15->12, breaking the same avatar's own S3 flat-20 pattern
+				// with no justification). Shield/mana brought down from ~4-5x the heal anchor
+				// (S3) toward ~3.4-4x -- still priced above a plain heal since it also grants
+				// full CC immunity, but not by as wide a margin.
 				Slot: 1, NameRu: "Щит хранителя", Type: "ACTIVE",
 				Target: "FRIEND", Targeting: "TARGET", Distance: 9, AoERadius: 0, AoEWidth: 0,
-				ManaCost: []int{30, 35, 40, 45}, Cooldown: []int{16, 15, 14, 13},
+				ManaCost: []int{28, 33, 38, 43}, Cooldown: []int{14, 14, 14, 14},
 				CastFx: "ArianaMeySkill1", CastFxDur: 1, PayloadFx: "", PayloadFxAt: "", PayloadDelay: 0.3,
 				BuffFx: "ArianaMeySkill1Effect", BuffFxOn: "target", BuffIcon: true, BuffDescVariant: "BuffSelf",
 				Ops: []Op{
@@ -2543,8 +2613,8 @@ func init() {
 					// (magic-damage immunity is still approximated by the absorb shield, since the
 					// engine has no true damage-type immunity); on the aimed friendly avatar
 					// (On:"ally"), or Ariana herself solo.
-					{Kind: OpShield, Value: PerLevel{120, 160, 200, 240}, Dur: PerLevel{4, 5, 6, 7}, On: "ally", GrantsCCImmune: true},
-					{Kind: OpBuffStat, Value: PerLevel{30, 40, 50, 60}, Dur: PerLevel{4, 5, 6, 7}, Stat: "magic_armor", On: "ally"},
+					{Kind: OpShield, Value: PerLevel{95, 120, 145, 170}, Dur: PerLevel{4, 5, 6, 7}, On: "ally", GrantsCCImmune: true},
+					{Kind: OpBuffStat, Value: PerLevel{28, 38, 48, 58}, Dur: PerLevel{4, 5, 6, 7}, Stat: "magic_armor", On: "ally"},
 				},
 				TipArgs: map[string]PerLevel{
 					"duration": PerLevel{4, 5, 6, 7},
@@ -2590,9 +2660,13 @@ func init() {
 				},
 			},
 			{
+				// PVP balance redesign: this doubles up (ally AND self get the full shield+HoT
+				// from one cast), which the client text genuinely calls for -- so the PER-TARGET
+				// magnitude comes down instead of cutting the double-application, keeping total
+				// value/mana closer to a single strong defensive cooldown rather than two.
 				Slot: 4, NameRu: "Касание спасителя", Type: "ACTIVE",
 				Target: "FRIEND", Targeting: "TARGET", Distance: 8, AoERadius: 0, AoEWidth: 0,
-				ManaCost: []int{70, 80, 90, 100}, Cooldown: []int{45, 42, 39, 36},
+				ManaCost: []int{65, 75, 85, 95}, Cooldown: []int{38, 36, 34, 32},
 				CastFx: "ArianaMeySkill4", CastFxDur: 1.2, PayloadFx: "ArianaMeySkill4Effect1", PayloadFxAt: "target", PayloadDelay: 0.6,
 				BuffFx: "ArianaMeySkill4Effect2", BuffFxOn: "target", BuffIcon: true, BuffDescVariant: "BuffTarget",
 				Ops: []Op{
@@ -2605,14 +2679,14 @@ func init() {
 					// the tooltip's own damageSP term (OpHot now supports it). The prior encoding
 					// ALSO stacked a self-only hp_regen buff on top of Ariana's own OpHot, healing
 					// her at roughly double the ally's rate for the identical cast -- dropped.
-					{Kind: OpShield, Value: PerLevel{200, 260, 320, 380}, Dur: PerLevel{4, 5, 5, 6}, On: "ally"},
-					{Kind: OpHot, Value: PerLevel{10, 14, 18, 22}, PerSP: 1, Dur: PerLevel{4, 5, 5, 6}, On: "ally"},
-					{Kind: OpShield, Value: PerLevel{200, 260, 320, 380}, Dur: PerLevel{4, 5, 5, 6}},
-					{Kind: OpHot, Value: PerLevel{10, 14, 18, 22}, PerSP: 1, Dur: PerLevel{4, 5, 5, 6}},
+					{Kind: OpShield, Value: PerLevel{170, 210, 250, 290}, Dur: PerLevel{4, 5, 5, 6}, On: "ally"},
+					{Kind: OpHot, Value: PerLevel{9, 12, 15, 18}, PerSP: 1, Dur: PerLevel{4, 5, 5, 6}, On: "ally"},
+					{Kind: OpShield, Value: PerLevel{170, 210, 250, 290}, Dur: PerLevel{4, 5, 5, 6}},
+					{Kind: OpHot, Value: PerLevel{9, 12, 15, 18}, PerSP: 1, Dur: PerLevel{4, 5, 5, 6}},
 				},
 				TipArgs: map[string]PerLevel{
 					"duration": PerLevel{4, 5, 5, 6},
-					"regenMod": PerLevel{10, 14, 18, 22},
+					"regenMod": PerLevel{9, 12, 15, 18},
 					"damageSP": PerLevel{1, 1, 1, 1},
 				},
 			},
@@ -2797,18 +2871,20 @@ func init() {
 		Prefab: "Avtr_Sp_Neirofim", AttackProjectile: false,
 		Skills: [4]Skill{
 			{
+				// PVP balance redesign: mana rises, cd flat-ish, base dmg/mana at the
+				// single-target rate; the missing-mana bonus % and slow mechanic are unchanged.
 				Slot: 1, NameRu: "Паралич воли", Type: "ACTIVE",
 				Target: "ENEMY+NOT_BUILDING", Targeting: "TARGET", Distance: 8, AoERadius: 0, AoEWidth: 0,
-				ManaCost: []int{30, 35, 40, 45}, Cooldown: []int{10, 10, 9, 8},
+				ManaCost: []int{26, 31, 36, 41}, Cooldown: []int{9, 9, 8, 8},
 				CastFx: "NeirofimSkill1", CastFxDur: 1, PayloadFx: "NeirofimSkill1Effect", PayloadFxAt: "target", PayloadDelay: 0.4,
 				BuffFx: "SlowMoveEffect", BuffFxOn: "target", BuffIcon: false, BuffDescVariant: "BuffTarget",
 				Ops: []Op{
 					// «Чем меньше маны у цели, тем больше урон, но слабее замедление»: base +
 					// dmgMissMana × missing mana, slow scaled by remaining mana (§ OpManaScaledDamage).
-					{Kind: OpManaScaledDamage, Value: PerLevel{70, 100, 130, 160}, Value2: PerLevel{0.1, 0.15, 0.2, 0.25}, Dur: PerLevel{3, 3, 3, 3}, Scale: "magic", PerSP: 1},
+					{Kind: OpManaScaledDamage, Value: PerLevel{65, 82, 98, 120}, Value2: PerLevel{0.1, 0.15, 0.2, 0.25}, Dur: PerLevel{3, 3, 3, 3}, Scale: "magic", PerSP: 1},
 				},
 				TipArgs: map[string]PerLevel{
-					"damage":      PerLevel{70, 100, 130, 160},
+					"damage":      PerLevel{65, 82, 98, 120},
 					"damageSP":    PerLevel{1, 1, 1, 1},
 					"dmgMissMana": PerLevel{0.1, 0.15, 0.2, 0.25},
 					"duration":    PerLevel{3, 3, 3, 3},
@@ -2858,14 +2934,17 @@ func init() {
 				},
 			},
 			{
+				// PVP balance redesign (round 2, per verification audit): round-1 numbers still
+				// undershot the design goal stated right here (cost near PlusMinus's own ult,
+				// 50-80% of his pool) -- 98/200=49% barely touched the bottom of that range, and
+				// the cd taper (70->46, -34%) was steeper than every other ultimate in this pass
+				// (16-25%). An unavoidable, unkiteable full-map silence with no counterplay
+				// should not be both cheaper AND faster than PlusMinus's dodgeable AoE ult. Cost
+				// raised further, cd taper flattened to match the other ults' range.
 				Slot: 4, NameRu: "Молчание", Type: "ACTIVE",
 				Target: "", Targeting: "", Distance: 0, AoERadius: 12, AoEWidth: 0,
-				ManaCost: []int{60, 70, 80, 90},
-				// CD raised from {45,42,39,36} (PVP balance pass): the CLIENT mechanic itself
-				// (silence every enemy, map-wide) is untouched -- only the cadence. A team-wide
-				// hard-CC with no positional counterplay at a sub-45s max-rank CD was coming
-				// back almost every fight in a 5v5 «Штурм» match.
-				Cooldown: []int{75, 65, 55, 48},
+				ManaCost: []int{80, 90, 100, 110},
+				Cooldown: []int{70, 64, 58, 54},
 				CastFx: "NeirofimSkill4", CastFxDur: 1.5, PayloadFx: "NeirofimSkill4Effect", PayloadFxAt: "self", PayloadDelay: 1,
 				BuffFx: "SilenceEffect", BuffFxOn: "target", BuffIcon: false, BuffDescVariant: "",
 				Ops: []Op{
@@ -3064,27 +3143,23 @@ func init() {
 		Prefab: "Avtr_Tank_Sigilion", AttackProjectile: false,
 		Skills: [4]Skill{
 			{
+				// PVP balance redesign (round 2, per verification audit): a FULL-TEAM instant
+				// AoE r5 hard stun in a non-ultimate slot needs its control priced separately
+				// from its damage, not folded into the same near-nuke discount -- cd raised
+				// further and the stun's own top-rank duration trimmed (was scaling to 3s).
 				Slot: 1, NameRu: "Сотрясающий топот", Type: "ACTIVE",
 				Target: "", Targeting: "", Distance: 0, AoERadius: 5, AoEWidth: 0,
-				ManaCost: []int{35, 40, 45, 50},
-				// CD raised from {14,13,12,11} (which normalizeKit extends to a 5th rank via
-				// linear extrapolation, landing at 10 -- PVP balance pass). This is a
-				// self-centered AoE r5 hard stun (radius falls back to AoERadius when the op has
-				// none, see damageTargetsLocked), i.e. a near-team-wide lockdown on a
-				// non-ultimate slot -- at the old CD it was up again before a 5v5 clump could
-				// reposition. Written out to all 5 ranks explicitly so the max-rank value is
-				// exact, not another extrapolation.
-				Cooldown: []int{24, 21, 19, 17, 15},
+				ManaCost: []int{30, 35, 40, 45}, Cooldown: []int{24, 22, 20, 18},
 				CastFx: "SigilionSkill1", CastFxDur: 1, PayloadFx: "", PayloadFxAt: "", PayloadDelay: 0,
 				BuffFx: "StunEffect", BuffFxOn: "target", BuffIcon: false, BuffDescVariant: "",
 				Ops: []Op{
-					{Kind: OpDamage, Value: PerLevel{60, 85, 110, 135}, Scale: "magic", PerSP: 1},
-					{Kind: OpStun, Dur: PerLevel{1.5, 2, 2.5, 3}},
+					{Kind: OpDamage, Value: PerLevel{50, 62, 75, 88}, Scale: "magic", PerSP: 1},
+					{Kind: OpStun, Dur: PerLevel{1.5, 2, 2.25, 2.5}},
 				},
 				TipArgs: map[string]PerLevel{
-					"damage":   PerLevel{60, 85, 110, 135},
+					"damage":   PerLevel{50, 62, 75, 88},
 					"damageSP": PerLevel{1, 1, 1, 1},
-					"duration": PerLevel{1.5, 2, 2.5, 3},
+					"duration": PerLevel{1.5, 2, 2.25, 2.5},
 				},
 			},
 			{
@@ -3118,13 +3193,15 @@ func init() {
 				},
 			},
 			{
+				// PVP balance redesign: cd tapers a bit tighter (was 50-44) so this can be the
+				// tank's real power spike now that S1 costs less and hits softer.
 				Slot: 4, NameRu: "Мощь берсерка", Type: "ACTIVE",
 				Target: "", Targeting: "", Distance: 0, AoERadius: 0, AoEWidth: 0,
-				ManaCost: []int{50, 55, 60, 65}, Cooldown: []int{50, 48, 46, 44},
+				ManaCost: []int{45, 52, 59, 66}, Cooldown: []int{42, 39, 36, 33},
 				CastFx: "SigilionSkill4", CastFxDur: 1, PayloadFx: "", PayloadFxAt: "", PayloadDelay: 0,
 				BuffFx: "SigilionSkill4Effect", BuffFxOn: "self", BuffIcon: true, BuffDescVariant: "BuffSelf",
 				Ops: []Op{
-					{Kind: OpBuffStat, Value: PerLevel{1.5, 1.6, 1.7, 1.8}, Dur: PerLevel{20, 20, 20, 20}, Stat: "dmg_pct", On: "self"},
+					{Kind: OpBuffStat, Value: PerLevel{1.4, 1.5, 1.6, 1.7}, Dur: PerLevel{20, 20, 20, 20}, Stat: "dmg_pct", On: "self"},
 					// CLIENT «Мощь берсерка»: "ранит себя на 50% от увеличенного [урона от атак]" --
 					// a PER-ATTACK self-hit proportional to the LIVE dmg_pct bonus, not a flat
 					// hp_regen debuff (a prior pass's tooltip numbers didn't match the real
@@ -3132,7 +3209,7 @@ func init() {
 					{Kind: OpSelfRecoil, Value: PerLevel{0.5, 0.5, 0.5, 0.5}, Dur: PerLevel{20, 20, 20, 20}},
 				},
 				TipArgs: map[string]PerLevel{
-					"dmgBoost": PerLevel{50, 60, 70, 80},
+					"dmgBoost": PerLevel{40, 50, 60, 70},
 					"damageSP": PerLevel{1, 1, 1, 1},
 				},
 			},
@@ -3329,39 +3406,46 @@ func init() {
 		Prefab: "Avtr_Tank_Velial", AttackProjectile: false,
 		Skills: [4]Skill{
 			{
+				// PVP balance redesign (round 2, per verification audit): round-1 dmg/mana
+				// (2.5-3.0) still exceeded the AoE-nuke band (1.7-2.3) with no CC to justify the
+				// higher single-target+control band -- and the 30% lifesteal (unchanged) rides
+				// on top of that damage across up to 3 targets. Brought down into the AoE-nuke
+				// band; the lifesteal is the bonus value, not stacked on top of nuke-tier damage.
 				Slot: 1, NameRu: "Удар изверга", Type: "ACTIVE",
 				Target: "", Targeting: "SELF", Distance: 0, AoERadius: 4, AoEWidth: 0,
-				ManaCost: []int{25, 30, 35, 40}, Cooldown: []int{10, 9, 8, 7},
+				ManaCost: []int{22, 28, 34, 40}, Cooldown: []int{9, 8, 8, 7},
 				CastFx: "VelialSkill1", CastFxDur: 1.2, PayloadFx: "VelialSkill1Effect", PayloadFxAt: "self", PayloadDelay: 0.4,
 				BuffFx: "", BuffFxOn: "", BuffIcon: false, BuffDescVariant: "",
 				Ops: []Op{
 					// MaxTargets 3 (PVP balance pass): OpLifestealHit heals Velial once PER
 					// enemy the AoE connects with, uncapped -- in the 5v5 clumps this radius is
-					// built for, that turned a single 40-mana/7s-cd cast into 150-260+ self-heal
-					// (up to half his 520 HP pool at once), making him nearly unkillable in a
-					// sustained teamfight against the compressed 420-525 HP roster. Capped like
-					// Rognar's «Могильный холод» caps its own multi-target op.
-					{Kind: OpLifestealHit, Value: PerLevel{75, 105, 140, 175}, Value2: PerLevel{0.3, 0.3, 0.3, 0.3}, Scale: "magic", Radius: 4, MaxTargets: 3},
+					// built for, that turned a single cast into 150-260+ self-heal (up to half his
+					// 520 HP pool at once), making him nearly unkillable in a sustained teamfight
+					// against the compressed 420-525 HP roster. Capped like Rognar's «Могильный
+					// холод» caps its own multi-target op.
+					{Kind: OpLifestealHit, Value: PerLevel{40, 55, 68, 82}, Value2: PerLevel{0.3, 0.3, 0.3, 0.3}, Scale: "magic", Radius: 4, MaxTargets: 3},
 				},
 				TipArgs: map[string]PerLevel{
-					"damage":   PerLevel{75, 105, 140, 175},
+					"damage":   PerLevel{40, 55, 68, 82},
 					"damageSP": PerLevel{1, 1, 1, 1},
 				},
 			},
 			{
-				// stats.txt: "КД второй способности 20 секунд" -> Разлом cd = 20 flat.
+				// stats.txt: "КД второй способности 20 секунд" -> Разлом cd = 20 flat (kept
+				// exactly; only cd is stats.txt-anchored here). Cost/damage redesigned: dmg/mana
+				// at the single-target-burst+hard-CC rate this ability itself first anchored.
 				Slot: 2, NameRu: "Разлом", Type: "ACTIVE",
 				Target: "POINT", Targeting: "", Distance: 9, AoERadius: 0, AoEWidth: 3,
-				ManaCost: []int{35, 40, 45, 50, 55}, Cooldown: []int{20, 20, 20, 20, 20},
+				ManaCost: []int{28, 34, 40, 46, 52}, Cooldown: []int{20, 20, 20, 20, 20},
 				CastFx: "VelialSkill2", CastFxDur: 1.2, PayloadFx: "", PayloadFxAt: "", PayloadDelay: 0.5,
 				BuffFx: "", BuffFxOn: "", BuffIcon: false, BuffDescVariant: "",
 				Ops: []Op{
-					{Kind: OpDamage, Value: PerLevel{85, 120, 155, 190}, Scale: "phys", PerSP: 1},
-					{Kind: OpStun, Dur: PerLevel{2, 2, 2, 2}},
+					{Kind: OpDamage, Value: PerLevel{75, 95, 115, 135, 155}, Scale: "phys", PerSP: 1},
+					{Kind: OpStun, Dur: PerLevel{2, 2, 2, 2, 2}},
 				},
 				TipArgs: map[string]PerLevel{
-					"damageAmount": PerLevel{85, 120, 155, 190},
-					"damageSP":     PerLevel{1, 1, 1, 1},
+					"damageAmount": PerLevel{75, 95, 115, 135, 155},
+					"damageSP":     PerLevel{1, 1, 1, 1, 1},
 				},
 			},
 			{
@@ -3385,9 +3469,11 @@ func init() {
 				},
 			},
 			{
+				// PVP balance redesign: cd tapers a bit less steeply (was 45-30) to balance the
+				// slightly higher mana cost -- still a long-CD team-utility ultimate.
 				Slot: 4, NameRu: "Трибунал", Type: "ACTIVE",
 				Target: "ENEMY+NOT_BUILDING", Targeting: "TARGET", Distance: 9, AoERadius: 0, AoEWidth: 0,
-				ManaCost: []int{40, 45, 50, 55}, Cooldown: []int{45, 40, 35, 30},
+				ManaCost: []int{35, 42, 49, 56}, Cooldown: []int{38, 35, 32, 29},
 				CastFx: "VelialSkill4", CastFxDur: 1.3, PayloadFx: "", PayloadFxAt: "", PayloadDelay: 0.4,
 				BuffFx: "VelialSkill4Effect", BuffFxOn: "target", BuffIcon: true, BuffDescVariant: "BuffTarget",
 				// CLIENT «...цель становится видна в невидимости для всех членов союзной
