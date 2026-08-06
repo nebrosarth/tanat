@@ -12,6 +12,7 @@ package battleserver
 import (
 	"fmt"
 	"log"
+	"math/rand"
 	"net"
 	"os"
 	"strconv"
@@ -114,9 +115,13 @@ func (s *Server) spawnDotaBotsLocked(inst *huntInstance, target int) {
 // bypassing assignSide() entirely -- so nextSide never advances for them. Filling bots by
 // blindly consuming nextSide after such a player joined double-counted their side (seen
 // live: a 10-headcount fill split 6/4 instead of 5/5). Counting actual membership is
-// correct regardless of which path assigned anyone's side. Ties fall back to assignSide()
-// (which still advances it, so a LATER real joiner with no pre-assigned team keeps
-// alternating sensibly relative to the bots already here).
+// correct regardless of which path assigned anyone's side.
+//
+// A tie is a genuine free choice -- either side keeps the match balanced -- so it's
+// resolved by a coin flip rather than the deterministic alternator: which bot (and
+// therefore which avatar, since the roster is drawn in a fixed slot order) lands on which
+// side then varies match to match instead of Human always getting the same half of the
+// roster.
 func (s *Server) balancedDotaSideLocked(inst *huntInstance) gamedata.DotaSide {
 	humanN, elfN := 0, 0
 	for _, mem := range inst.members {
@@ -131,8 +136,10 @@ func (s *Server) balancedDotaSideLocked(inst *huntInstance) gamedata.DotaSide {
 		return gamedata.DotaSideHuman
 	case elfN < humanN:
 		return gamedata.DotaSideElf
+	case rand.Intn(2) == 0:
+		return gamedata.DotaSideHuman
 	default:
-		return inst.dota.assignSide()
+		return gamedata.DotaSideElf
 	}
 }
 
