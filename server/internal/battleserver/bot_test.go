@@ -132,6 +132,40 @@ func TestBotRetreatsAtLowHP(t *testing.T) {
 	}
 }
 
+// TestBotRetreatCancelsOwnAttack: a bot that was already auto-attacking (mob or PvP) when
+// it drops to retreat HP must actually leave -- not have its own still-armed attack chase
+// walk it right back into the fight. Reported live: a low-HP bot tried to retreat and its
+// own auto-attack kept pulling it back. handleMove cancels this for a real player's click,
+// but a bot's move decision never goes through handleMove at all.
+func TestBotRetreatCancelsOwnAttack(t *testing.T) {
+	s, human, inst, cleanup := newDotaConn(t, "Avtr_Tank_Velial")
+	defer cleanup()
+	elf := dotaPlayerConn(t, s, inst, 1001, dotaTeamElf, human.x+2, human.y)
+	b := &botBrain{c: human, slot: 0, lane: 0, phase: botPhaseLane}
+
+	human.lock()
+	defer human.unlock()
+	// Pull the bot away from its own spawn/home first -- newDotaConn spawns exactly on
+	// home, which would make the retreat move a same-point no-op and defeat the point of
+	// asserting hasDest below.
+	human.x, human.snapT = human.x+40, s.battleTime()
+	s.startPvpAttackLocked(human, elf)
+	if human.huntState.pvpTarget != elf.objID {
+		t.Fatal("setup: PvP attack did not start")
+	}
+	human.huntState.hp = 1 // far below botRetreatHPFrac of max
+	now := float64(s.battleTime())
+	s.botLaneTickLocked(b, now)
+
+	if human.huntState.pvpTarget != 0 {
+		t.Fatalf("pvpTarget = %d after the bot decided to retreat, want 0 (still armed to chase back)",
+			human.huntState.pvpTarget)
+	}
+	if !human.hasDest {
+		t.Fatal("retreating bot has no destination -- its own attack chase blocked the move")
+	}
+}
+
 // TestBotAvoidsOutnumberedFight: a bot must not engage a lone enemy hero who has two
 // teammates standing right next to them.
 func TestBotAvoidsOutnumberedFight(t *testing.T) {

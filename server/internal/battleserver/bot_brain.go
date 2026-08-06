@@ -240,8 +240,29 @@ func botHomeLocked(c *conn) (float32, float32) {
 // when the destination hasn't materially changed since the last order (moveToLocked
 // restarts the arrival timer/leg walk every call, which is fine once per think tick but
 // wasteful and jittery to repeat at an unchanged goal).
+//
+// A bot's move decision goes straight to conn.moveToLocked, NOT the handleMove packet
+// handler a real client's click runs through -- so handleMove's own attack-cancelling
+// (1d11366: a real player's flee click was being overridden by their own still-armed
+// auto-attack/PvP-attack chase re-issuing chaseMoveLocked on its own retry cadence) never
+// applied to a bot at all. Reported live: a low-HP bot tried to retreat and its own
+// auto-attack kept walking it back into the fight -- the exact same bug, just reached
+// through the bot's retreat call instead of a real MOVE_PLAYER packet. This is the single
+// choke point every bot movement decision goes through, so cancelling here covers all of
+// them, mirroring handleMove's own cancellation.
 func (s *Server) botMoveTowardLocked(b *botBrain, tx, ty float32, now float64) {
-	c := b.c
+	c, hs := b.c, b.c.huntState
+	// Cancel any live attack/order BEFORE the "already there" short-circuit below: a bot
+	// that decides to disengage while standing right on top of its destination (e.g.
+	// retreating to base while already near base) must still drop its own attack chase,
+	// not just skip the no-op move.
+	if hs.attackTarget != 0 {
+		s.stopAttackLocked(c, false)
+	}
+	if hs.pvpTarget != 0 {
+		s.stopPvpAttackLocked(c, false)
+	}
+	s.cancelOrderLocked(c)
 	cx, cy := c.posAtLocked(float32(now))
 	if dist2(cx, cy, tx, ty) <= 2*2 {
 		return // already there
