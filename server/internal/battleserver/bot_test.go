@@ -6,8 +6,13 @@ import (
 	"tanatserver/internal/gamedata"
 )
 
-// TestSpawnDotaBotsFillsBalancedTeams: spawning bots up to a target headcount alternates
-// sides evenly and assigns lanes in the 2/1/2 pattern per side.
+// TestSpawnDotaBotsFillsBalancedTeams: spawning bots up to a target headcount keeps the
+// two sides within 1 of each other and assigns lanes in the 2/1/2 pattern per side.
+// newDotaConn's solo member never calls assignSide() (it defaults to Human without
+// advancing dotaState.nextSide) -- exactly the "explicit/pre-assigned side" case a real
+// matchmade player hits, which is what desynced the fill in the first place (a 10-headcount
+// fill split 6/4 before balancedDotaSideLocked started counting actual membership instead
+// of trusting the alternator).
 func TestSpawnDotaBotsFillsBalancedTeams(t *testing.T) {
 	s, human, inst, cleanup := newDotaConn(t, "Avtr_Tank_Velial")
 	defer cleanup()
@@ -30,16 +35,49 @@ func TestSpawnDotaBotsFillsBalancedTeams(t *testing.T) {
 			elfN++
 		}
 	}
-	if humanN == 0 || elfN == 0 {
-		t.Fatalf("expected members on both sides, got human=%d elf=%d", humanN, elfN)
-	}
 	if humanN+elfN != 10 {
 		t.Fatalf("human+elf = %d, want 10", humanN+elfN)
+	}
+	if diff := humanN - elfN; diff > 1 || diff < -1 {
+		t.Fatalf("sides = human %d / elf %d, want within 1 of each other (5/5 for 10)", humanN, elfN)
 	}
 	for _, b := range inst.bots {
 		if b.lane < 0 || b.lane >= len(inst.dota.m.Lanes) {
 			t.Fatalf("bot lane = %d, out of range [0,%d)", b.lane, len(inst.dota.m.Lanes))
 		}
+	}
+}
+
+// TestSpawnDotaBotsBalancesAroundExplicitElfPlayer: the same desync bug, mirrored --
+// a real player pre-assigned to the ELF side (dotaPlayerConn's explicit team, exactly how
+// a matchmaker-assigned PendingBattle.Team lands) must still get an evenly split fill, not
+// have the fill treat them as if nextSide already accounted for them.
+func TestSpawnDotaBotsBalancesAroundExplicitElfPlayer(t *testing.T) {
+	s, human, inst, cleanup := newDotaConn(t, "Avtr_Tank_Velial")
+	defer cleanup()
+	// Replace the default Human solo member with an explicit Elf one, the same way
+	// sendHuntWorldState assigns a matchmade player's side straight from
+	// PendingBattle.Team without ever touching dotaState.assignSide().
+	delete(inst.members, human.objID)
+	elf := dotaPlayerConn(t, s, inst, 2000, dotaTeamElf, human.x, human.y)
+
+	elf.lock()
+	defer elf.unlock()
+	s.spawnDotaBotsLocked(inst, 10)
+
+	humanN, elfN := 0, 0
+	for _, mem := range inst.members {
+		if mem.playerTeam() == dotaTeamHuman {
+			humanN++
+		} else {
+			elfN++
+		}
+	}
+	if humanN+elfN != 10 {
+		t.Fatalf("human+elf = %d, want 10", humanN+elfN)
+	}
+	if diff := humanN - elfN; diff > 1 || diff < -1 {
+		t.Fatalf("sides = human %d / elf %d, want within 1 of each other (5/5 for 10)", humanN, elfN)
 	}
 }
 

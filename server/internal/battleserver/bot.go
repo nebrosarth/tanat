@@ -91,9 +91,9 @@ func (s *Server) maybeFillDotaBotsLocked(c *conn) {
 	s.spawnDotaBotsLocked(inst, target)
 }
 
-// spawnDotaBotsLocked adds bot heroes until the match reaches target headcount,
-// alternating sides the same way a real joiner would (dotaState.assignSide), cycling the
-// balanced avatar roster. Caller holds inst.mu.
+// spawnDotaBotsLocked adds bot heroes until the match reaches target headcount, keeping
+// the two sides as even as possible (balancedDotaSideLocked), cycling the balanced avatar
+// roster. Caller holds inst.mu.
 func (s *Server) spawnDotaBotsLocked(inst *huntInstance, target int) {
 	roster := botAvatarRoster()
 	if len(roster) == 0 {
@@ -101,9 +101,38 @@ func (s *Server) spawnDotaBotsLocked(inst *huntInstance, target int) {
 		return
 	}
 	for slot := 0; len(inst.members) < target; slot++ {
-		side := inst.dota.assignSide()
+		side := s.balancedDotaSideLocked(inst)
 		av := roster[slot%len(roster)]
 		s.newBotConnLocked(inst, slot, side, av)
+	}
+}
+
+// balancedDotaSideLocked returns whichever side currently has fewer members, counted
+// directly off inst.members rather than trusting dotaState.nextSide's own alternation.
+// That counter is NOT authoritative: a real matchmade player carries an explicit
+// PendingBattle.Team and sendHuntWorldState assigns it straight from sideForTeam,
+// bypassing assignSide() entirely -- so nextSide never advances for them. Filling bots by
+// blindly consuming nextSide after such a player joined double-counted their side (seen
+// live: a 10-headcount fill split 6/4 instead of 5/5). Counting actual membership is
+// correct regardless of which path assigned anyone's side. Ties fall back to assignSide()
+// (which still advances it, so a LATER real joiner with no pre-assigned team keeps
+// alternating sensibly relative to the bots already here).
+func (s *Server) balancedDotaSideLocked(inst *huntInstance) gamedata.DotaSide {
+	humanN, elfN := 0, 0
+	for _, mem := range inst.members {
+		if mem.playerTeam() == dotaTeamHuman {
+			humanN++
+		} else {
+			elfN++
+		}
+	}
+	switch {
+	case humanN < elfN:
+		return gamedata.DotaSideHuman
+	case elfN < humanN:
+		return gamedata.DotaSideElf
+	default:
+		return inst.dota.assignSide()
 	}
 }
 
