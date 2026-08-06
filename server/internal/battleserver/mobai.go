@@ -1218,9 +1218,16 @@ func (s *Server) summonLocked(c *conn, op gamedata.Op, ctx opCtx, now float64) {
 			sm.ordTarget = ctx.target.id
 		}
 		hs.summons[id] = sm
-		// Render on every ready member (owner + teammates), each in its own tracker.
-		// Outside an instance c.members() is [c], so this is the owner-only path.
+		// Render on every ready TEAMMATE, each in its own tracker. Outside an instance
+		// c.members() is [c], so this is the owner-only path. In «Штурм» an ENEMY does
+		// not get it here -- dotaVisionPassLocked (vision.go) reveals it once genuinely
+		// in vision, the same fog delay every other unit gets. Arena has no vision pass
+		// yet, so it still reveals to everyone immediately, unchanged.
+		dotaFog := c.inst != nil && c.inst.dota != nil
 		for _, mem := range c.members() {
+			if mem.huntState == nil || (dotaFog && mem.playerTeam() != sm.team) {
+				continue
+			}
 			s.revealSummonToMemberLocked(mem, sm, now)
 		}
 		// A persistent aura attached to the unit (Frost's ice elemental) -- started once,

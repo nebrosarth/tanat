@@ -491,6 +491,9 @@ func (s *Server) dotaTickLocked(rep *conn, now float64) {
 	s.dotaSpawnWavesLocked(rep, now)
 	// Fail any timed PvP battle-task whose deadline passed with its objective unmet.
 	s.sweepPvpTaskTimersLocked(rep, now)
+	// Fog of war: decide what each side's clients are actually SHOWN this tick. See
+	// vision.go -- this never touches m.active, only the object list.
+	s.dotaVisionPassLocked(rep.inst, now)
 	// Drive every live combatant: creeps march + fight, cannons/towers shoot.
 	for _, m := range rep.inst.mobs {
 		if m.dead {
@@ -818,13 +821,14 @@ func (s *Server) spawnCreepWaveLocked(rep *conn, x, z float64, side gamedata.Dot
 			hasProj: mob.AttackRange > 0,
 		}
 		rep.inst.mobs[cm.id] = cm
-		// Render through the SHARED reveal, which also marks the creep shown. That flag is
-		// what introduceMemberLocked hands a late joiner, so before this a player who
-		// joined a match in progress saw an empty lane and took damage from nothing until
-		// the next wave. It also gates mobSeparation. revealMobLocked fans out over
-		// memberList(), which is the worldReady-filtered set -- stricter than the raw
-		// member map this used to walk, so a creep can no longer race the scene build.
-		s.revealMobLocked(rep, cm, now)
+		// Render on the creep's own side immediately; the enemy only gets it once
+		// dotaVisionPassLocked (vision.go) finds it within vision, on a later tick -- the
+		// same fog delay a fresh wave gets in Dota. shown=true is still set here (same
+		// bookkeeping revealMobLocked used), which is what introduceMemberLocked hands a
+		// late joiner on the creep's own side, so before this a player who joined a match
+		// in progress saw an empty lane and took damage from nothing until the next wave.
+		// It also gates mobSeparation.
+		s.dotaRevealCreepToOwnTeamLocked(rep, cm, now)
 	}
 	d.waveParity++
 }

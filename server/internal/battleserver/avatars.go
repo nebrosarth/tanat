@@ -92,8 +92,15 @@ func (s *Server) removeAvatarForLocked(viewer, owner *conn) {
 // state didn't include -- the fog pass only reveals on a not-shown -> shown
 // transition, so a mob already shown to the party needs an explicit reveal here).
 func (s *Server) introduceMemberLocked(c *conn, now float64) {
+	// «Штурм» fog: an enemy avatar/summon/creep is left untracked here and picked up by
+	// dotaVisionPassLocked (vision.go) the moment the newcomer's own side actually has
+	// vision of it -- the same delay every other unit's fog gets, instead of the
+	// newcomer seeing the whole enemy team the instant they connect. Arena has no
+	// vision pass yet (inst.dota is nil there), so it keeps showing enemies immediately,
+	// unchanged.
+	dotaFog := c.inst != nil && c.inst.dota != nil
 	for _, other := range c.members() {
-		if other == c {
+		if other == c || (dotaFog && arenaEnemies(c, other)) {
 			continue
 		}
 		s.renderAvatarForLocked(c, other, now) // existing player -> newcomer's client
@@ -111,8 +118,12 @@ func (s *Server) introduceMemberLocked(c *conn, now float64) {
 		}
 	}
 	for _, m := range c.huntState.mobs {
-		if m.shown && !m.dead {
-			s.revealMobToMemberLocked(c, m, now)
+		if !m.shown || m.dead {
+			continue
 		}
+		if dotaFog && m.enemyOf(c.playerTeam()) {
+			continue // enemy creep: dotaVisionPassLocked reveals it once in range
+		}
+		s.revealMobToMemberLocked(c, m, now)
 	}
 }
