@@ -174,3 +174,39 @@ func TestDotaStructuresAndSpawnsAreWalkable(t *testing.T) {
 		t.Error("no route from the human spawn to the elf spawn: the arena is not connected")
 	}
 }
+
+// TestDotaSpawnsAreBehindTheirAltar: the spawn/respawn point must sit farther from the
+// lanes than its own altar (a Dota-fountain arrangement, shielded behind the base's win
+// object), not in front of it facing the enemy. Reported live: the old coordinates put
+// both spawns between their altar and the lanes, so anything that had pushed to base could
+// reach a respawning player before reaching the altar itself -- an endless spawn-camp brawl.
+func TestDotaSpawnsAreBehindTheirAltar(t *testing.T) {
+	m, ok := DotaMapByID(101)
+	if !ok {
+		t.Fatal("map 101 (map_1_0) missing")
+	}
+	var humanAltar, elfAltar *DotaStructure
+	for i, sc := range m.Structures {
+		if sc.Role != DotaAltar {
+			continue
+		}
+		switch sc.Side {
+		case DotaSideHuman:
+			humanAltar = &m.Structures[i]
+		case DotaSideElf:
+			elfAltar = &m.Structures[i]
+		}
+	}
+	if humanAltar == nil || elfAltar == nil {
+		t.Fatal("map 101 is missing an altar for one or both sides")
+	}
+	// The human base sits at the west end (more negative X): "behind" the altar means
+	// further west than the altar itself.
+	if m.SpawnHuman.X >= humanAltar.X {
+		t.Fatalf("human spawn X=%.1f is not behind altar X=%.1f (west of it)", m.SpawnHuman.X, humanAltar.X)
+	}
+	// The elf base sits at the east end: "behind" means further east than the altar.
+	if m.SpawnElf.X <= elfAltar.X {
+		t.Fatalf("elf spawn X=%.1f is not behind altar X=%.1f (east of it)", m.SpawnElf.X, elfAltar.X)
+	}
+}

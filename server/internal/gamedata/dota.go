@@ -186,8 +186,19 @@ var map10 = DotaMap{
 	WinDesc:    "Map_1_0_WinDesc",
 	MinPlayers: 1,
 	MaxPlayers: 16,
-	SpawnHuman: Vec2{X: -186, Y: -4},
-	SpawnElf:   Vec2{X: 175, Y: -11},
+	// Behind the altar (deeper into the base, away from the lanes), not in front of it:
+	// map_1_0 ships no Reborn_point marker for this map (unlike map_6_0's real ones --
+	// see map60's doc comment), so this coordinate has always been a server-authored
+	// placement, not extracted data. The original placement put it in FRONT of the altar
+	// (closer to the lanes/enemy: human altar sits at X=-202.16, the old -186 spawn was
+	// 16u east of it, i.e. toward the centre), matching neither real Dota's fountain
+	// (deep behind the ancient, shielded by it) nor the "protective field" this doc
+	// comment already promises. Reported live: bots respawning there immediately traded
+	// blows with whatever had pushed to the base, an endless spawn-camp brawl. Moved to
+	// the mirror position behind the altar (confirmed open, walkable ground all the way
+	// to the map edge -- see TestDotaStructuresAndSpawnsAreWalkable).
+	SpawnHuman: Vec2{X: -220, Y: -4},
+	SpawnElf:   Vec2{X: 209, Y: -11},
 	Nav:        navGrid10,
 	HumanCreepMelee: mobHumanCreepMelee, HumanCreepRange: mobHumanCreepRange,
 	ElfCreepMelee: mobElfCreepMelee, ElfCreepRange: mobElfCreepRange,

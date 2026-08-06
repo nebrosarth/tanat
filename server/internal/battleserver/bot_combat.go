@@ -20,6 +20,29 @@ const botEngageRadius = 16.0
 // teammate a little further back still arrives in time to matter.
 const botFightRadius = 24.0
 
+// botNoDiveRadius keeps a chase from continuing into an enemy tower/cannon's kill zone.
+// DotaGunRange/DotaTowerRange are both ~10-11u; a few extra units of margin means a bot
+// breaks off BEFORE it's actually taking structure damage, not after. Without this, a
+// fleeing hero kited a bot straight through the enemy's own cannons and all the way to
+// their fountain -- the numbers-favourability check alone never catches this, since it
+// only counts nearby HEROES, not the structures doing the actual killing.
+const botNoDiveRadius = 15.0
+
+// botEnemyStructureDangerLocked reports whether (x,y) is within botNoDiveRadius of any
+// living enemy structure (gun/tower/altar) -- i.e. whether continuing a fight AT that spot
+// means tower-diving, not hero-fighting.
+func (s *Server) botEnemyStructureDangerLocked(c *conn, x, y float32) bool {
+	for _, m := range c.huntState.mobs {
+		if m.dead || !m.structure || !m.enemyOf(c.playerTeam()) {
+			continue
+		}
+		if dist2(x, y, m.x, m.y) <= botNoDiveRadius*botNoDiveRadius {
+			return true
+		}
+	}
+	return false
+}
+
 // botCombatTickLocked looks for a nearby enemy hero worth fighting and, if one is found,
 // drives that engagement for this tick (ability, then attack order). Reports whether it
 // issued an order, so the caller (botTickLocked) skips the phase-specific logic below it.
@@ -36,11 +59,22 @@ func (s *Server) botCombatTickLocked(b *botBrain, now float64) bool {
 	enemies := botLivingEnemyHeroes(c, now)
 	if len(enemies) == 0 {
 		b.engageTarget = 0
+		s.stopPvpAttackLocked(c, false)
 		return false
 	}
 	target := s.botPickEngageTargetLocked(b, enemies, now)
 	if target == nil {
 		b.engageTarget = 0
+		// The brain just decided this fight is no longer worth it (out of range,
+		// unfavourable numbers, or -- see botEnemyStructureDangerLocked -- about to walk
+		// into the enemy's own tower/cannon range). Without this, hs.pvpTarget stays set
+		// and armPvpAttackTimer's own chase-and-rearm loop keeps running on its own
+		// cadence regardless of what the brain thinks now: reported live, this is how a
+		// bot ended up chasing a fleeing hero straight through the enemy's cannons and
+		// onto their fountain. armPvpAttackTimer only ever stops itself when the victim
+		// actually dies/leaves/goes invisible -- it has no notion of "too deep," so the
+		// brain has to be the one pulling the plug every think tick it reconsiders.
+		s.stopPvpAttackLocked(c, false)
 		return false
 	}
 	b.engageTarget = target.objID
@@ -77,11 +111,14 @@ func (s *Server) botPickEngageTargetLocked(b *botBrain, enemies []*conn, now flo
 	if nearest == nil {
 		return nil
 	}
+	tx, ty := nearest.posAtLocked(float32(now))
+	if s.botEnemyStructureDangerLocked(c, tx, ty) {
+		return nil // the fight (or the chase toward it) is inside the enemy's own tower/cannon range -- not worth pressing
+	}
 
 	// Favourability: count living allies vs enemies near the FIGHT LOCATION. A lone
 	// laner does not start a fight next to two enemy teammates, and won't press a fight
 	// while alone and already hurt even if the numbers are even.
-	tx, ty := nearest.posAtLocked(float32(now))
 	allyN, enemyN := 1, 1 // self + target
 	for _, mem := range c.inst.members {
 		if mem == c || mem == nearest || mem.huntState == nil || mem.huntState.deadUntil > 0 {

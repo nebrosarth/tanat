@@ -207,6 +207,59 @@ func TestBotEngagesFavorableFight(t *testing.T) {
 	}
 }
 
+// TestBotDoesNotEngageNearEnemyStructure: a bot must not pick a fight with an enemy hero
+// standing inside their own tower/cannon's range -- fighting there means fighting the
+// structure too, not just the hero.
+func TestBotDoesNotEngageNearEnemyStructure(t *testing.T) {
+	s, human, inst, cleanup := newDotaConn(t, "Avtr_Tank_Velial")
+	defer cleanup()
+	b := &botBrain{c: human, slot: 0, lane: 0, phase: botPhaseLane}
+	elf := dotaPlayerConn(t, s, inst, 1001, dotaTeamElf, human.x+3, human.y)
+	gun := &mobState{id: 65200, structure: true, team: dotaTeamElf, x: elf.x, y: elf.y, hp: 100, maxHP: 100}
+
+	human.lock()
+	defer human.unlock()
+	inst.mobs[gun.id] = gun
+	now := float64(s.battleTime())
+	acted := s.botCombatTickLocked(b, now)
+
+	if acted || human.huntState.pvpTarget != 0 {
+		t.Fatalf("bot engaged a hero standing in its own structure's range (pvpTarget=%d, acted=%v)",
+			human.huntState.pvpTarget, acted)
+	}
+}
+
+// TestBotBreaksOffChaseIntoEnemyStructureRange: a bot already mid-chase must actually
+// disengage once press the fight would mean tower-diving, not just stop picking new
+// fights. Reported live: a bot kept chasing a fleeing hero straight through the enemy's
+// own cannons and onto their fountain -- armPvpAttackTimer has no notion of "too deep", so
+// the brain dropping the target has to actually cancel the attack, not just stop re-
+// affirming it.
+func TestBotBreaksOffChaseIntoEnemyStructureRange(t *testing.T) {
+	s, human, inst, cleanup := newDotaConn(t, "Avtr_Tank_Velial")
+	defer cleanup()
+	b := &botBrain{c: human, slot: 0, lane: 0, phase: botPhaseLane}
+	elf := dotaPlayerConn(t, s, inst, 1001, dotaTeamElf, human.x+3, human.y)
+
+	human.lock()
+	defer human.unlock()
+	s.startPvpAttackLocked(human, elf)
+	b.engageTarget = elf.objID
+	if human.huntState.pvpTarget != elf.objID {
+		t.Fatal("setup: PvP attack did not start")
+	}
+	// The chase has now carried the fleeing target next to their own cannon.
+	gun := &mobState{id: 65201, structure: true, team: dotaTeamElf, x: elf.x, y: elf.y, hp: 100, maxHP: 100}
+	inst.mobs[gun.id] = gun
+	now := float64(s.battleTime())
+	acted := s.botCombatTickLocked(b, now)
+
+	if acted || human.huntState.pvpTarget != 0 {
+		t.Fatalf("bot kept chasing into its own target's structure range (pvpTarget=%d, acted=%v)",
+			human.huntState.pvpTarget, acted)
+	}
+}
+
 // TestBotSpendsSkillPointOnAvailability: a bot with a banked point and a learnable slot
 // must spend it the same tick, through the real UPGRADE_SKILL validation.
 func TestBotSpendsSkillPointOnAvailability(t *testing.T) {
