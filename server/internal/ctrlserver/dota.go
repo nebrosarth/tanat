@@ -297,6 +297,46 @@ func (s *Server) handleFightReady(req ctrlproto.Request, resp *ctrlproto.Respons
 		Set("map_id", sel.mapID))
 }
 
+// handleFightLog answers fight|log {fight_id}: this match's end-of-battle scoreboard,
+// requested once by the client right after it receives BATTLE_END (Battle.OnBattleEnd ->
+// SendGetFightLog(BattleId, -1) in the decompiled client). fight_id is the REQUESTING
+// CLIENT'S OWN battleId -- every participant of the same match was issued a DIFFERENT one
+// at CONNECT (see battleserver's conn.battleID) -- so this is always a single map lookup,
+// never a room/match id. Before this handler existed at all, fight|log fell through to the
+// generic UNHANDLED ack (no "log" key whatsoever), which is why the end-of-match table
+// came up empty: FightLogArgParser built zero rows from a response that never had any.
+// Missing/expired data (server restarted mid-match, a stray/duplicate request, or a match
+// that never called settleMatchLocked) answers with an empty heroes map rather than
+// failing -- the client tolerates that as an empty scoreboard, same as before this existed.
+func (s *Server) handleFightLog(req ctrlproto.Request, resp *ctrlproto.Response) {
+	u := s.userFromSession(req)
+	if u == nil {
+		resp.Fail("fight", "log", 6013)
+		return
+	}
+	fightID := req.Params.IntOr("fight_id", -1)
+	heroes := amf.NewArray()
+	n := 0
+	if entries, ok := s.Store.FightLog(fightID); ok {
+		for avatarID, e := range entries {
+			heroes.Set(strconv.Itoa(int(avatarID)), amf.NewArray().
+				Set("avatar", e.AvatarID).
+				Set("nick", e.Nick).
+				Set("team", e.Team).
+				Set("AvatarKills", e.Kills).
+				Set("Assists", e.Assists).
+				Set("Deaths", e.Deaths).
+				Set("level", e.Level).
+				Set("money", e.Money).
+				Set("rating", e.NewRating).
+				Set("old_rating", e.OldRating))
+			n++
+		}
+	}
+	log.Printf("ctrl: fight|log user=%d fight_id=%d heroes=%d", u.ID, fightID, n)
+	resp.Add("fight", "log", amf.NewArray().Set("log", amf.NewArray().Set("heroes", heroes)))
+}
+
 // handleFightDesert answers fight|desert {map_id}: leave the queue/lobby. For a solo
 // instant-match this just drops the pending selection.
 func (s *Server) handleFightDesert(req ctrlproto.Request, resp *ctrlproto.Response) {

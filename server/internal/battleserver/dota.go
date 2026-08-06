@@ -302,7 +302,7 @@ func newDotaStructure(sc gamedata.DotaStructure, team int32) *mobState {
 		// because that is where it was built.
 		homed: false,
 		hp:    hp, maxHP: hp, dmgMin: dmgLo, dmgMax: dmgHi,
-		team:  team, structure: true, altar: sc.Role == gamedata.DotaAltar,
+		team: team, structure: true, altar: sc.Role == gamedata.DotaAltar,
 		dotaRole: sc.Role, dotaPrefab: sc.Prefab,
 		// Only the CANNONS fire a visible shell: their prefabs are the only buildings
 		// carrying a projectile pool (and the only ones flagged mIsCannon). The towers
@@ -667,6 +667,7 @@ func (s *Server) dotaEndLocked(rep *conn, winner int32, now float64) {
 	for _, mem := range rep.inst.members {
 		s.push(mem, battleproto.CmdBattleEnd, amf.NewArray().Set("id", winner))
 	}
+	s.settleMatchLocked(rep.inst, winner, now)
 	if d.castleID != 0 {
 		s.settleCastleBattleLocked(rep.inst, d.castleID, winner)
 	}
@@ -806,10 +807,10 @@ func (s *Server) spawnCreepWaveLocked(rep *conn, x, z float64, side gamedata.Dot
 			// which is exactly what a player respawning near their own base used to do.
 			homed:  false,
 			spawnX: px, spawnY: py,
-			hp:     mob.Health, maxHP: mob.Health,
+			hp: mob.Health, maxHP: mob.Health,
 			dmgMin: float64(mob.DmgMin), dmgMax: float64(mob.DmgMax),
-			xp:     mob.XP, coins: mob.Coins,
-			team:   team, lane: lane, laneFwd: fwd, laneIdx: entry,
+			xp: mob.XP, coins: mob.Coins,
+			team: team, lane: lane, laneFwd: fwd, laneIdx: entry,
 			lastSync: now,
 			// The roster's ranged creep (Creep2, the only one with an AttackRange) is
 			// also the only one whose prefab carries a projectile pool -- unlike the

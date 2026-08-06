@@ -868,10 +868,19 @@ type huntState struct {
 	// team is the player's side. 0 means "unset": Hunt and «Штурм» leave it 0, and
 	// playerTeam() reads that as the local co-op side (dotaPlayerTeam), which is exactly
 	// how every avatar was rendered before Arena existed. «Арена» sets it to ArenaTeamA
-	// or ArenaTeamB so two players can be enemies. frags is this player's kill count,
-	// shown nowhere yet but summed per team for the win check.
-	team  int32
-	frags int32
+	// or ArenaTeamB so two players can be enemies. frags is this player's HERO-kill count
+	// this match («Арена»: arenaCreditKillLocked; «Штурм»: dotaCreditHeroKillLocked --
+	// never a creep/structure kill), summed per team for Arena's win check and, together
+	// with deaths/assists, fed straight into the end-of-match scoreboard (fight|log --
+	// see rating.go's settleMatchLocked). deaths is any player death regardless of cause
+	// (playerDieLocked, every mode). assists is credited only on a «Штурм» hero kill, to
+	// every living teammate who shared its XP (grantKillXPLocked's radius) besides the
+	// credited killer -- «Арена» has no such notion of nearby-ally credit, so it always
+	// reports 0 assists there.
+	team    int32
+	frags   int32
+	deaths  int32
+	assists int32
 	// pvpTarget is the enemy avatar's objID this player is auto-attacking in «Арена» (0 =
 	// none). It is the player-vs-player twin of attackTarget, which only ever holds a mob
 	// id; keeping them separate means the mob attack loop and the PvP loop never confuse a

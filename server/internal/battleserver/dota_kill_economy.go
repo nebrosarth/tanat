@@ -17,11 +17,14 @@ const dotaXPShareRadius = 20.0
 // of killer's side within dotaXPShareRadius of (x,y) -- a real «Штурм» match. This is the
 // mechanic behind "пять аватаров на одной линии невыгодно": the same wave gives each of
 // them proportionally less. rep is any live member of the instance, used only to reach
-// inst.members the same way every other *Locked helper does.
-func (s *Server) grantKillXPLocked(rep *conn, killer *conn, xp float64, x, y float32) {
+// inst.members the same way every other *Locked helper does. Returns the sharing set (just
+// [killer] outside a live «Штурм» sim) so a hero kill's caller (dotaCreditHeroKillLocked)
+// can credit the SAME roster with assists -- one radius, one notion of "was in on this
+// kill", not two that could quietly drift apart.
+func (s *Server) grantKillXPLocked(rep *conn, killer *conn, xp float64, x, y float32) []*conn {
 	if rep == nil || rep.inst == nil || rep.inst.dota == nil || killer == nil || killer.huntState == nil {
 		s.grantXPLocked(killer, xp)
-		return
+		return []*conn{killer}
 	}
 	now := float64(s.battleTime())
 	team := killer.playerTeam()
@@ -43,6 +46,7 @@ func (s *Server) grantKillXPLocked(rep *conn, killer *conn, xp float64, x, y flo
 	for _, mem := range sharing {
 		s.grantXPLocked(mem, share)
 	}
+	return sharing
 }
 
 // dotaHeroKillBaseXP/dotaHeroKillPerLevelXP/dotaHeroKillBaseCoins/dotaHeroKillPerLevelCoins
@@ -73,8 +77,19 @@ func (s *Server) dotaCreditHeroKillLocked(killer, victim *conn, now float64) {
 	xp := dotaHeroKillBaseXP + dotaHeroKillPerLevelXP*lvl
 	coins := dotaHeroKillBaseCoins + dotaHeroKillPerLevelCoins*int32(lvl)
 	kx, ky := killer.posAtLocked(float32(now))
-	s.grantKillXPLocked(killer, killer, xp, kx, ky)
+	sharing := s.grantKillXPLocked(killer, killer, xp, kx, ky)
 	s.awardCoinsLocked(killer, victim.objID, coins)
+	// The scoreboard's AvatarKills/Assists (fight|log -- see rating.go): the credited
+	// killer gets the kill, and every OTHER teammate who shared the kill's XP (same
+	// sharing set, so "was in on this kill" means one consistent thing) gets an assist.
+	if killer.huntState != nil {
+		killer.huntState.frags++
+	}
+	for _, mem := range sharing {
+		if mem != killer && mem.huntState != nil {
+			mem.huntState.assists++
+		}
+	}
 	log.Printf("battle: «Штурм» room=%d hero kill: %d killed %d (xp=%.0f coins=%d)",
 		inst.id, killer.objID, victim.objID, xp, coins)
 }

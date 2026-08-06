@@ -561,6 +561,8 @@ func (s *Server) dispatch(req ctrlproto.Request, resp *ctrlproto.Response) {
 		s.handleFightReady(req, resp)
 	case ctrlproto.CmdKey("fight", "desert"):
 		s.handleFightDesert(req, resp)
+	case ctrlproto.CmdKey("fight", "log"):
+		s.handleFightLog(req, resp)
 	case ctrlproto.CmdKey("user", "leave_info"):
 		// BattleScreen asks for the desertion/karma penalty shown on the exit
 		// button. UserLeaveInfoArgParser requires current_karma/new_karma/labels/

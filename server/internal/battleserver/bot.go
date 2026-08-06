@@ -50,6 +50,24 @@ func botAvatarRoster() []gamedata.Avatar {
 	return out
 }
 
+// isBotConn reports whether c is a server-controlled bot (see botIDBase) rather than a
+// real player. Used wherever match-end settlement (rating.go) must treat a bot
+// differently from a live account -- a bot has no persistent rating worth reading or
+// writing, only the fixed session.RatingDefault stand-in.
+func isBotConn(c *conn) bool { return c.objID >= botIDBase }
+
+// dotaRateBotMatches reads TANAT_RATE_BOT_MATCHES: unset, empty, or anything other than
+// "0" means a match a bot participated in still settles rating normally for its real
+// players (the default -- TANAT_DOTA_BOTS is meant to make solo/short-queue testing and
+// play feel like a real match, rating included). "0" turns that off: a bot-filled match's
+// outcome never touches anyone's rating, so bot-padding a rating climb isn't possible at
+// the cost of a bot-filled queue giving no PvP progression at all. Gated exactly like the
+// existing TANAT_CASTLE_TEST_MAP/TANAT_DOTA_BOTS dev switches; consulted from
+// rating.go's settleMatchLocked.
+func dotaRateBotMatches() bool {
+	return os.Getenv("TANAT_RATE_BOT_MATCHES") != "0"
+}
+
 // dotaBotFillTarget reads TANAT_DOTA_BOTS: unset, empty, or non-positive = bots disabled
 // (default, unchanged behaviour for every existing launch path); an integer 2..10 is the
 // target TOTAL headcount (real players + bots) a fresh «Штурм» match is topped up to.

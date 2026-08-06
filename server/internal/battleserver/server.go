@@ -96,6 +96,13 @@ type conn struct {
 	selfPlayerID int32
 	objID        int32
 	worldSent    bool
+	// battleID is the id this connection's own CONNECT reply carried (s.newBattleID(),
+	// echoed to the client as ConnectArg.mBattleId). It is per-CONNECTION, not per-match --
+	// every participant in the same «Штурм»/«Арена» instance gets a DIFFERENT battleID --
+	// so it exists solely to answer THIS client's own later fight|log{fight_id} request
+	// (Ctrl channel) with the shared match scoreboard settleMatchLocked published under
+	// it. See session.Store.SetFightLog/FightLog.
+	battleID int32
 
 	// lk is the mutex guarding this connection's mutable state. For a lobby conn
 	// (or a bare test conn) it is &mvMu -- private. For a hunt member it is
@@ -288,6 +295,7 @@ func (s *Server) handleConnect(c *conn, p battleproto.Packet) {
 	pass := p.Args.StringOr("pass", "")
 	battleID := s.newBattleID()
 	c.selfPlayerID = clientID
+	c.battleID = battleID
 
 	// A game-mode launch (hunt|ready) hands the client a one-time password; if
 	// it matches the pending battle for this user, this connection is that

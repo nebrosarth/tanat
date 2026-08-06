@@ -162,12 +162,12 @@ func (s *Server) handleFullHeroInfo(req ctrlproto.Request, resp *ctrlproto.Respo
 // gameInfoFields builds the HeroGameInfo body ({user_id, level, exp, next_exp,
 // stats, clan_info, buffs}). Stats default to 0; no clan; no buffs.
 func (s *Server) gameInfoFields(h *session.Hero) *amf.MixedArray {
-	id, level, exp, next := int32(-1), int32(1), int32(0), int32(100)
+	id, level, exp, next, rating := int32(-1), int32(1), int32(0), int32(100), session.RatingDefault
 	if h != nil {
-		id, level, exp, next = h.ID, h.Level, h.Exp, h.NextExp
+		id, level, exp, next, rating = h.ID, h.Level, h.Exp, h.NextExp, h.Rating
 	}
 	stats := amf.NewArray().
-		Set("HERO_RATING", int32(0)).Set("ASSISTS", int32(0)).
+		Set("HERO_RATING", rating).Set("ASSISTS", int32(0)).
 		Set("AVATARKILLS", int32(0)).Set("CREEPKILLS", int32(0)).
 		Set("DEATHS", int32(0)).Set("FIGHTS", int32(0)).
 		Set("WINS", int32(0)).Set("LOSE", int32(0)).
@@ -209,7 +209,7 @@ func (s *Server) addHeroData(m *amf.MixedArray, h *session.Hero) {
 			Set("level", h.Level).
 			Set("exp", h.Exp).
 			Set("next_exp", h.NextExp).
-			Set("rating", int32(0)))
+			Set("rating", h.Rating))
 	m.Set(strconv.Itoa(int(h.ID)), entry)
 }
 

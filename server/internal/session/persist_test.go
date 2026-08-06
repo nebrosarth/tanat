@@ -15,6 +15,7 @@ func TestPersistenceRoundTrip(t *testing.T) {
 	u, _, _ := s1.LoginOrRegister("a@b.c", "pw")
 	s1.CreateHero(u, 2 /*elf*/, false, 3, 4, 5, 6, 7)
 	u.Hero.Money = 4242 // simulate a money change
+	u.Hero.Rating = 1234
 	s1.Save()
 
 	s2 := NewPersistentStore(path)
@@ -34,6 +35,9 @@ func TestPersistenceRoundTrip(t *testing.T) {
 	}
 	if got.Hero.Money != 4242 {
 		t.Errorf("reloaded money = %d, want 4242", got.Hero.Money)
+	}
+	if got.Hero.Rating != 1234 {
+		t.Errorf("reloaded rating = %d, want 1234", got.Hero.Rating)
 	}
 	// nextUserID must continue past the loaded users.
 	u2, _, _ := s2.LoginOrRegister("b@b.c", "pw")

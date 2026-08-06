@@ -8,6 +8,7 @@ import (
 	"tanatserver/internal/amf"
 	"tanatserver/internal/ctrlproto"
 	"tanatserver/internal/gamedata"
+	"tanatserver/internal/session"
 )
 
 // TestDotaMatchmakingFlow drives the Ctrl side of the «Штурм» (DOTA) solo
@@ -369,5 +370,95 @@ func TestCastleTestMapEnvVarExposesItUnderFightTab(t *testing.T) {
 	}
 	if pb.CastleID != 0 {
 		t.Error("a fight|* launch onto the castle map must NOT carry a CastleID -- it bypasses the castle flow's ownership/reward wiring by design (test path only)")
+	}
+}
+
+// TestFightLogServesPublishedScoreboard: once battleserver has published a match's
+// scoreboard (session.Store.SetFightLog -- see battleserver/rating.go), fight|log{fight_id}
+// must actually return it as {log:{heroes:{...}}}. Before this handler existed, fight|log
+// fell through to the generic UNHANDLED ack with no "log" key at all, which is why the
+// client's end-of-match table came up empty no matter what battleserver published.
+func TestFightLogServesPublishedScoreboard(t *testing.T) {
+	srv := New()
+	ts := httptest.NewServer(srv.Handler())
+	defer ts.Close()
+	url := ts.URL + "/entry_point.php"
+
+	login := postEnvelope(t, url, loginEnvelope("scoreboard@example.com", "pw", "1.11", "0", "", 1))
+	lr, _ := login.GetArray(ctrlproto.CmdKey("user", "login"))
+	sessKey, _ := lr.GetString("sess_key")
+	userID, _ := lr.GetInt("id")
+
+	srv.Store.SetFightLog(4242, map[int32]session.FightLogEntry{
+		1000: {AvatarID: 1000, Nick: "Hero", Team: 1, Kills: 5, Assists: 2, Deaths: 1,
+			Level: 6, Money: 300, OldRating: 1000, NewRating: 1024},
+	})
+
+	req := amf.NewArray().Set("object", "fight").Set("action", "log").
+		Set("params", amf.NewArray().Set("fight_id", int32(4242))).
+		Set("sess_uid", userID).Set("sess_key", sessKey).Set("counter", int32(2))
+	resp, _ := postEnvelope(t, url, req).GetArray(ctrlproto.CmdKey("fight", "log"))
+	if resp == nil {
+		t.Fatal("no fight|log response")
+	}
+	logArr, ok := resp.GetArray("log")
+	if !ok {
+		t.Fatal("fight|log response has no \"log\" key")
+	}
+	heroes, ok := logArr.GetArray("heroes")
+	if !ok {
+		t.Fatal("fight|log's \"log\" has no \"heroes\" key")
+	}
+	row, ok := heroes.GetArray("1000")
+	if !ok {
+		t.Fatal("fight|log heroes has no entry for avatar 1000 -- the table would render empty")
+	}
+	if kills, _ := row.GetInt("AvatarKills"); kills != 5 {
+		t.Errorf("AvatarKills = %d, want 5", kills)
+	}
+	if assists, _ := row.GetInt("Assists"); assists != 2 {
+		t.Errorf("Assists = %d, want 2", assists)
+	}
+	if deaths, _ := row.GetInt("Deaths"); deaths != 1 {
+		t.Errorf("Deaths = %d, want 1", deaths)
+	}
+	if rating, _ := row.GetInt("rating"); rating != 1024 {
+		t.Errorf("rating = %d, want 1024", rating)
+	}
+	if old, _ := row.GetInt("old_rating"); old != 1000 {
+		t.Errorf("old_rating = %d, want 1000", old)
+	}
+	if nick, _ := row.GetString("nick"); nick != "Hero" {
+		t.Errorf("nick = %q, want %q", nick, "Hero")
+	}
+}
+
+// TestFightLogUnknownFightIDIsEmptyNotError: a stale/expired/never-published fight_id
+// (server restarted mid-match, or a stray duplicate request) must answer with an empty
+// scoreboard rather than failing the request.
+func TestFightLogUnknownFightIDIsEmptyNotError(t *testing.T) {
+	srv := New()
+	ts := httptest.NewServer(srv.Handler())
+	defer ts.Close()
+	url := ts.URL + "/entry_point.php"
+
+	login := postEnvelope(t, url, loginEnvelope("noscoreboard@example.com", "pw", "1.11", "0", "", 1))
+	lr, _ := login.GetArray(ctrlproto.CmdKey("user", "login"))
+	sessKey, _ := lr.GetString("sess_key")
+	userID, _ := lr.GetInt("id")
+
+	req := amf.NewArray().Set("object", "fight").Set("action", "log").
+		Set("params", amf.NewArray().Set("fight_id", int32(99999))).
+		Set("sess_uid", userID).Set("sess_key", sessKey).Set("counter", int32(2))
+	resp, _ := postEnvelope(t, url, req).GetArray(ctrlproto.CmdKey("fight", "log"))
+	if resp == nil {
+		t.Fatal("no fight|log response")
+	}
+	logArr, ok := resp.GetArray("log")
+	if !ok {
+		t.Fatal("fight|log response has no \"log\" key")
+	}
+	if _, ok := logArr.GetArray("heroes"); !ok {
+		t.Fatal("fight|log's \"log\" has no \"heroes\" key even when empty")
 	}
 }

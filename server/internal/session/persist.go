@@ -59,7 +59,8 @@ var schemaStmts = []string{
 		next_exp      INTEGER NOT NULL DEFAULT 0,
 		next_item_id  INTEGER NOT NULL DEFAULT 0,
 		clan_id       INTEGER NOT NULL DEFAULT 0,
-		clan_role     INTEGER NOT NULL DEFAULT 0
+		clan_role     INTEGER NOT NULL DEFAULT 0,
+		rating        INTEGER NOT NULL DEFAULT 1000
 	)`,
 	`CREATE TABLE IF NOT EXISTS bag_items (
 		user_id    INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -240,6 +241,7 @@ func migrateSchema(db *sql.DB) error {
 		{"users", "banned", "ALTER TABLE users ADD COLUMN banned INTEGER NOT NULL DEFAULT 0"},
 		{"heroes", "clan_id", "ALTER TABLE heroes ADD COLUMN clan_id INTEGER NOT NULL DEFAULT 0"},
 		{"heroes", "clan_role", "ALTER TABLE heroes ADD COLUMN clan_role INTEGER NOT NULL DEFAULT 0"},
+		{"heroes", "rating", "ALTER TABLE heroes ADD COLUMN rating INTEGER NOT NULL DEFAULT 1000"},
 	}
 	for _, a := range adds {
 		has, err := columnExists(db, a.table, a.column)
@@ -335,7 +337,7 @@ func (s *Store) loadAllLocked() error {
 	}
 
 	hrows, err := s.db.Query(`SELECT user_id, race, gender, face, hair, dist_mark, skin_color,
-		hair_color, money, diamond_money, level, exp, next_exp, next_item_id, clan_id, clan_role FROM heroes`)
+		hair_color, money, diamond_money, level, exp, next_exp, next_item_id, clan_id, clan_role, rating FROM heroes`)
 	if err != nil {
 		return err
 	}
@@ -344,7 +346,7 @@ func (s *Store) loadAllLocked() error {
 		h := &Hero{}
 		if err := hrows.Scan(&uid, &h.Race, &gender, &h.Face, &h.Hair, &h.DistMark,
 			&h.SkinColor, &h.HairColor, &h.Money, &h.DiamondMoney, &h.Level,
-			&h.Exp, &h.NextExp, &h.NextItemID, &h.ClanID, &h.ClanRole); err != nil {
+			&h.Exp, &h.NextExp, &h.NextItemID, &h.ClanID, &h.ClanRole, &h.Rating); err != nil {
 			hrows.Close()
 			return err
 		}
@@ -647,17 +649,17 @@ func writeUserTx(tx *sql.Tx, u *User) error {
 		h := u.Hero
 		if _, err := tx.Exec(
 			`INSERT INTO heroes(user_id, race, gender, face, hair, dist_mark, skin_color,
-			   hair_color, money, diamond_money, level, exp, next_exp, next_item_id, clan_id, clan_role)
-			 VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			   hair_color, money, diamond_money, level, exp, next_exp, next_item_id, clan_id, clan_role, rating)
+			 VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 			 ON CONFLICT(user_id) DO UPDATE SET
 			   race=excluded.race, gender=excluded.gender, face=excluded.face, hair=excluded.hair,
 			   dist_mark=excluded.dist_mark, skin_color=excluded.skin_color, hair_color=excluded.hair_color,
 			   money=excluded.money, diamond_money=excluded.diamond_money, level=excluded.level,
 			   exp=excluded.exp, next_exp=excluded.next_exp, next_item_id=excluded.next_item_id,
-			   clan_id=excluded.clan_id, clan_role=excluded.clan_role`,
+			   clan_id=excluded.clan_id, clan_role=excluded.clan_role, rating=excluded.rating`,
 			u.ID, h.Race, boolToInt(h.Gender), h.Face, h.Hair, h.DistMark, h.SkinColor,
 			h.HairColor, h.Money, h.DiamondMoney, h.Level, h.Exp, h.NextExp, h.NextItemID,
-			h.ClanID, h.ClanRole); err != nil {
+			h.ClanID, h.ClanRole, h.Rating); err != nil {
 			return err
 		}
 		if err := rewriteChild(tx, "bag_items", u.ID,

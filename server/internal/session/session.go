@@ -87,7 +87,18 @@ type Hero struct {
 	// at most one clan. See session/clan.go.
 	ClanID   int32
 	ClanRole int32
+	// Rating is the hero's persistent PvP rating (Elo-style), shown on the client's
+	// profile/roster/friends screens (HERO_RATING, hero|get_data_list's "rating") and on
+	// the end-of-match scoreboard (fight|log's "rating"/"old_rating" -- see
+	// battleserver/rating.go, the only place this is ever mutated). Starts at
+	// RatingDefault; never goes below 0.
+	Rating int32
 }
+
+// RatingDefault is the rating a freshly created hero starts at, and the value a
+// battleserver-side bot (which has no rating worth reading -- see battleserver's
+// isBotConn) is treated as when a match's Elo expected-score is computed against it.
+const RatingDefault int32 = 1000
 
 // BagItem is one persisted consumable stack. ArticleID is the gamedata item
 // catalog id (shared between the Ctrl-channel bag's artikul_id and the Battle
@@ -160,10 +171,15 @@ type Store struct {
 	clanInviteCD map[int32]int64          // invitee userID -> earliest unix time a new invite may be sent
 	castleOwner  map[int32]castleOwnerRec // castleID -> owning clan (see castle.go)
 	castleLog    map[int32][]CastleBattleRecord
-	nextClanID   int32
-	nextUserID   int32
-	path         string  // SQLite database file; "" = in-memory only
-	db           *sql.DB // nil for an in-memory store (NewStore)
+	// fightLogs is the just-ended-match scoreboard the client asks for right after
+	// BATTLE_END (fight|log's "fight_id" is the per-CONNECTION battleId each client was
+	// issued -- see fightlog.go). In-memory only, like pending: a server restart mid-match
+	// just means nobody sees the last scoreboard, the same tradeoff pending already makes.
+	fightLogs  map[int32]map[int32]FightLogEntry // battleId -> avatarId -> that hero's row
+	nextClanID int32
+	nextUserID int32
+	path       string  // SQLite database file; "" = in-memory only
+	db         *sql.DB // nil for an in-memory store (NewStore)
 }
 
 func NewStore() *Store {
@@ -180,6 +196,7 @@ func NewStore() *Store {
 		clanInviteCD: map[int32]int64{},
 		castleOwner:  map[int32]castleOwnerRec{},
 		castleLog:    map[int32][]CastleBattleRecord{},
+		fightLogs:    map[int32]map[int32]FightLogEntry{},
 		nextClanID:   1,
 		nextUserID:   1,
 	}
@@ -283,6 +300,40 @@ func (s *Store) AddHeroMoney(userID, delta int32) (money, diamonds int32, ok boo
 	}
 	s.saveUserLocked(u)
 	return u.Hero.Money, u.Hero.DiamondMoney, true
+}
+
+// HeroRating returns a user's current persistent PvP rating WITHOUT changing it.
+// ok=false if the user or hero is missing.
+func (s *Store) HeroRating(userID int32) (rating int32, ok bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	u, found := s.usersByID[userID]
+	if !found || u.Hero == nil {
+		return 0, false
+	}
+	return u.Hero.Rating, true
+}
+
+// ApplyHeroRatingDelta adjusts a user's persistent PvP rating by delta (negative to
+// lower it) and saves, returning the rating before and after -- exactly the {old_rating,
+// rating} pair the end-of-match scoreboard (fight|log) reports per hero. Floors at 0, the
+// same non-negative guarantee every other persistent counter (money, exp) already keeps.
+// ok=false with no change when the user/hero is missing. See battleserver/rating.go for
+// the only caller (the Elo settlement at match end).
+func (s *Store) ApplyHeroRatingDelta(userID, delta int32) (oldRating, newRating int32, ok bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	u, found := s.usersByID[userID]
+	if !found || u.Hero == nil {
+		return 0, 0, false
+	}
+	old := u.Hero.Rating
+	u.Hero.Rating += delta
+	if u.Hero.Rating < 0 {
+		u.Hero.Rating = 0
+	}
+	s.saveUserLocked(u)
+	return old, u.Hero.Rating, true
 }
 
 // HeroMoney returns a user's current persistent money/diamond totals WITHOUT
@@ -468,6 +519,7 @@ func (s *Store) CreateHero(u *User, race int32, gender bool, face, hair, distMar
 		Level:     1,
 		Exp:       0,
 		NextExp:   100,
+		Rating:    RatingDefault,
 	}
 	// Starter wallet is admin-tunable (defaults 1000 bronze / 100 diamond).
 	h.Money, h.DiamondMoney = gamedata.NewHeroWallet()
@@ -490,7 +542,7 @@ func (s *Store) CreateBotHero(id int32, username string) *Hero {
 	if u, ok := s.usersByID[id]; ok && u.Hero != nil {
 		return u.Hero
 	}
-	h := &Hero{ID: id, Level: 1, NextExp: 100}
+	h := &Hero{ID: id, Level: 1, NextExp: 100, Rating: RatingDefault}
 	h.Money, h.DiamondMoney = gamedata.NewHeroWallet()
 	s.usersByID[id] = &User{ID: id, Username: username, Hero: h, HasHero: true}
 	return h

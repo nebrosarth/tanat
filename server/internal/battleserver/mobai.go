@@ -3252,6 +3252,7 @@ func (s *Server) playerDieLocked(c *conn, killer int32, now float64) {
 	hs.deadUntil = now + respawnDelay
 	hs.diedAt = now
 	hs.corpseHidden = false
+	hs.deaths++
 
 	// Gellar's «Порабощение»: «При смерти теряет половину из накопленных душ». Death also
 	// cleanses Hekata's kill-window (its +30% buff is dropped with the other timed mods

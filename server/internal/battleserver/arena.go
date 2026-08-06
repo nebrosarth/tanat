@@ -151,6 +151,7 @@ func (s *Server) arenaEndLocked(inst *huntInstance, winner int32, now float64) {
 	for _, mem := range inst.members {
 		s.push(mem, battleproto.CmdBattleEnd, amf.NewArray().Set("id", winner))
 	}
+	s.settleMatchLocked(inst, winner, now)
 }
 
 // ---- PvP auto-attack: the twin of hunt.go's mob attack loop, aimed at an avatar ----
