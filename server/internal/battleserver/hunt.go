@@ -587,10 +587,10 @@ type huntState struct {
 	// effector only when the displayed integer actually changes.
 	passiveBuffCount [4]int32
 
-	hasProjectile bool
-	procs         []procState // rolled when the avatar HITS (basic attack)
-	defenseProcs  []procState // rolled when the avatar is STRUCK (Titanid «Каменная кожа»)
-	killProcs     []procState // rolled whenever the avatar's side KILLS an enemy (Gayal «Аура погибших»)
+	hasProjectile  bool
+	procs          []procState // rolled when the avatar HITS (basic attack)
+	defenseProcs   []procState // rolled when the avatar is STRUCK (Titanid «Каменная кожа»)
+	killProcs      []procState // rolled whenever the avatar's side KILLS an enemy (Gayal «Аура погибших»)
 	anyDamageProcs []procState // ALSO rolled once per cast when the avatar's own skill damage lands (Anhel «Зов фантомов»)
 	// lastDamageWasSkill flags the hit ABOUT to run runDefenseProcsLocked as mob/boss SKILL
 	// damage (Op.SkillOnly, Neirofim's «Обращение энергии») rather than a basic attack
@@ -1048,6 +1048,19 @@ type mobState struct {
 	// which shoot just as far -- ship an EMPTY one and stay hitscan. Verified against
 	// the bundles (data/buildings/Functional/Fn_{Human,Elf}.unity3d).
 	hasProj bool
+
+	// heroOwner marks this mobState as a TRANSIENT SHADOW standing in for a live enemy
+	// PLAYER during ops-target resolution (see pvp_hero_targets.go): nil for every real
+	// mob/creep/structure. The ops engine (damageTargetsLocked/mobsWithinLocked/
+	// mobsAlongLineLocked/opTargetsLocked) only ever knew how to hit inst.mobs, so a
+	// skill's OpDamage/OpStun/OpRoot/OpSlow/OpSilence could never touch an enemy hero --
+	// only the plain auto-attack path (hitPlayerFromLocked) could. Rather than rewrite
+	// that whole engine around an interface, a shadow is built FRESH per ops resolution
+	// (never stored in inst.mobs, never ticked, never leaks between casts) so every
+	// existing scan keeps returning []*mobState unchanged; the two or three places that
+	// actually APPLY damage/status branch on heroOwner!=nil and redirect to the real
+	// conn/huntState instead of mutating the throwaway shadow.
+	heroOwner *conn
 }
 
 // attackProtoID is the ATTACK effector prototype this unit swings with. It is the id
@@ -2675,6 +2688,14 @@ func (s *Server) hitMobFlagsLocked(c *conn, ms *mobState, dmg float64, damager i
 	if ms.dead {
 		return
 	}
+	// A disposable enemy-hero shadow (see pvp_hero_targets.go): redirect the whole hit
+	// into the REAL player-damage pipeline (armor/dodge/block/thorns/absorb, death + PvP
+	// kill credit) instead of the mob-only bookkeeping below, none of which applies to a
+	// shadow that is discarded, unstored, the instant this call returns.
+	if ms.heroOwner != nil {
+		s.hitPlayerFromLocked(ms.heroOwner, damager, dmg, float64(s.battleTime()), nil, c)
+		return
+	}
 	if c.altarShieldedLocked(ms) {
 		return
 	}
@@ -2786,7 +2807,7 @@ func (s *Server) hitMobFlagsLocked(c *conn, ms *mobState, dmg float64, damager i
 			s.resumeAutoAttackLocked(killer, float64(s.battleTime()), 0)
 		}
 	}
-	s.grantXPLocked(killer, ms.xpReward())
+	s.grantKillXPLocked(c, killer, ms.xpReward(), ms.x, ms.y)
 	s.awardCoinsLocked(killer, ms.id, ms.coinReward())
 	// Advance any accepted PvE quest whose objective is a kill on this Hunt map.
 	s.creditQuestKillLocked(killer, ms)
@@ -3007,6 +3028,22 @@ func (s *Server) handleUpgradeSkill(c *conn, p battleproto.Packet) {
 	proto := p.Args.IntOr("id", -1)
 	c.lock()
 	defer c.unlock()
+	if !s.upgradeSkillLocked(c, proto) {
+		if err := c.send(battleproto.Packet{Cmd: p.Cmd, Args: amf.NewArray(),
+			RequestID: p.RequestID, Status: false, Error: "cannot upgrade"}); err != nil {
+			log.Printf("battle: %s UPGRADE_SKILL reply error: %v", c.RemoteAddr(), err)
+		}
+		return
+	}
+	s.ack(c, p)
+}
+
+// upgradeSkillLocked is UPGRADE_SKILL's validated core, split out of handleUpgradeSkill so
+// a bot (bot.go) can spend a skill point through the exact same rules a real client's
+// request is checked against, instead of a parallel bot-only path. proto is the skill's
+// active-effector prototype id (what the client's UPGRADE_SKILL{id} names). Reports
+// whether the upgrade actually happened. Caller holds the lock.
+func (s *Server) upgradeSkillLocked(c *conn, proto int32) bool {
 	hs := c.huntState
 	slot := skillSlotByProto(hs.av, proto)
 	// Reject if: not a skill; no points; already at the skill's max rank; or the
@@ -3021,15 +3058,10 @@ func (s *Server) handleUpgradeSkill(c *conn, p battleproto.Packet) {
 			(req >= 0 && int(hs.level) < req)
 	}
 	if cannot {
-		if err := c.send(battleproto.Packet{Cmd: p.Cmd, Args: amf.NewArray(),
-			RequestID: p.RequestID, Status: false, Error: "cannot upgrade"}); err != nil {
-			log.Printf("battle: %s UPGRADE_SKILL reply error: %v", c.RemoteAddr(), err)
-		}
-		return
+		return false
 	}
 	hs.points--
 	hs.skillLevel[slot-1]++
-	s.ack(c, p)
 
 	old := hs.childEff[slot-1]
 	s.push(c, battleproto.CmdRemEffector, amf.NewArray().Set("id", old))
@@ -3043,6 +3075,7 @@ func (s *Server) handleUpgradeSkill(c *conn, p battleproto.Packet) {
 	s.reapplyPassiveLocked(c, slot, float64(s.battleTime()))
 	log.Printf("battle: %s skill %d upgraded to L%d (points left %d)",
 		c.RemoteAddr(), slot, hs.skillLevel[slot-1], hs.points)
+	return true
 }
 
 // reapplyPassiveLocked re-derives a permanent passive's self-buff stat mods and

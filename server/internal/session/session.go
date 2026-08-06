@@ -477,6 +477,25 @@ func (s *Store) CreateHero(u *User, race int32, gender bool, face, hair, distMar
 	return h
 }
 
+// CreateBotHero registers a synthetic in-memory account+hero for a server-controlled
+// «Штурм» bot: no email/password, no session, and deliberately no persistence -- a bot is
+// a match participant, not a real account, and must not leak into the account database.
+// Reuses the exact Hero fields the real economy plumbing (AddHeroMoney/SpendHeroMoney/
+// AddHeroExp) reads, so a bot buys/earns through the identical validated path a live
+// player does, instead of a parallel bot-only currency. id must not collide with a real
+// user id -- see battleserver's reserved bot id range.
+func (s *Store) CreateBotHero(id int32, username string) *Hero {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if u, ok := s.usersByID[id]; ok && u.Hero != nil {
+		return u.Hero
+	}
+	h := &Hero{ID: id, Level: 1, NextExp: 100}
+	h.Money, h.DiamondMoney = gamedata.NewHeroWallet()
+	s.usersByID[id] = &User{ID: id, Username: username, Hero: h, HasHero: true}
+	return h
+}
+
 // SetPendingBattle records that userID has been issued a battle launch (mode
 // entry): the Battle server will match the CONNECT password against it.
 func (s *Store) SetPendingBattle(userID int32, pb PendingBattle) {

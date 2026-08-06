@@ -67,6 +67,12 @@ type huntInstance struct {
 	// deathmatch, no mobs. It holds the two sides' frag counts, the win condition and
 	// the respawn-point pool. See arena.go. nil = not an arena.
 	arena *arenaState
+
+	// bots holds the decision state for every bot-controlled member (see bot.go/
+	// bot_brain.go), keyed by objID. A bot's *conn lives in members like any other --
+	// this is purely the "what is it thinking" side, ticked from runInstanceTicker
+	// alongside the shared per-member upkeep. Empty/nil in every world with no bots.
+	bots map[int32]*botBrain
 }
 
 // newHuntInstance builds an instance for a map and seeds its shared mob set from
@@ -284,6 +290,12 @@ func (s *Server) runInstanceTicker(inst *huntInstance) {
 			if !c.huntState.closed {
 				s.memberTickLocked(c, now)
 				rep = c
+				// Bot decision-making rides the same shared tick: a bot is an ordinary
+				// member for every OTHER purpose (regen, status expiry, channels...),
+				// this is the one extra step that gives it a "mind".
+				if brain := inst.bots[c.objID]; brain != nil {
+					s.botTickLocked(brain, now)
+				}
 			}
 		}
 		// One shared object pass for the whole world, driven through any live member.

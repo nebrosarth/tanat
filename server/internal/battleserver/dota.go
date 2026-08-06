@@ -101,6 +101,15 @@ type dotaState struct {
 	// check) is identical to a plain «Штурм» match; this field is only consulted at
 	// the very end, in dotaEndLocked, to run the castle-specific payout.
 	castleID int32
+
+	// botsFilled marks that this instance's one-time bot backfill (see bot.go,
+	// TANAT_DOTA_BOTS) has already run, so a second real player joining the same
+	// room doesn't spawn a second wave of bots on top of the first.
+	botsFilled bool
+
+	// startedAt is the battle-time this match's world was built -- bot_tactics.go's
+	// early/late-game phase heuristic reads elapsed match time off it.
+	startedAt float64
 }
 
 // teamForSide maps a baked map side to its ABSOLUTE in-battle team: Human -> team 1,
@@ -215,12 +224,14 @@ func newDotaInstance(s *Server, id, mapID int32) *huntInstance {
 		drops:          map[int32]*dropState{},
 		nextDropID:     dropChestBaseID,
 		nextDropItemID: dropItemBaseID,
+		bots:           map[int32]*botBrain{},
 	}
 	d := &dotaState{
 		m:         dm,
 		nextSide:  gamedata.DotaSideHuman, // the first (or solo) joiner fights for «Собор»
 		nextWave:  map[int32]float64{},
 		nextCreep: dotaCreepIDBase,
+		startedAt: float64(s.battleTime()),
 	}
 	inst.dota = d
 	for _, sc := range dm.Structures {

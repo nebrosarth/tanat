@@ -149,32 +149,38 @@ func (s *Server) applyAvatarItemStatsLocked(c *conn, it gamedata.AvatarItem, now
 func (s *Server) handleBuy(c *conn, p battleproto.Packet) {
 	c.lock()
 	defer c.unlock()
+	s.buyItemLocked(c, p.Args.IntOr("itemId", -1))
+	// Any validation miss just acks with no state change (the client's own gates should
+	// already prevent it, so this is defence, not a user-facing error path) -- buyItemLocked
+	// reports success/failure only for a bot's benefit; the wire reply is unconditional.
+	s.ack(c, p)
+}
+
+// buyItemLocked is BUY's validated core, split out of handleBuy so a bot (bot.go) can
+// spend gold on an avatar-tree item through the exact same rules (real item, not already
+// owned, parents owned, affordable) a real client's request is checked against. article is
+// the battle proto id, which for tree items equals the Ctrl catalog article id. Reports
+// whether the purchase happened. Caller holds the lock.
+func (s *Server) buyItemLocked(c *conn, article int32) bool {
 	hs := c.huntState
 	if hs == nil || hs.closed {
-		s.ack(c, p) // not in a battle (lobby): nothing to buy
-		return
+		return false // not in a battle (lobby): nothing to buy
 	}
-	// itemId is the battle proto id; for tree items that equals the article id.
-	article := p.Args.IntOr("itemId", -1)
 	it, ok := gamedata.AvatarItemByArticle(article)
 	if !ok {
-		s.ack(c, p)
-		return
+		return false
 	}
 	if hs.ownedTreeItems[it.ArticleID] {
-		s.ack(c, p) // already bought this match
-		return
+		return false // already bought this match
 	}
 	for _, par := range it.Parents {
 		if !hs.ownedTreeItems[par] {
-			s.ack(c, p) // parent not owned -> still LOCKED
-			return
+			return false // parent not owned -> still LOCKED
 		}
 	}
 	money, diamonds, ok := s.Store.SpendHeroMoney(c.selfPlayerID, it.Price)
 	if !ok {
-		s.ack(c, p) // no hero, or can't afford
-		return
+		return false // no hero, or can't afford
 	}
 
 	if hs.ownedTreeItems == nil {
@@ -194,6 +200,5 @@ func (s *Server) handleBuy(c *conn, p battleproto.Packet) {
 		Set("id", invID).Set("proto", it.ArticleID).Set("count", int32(1)))
 	// Permanent stat bonuses + re-sync.
 	s.applyAvatarItemStatsLocked(c, it, now)
-	// Success ack for the BUY request (client reads itemId off its own request).
-	s.ack(c, p)
+	return true
 }

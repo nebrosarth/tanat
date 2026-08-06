@@ -454,6 +454,9 @@ func (s *Server) sendWorldState(c *conn) {
 
 	if c.hunt != nil {
 		s.sendHuntWorldState(c, name)
+		// Dev/test convenience (TANAT_DOTA_BOTS): backfill a fresh «Штурм» match with
+		// bot-controlled heroes now that this player's own side is assigned. See bot.go.
+		s.maybeFillDotaBotsLocked(c)
 		return
 	}
 
@@ -620,8 +623,11 @@ func (s *Server) handleMove(c *conn, p battleproto.Packet) {
 	defer c.unlock()
 	now := s.battleTime()
 	// Reject movement while a cast animation roots the avatar; re-freeze in place
-	// so any client-side move prediction snaps back to the cast spot.
-	if hs := c.huntState; hs != nil && float64(now) < hs.castLockUntil {
+	// so any client-side move prediction snaps back to the cast spot. A CC root/stun
+	// (Op.Root/OpStun, now landable on a hero too -- see pvp_hero_targets.go) freezes
+	// the same way: without this a rooted player could still walk away by just
+	// clicking, since MOVE_PLAYER never consulted hs.st at all.
+	if hs := c.huntState; hs != nil && (float64(now) < hs.castLockUntil || hs.st.rooted(float64(now))) {
 		cx, cy := c.posAtLocked(now)
 		c.stopArrivalLocked()
 		c.hasDest = false

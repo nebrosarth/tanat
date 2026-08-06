@@ -207,18 +207,27 @@ func (s *Server) startSkillOrderLocked(c *conn, slot int, target int32, px, py f
 		ms = hs.mobs[target]
 		switch {
 		case ms == nil:
-			// Not a mob: a FRIEND-castable skill (Arianna's «Щит хранителя» / «Касание
-			// спасителя») may be aimed at a party member's avatar. Resolve it and carry the
-			// ally objID through the cast so its heal/shield/buff lands on THAT ally, not the
-			// caster. Anything else (a stale/dead id) fizzles.
-			ally := c.friendlyMember(target)
-			if ally == nil || !skillHasTargetFlag(def, "FRIEND") {
+			// Not a mob: either a FRIEND-castable skill (Arianna's «Щит хранителя» /
+			// «Касание спасителя») aimed at a party member's avatar, or an ENEMY-castable
+			// skill aimed directly at a rival HERO (Teridin's sniper shot clicked on the
+			// enemy carry) -- heroes live in inst.members, not hs.mobs, so neither ever
+			// resolved as ms. A FRIEND cast carries the ally objID through so its heal/
+			// shield/buff lands on THAT ally, not the caster; an ENEMY cast against a hero
+			// resolves to a disposable shadow (see pvp_hero_targets.go) so it flows through
+			// exactly like a mob target from here on. Anything else (a stale/dead id, or a
+			// hero aimed at with a FRIEND-only skill) fizzles.
+			if ally := c.friendlyMember(target); ally != nil && skillHasTargetFlag(def, "FRIEND") {
+				allyObj = target
+				tx, ty = ally.posAtLocked(s.battleTime())
+				hasPos = true
+			} else if sh := s.dotaEnemyHeroShadowLocked(c, target, float64(s.battleTime())); sh != nil {
+				ms = sh
+				tx, ty = sh.x, sh.y
+				hasPos = true
+			} else {
 				s.orderDoneLocked(c, parent)
 				return
 			}
-			allyObj = target
-			tx, ty = ally.posAtLocked(s.battleTime())
-			hasPos = true
 		case ms.dead:
 			s.orderDoneLocked(c, parent)
 			return
@@ -291,6 +300,12 @@ func (s *Server) tickOrderLocked(c *conn, now float64) {
 	case o.target > 0:
 		ms = hs.mobs[o.target]
 		if ms == nil || ms.dead {
+			// Not a mob (or it died mid-chase): re-try as a live enemy hero, the twin of
+			// startSkillOrderLocked's own fallback -- an approach-cast started on a rival
+			// hero must keep tracking them tick by tick, exactly like chasing a mob.
+			ms = s.dotaEnemyHeroShadowLocked(c, o.target, now)
+		}
+		if ms == nil {
 			hs.order = nil
 			s.orderDoneLocked(c, skillProtoID(hs.av, o.slot))
 			return
@@ -740,6 +755,13 @@ func (s *Server) firePayloadLocked(c *conn, p payload, now float64) {
 		ms = hs.mobs[p.target]
 		if ms != nil && ms.dead {
 			ms = nil
+		}
+		if ms == nil {
+			// Not a live mob: p.target may name an enemy HERO instead (see
+			// pvp_hero_targets.go) -- re-resolved fresh here, at IMPACT time rather than
+			// cast time, so a delayed payload lands on the hero's current position/HP,
+			// not a stale snapshot from when the cast started.
+			ms = s.dotaEnemyHeroShadowLocked(c, p.target, now)
 		}
 	}
 	// Payload fx placement -- only for the primary payload, not a deferred
@@ -1375,7 +1397,12 @@ func (s *Server) damageTargetsLocked(c *conn, ctx opCtx, radius float64) []*mobS
 				length = float64(sk.Distance)
 			}
 		}
-		return c.mobsAlongLineLocked(cx, cy, ctx.px, ctx.py, float64(sk.AoEWidth)/2, length)
+		out := c.mobsAlongLineLocked(cx, cy, ctx.px, ctx.py, float64(sk.AoEWidth)/2, length)
+		// Enemy HEROES stand in this same swath via a disposable shadow (see
+		// pvp_hero_targets.go) -- without this a line skill aimed through the enemy
+		// team only ever caught their creeps, never the heroes among them.
+		out = append(out, s.dotaEnemyHeroShadowsAlongLineLocked(c, cx, cy, ctx.px, ctx.py, float64(sk.AoEWidth)/2, length)...)
+		return out
 	}
 	if radius <= 0 {
 		if ctx.target != nil {
@@ -1391,7 +1418,12 @@ func (s *Server) damageTargetsLocked(c *conn, ctx opCtx, radius float64) []*mobS
 		}
 	}
 	x, y := s.centerLocked(c, ctx)
-	return c.mobsWithinLocked(x, y, radius)
+	out := c.mobsWithinLocked(x, y, radius)
+	// Enemy HEROES stand in this same radius scan via a disposable shadow (see
+	// pvp_hero_targets.go) -- without this an AoE nuke aimed at the enemy team only
+	// ever caught their creeps, never the heroes standing among them.
+	out = append(out, s.dotaEnemyHeroShadowsLocked(c, x, y, radius)...)
+	return out
 }
 
 // opTargetsLocked resolves a damaging/CC op's victims and applies its MaxTargets cap
@@ -1861,7 +1893,7 @@ func (s *Server) applyOpsLocked(c *conn, ops []gamedata.Op, ctx opCtx, now float
 				}
 				m.st.dots = append(m.st.dots, overTime{
 					perSec: perSec, perSecEnd: perSecEnd, startAt: now,
-					until: now + op.Dur.At(ctx.level),
+					until:    now + op.Dur.At(ctx.level),
 					nextTick: now + dotTickInterval, srcObj: c.objID,
 				})
 				// Persistent acid/poison visual on the victim (one shared copy, shown
@@ -2003,11 +2035,22 @@ func (s *Server) applyOpsLocked(c *conn, ops []gamedata.Op, ctx opCtx, now float
 
 		case gamedata.OpStun:
 			for _, m := range s.opTargetsLocked(c, ctx, op) {
+				// A disposable enemy-hero shadow (see pvp_hero_targets.go): write the CC
+				// straight into the real huntState.st via the hero-side twin, not the
+				// shadow's own copy, which is discarded unread the instant this op returns.
+				if m.heroOwner != nil {
+					s.dotaStunHeroLocked(c, m.heroOwner, now, op.Dur.At(ctx.level)+ctx.durBonus)
+					continue
+				}
 				s.stunMobLocked(c, m, now, op.Dur.At(ctx.level)+ctx.durBonus)
 			}
 
 		case gamedata.OpRoot:
 			for _, m := range s.opTargetsLocked(c, ctx, op) {
+				if m.heroOwner != nil {
+					s.dotaRootHeroLocked(c, m.heroOwner, now, op.Dur.At(ctx.level))
+					continue
+				}
 				m.st.rootUntil = math.Max(m.st.rootUntil, now+op.Dur.At(ctx.level))
 				s.ensureMobStatusFxLocked(c, m, &m.st.rootFx, "StunEffect")
 				s.stopMobLocked(c, m, now)
@@ -2015,6 +2058,14 @@ func (s *Server) applyOpsLocked(c *conn, ops []gamedata.Op, ctx opCtx, now float
 
 		case gamedata.OpSlow:
 			for _, m := range s.opTargetsLocked(c, ctx, op) {
+				if m.heroOwner != nil {
+					decayTo := 0.0
+					if len(op.DecayTo) > 0 {
+						decayTo = op.DecayTo.At(ctx.level)
+					}
+					s.dotaSlowHeroLocked(c, m.heroOwner, now, op.Value.At(ctx.level), op.Dur.At(ctx.level), decayTo)
+					continue
+				}
 				m.st.slowUntil = now + op.Dur.At(ctx.level)
 				m.st.slowFactor = op.Value.At(ctx.level)
 				m.st.slowFactorEnd = m.st.slowFactor
@@ -2028,14 +2079,23 @@ func (s *Server) applyOpsLocked(c *conn, ops []gamedata.Op, ctx opCtx, now float
 
 		case gamedata.OpAttackSlow:
 			for _, m := range s.opTargetsLocked(c, ctx, op) {
+				if m.heroOwner != nil {
+					s.dotaAttackSlowHeroLocked(c, m.heroOwner, now, op.Dur.At(ctx.level), op.Value.At(ctx.level))
+					continue
+				}
 				m.st.atkSlowUntil = now + op.Dur.At(ctx.level)
 				m.st.atkSlowFactor = op.Value.At(ctx.level)
 				s.ensureMobStatusFxLocked(c, m, &m.st.atkSlowFx, "SlowAttackEffect")
 			}
 
 		case gamedata.OpSilence:
-			// Mobs have no skills: silencing one also stops its attacks.
+			// Mobs have no skills: silencing one also stops its attacks. A hero keeps
+			// auto-attacking while silenced -- see dotaSilenceHeroLocked.
 			for _, m := range s.opTargetsLocked(c, ctx, op) {
+				if m.heroOwner != nil {
+					s.dotaSilenceHeroLocked(c, m.heroOwner, now, op.Dur.At(ctx.level))
+					continue
+				}
 				m.st.silenceUntil = now + op.Dur.At(ctx.level)
 				m.st.atkSlowUntil = math.Max(m.st.atkSlowUntil, now+op.Dur.At(ctx.level))
 				m.st.atkSlowFactor = 0.1
@@ -2373,13 +2433,13 @@ func (s *Server) applyOpsLocked(c *conn, ops []gamedata.Op, ctx opCtx, now float
 				nextPulse: firstPulse,
 				target:    mobID(ctx.target),
 				px:        ctx.px, py: ctx.py, hasPos: ctx.hasPos, ops: op.Ops,
-				interruptible: channelInterruptible(hs.av.Prefab, ctx.slot),
-				breakDist:     op.TriggerRadius,               // >0 = leash (Inshari siphon)
-				stunOnBreak:   op.Value2.At(ctx.level),        // stun seconds when the leash snaps
-				growth:        growth,
-				growthSP:      growthSP,
-				stunGrowth:    stunGrowth,
-				radiusGrowth:  radiusGrowth,
+				interruptible:  channelInterruptible(hs.av.Prefab, ctx.slot),
+				breakDist:      op.TriggerRadius,        // >0 = leash (Inshari siphon)
+				stunOnBreak:    op.Value2.At(ctx.level), // stun seconds when the leash snaps
+				growth:         growth,
+				growthSP:       growthSP,
+				stunGrowth:     stunGrowth,
+				radiusGrowth:   radiusGrowth,
 				growthPerEnemy: growthPerEnemy,
 				growthRadius:   growthRadius,
 			})

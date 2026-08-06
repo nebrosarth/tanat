@@ -3061,7 +3061,11 @@ func (s *Server) hitPlayerFromLocked(c *conn, damagerID int32, dmg float64, now 
 		s.syncSelfLocked(c, syncHealth)
 		s.playerDieLocked(c, damagerID, now)
 		if pvpAttacker != nil {
-			s.arenaCreditKillLocked(pvpAttacker, c, now)
+			if c.inst != nil && c.inst.dota != nil {
+				s.dotaCreditHeroKillLocked(pvpAttacker, c, now)
+			} else {
+				s.arenaCreditKillLocked(pvpAttacker, c, now)
+			}
 		}
 		return
 	}
