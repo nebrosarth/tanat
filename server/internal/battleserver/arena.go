@@ -171,6 +171,29 @@ func (s *Server) startPvpAttackLocked(c *conn, victim *conn) {
 		time.Duration(float64(time.Second)/s.attackPeriodLocked(hs)))
 }
 
+// stopPvpAttackLocked cancels an in-progress PvP (hero-vs-hero) attack -- the pvpTarget
+// twin of stopAttackLocked. Bumping attackSeq is what actually stops it: the next
+// armPvpAttackTimer closure checks hs.attackSeq != seq and returns instead of re-arming.
+// Without a caller of this, clicking away mid-fight left the old timer chain armed, and it
+// kept calling chaseMoveLocked back toward the enemy on its own cadence -- overriding the
+// player's own move order, so they could click to flee repeatedly and the timer just
+// walked them back and resumed swinging the moment they were back in range.
+func (s *Server) stopPvpAttackLocked(c *conn, silent bool) {
+	hs := c.huntState
+	if hs.pvpTarget == 0 {
+		return
+	}
+	hs.pvpTarget = 0
+	hs.attackSeq++
+	if !silent {
+		s.pushAvatarAllLocked(c, battleproto.CmdActionDone, amf.NewArray().
+			Set("id", c.objID).
+			Set("action", attackProtoID(hs.av)).
+			Set("item", false).
+			Set("cooldown", float64(s.battleTime())))
+	}
+}
+
 // armPvpAttackTimer is the PvP attack tick: chase the enemy avatar, and once in reach
 // play the swing ACTION and schedule the hit, re-arming on the attacker's cadence. A
 // close twin of armAttackTimer; the differences are that the target is resolved from
@@ -185,7 +208,9 @@ func (s *Server) armPvpAttackTimer(c *conn, seq int, targetID int32, delay, inte
 		}
 		victim := c.pvpMember(targetID)
 		if victim == nil || !arenaEnemies(c, victim) || victim.huntState.deadUntil > 0 {
-			s.stopAttackLocked(c, false)
+			// Was s.stopAttackLocked(c, false), which no-ops here: hs.attackTarget is
+			// never set on the PvP path, so that call never cleared hs.pvpTarget at all.
+			s.stopPvpAttackLocked(c, false)
 			return
 		}
 		now := s.battleTime()

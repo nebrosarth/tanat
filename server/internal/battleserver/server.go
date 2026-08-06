@@ -645,6 +645,13 @@ func (s *Server) handleMove(c *conn, p battleproto.Packet) {
 		if hs.attackTarget != 0 {
 			s.stopAttackLocked(c, false)
 		}
+		// PvP (hero-vs-hero) auto-attack: without this, the armPvpAttackTimer chain
+		// armed by an earlier right-click on an enemy hero stayed live through a move
+		// order and kept walking the avatar back to the enemy every ~250ms until back
+		// in range -- a click to flee mid-fight did nothing (see stopPvpAttackLocked).
+		if hs.pvpTarget != 0 {
+			s.stopPvpAttackLocked(c, false)
+		}
 		s.cancelOrderLocked(c)
 		// ...and it commands the pets too: they break off and walk to the click. The
 		// avatar's own destination cannot stand in for this -- c.hasDest clears the

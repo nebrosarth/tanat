@@ -78,6 +78,36 @@ func TestPvpSpellSlowAndSilenceApplyToEnemyHero(t *testing.T) {
 	}
 }
 
+// TestMoveCancelsPvpAttack: clicking to move away while auto-attacking an enemy hero must
+// cancel the PvP attack chain, not leave it armed to keep chasing/re-engaging on its own
+// schedule. Reported live: a player fighting a hero (auto-attack, possibly with a skill
+// thrown in) could click to flee repeatedly and the avatar kept turning back to fight --
+// handleMove cancelled hs.attackTarget (mob attacks) but never hs.pvpTarget, so the
+// armPvpAttackTimer chain from the original engage stayed alive and its own ~250ms retry
+// kept calling chaseMoveLocked back toward the enemy, overriding every move order.
+func TestMoveCancelsPvpAttack(t *testing.T) {
+	s, human, inst, cleanup := newDotaConn(t, "Avtr_Tank_Velial")
+	defer cleanup()
+	elf := dotaPlayerConn(t, s, inst, 1001, dotaTeamElf, human.x+2, human.y)
+
+	human.lock()
+	s.startPvpAttackLocked(human, elf)
+	startedOK := human.huntState.pvpTarget == elf.objID
+	human.unlock()
+	if !startedOK {
+		t.Fatal("setup: PvP attack did not start")
+	}
+
+	s.handleMove(human, fakeMovePacket(human.x-20, human.y))
+
+	human.lock()
+	defer human.unlock()
+	if human.huntState.pvpTarget != 0 {
+		t.Fatalf("pvpTarget = %d after a move order, want 0 (still armed to chase back to the enemy)",
+			human.huntState.pvpTarget)
+	}
+}
+
 // TestPvpRootedHeroCannotMove pins handleMove's new guard: a rooted player's MOVE_PLAYER
 // is rejected and the avatar is frozen in place, instead of silently walking away from a
 // root/stun that CC ops can now actually apply.

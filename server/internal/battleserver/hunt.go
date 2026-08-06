@@ -1895,6 +1895,11 @@ func (s *Server) startAttackLocked(c *conn, ms *mobState) {
 	s.breakInterruptibleChannelsLocked(c)
 	s.cancelOrderLocked(c)
 	hs.attackTarget = ms.id
+	// Symmetric with startPvpAttackLocked clearing attackTarget: switching to attack a
+	// mob while mid-PvP-fight must drop the stale pvpTarget, or a later handleMove (or
+	// any other pvpTarget-aware check) could still see a "still fighting a hero" signal
+	// this click was meant to replace.
+	hs.pvpTarget = 0
 	// Pets fight on the player's orders: the same click that sends the avatar at this
 	// target sends them. (A no-op for a swarm summon, which picks its own fights.)
 	s.orderPetsAttackLocked(c, ms.id)
