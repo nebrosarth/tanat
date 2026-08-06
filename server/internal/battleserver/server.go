@@ -795,6 +795,15 @@ func (c *conn) resetChaseLocked() {
 // mode aimAlong's throttle guards against for mobs).
 func (c *conn) chaseMoveLocked(s *Server, tx, ty float32) {
 	now := float64(s.battleTime())
+	// Rooted/stunned: no SERVER-DRIVEN movement either. handleMove already refuses the
+	// player's own click, but every chase re-arm (PvP auto-attack, mob auto-attack,
+	// approach-then-cast) calls this same function on its own retry cadence, bypassing
+	// that guard entirely -- a rooted hero still fighting back (auto-attacking someone)
+	// kept getting walked toward its target every ~250ms, which is exactly why a root
+	// looked like it "didn't work" whenever the victim had a chase already in flight.
+	if hs := c.huntState; hs != nil && hs.st.rooted(now) {
+		return
+	}
 	drift := math.Hypot(float64(tx-c.chaseGoalX), float64(ty-c.chaseGoalY))
 	if drift <= 1.0 && (c.hasDest || now-c.chaseRepathAt < 1.0) {
 		return // same goal and the walker is busy (or retried recently): keep walking

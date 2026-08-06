@@ -144,6 +144,32 @@ func TestPvpSpellSlowAndSilenceApplyToEnemyHero(t *testing.T) {
 	}
 }
 
+// TestRootedHeroChaseDoesNotMove: a rooted hero must not be walked anywhere by SERVER-
+// DRIVEN movement either (a PvP/mob auto-attack chase re-arming on its own cadence, or an
+// approach-then-cast retry) -- only handleMove (the player's own click) was gated before.
+// Reported live: Miriam's «Выстрел бури» knocked an enemy hero back and damaged them, but
+// the root never visibly held -- because the victim, still auto-attacking someone back,
+// kept getting walked toward that target by chaseMoveLocked every ~250ms regardless.
+func TestRootedHeroChaseDoesNotMove(t *testing.T) {
+	s, human, inst, cleanup := newDotaConn(t, "Avtr_Tank_Velial")
+	defer cleanup()
+	elf := dotaPlayerConn(t, s, inst, 1001, dotaTeamElf, human.x+2, human.y)
+
+	elf.lock()
+	now := float64(s.battleTime())
+	elf.huntState.st.rootUntil = now + 5
+	startX, startY := elf.x, elf.y
+	elf.chaseMoveLocked(s, startX+50, startY) // e.g. armPvpAttackTimer's own re-arm chasing a target
+	elf.unlock()
+
+	if elf.hasDest {
+		t.Fatal("rooted hero has a destination after chaseMoveLocked -- server-driven movement ignored the root")
+	}
+	if elf.x != startX || elf.y != startY {
+		t.Fatalf("rooted hero moved to (%.1f,%.1f), want to stay at (%.1f,%.1f)", elf.x, elf.y, startX, startY)
+	}
+}
+
 // TestMoveCancelsPvpAttack: clicking to move away while auto-attacking an enemy hero must
 // cancel the PvP attack chain, not leave it armed to keep chasing/re-engaging on its own
 // schedule. Reported live: a player fighting a hero (auto-attack, possibly with a skill
