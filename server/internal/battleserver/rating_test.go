@@ -90,6 +90,15 @@ func TestSettleMatchAppliesEloRatingAndFightLog(t *testing.T) {
 	if !ok || we.Kills != 3 || we.Assists != 1 {
 		t.Errorf("winner fight-log entry = %+v, want Kills=3 Assists=1", we)
 	}
+	// Reported live: the scoreboard showed the WRONG hero's portrait (a real player's
+	// small user id happened to collide with a different avatar's catalog id) and no
+	// portrait at all for bots (whose synthetic user id matches no avatar). AvatarID must
+	// be the avatar TYPE id the client's portrait lookup actually uses, not the
+	// player/user id -- winner.selfPlayerID must never leak into it.
+	if we.AvatarID != winner.huntState.av.ID {
+		t.Errorf("winner fight-log AvatarID = %d, want the avatar type id %d (not the player id %d)",
+			we.AvatarID, winner.huntState.av.ID, winner.selfPlayerID)
+	}
 	le, ok := entries[loser.selfPlayerID]
 	if !ok || le.Deaths != 2 {
 		t.Errorf("loser fight-log entry = %+v, want Deaths=2", le)

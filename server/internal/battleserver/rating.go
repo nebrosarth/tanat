@@ -123,7 +123,16 @@ func (s *Server) buildFightLogTeamLocked(entries map[int32]session.FightLogEntry
 		}
 		money, _, _ := s.Store.HeroMoney(mem.selfPlayerID)
 		entries[mem.selfPlayerID] = session.FightLogEntry{
-			AvatarID:  mem.selfPlayerID,
+			// AvatarID is the AVATAR TYPE id (hs.av.ID, gamedata.AvatarByID's id space --
+			// the same one fight|select_avatar's avatar_id uses), NOT mem.selfPlayerID (the
+			// player/user id). The client resolves the scoreboard portrait by looking this
+			// value up in its avatar catalog (CtrlAvatarStore, keyed by AvatarData.mId) --
+			// sending the user id instead produced exactly the two symptoms reported live:
+			// a bot's huge synthetic id (900000+) matched no catalog entry (blank
+			// portrait), and a real player's small id happened to collide with a
+			// DIFFERENT real avatar's catalog id (id 1 = Rognar), showing the wrong hero's
+			// portrait instead of their own pick.
+			AvatarID:  hs.av.ID,
 			Nick:      mem.name,
 			Team:      mem.playerTeam(),
 			Kills:     hs.frags,

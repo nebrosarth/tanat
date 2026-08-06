@@ -6,6 +6,12 @@ package session
 // battleserver/rating.go's settleMatchLocked) and handed to the Store because ctrlserver
 // and battleserver share nothing else -- Store is the one thing both sides already hold.
 type FightLogEntry struct {
+	// AvatarID is the AVATAR TYPE id (gamedata.Avatar.ID -- the same id space
+	// fight|select_avatar's avatar_id and gamedata.AvatarByID use), NOT the player/user
+	// id: the client resolves this row's portrait by looking AvatarID up in its own
+	// avatar catalog. The map this entry lives in (session.Store.FightLog) is keyed by
+	// the player id instead -- that key identifies WHICH ROW, this field says WHICH HERO
+	// they played.
 	AvatarID int32
 	Nick     string
 	// Team is this hero's absolute in-battle team (1/2 for «Штурм», ArenaTeamA/B for

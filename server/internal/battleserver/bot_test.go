@@ -46,6 +46,40 @@ func TestSpawnDotaBotsFillsBalancedTeams(t *testing.T) {
 			t.Fatalf("bot lane = %d, out of range [0,%d)", b.lane, len(inst.dota.m.Lanes))
 		}
 	}
+	// The real player is on Velial, one of the 10 roster avatars -- a full 10-headcount
+	// fill (1 real + 9 bots against a 10-avatar roster) is exactly the scenario that
+	// reported a bot on the ENEMY team playing the same hero as the real player's pick.
+	seen := map[int32]int32{} // avatar id -> which objID has it
+	for id, mem := range inst.members {
+		if other, dup := seen[mem.huntState.av.ID]; dup {
+			t.Fatalf("avatar %d (%s) played by both %d and %d -- a full-roster fill must never duplicate a hero",
+				mem.huntState.av.ID, mem.huntState.av.Prefab, other, id)
+		}
+		seen[mem.huntState.av.ID] = id
+	}
+}
+
+// TestSpawnDotaBotsSkipsPlayersAvatar: reported live -- a real player who picked one of
+// the bot roster's own 10 avatars found a bot on the ENEMY team playing the exact same
+// hero. A small fill (well short of exhausting the 10-avatar roster) must never hand any
+// bot the real player's already-picked avatar.
+func TestSpawnDotaBotsSkipsPlayersAvatar(t *testing.T) {
+	s, human, inst, cleanup := newDotaConn(t, "Avtr_Tank_Velial")
+	defer cleanup()
+
+	human.lock()
+	defer human.unlock()
+	s.spawnDotaBotsLocked(inst, 5)
+
+	for id, mem := range inst.members {
+		if mem == human {
+			continue
+		}
+		if mem.huntState.av.ID == human.huntState.av.ID {
+			t.Fatalf("bot %d was assigned %s, the same avatar the real player already picked",
+				id, mem.huntState.av.Prefab)
+		}
+	}
 }
 
 // TestSpawnDotaBotsBalancesAroundExplicitElfPlayer: the same desync bug, mirrored --

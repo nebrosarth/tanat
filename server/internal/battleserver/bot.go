@@ -112,18 +112,48 @@ func (s *Server) maybeFillDotaBotsLocked(c *conn) {
 
 // spawnDotaBotsLocked adds bot heroes until the match reaches target headcount, keeping
 // the two sides as even as possible (balancedDotaSideLocked), cycling the balanced avatar
-// roster. Caller holds inst.mu.
+// roster while skipping any avatar already in play -- a real player's pick, or an earlier
+// bot's. Reported live: a player who picked one of the 10 roster avatars (all 10 ARE
+// balanced picks, so this isn't a rare coincidence) found a bot on the enemy team playing
+// the exact same hero, since the old plain slot%len(roster) cycle never looked at what
+// inst.members already had assigned. Caller holds inst.mu.
 func (s *Server) spawnDotaBotsLocked(inst *huntInstance, target int) {
 	roster := botAvatarRoster()
 	if len(roster) == 0 {
 		log.Printf("battle: «Штурм» bot fill requested but the avatar roster is empty, skipping")
 		return
 	}
+	taken := map[int32]bool{}
+	for _, mem := range inst.members {
+		if mem.huntState != nil {
+			taken[mem.huntState.av.ID] = true
+		}
+	}
+	next := 0
 	for slot := 0; len(inst.members) < target; slot++ {
 		side := s.balancedDotaSideLocked(inst)
-		av := roster[slot%len(roster)]
+		av := nextFreeRosterAvatar(roster, taken, &next)
+		taken[av.ID] = true
 		s.newBotConnLocked(inst, slot, side, av)
 	}
+}
+
+// nextFreeRosterAvatar returns the next avatar in roster (cycling from *next, the same
+// order spawnDotaBotsLocked always drew from) that isn't in taken, advancing *next past
+// it. Falls back to handing out a repeat once every roster entry is already taken --
+// which only happens if real players in this match have already covered the whole
+// roster themselves -- rather than looping forever with nothing left to offer.
+func nextFreeRosterAvatar(roster []gamedata.Avatar, taken map[int32]bool, next *int) gamedata.Avatar {
+	for i := 0; i < len(roster); i++ {
+		av := roster[(*next)%len(roster)]
+		*next++
+		if !taken[av.ID] {
+			return av
+		}
+	}
+	av := roster[(*next)%len(roster)]
+	*next++
+	return av
 }
 
 // balancedDotaSideLocked returns whichever side currently has fewer members, counted
