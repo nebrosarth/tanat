@@ -1,6 +1,7 @@
 package battleserver
 
 import (
+	"math"
 	"testing"
 
 	"tanatserver/internal/amf"
@@ -26,6 +27,71 @@ func TestPvpSpellDamageHitsEnemyHero(t *testing.T) {
 
 	if elf.huntState.hp >= 500 {
 		t.Fatalf("enemy hero hp = %g, want less than 500 -- AoE spell damage never landed on the hero", elf.huntState.hp)
+	}
+}
+
+// TestPvpKnockbackMovesEnemyHero: an OpKnockback caught in the same AoE as OpDamage/OpRoot
+// (Miriam's «Выстрел бури») must actually shove the enemy hero's real position, not a
+// disposable shadow -- reported live: the shot damaged and rooted an enemy hero fine, but
+// never visibly pushed them (knockbackMobLocked mutated a throwaway shadow's x/y).
+func TestPvpKnockbackMovesEnemyHero(t *testing.T) {
+	s, human, inst, cleanup := newDotaConn(t, "Avtr_Tank_Velial")
+	defer cleanup()
+	elf := dotaPlayerConn(t, s, inst, 1001, dotaTeamElf, human.x+2, human.y)
+	preX, preY := elf.x, elf.y
+
+	human.lock()
+	defer human.unlock()
+	now := float64(s.battleTime())
+	ops := []gamedata.Op{{Kind: gamedata.OpKnockback, Value: gamedata.PerLevel{4}, Radius: 5}}
+	s.applyOpsLocked(human, ops, opCtx{slot: 1, level: 1}, now)
+
+	moved := math.Hypot(float64(elf.x-preX), float64(elf.y-preY))
+	if moved < 0.5 {
+		t.Fatalf("enemy hero moved %.3f units after OpKnockback, want a real shove away from the caster", moved)
+	}
+}
+
+// TestPvpPullMovesEnemyHeroCloser: OpPull must yank the real enemy hero toward the caster,
+// the inverse of the knockback bug above.
+func TestPvpPullMovesEnemyHeroCloser(t *testing.T) {
+	s, human, inst, cleanup := newDotaConn(t, "Avtr_Tank_Velial")
+	defer cleanup()
+	elf := dotaPlayerConn(t, s, inst, 1001, dotaTeamElf, human.x+4, human.y)
+	now := float64(s.battleTime())
+	preDist := math.Hypot(float64(elf.x-human.x), float64(elf.y-human.y))
+
+	human.lock()
+	defer human.unlock()
+	ops := []gamedata.Op{{Kind: gamedata.OpPull, Radius: 6}}
+	s.applyOpsLocked(human, ops, opCtx{slot: 1, level: 1, target: dotaHeroShadowLocked(elf, now)}, now)
+
+	postDist := math.Hypot(float64(elf.x-human.x), float64(elf.y-human.y))
+	if postDist >= preDist {
+		t.Fatalf("enemy hero distance from caster = %.2f after OpPull, want less than the starting %.2f", postDist, preDist)
+	}
+}
+
+// TestPvpChillComboStunsEnemyHero: Frost's chill-then-rechill combo (OpChill) must persist
+// its "already chilled" marker on the REAL hero across two separate casts, then stun on the
+// second -- a hero shadow rebuilt fresh per cast can't hold that marker itself.
+func TestPvpChillComboStunsEnemyHero(t *testing.T) {
+	s, human, inst, cleanup := newDotaConn(t, "Avtr_Tank_Velial")
+	defer cleanup()
+	elf := dotaPlayerConn(t, s, inst, 1001, dotaTeamElf, human.x+2, human.y)
+
+	human.lock()
+	defer human.unlock()
+	now := float64(s.battleTime())
+	ops := []gamedata.Op{{Kind: gamedata.OpChill, Value2: gamedata.PerLevel{2}, Dur: gamedata.PerLevel{4}, Radius: 5}}
+	s.applyOpsLocked(human, ops, opCtx{slot: 1, level: 1}, now)
+	if elf.huntState.st.chillUntil <= now {
+		t.Fatal("first OpChill did not mark the enemy hero as chilled")
+	}
+
+	s.applyOpsLocked(human, ops, opCtx{slot: 1, level: 1}, now+0.1)
+	if !elf.huntState.st.stunned(now + 0.1) {
+		t.Fatal("re-chilling an already-chilled enemy hero did not stun them")
 	}
 }
 

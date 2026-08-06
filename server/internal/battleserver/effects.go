@@ -1753,16 +1753,32 @@ func (s *Server) applyOpsLocked(c *conn, ops []gamedata.Op, ctx opCtx, now float
 			// Frost «озноб»: chilling an already-chilled target instead stuns it and clears the
 			// chill (the signature combo); otherwise it just marks the chill window.
 			for _, m := range s.opTargetsLocked(c, ctx, op) {
-				if now < m.st.chillUntil {
-					s.stunMobLocked(c, m, now, op.Value2.At(ctx.level))
-					m.st.chillUntil = 0
-					if m.st.chillFx != 0 {
-						s.worldFxEndLocked(c, m.st.chillFx)
-						m.st.chillFx = 0
+				// A hero shadow's .st is a value COPY (see pvp_hero_targets.go) -- the
+				// chill marker has to live and be read back from the real huntState.st
+				// across TWO SEPARATE casts (chill, then re-chill), which a fresh
+				// per-resolution shadow can't hold. Read/write the real status directly.
+				st := &m.st
+				if m.heroOwner != nil {
+					st = &m.heroOwner.huntState.st
+				}
+				if now < st.chillUntil {
+					if m.heroOwner != nil {
+						s.dotaStunHeroLocked(c, m.heroOwner, now, op.Value2.At(ctx.level))
+					} else {
+						s.stunMobLocked(c, m, now, op.Value2.At(ctx.level))
+					}
+					st.chillUntil = 0
+					if st.chillFx != 0 {
+						s.worldFxEndLocked(c, st.chillFx)
+						st.chillFx = 0
 					}
 				} else if !op.OnlyIfChilled {
-					m.st.chillUntil = now + op.Dur.At(ctx.level)
-					s.ensureMobStatusFxLocked(c, m, &m.st.chillFx, "FrozenEffect")
+					st.chillUntil = now + op.Dur.At(ctx.level)
+					if m.heroOwner != nil {
+						s.ensureHeroStatusFxLocked(c, m.heroOwner, &st.chillFx, "FrozenEffect")
+					} else {
+						s.ensureMobStatusFxLocked(c, m, &st.chillFx, "FrozenEffect")
+					}
 				}
 			}
 
@@ -2242,7 +2258,11 @@ func (s *Server) applyOpsLocked(c *conn, ops []gamedata.Op, ctx opCtx, now float
 
 		case gamedata.OpPull:
 			if ctx.target != nil {
-				s.pullMobLocked(c, ctx.target, now)
+				if ctx.target.heroOwner != nil {
+					s.dotaPullHeroLocked(c, ctx.target.heroOwner, now)
+				} else {
+					s.pullMobLocked(c, ctx.target, now)
+				}
 			}
 
 		case gamedata.OpKnockback:
@@ -2254,6 +2274,10 @@ func (s *Server) applyOpsLocked(c *conn, ops []gamedata.Op, ctx opCtx, now float
 				break
 			}
 			for _, m := range s.opTargetsLocked(c, ctx, op) {
+				if m.heroOwner != nil {
+					s.dotaKnockbackHeroLocked(c, m.heroOwner, op.Value.At(ctx.level), now)
+					continue
+				}
 				s.knockbackMobLocked(c, m, op.Value.At(ctx.level), now)
 			}
 

@@ -2,6 +2,7 @@ package battleserver
 
 import (
 	"math"
+	"time"
 
 	"tanatserver/internal/gamedata"
 )
@@ -212,4 +213,83 @@ func (s *Server) dotaAttackSlowHeroLocked(c *conn, mem *conn, now, dur, factor f
 	hs.st.atkSlowUntil = now + dur
 	hs.st.atkSlowFactor = factor
 	s.ensureHeroStatusFxLocked(c, mem, &hs.st.atkSlowFx, "SlowAttackEffect")
+}
+
+// ---- position ops on a hero: knockback/pull actually move the real conn ----
+//
+// knockbackMobLocked/pullMobLocked mutate a *mobState's x/y directly -- on a hero shadow
+// that is a silent no-op (the shadow is discarded unread), which is exactly what Miriam's
+// «Выстрел бури» reported live: it damaged and rooted an enemy hero (OpDamage/OpRoot
+// already redirected) but never actually shoved them. These two write straight to the
+// real mem.x/mem.y instead.
+
+// dotaKnockbackHeroLocked shoves an enemy hero directly away from the caster by dist
+// units, clipped to walkable ground -- the hero-side twin of knockbackMobLocked. Same wire
+// pattern: the authoritative position moves to the landing spot at once, but the broadcast
+// carries the OLD position with a real glide velocity so clients animate a shove instead of
+// a teleport; a one-shot timer then sends the matching stop once the glide has had time to
+// land. Any in-flight move order is dropped first, or the player's own destination could
+// still "arrive" afterward and stomp the shoved position.
+func (s *Server) dotaKnockbackHeroLocked(c *conn, mem *conn, dist float64, now float64) {
+	if dist <= 0 {
+		dist = 3
+	}
+	cx, cy := c.posAtLocked(float32(now))
+	mx, my := mem.posAtLocked(float32(now))
+	dx, dy := float64(mx-cx), float64(my-cy)
+	d := math.Hypot(dx, dy)
+	if d < 1e-6 {
+		dx, dy, d = 1, 0, 1
+	}
+	ux, uy := dx/d, dy/d
+	fromX, fromY := mx, my
+	tx := mx + float32(ux*dist)
+	ty := my + float32(uy*dist)
+	if mem.nav != nil {
+		nx, ny := mem.nav.Clip(float64(mx), float64(my), float64(tx), float64(ty))
+		tx, ty = float32(nx), float32(ny)
+	}
+	adist := math.Hypot(float64(tx-fromX), float64(ty-fromY))
+	if adist < 1e-3 {
+		return
+	}
+	dur := adist / knockbackSpeed
+	if dur < knockbackMinTime {
+		dur = knockbackMinTime
+	}
+	mem.stopArrivalLocked()
+	mem.hasDest = false
+	mem.x, mem.y = tx, ty
+	mem.vx, mem.vy = 0, 0
+	mem.snapT = float32(now)
+	mem.sendPosLocked(s, fromX, fromY, float32(ux*knockbackSpeed), float32(uy*knockbackSpeed), float32(now))
+
+	time.AfterFunc(time.Duration(dur*float64(time.Second)), func() {
+		mem.lock()
+		defer mem.unlock()
+		if mem.huntState == nil || mem.huntState.closed || mem.hasDest {
+			return // closed, or a real move order has since taken over -- don't stomp it
+		}
+		at := s.battleTime()
+		mem.x, mem.y, mem.vx, mem.vy, mem.snapT = tx, ty, 0, 0, at
+		mem.sendPosLocked(s, tx, ty, 0, 0, at)
+	})
+}
+
+// dotaPullHeroLocked yanks an enemy hero to within 1.5 units of the caster -- the
+// hero-side twin of pullMobLocked. An instant reposition (unlike knockback's timed glide),
+// so no follow-up timer is needed.
+func (s *Server) dotaPullHeroLocked(c *conn, mem *conn, now float64) {
+	cx, cy := c.posAtLocked(float32(now))
+	mx, my := mem.posAtLocked(float32(now))
+	d := math.Hypot(float64(mx-cx), float64(my-cy))
+	if d < 1.5 {
+		return
+	}
+	nx := cx + float32(float64(mx-cx)*1.5/d)
+	ny := cy + float32(float64(my-cy)*1.5/d)
+	mem.stopArrivalLocked()
+	mem.hasDest = false
+	mem.x, mem.y, mem.vx, mem.vy, mem.snapT = nx, ny, 0, 0, float32(now)
+	mem.sendPosLocked(s, nx, ny, 0, 0, float32(now))
 }
