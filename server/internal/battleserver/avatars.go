@@ -76,6 +76,14 @@ func (s *Server) renderAvatarForLocked(viewer, owner *conn, now float64) {
 			setFloats(syncDmgMin, idx, float32(a.DmgMin)).
 			setFloats(syncDmgMax, idx, float32(a.DmgMax)).
 			setFloats(syncRadius, idx, float32(a.Radius())).
+			// Vision: WarFogObject.Update only spawns a reveal zone once mViewRadius > 0
+			// AND friendliness is known (see the self-avatar's identical field in hunt.go's
+			// world-state chain). This sync never carried it, so an ALLY's avatar rendered
+			// on a teammate's client -- unlike the self avatar, every mob, every summon and
+			// every structure, all of which already send it -- lit nothing: a teammate
+			// standing in fog stayed fogged from every other member's point of view even
+			// though their own model was right there.
+			setFloats(syncViewRadius, idx, effectiveViewRadius(avatarViewRadius)).
 			setInt(syncTeam, idx, owner.playerTeam()).
 			build(vh.tr.count())))
 }

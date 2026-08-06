@@ -205,6 +205,43 @@ func TestSelfAvatarWorldStateCarriesViewRadiusAndTeam(t *testing.T) {
 	}
 }
 
+// TestAllyAvatarRevealCarriesViewRadius pins the follow-up fog bug reported live:
+// "allied avatars don't clear the fog". renderAvatarForLocked (avatars.go) is what
+// puts a TEAMMATE's hero on a viewer's client -- distinct from the self-avatar's own
+// world-state sync (hunt.go), which already carried VIEW_RADIUS, and distinct from
+// the mob/summon/structure reveals (mobai.go/dota.go), which do too. This one alone
+// never sent it, so a teammate's model rendered on screen but lit no fog around
+// itself from anyone else's point of view -- exactly the reported symptom.
+func TestAllyAvatarRevealCarriesViewRadius(t *testing.T) {
+	s := New(session.NewStore())
+	viewer, syncs := collectSyncs(t)
+	dm := gamedata.DotaMaps()[0]
+	inst := newDotaInstance(s, dm.ID, dm.ID)
+	av := avatarByPrefab(t, "Avtr_Tank_Velial")
+	viewer.objID = 1000
+	vhs := &huntState{
+		av: av, kit: gamedata.SkillsFor(av),
+		mobs: inst.mobs, summons: map[int32]*summonState{},
+		hp: av.Health, mana: av.Mana,
+	}
+	vhs.tr.add(viewer.objID)
+	vhs.inst = inst
+	vhs.worldReady = true
+	viewer.huntState = vhs
+	viewer.inst = inst
+	viewer.lk = &inst.mu
+	inst.members[viewer.objID] = viewer
+
+	ally := dotaPlayerConn(t, s, inst, 1001, dotaTeamHuman, 5, 5)
+
+	go func() {
+		viewer.lock()
+		s.renderAvatarForLocked(viewer, ally, float64(s.battleTime()))
+		viewer.unlock()
+	}()
+	awaitViewRadiusSync(t, syncs)
+}
+
 // TestViewRadiiAreNonZero guards the values themselves: a zero radius clears nothing,
 // which is exactly the bug (an unset VIEW_RADIUS defaults to 0 on the client).
 func TestViewRadiiAreNonZero(t *testing.T) {
