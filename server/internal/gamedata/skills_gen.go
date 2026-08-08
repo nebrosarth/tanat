@@ -696,7 +696,14 @@ func init() {
 				Slot: 1, NameRu: "Метание топоров", Type: "ACTIVE",
 				Target: "POINT", Targeting: "TARGET+NOCLAMP", Distance: 9, AoERadius: 3, AoEWidth: 3,
 				ManaCost: []int{30, 35, 40, 45}, Cooldown: []int{9, 9, 8, 8},
-				CastFx: "NerlagSkill1", CastFxDur: 0.6, PayloadFx: "NerlagSkill1Effect", PayloadFxAt: "point", PayloadDelay: 0.4,
+				// PayloadFxAt="throw" (not "point"): both NerlagSkill1Effect gfx sub-effects are
+				// baked SELF_TO_TARGET -- they fly from Nerlag to a real target OBJECT, not a bare
+				// ground point ("point" always sends target=0, which a SELF_TO_TARGET fx has
+				// nothing to resolve against and never renders). "throw" pins an invisible anchor
+				// at the click point and flies to THAT object instead, exactly what the thrown-axe
+				// visual needs. PayloadFlight:0.3 gives the axes a real (short) flight time instead
+				// of landing the instant they're announced.
+				CastFx: "NerlagSkill1", CastFxDur: 0.6, PayloadFx: "NerlagSkill1Effect", PayloadFxAt: "throw", PayloadDelay: 0.4, PayloadFlight: 0.3,
 				BuffFx: "", BuffFxOn: "", BuffIcon: false, BuffDescVariant: "",
 				// CLIENT «...и {*aoeDamageInc}+{*@damageIncSP} дополнительного урона каждому
 				// последующему врагу, которого они заденут»: each successive enemy the throw's
@@ -735,7 +742,11 @@ func init() {
 				Slot: 3, NameRu: "Прилив крови", Type: "PASSIVE",
 				Target: "", Targeting: "", Distance: 0, AoERadius: 0, AoEWidth: 0,
 				ManaCost: []int{0, 0, 0, 0}, Cooldown: []int{0, 0, 0, 0},
-				CastFx: "", CastFxDur: 0, PayloadFx: "", PayloadFxAt: "", PayloadDelay: 0,
+				// The client's baked registry has a dedicated one-shot blood-burst
+				// (NerlagSkill3Effect, SELF-mode) for this exact passive that was simply never
+				// wired up -- every other OnDamaged-proc passive in the file carries at least
+				// one fx field. Caught by runDefenseProcsLocked's "self" PayloadFx start.
+				CastFx: "", CastFxDur: 0, PayloadFx: "NerlagSkill3Effect", PayloadFxAt: "self", PayloadDelay: 0,
 				BuffFx: "", BuffFxOn: "", BuffIcon: false, BuffDescVariant: "BuffSelf",
 				// «имеет шанс при ударе по нему, не потерять, а восстановить здоровье на
 				// величину получаемого урона»: an ON-DAMAGED proc (chance = healProb) whose
@@ -1149,7 +1160,7 @@ func init() {
 				// before it arrived; PayloadFlightSpeed holds the ops back by distance/35.
 				CastFx: "FrostSkill1", CastFxDur: 1.2, PayloadFx: "FrostSkill1Effect1", PayloadFxAt: "target", PayloadDelay: 0.5,
 				PayloadFlightSpeed: 35,
-				BuffFx: "FrostSkill1Effect3", BuffFxOn: "target", BuffIcon: false, BuffDescVariant: "Buff1Target",
+				BuffFx:             "FrostSkill1Effect3", BuffFxOn: "target", BuffIcon: false, BuffDescVariant: "Buff1Target",
 				Ops: []Op{
 					{Kind: OpDamage, Value: PerLevel{70, 105, 140, 175}, Scale: "magic", PerSP: 1},
 					{Kind: OpSlow, Value: PerLevel{0.8, 0.8, 0.8, 0.8}, Dur: PerLevel{2, 2, 3, 3}},
@@ -1745,7 +1756,12 @@ func init() {
 				Slot: 1, NameRu: "Бросок плоти", Type: "ACTIVE",
 				Target: "ENEMY+NOT_BUILDING", Targeting: "TARGET", Distance: 10, AoERadius: 0, AoEWidth: 0,
 				ManaCost: []int{24, 29, 34, 39}, Cooldown: []int{9, 9, 8, 8},
-				CastFx: "AbominatorSkill1", CastFxDur: 0.8, PayloadFx: "AbominatorSkill1Effect1", PayloadFxAt: "target", PayloadDelay: 0.6,
+				// PayloadFlightSpeed: the client's VFX_..._Skill1_prop01 is a real SELF_TO_TARGET
+				// flying chunk (SmoothMove bySpeed=true, speed=40, maxDistance=10 -- matching this
+				// skill's own Distance:10), not an instant impact. Without it the stun/damage/slow
+				// landed the instant the flesh chunk left Abominator's hand instead of when it
+				// actually reaches the target, the same class of fix Frost's «Стужа» needed.
+				CastFx: "AbominatorSkill1", CastFxDur: 0.8, PayloadFx: "AbominatorSkill1Effect1", PayloadFxAt: "target", PayloadDelay: 0.6, PayloadFlightSpeed: 40,
 				BuffFx: "AbominatorSkill1Effect2", BuffFxOn: "self", BuffIcon: true, BuffDescVariant: "BuffSelf",
 				Ops: []Op{
 					{Kind: OpDamage, Value: PerLevel{65, 80, 95, 118}, Scale: "magic", PerSP: 1},
@@ -1848,7 +1864,15 @@ func init() {
 				CastFx: "AstarotSkill1Effect", CastFxDur: 0.5, PayloadFx: "AstarotSkill1", PayloadFxAt: "point", PayloadDelay: 0.3,
 				BuffFx: "SlowMoveEffect", BuffFxOn: "target", BuffIcon: false, BuffDescVariant: "BuffTarget",
 				Ops: []Op{
-					{Kind: OpBlink},
+					// A very fast OpDash, not OpBlink -- the client never snaps to a server
+					// position, it smoothly slides toward it (SmoothErrorCorrector caps
+					// catch-up speed while standing), so a raw teleport just made Astarot
+					// barely appear to move even though the server-side position/damage/slow
+					// jumped instantly. Speed 30 covers the max 9u jump in ~0.3s, matching
+					// PayloadDelay so the AstarotSkill1 impact fx (SELFPOS, sampled at
+					// EFFECT_START) lands close to the caster's arrival spot -- the same shape
+					// ShinDalar's «Смертоносный рывок»/«Астральный прыжок» already use.
+					{Kind: OpDash, Value: PerLevel{30, 30, 30, 30}},
 					{Kind: OpDamage, Value: PerLevel{135, 150, 170, 190}, Scale: "magic", Radius: 3, PerSP: 1},
 					{Kind: OpSlow, Value: PerLevel{0.7, 0.7, 0.7, 0.7}, Dur: PerLevel{3, 3, 3, 3}, Radius: 3},
 				},
@@ -2172,7 +2196,11 @@ func init() {
 				// circle at the landing point -- enemies she rushes THROUGH are cut.
 				Target: "POINT", Targeting: "", Distance: 10, AoERadius: 3, AoEWidth: 6,
 				ManaCost: []int{25, 30, 35, 40}, Cooldown: []int{10, 9, 8, 7},
-				CastFx: "ShinDalarSkill1", CastFxDur: 0.5, PayloadFx: "ShinDalarSkill1Effect", PayloadFxAt: "point", PayloadDelay: 0.2,
+				// PayloadFx cleared: the registry's "ShinDalarSkill1Effect" carries zero gfx/sfx
+				// (nothing to render) -- the real dash-cleave visual (2 gfx + 1 sfx) is authored
+				// under the CAST fx name instead, "ShinDalarSkill1" (already wired above), so
+				// this cut's impact was always going to render nothing regardless of placement.
+				CastFx: "ShinDalarSkill1", CastFxDur: 0.5, PayloadFx: "", PayloadFxAt: "", PayloadDelay: 0.2,
 				BuffFx: "", BuffFxOn: "", BuffIcon: false, BuffDescVariant: "",
 				Ops: []Op{
 					{Kind: OpDash, Value: PerLevel{24, 24, 24, 24}},
@@ -2945,7 +2973,7 @@ func init() {
 				Target: "", Targeting: "", Distance: 0, AoERadius: 12, AoEWidth: 0,
 				ManaCost: []int{80, 90, 100, 110},
 				Cooldown: []int{70, 64, 58, 54},
-				CastFx: "NeirofimSkill4", CastFxDur: 1.5, PayloadFx: "NeirofimSkill4Effect", PayloadFxAt: "self", PayloadDelay: 1,
+				CastFx:   "NeirofimSkill4", CastFxDur: 1.5, PayloadFx: "NeirofimSkill4Effect", PayloadFxAt: "self", PayloadDelay: 1,
 				BuffFx: "SilenceEffect", BuffFxOn: "target", BuffIcon: false, BuffDescVariant: "",
 				Ops: []Op{
 					// CLIENT «Молчание»: silence EVERY enemy on the map and drain mana (= half the
@@ -3095,8 +3123,15 @@ func init() {
 				Slot: 3, NameRu: "Могильный холод", Type: "ACTIVE",
 				Target: "", Targeting: "", Distance: 0, AoERadius: 6, AoEWidth: 0,
 				ManaCost: []int{30, 35, 40, 45}, Cooldown: []int{12, 11, 10, 9},
-				CastFx: "RognarSkill3", CastFxDur: 1, PayloadFx: "RognarSkill3Effect1", PayloadFxAt: "target", PayloadDelay: 0.4,
-				BuffFx: "RognarSkill3Effect2", BuffFxOn: "target", BuffIcon: false, BuffDescVariant: "",
+				// PayloadFxAt/BuffFxOn "self", not "target": this is a self-cast (Target:"") that
+				// picks 2 RANDOM enemies inside OpDot/OpSlow's own resolution, so there is never a
+				// single ctx.target for a "target"-mode placement to hang on -- it degenerated into
+				// a caster-to-caster flight (PayloadFx) and never started at all (BuffFx, gated on
+				// a live ms). The registry itself agrees this should be self-anchored:
+				// RognarSkill3Effect2 (BuffFx) is baked SELF-mode, an aura radiating from Rognar,
+				// not a per-target debuff prop.
+				CastFx: "RognarSkill3", CastFxDur: 1, PayloadFx: "RognarSkill3Effect1", PayloadFxAt: "self", PayloadDelay: 0.4,
+				BuffFx: "RognarSkill3Effect2", BuffFxOn: "self", BuffIcon: false, BuffDescVariant: "",
 				Ops: []Op{
 					// CLIENT «Могильный холод»: «замедление и количество наносимого урона
 					// постепенно спадает за время действия способности» -- both the DoT and the
@@ -3579,7 +3614,12 @@ func init() {
 				Slot: 1, NameRu: "Таран", Type: "ACTIVE",
 				Target: "POINT", Targeting: "", Distance: 10, AoERadius: 4, AoEWidth: 0,
 				ManaCost: []int{30, 35, 40, 45}, Cooldown: []int{14, 13, 12, 11},
-				CastFx: "ZamaranSkill1", CastFxDur: 0.6, PayloadFx: "ZamaranSkill1", PayloadFxAt: "point", PayloadDelay: 0.2,
+				// PayloadFx cleared here: "ZamaranSkill1" is the SAME registry entry as CastFx
+				// (a one-shot SELFPOS slam), so leaving both wired fired it TWICE near cast time
+				// (t=0 and t=PayloadDelay) -- neither anywhere near where OpDash's
+				// StrikeOnArrival actually lands the AoE damage+slow. dashArrivalFx (effects.go)
+				// now fires this same fx once, at the real arrival moment.
+				CastFx: "ZamaranSkill1", CastFxDur: 0.6, PayloadFx: "", PayloadFxAt: "", PayloadDelay: 0.2,
 				BuffFx: "", BuffFxOn: "", BuffIcon: false, BuffDescVariant: "",
 				Ops: []Op{
 					// Client: "бросается в выбранную точку, отпихивая всех врагов в стороны.
@@ -3626,9 +3666,9 @@ func init() {
 				Ops: []Op{
 					{Kind: OpProc, Chance: PerLevel{0.3, 0.3, 0.3, 0.3}, Ops: []Op{
 						// Client «понизится физическая броня на {coef%}%»: a PERCENTAGE reduction
-					// (matches the coef TipArgs, 10-25%), not a flat armor-point subtraction --
-					// armor_pct is the multiplicative stat, phys_armor is raw points (pass-11 audit).
-					{Kind: OpBuffStat, Value: PerLevel{0.9, 0.85, 0.8, 0.75}, Dur: PerLevel{10, 10, 10, 10}, Stat: "armor_pct", On: "target"},
+						// (matches the coef TipArgs, 10-25%), not a flat armor-point subtraction --
+						// armor_pct is the multiplicative stat, phys_armor is raw points (pass-11 audit).
+						{Kind: OpBuffStat, Value: PerLevel{0.9, 0.85, 0.8, 0.75}, Dur: PerLevel{10, 10, 10, 10}, Stat: "armor_pct", On: "target"},
 					}},
 				},
 				TipArgs: map[string]PerLevel{

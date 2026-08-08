@@ -909,6 +909,20 @@ func (s *Server) tickChannelsLocked(c *conn, now float64) {
 				durBonus:    ch.stunGrowth * float64(ch.pulseCount),
 				radiusBonus: ch.radiusGrowth * float64(ch.pulseCount)}
 			s.applyOpsLocked(c, ch.ops, ctx, now)
+			// A per-wave escalating visual (Titanid's «Землетрясение» waves 2/3), owned to a
+			// fresh stationary anchor at the channel's own ground point -- NOT the caster,
+			// who this ground-anchored channel lets walk away mid-quake -- so a moving
+			// Titanid doesn't drag the SELF-baked crack fx off the actual blast point.
+			if fx := channelWavePulseFx(hs.av.Prefab, ch.slot, ch.pulseCount); fx != "" {
+				wx, wy := ch.px, ch.py
+				if !ch.hasPos {
+					wx, wy = c.posAtLocked(float32(now))
+				}
+				anchor := s.spawnTrapAnchorLocked(c, wx, wy, now)
+				uid := s.fxStartLocked(c, fx, anchor, 0, false, 0, 0)
+				hs.scheduleFxEnd(uid, now+2.0)
+				hs.anchorEnds = append(hs.anchorEnds, anchorEnd{id: anchor, at: now + 2.3})
+			}
 			ch.pulseCount++
 			// Op.Count channel: stop the moment the authored number of pulses has been
 			// delivered, without waiting for the duration to lapse.

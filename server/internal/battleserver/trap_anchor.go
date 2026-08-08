@@ -34,8 +34,17 @@ func trapAnchorProtoDesc() string {
 // maintained by prefab+slot (like channelInterruptible): Elgorm's «Оскверненная
 // почва» (slot 3) uses SELF-baked fx (ElgormSkill3Effect1 trap + ElgormSkill3Effect2
 // trigger).
+//
+// Dutnik's «Мина» (slot 1) and «Оглушающая ловушка» (slot 2): both
+// DutnikSkillNTrapEffect (the planted mine) and DutnikSkillNTrapTriggeredEffect (its
+// detonation) are SELF-baked, so owned to the caster both followed Dutnik instead of
+// sitting at the up-to-8-unit-away cast point. Mihalych's «Западня» (slot 3) is the
+// same shape (MihalychSkill3TrapEffect SELF + MihalychSkill3TrapTriggeredEffect
+// SELFPOS) -- the trap's hit-detection already stays fixed, only the visual trailed.
 func trapUsesAnchor(prefab string, slot int) bool {
-	return prefab == "Avtr_Dsb_Elgorm" && slot == 3
+	return (prefab == "Avtr_Dsb_Elgorm" && slot == 3) ||
+		(prefab == "Avtr_HK_Dutnik" && (slot == 1 || slot == 2)) ||
+		(prefab == "Avtr_HK_Mihalych" && slot == 3)
 }
 
 // payloadFxUsesAnchor reports whether a skill's POINT payload fx is SELF-mode (parents
@@ -66,11 +75,19 @@ func payloadFxUsesAnchor(prefab string, slot int) bool {
 	// skill3_prop01 is a SELF-baked ground Projector + falling-hammer mesh (its own
 	// VisualEffectTargets carries no targets), so it parented to the caster instead of
 	// landing at the clicked point -- «молот создаётся не в точке каста, а на аватаре».
+	//
+	// ArianaMey's «Исцеление» (slot 3): the heal's ground-area payload fx is SELF-baked,
+	// so it trailed her instead of staying at the clicked point (Distance 10, AoERadius 4).
+	// Cerber's «Круг узника» (slot 1): the stun/channel-damage ground circle
+	// (CerberSkill1AreaEffect) is SELF-baked, so it trailed Cerber instead of marking the
+	// clicked ground point where the stun/damage actually applies.
 	return (prefab == "Avtr_Tank_Titanid" && slot == 1) ||
 		(prefab == "Avtr_Dsb_Edilia" && slot == 4) ||
 		(prefab == "Avtr_Dsb_Morlokay" && slot == 1) ||
 		(prefab == "Avtr_DPS_Sharli" && slot == 3) ||
-		(prefab == "Avtr_DPS_Miriam" && slot == 4)
+		(prefab == "Avtr_DPS_Miriam" && slot == 4) ||
+		(prefab == "Avtr_Sp_Arianna" && slot == 3) ||
+		(prefab == "Avtr_DPS_Cerber" && slot == 1)
 }
 
 // payloadTargetFxOwnedToTarget reports whether a skill's target-mode payload fx is a
@@ -87,9 +104,28 @@ func payloadTargetFxOwnedToTarget(prefab string, slot int) bool {
 	// Frost's «Гробница холода» (slot 3): FrostSkill3Effect1 is the ice FORMING over the
 	// victim -- a SELF-baked FreezeEffect with a ground projector -- so owned to the caster
 	// it froze Frost instead of whoever she aimed at.
+	//
+	// Same shape, found in the follow-up audit of the rest of the roster: ArianaMey's
+	// «Касание спасителя» (slot 4, shield/heal touch), Cerber's «Знак смертника» (slot 4,
+	// silence+DoT mark), Gektor's «Казнь» (slot 4, execute), Inshari's «Возмездие» (slot 4,
+	// execute), Neirofim's «Паралич воли» (slot 1, paralyze/slow impact), Rognar's
+	// «Окропление кровью» (slot 1, bleed mark) and «Канал смерти» (slot 4, damage/heal
+	// link), Sandariel's «Солнечное копьё» (slot 1, stun/damage impact), ShinDalar's
+	// «Вскрытие ран» (slot 4, acid burst), Tangren's «Танец смерти» (slot 4, first
+	// skull-strike) -- every one a SELF-baked payload fx sent with PayloadFxAt:"target"
+	// and rendering on the CASTER instead of the struck enemy until added here.
 	return (prefab == "Avtr_DPS_Sharli" && slot == 1) ||
 		(prefab == "Avtr_Sp_Kiona" && slot == 4) ||
-		(prefab == "Avtr_Dsb_Frost" && slot == 3)
+		(prefab == "Avtr_Dsb_Frost" && slot == 3) ||
+		(prefab == "Avtr_Sp_Arianna" && slot == 4) ||
+		(prefab == "Avtr_DPS_Cerber" && slot == 4) ||
+		(prefab == "Avtr_Tank_Gektor" && slot == 4) ||
+		(prefab == "Avtr_Sp_Inshari" && slot == 4) ||
+		(prefab == "Avtr_Sp_Neirofim" && slot == 1) ||
+		(prefab == "Avtr_Tank_Rognar" && (slot == 1 || slot == 4)) ||
+		(prefab == "Avtr_DPS_Sandariel" && slot == 1) ||
+		(prefab == "Avtr_HK_ShinDalar" && slot == 4) ||
+		(prefab == "Avtr_HK_Tangren" && slot == 4)
 }
 
 // allocAnchorID hands out a party-wide anchor object id (instance space) or a per-conn

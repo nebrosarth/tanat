@@ -2504,6 +2504,16 @@ func (s *Server) runProcsLocked(c *conn, ms *mobState, now float64) {
 		}
 		ctx := opCtx{slot: pr.slot, level: level, target: ms, px: ms.x, py: ms.y, hasPos: true}
 		s.applyOpsLocked(c, pr.ops, ctx, now)
+		// A target-mode BuffFx is normally started by firePayloadLocked, reachable only
+		// from the ACTIVE-cast pipeline -- an on-hit passive (Gektor's «Разящий удар»)
+		// never casts, it just runs ops on every swing, so its own strike-flourish visual
+		// silently never played even though the bonus damage+slow landed. A short fixed
+		// window (not targetBuffTTL, which only reads top-level ops -- this proc's Ops are
+		// wrapped one level down inside the OpProc) is enough for a per-swing flourish.
+		if def := hs.skillDef(pr.slot); def.BuffFxOn == "target" && def.BuffFx != "" {
+			uid := s.fxStartLocked(c, def.BuffFx, ms.id, 0, false, 0, 0)
+			hs.scheduleFxEnd(uid, now+1.5)
+		}
 		if cd := pr.cd.At(level); cd > 0 {
 			pr.readyAt = now + cd
 			s.pushPassiveProcCooldownLocked(c, pr.slot, pr.readyAt)
@@ -2614,6 +2624,14 @@ func (s *Server) runDefenseProcsLocked(c *conn, attacker *mobState, dmg float64,
 		// for the damage just taken (Nerlag's «Прилив крови»: OpHeal with Value2>0).
 		ctx := opCtx{slot: pr.slot, level: level, target: attacker, px: px, py: py, hasPos: true, dmgIn: dmg}
 		s.applyOpsLocked(c, pr.ops, ctx, now)
+		// A "self" PayloadFx is normally started by firePayloadLocked, reachable only from
+		// the ACTIVE-cast pipeline -- a defense proc never casts, it just runs ops, so its
+		// own fx (Gektor's «Реванш» counter-nova) silently never played even though the
+		// damage landed. Mirror firePayloadLocked's "self" case here.
+		if def := hs.skillDef(pr.slot); def.PayloadFx != "" && def.PayloadFxAt == "self" {
+			uid := s.fxStartLocked(c, def.PayloadFx, c.objID, 0, false, 0, 0)
+			hs.scheduleFxEnd(uid, now+3.0)
+		}
 		if cd := pr.cd.At(level); cd > 0 {
 			pr.readyAt = now + cd
 			s.pushPassiveProcCooldownLocked(c, pr.slot, pr.readyAt)

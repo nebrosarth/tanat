@@ -372,6 +372,41 @@ func channelSustainsThroughDisruption(prefab string, slot int) bool {
 		(prefab == "Avtr_DPS_Gellar" && slot == 4)
 }
 
+// channelWavePulseFx names the fx to fire on a channel's Nth pulse (pulseCount, 0-based,
+// read BEFORE it increments) for a channel whose client registry authored a DISTINCT
+// escalating visual per pulse instead of one static payload fx. Titanid's «Землетрясение»
+// hits in 3 growing waves, but only the first (TitanidSkill1Effect1, already fired once
+// at cast time as the skill's own PayloadFx) ever played -- Effect2/Effect3 sat right
+// next to it in the registry, with their own progressively wider ground-crack props,
+// completely unreferenced. Pulse 0 is left alone (it roughly coincides with the
+// cast-time Effect1 flourish); pulses 1 and 2 get Effect2/Effect3. Hand-maintained by
+// prefab+slot like channelInterruptible.
+func channelWavePulseFx(prefab string, slot, pulseCount int) string {
+	if prefab != "Avtr_Tank_Titanid" || slot != 1 {
+		return ""
+	}
+	switch pulseCount {
+	case 1:
+		return "TitanidSkill1Effect2"
+	case 2:
+		return "TitanidSkill1Effect3"
+	}
+	return ""
+}
+
+// dashArrivalFx names the fx to fire at the moment a StrikeOnArrival dash lands
+// (owned to the caster, who by then stands at the arrival point) for a skill whose
+// only registered impact visual is SELFPOS-mode and got wired as both the skill's
+// CastFx and its regular "point" PayloadFx -- both of which fire near CAST time, well
+// before a dash with any real travel distance actually lands. Hand-maintained by
+// prefab+slot like channelWavePulseFx.
+func dashArrivalFx(prefab string, slot int) string {
+	if prefab == "Avtr_Tank_Zamaran" && slot == 1 {
+		return "ZamaranSkill1"
+	}
+	return ""
+}
+
 // channelPulseDelay is the lead-in before a channel's FIRST damage pulse, matching
 // the client payload fx's own start delay so the server ticks land in step with the
 // visual. Elgorm's «Стрелы Аркана» arrow burst (ProjectileBurst on
@@ -604,6 +639,20 @@ func (s *Server) execCastLocked(c *conn, slot int, ms *mobState, px, py float32,
 	if delay <= 0 {
 		s.runDuePayloadsLocked(c, now)
 	}
+	// A self-mode BuffFx is normally started by addPlayerModLocked (fires when an
+	// OpBuffStat mod is applied) or the OpChannel self-buff branch (execOpsLocked, see its
+	// own doc comment) -- a skill whose only mechanic is neither (Rognar's «Канал смерти»,
+	// OpDeathLink; Urg's «Непроглядные дебри», OpSilence+OpGrove) never reaches either path,
+	// so its buff visual silently never played even though the mechanic itself worked.
+	// activeSelfBuffTTL's fallback (below) only fires when skillHasAnyBuffStat/the channel
+	// branch didn't already handle it, so this can never double-start an fx that's already
+	// covered.
+	if def.BuffFxOn == "self" && def.BuffFx != "" && !skillHasAnyBuffStat(def) && !skillHasChannel(def) {
+		if ttl := activeSelfBuffTTL(def, level); ttl > 0 {
+			buffUID := s.fxStartLocked(c, def.BuffFx, c.objID, 0, false, 0, 0)
+			hs.scheduleFxEnd(buffUID, now+ttl)
+		}
+	}
 
 	// Close the action so animations settle and the cooldown sweep starts. Remember
 	// the cast's target so the avatar rolls back into auto-attack on it when the
@@ -736,10 +785,30 @@ func targetBuffTTL(def gamedata.Skill, level int) float64 {
 		// at all -- «не создаётся prop». The encasement itself is an OpStun (both halves of
 		// the dual cast carry one), and that is exactly how long the ice should stand.
 		buff := op.Kind == gamedata.OpBuffStat && op.On == "target"
-		encase := op.Kind == gamedata.OpStun || op.Kind == gamedata.OpRoot
+		// Urg's «Древесный камуфляж» is the same shape as the OpStun/OpRoot cases below: the
+		// tree-transformation particle+sound IS the visible state, for exactly as long as the
+		// ally stays disguised (OpTreeForm's own Dur), not a stat buff at all.
+		encase := op.Kind == gamedata.OpStun || op.Kind == gamedata.OpRoot || op.Kind == gamedata.OpTreeForm
 		if !buff && !encase {
 			continue
 		}
+		if d := op.Dur.At(level); d > ttl {
+			ttl = d
+		}
+	}
+	return ttl
+}
+
+// activeSelfBuffTTL is the fallback duration for a self-mode BuffFx that neither
+// addPlayerModLocked nor the OpChannel self-buff branch will ever start (see
+// execCastLocked's own doc comment on the call site): the longest Dur among ANY
+// top-level op, regardless of kind -- unlike targetBuffTTL this isn't restricted to
+// OpBuffStat/OpStun/OpRoot, because the skills this covers sustain via their own
+// distinct op kind (Rognar's OpDeathLink, Urg's OpGrove) with no stat-buff at all. 0
+// means no top-level op carries an applicable duration, so no fx is started.
+func activeSelfBuffTTL(def gamedata.Skill, level int) float64 {
+	var ttl float64
+	for _, op := range def.Ops {
 		if d := op.Dur.At(level); d > ttl {
 			ttl = d
 		}
@@ -869,7 +938,15 @@ func (s *Server) firePayloadLocked(c *conn, p payload, now float64) {
 				hs.anchorEnds = append(hs.anchorEnds, anchorEnd{id: anchor, at: now + fxLife + 0.3})
 			}
 		case "self":
-			uid := s.fxStartLocked(c, def.PayloadFx, c.objID, 0, false, 0, 0)
+			// target=c.objID (not 0) and the caster's own live position: a SELF-mode
+			// sub-effect parents to the owner regardless (unaffected either way), but a
+			// registry entry that ALSO carries a TARGET/SELF_TO_TARGET sub-effect (Inshari's
+			// «Тёмное правосудие», an untargeted radius nova with no selected victim to aim
+			// at) previously got target=0/hasPos=false -- nothing to resolve that
+			// sub-effect's endpoint against, so it rendered at the world origin instead of
+			// on/around the caster.
+			sx, sy := c.posAtLocked(float32(now))
+			uid := s.fxStartLocked(c, def.PayloadFx, c.objID, c.objID, true, sx, sy)
 			hs.scheduleFxEnd(uid, now+fxLife)
 			hs.noteCastFxLocked(p.slot, uid, false)
 		case "throw":
@@ -944,6 +1021,19 @@ func (s *Server) firePayloadLocked(c *conn, p payload, now float64) {
 		}
 		// The anchor must outlive every fx parented to it, or they are torn down with it.
 		hs.anchorEnds = append(hs.anchorEnds, anchorEnd{id: p.anchor, at: now + math.Max(lingerLife, 3.0) + 0.3})
+	}
+
+	// A StrikeOnArrival dash's own impact visual (Zamaran's «Таран» slam), fired NOW --
+	// the caster stands at the actual landing spot at this exact moment, which is what a
+	// SELFPOS-mode fx needs (it captures the owner's position once, at EFFECT_START).
+	// Without this the skill's only registered impact fx played twice near cast time
+	// instead (once as CastFx, once as a normal "point" PayloadFx at PayloadDelay), well
+	// before a real dash actually lands, and nothing marked the true strike point.
+	if p.resume {
+		if fx := dashArrivalFx(hs.av.Prefab, p.slot); fx != "" {
+			uid := s.fxStartLocked(c, fx, c.objID, 0, false, 0, 0)
+			hs.scheduleFxEnd(uid, now+2.0)
+		}
 	}
 
 	ops := def.Ops
