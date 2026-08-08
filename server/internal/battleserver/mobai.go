@@ -3077,6 +3077,9 @@ func (s *Server) hitPlayerFromLocked(c *conn, damagerID int32, dmg float64, now 
 		Set("damager", damagerID).
 		Set("flags", int32(0)).
 		Set("damage", dmg))
+	if c.inst != nil && c.inst.dota != nil && c.inst.dota.telemetry != nil {
+		s.telemetryRecordDamageLocked(c.inst.dota.telemetry, c, damagerID, pvpAttacker, dmg, hs.hp <= 0, c.inst.dota.telemetryMatchTimeLocked(now), now)
+	}
 	if hs.hp <= 0 {
 		hs.hp = 0
 		s.syncSelfLocked(c, syncHealth)

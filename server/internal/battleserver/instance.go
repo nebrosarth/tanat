@@ -81,13 +81,13 @@ type huntInstance struct {
 func newHuntInstance(s *Server, id, mapID int32) *huntInstance {
 	m, _ := gamedata.HuntMapByID(mapID)
 	inst := &huntInstance{
-		s:            s,
-		id:           id,
-		mapID:        mapID,
-		m:            m,
-		nav:          m.Nav,
-		mobs:         map[int32]*mobState{},
-		members:      map[int32]*conn{},
+		s:              s,
+		id:             id,
+		mapID:          mapID,
+		m:              m,
+		nav:            m.Nav,
+		mobs:           map[int32]*mobState{},
+		members:        map[int32]*conn{},
 		nextFxUID:      1 << 20, // world fx id base, far above per-conn hs.nextFxUID
 		nextSummonID:   300000,  // party-wide summon id base, clear of avatar/mob ids
 		nextAnchorID:   400000,  // party-wide trap-anchor id base, clear of summon ids
@@ -295,6 +295,12 @@ func (s *Server) runInstanceTicker(inst *huntInstance) {
 				// this is the one extra step that gives it a "mind".
 				if brain := inst.bots[c.objID]; brain != nil {
 					s.botTickLocked(brain, now)
+				}
+				// Telemetry (see telemetry.go): a no-op unless TANAT_BOT_TELEMETRY is
+				// set, in which case this is every «Штурм» hero's per-tick position/
+				// state snapshot, bots and real players alike.
+				if inst.dota != nil && inst.dota.telemetry != nil {
+					s.telemetrySnapshotLocked(inst.dota.telemetry, c, inst.dota.telemetryMatchTimeLocked(now), now)
 				}
 			}
 		}

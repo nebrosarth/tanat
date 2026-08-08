@@ -2777,6 +2777,13 @@ func (s *Server) hitMobFlagsLocked(c *conn, ms *mobState, dmg float64, damager i
 	killer := s.creditConnLocked(c, damager)
 	ms.hp = 0
 	ms.dead = true
+	if ms.structure && c.inst != nil && c.inst.dota != nil && c.inst.dota.telemetry != nil {
+		var attributedKiller *conn
+		if killer != nil && killer.objID == damager {
+			attributedKiller = killer
+		}
+		s.telemetryRecordStructureDestroyLocked(c.inst.dota.telemetry, ms, attributedKiller, c.inst.dota.telemetryMatchTimeLocked(now))
+	}
 	// Op.OnKill's Dur-marked kill window (Lirvein's «Изощренный бросок»): a late kill by
 	// ANY source still pays off the ORIGINAL caster, not just an instant kill by their
 	// cast. Read before ms.st is wiped below.

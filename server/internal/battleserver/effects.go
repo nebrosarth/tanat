@@ -559,6 +559,9 @@ func (s *Server) execCastLocked(c *conn, slot int, ms *mobState, px, py float32,
 	}
 	hs.mana -= cost
 	s.syncSelfLocked(c, syncMana)
+	if c.inst != nil && c.inst.dota != nil && c.inst.dota.telemetry != nil {
+		s.telemetryRecordCastLocked(c.inst.dota.telemetry, c, slot, ms, px, py, hasPos, c.inst.dota.telemetryMatchTimeLocked(now))
+	}
 
 	cd := skillCooldown(float64(def.Cooldown[level-1]))
 	hs.cooldownUntil[slot-1] = now + cd

@@ -7,4 +7,5 @@
 /server/*.db-shm
 /server/*.db-wal
 /server/accounts.json.imported
+/server/telemetry/
 /_decompiled/

@@ -110,6 +110,17 @@ type dotaState struct {
 	// startedAt is the battle-time this match's world was built -- bot_tactics.go's
 	// early/late-game phase heuristic reads elapsed match time off it.
 	startedAt float64
+
+	// telemetry is this match's optional recording session (see telemetry.go),
+	// non-nil only when TANAT_BOT_TELEMETRY is set. nil-safe on every method, so
+	// every call site can use it unconditionally without an extra guard.
+	telemetry *telemetryRecorder
+}
+
+// telemetryMatchTimeLocked is elapsed match time (dotaState.startedAt to now), the "t"
+// every telemetry event line carries.
+func (d *dotaState) telemetryMatchTimeLocked(now float64) float64 {
+	return now - d.startedAt
 }
 
 // teamForSide maps a baked map side to its ABSOLUTE in-battle team: Human -> team 1,
@@ -232,6 +243,13 @@ func newDotaInstance(s *Server, id, mapID int32) *huntInstance {
 		nextWave:  map[int32]float64{},
 		nextCreep: dotaCreepIDBase,
 		startedAt: float64(s.battleTime()),
+	}
+	if dir := botTelemetryDir(); dir != "" {
+		d.telemetry = newTelemetryRecorder(dir, mapID)
+		d.telemetry.record(telemetryMatchStart{
+			telemetryEvent: newTelemetryEvent("match_start", 0),
+			MapID:          mapID,
+		})
 	}
 	inst.dota = d
 	for _, sc := range dm.Structures {
@@ -674,6 +692,7 @@ func (s *Server) dotaEndLocked(rep *conn, winner int32, now float64) {
 	if d.castleID != 0 {
 		s.settleCastleBattleLocked(rep.inst, d.castleID, winner)
 	}
+	s.telemetryRecordMatchEndLocked(d.telemetry, rep.inst, winner, d.telemetryMatchTimeLocked(now))
 }
 
 // dotaCampWaveIDBase is the d.nextWave key space for standalone DotaCreepCamps
