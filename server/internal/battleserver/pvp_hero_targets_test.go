@@ -275,6 +275,30 @@ func TestDotaKillXPSplitsAmongNearbyTeammates(t *testing.T) {
 	}
 }
 
+// TestDotaCreepKillGrantsProximityXP covers the no-last-hit case: when a friendly creep
+// kills an enemy creep, nearby heroes still split XP even though no hero receives gold.
+func TestDotaCreepKillGrantsProximityXP(t *testing.T) {
+	s, human, inst, cleanup := newDotaConn(t, "Avtr_Tank_Velial")
+	defer cleanup()
+	ally := dotaPlayerConn(t, s, inst, 1001, dotaTeamHuman, human.x+3, human.y)
+	attacker := &mobState{id: 65010, team: dotaTeamHuman, hp: 100, maxHP: 100}
+	victim := &mobState{id: 65011, team: dotaTeamElf, hp: 1, maxHP: 100, xp: 100,
+		x: human.x, y: human.y, shown: true, active: true}
+
+	human.lock()
+	defer human.unlock()
+	inst.mobs[attacker.id] = attacker
+	inst.mobs[victim.id] = victim
+	startHuman, startAlly := human.huntState.xp, ally.huntState.xp
+	s.dotaDamageLocked(human, victim, 10, attacker.id, float64(s.battleTime()))
+
+	gotHuman := human.huntState.xp - startHuman
+	gotAlly := ally.huntState.xp - startAlly
+	if gotHuman < 49.99 || gotHuman > 50.01 || gotAlly < 49.99 || gotAlly > 50.01 {
+		t.Fatalf("creep-death proximity XP = human %.2f ally %.2f, want 50/50", gotHuman, gotAlly)
+	}
+}
+
 // fakeMovePacket builds a MOVE_PLAYER-shaped packet for handleMove tests.
 func fakeMovePacket(x, y float32) battleproto.Packet {
 	return battleproto.Packet{

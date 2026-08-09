@@ -26,19 +26,40 @@ func (s *Server) botNearestAllyLocked(b *botBrain, now float64) *conn {
 	return best
 }
 
+// botIsActiveLocked reports whether ally is currently doing something worth following --
+// mid-attack or mid-PvP-engagement. Without this, botRoamTickLocked's "chase the nearest
+// ally" fallback treats an equally idle teammate as just as valid a destination as an
+// engaged one: two bots with nothing to do converge on each other, satisfy each other's
+// botUpdatePhaseLocked "grouped" check, and anchor there -- see the fix below.
+func botIsActiveLocked(ally *conn) bool {
+	hs := ally.huntState
+	return hs != nil && (hs.attackTarget != 0 || hs.pvpTarget != 0)
+}
+
 // botRoamTickLocked: a pair (or a laner between waves) drifts toward wherever the rest of
 // the team already is, still farming/fighting anything it passes along the way.
+//
+// The ally-chase fallback below used to be unconditional: once within botMoveTowardLocked's
+// own "already there" threshold (dist2<=2*2) of its nearest ally, the move became a
+// permanent no-op every subsequent think tick, and mutual proximity is exactly the
+// condition that put both bots into roam phase in the first place -- so any isolated pair
+// with nothing to fight froze in place indefinitely (measured: up to 72% of a match, never
+// leveling). Now the ally is only followed while doing so is an actual move AND the ally
+// itself is doing something worth following; otherwise this falls through to a genuine
+// redirect toward wherever the team as a whole still is (not just this bot's own,
+// possibly-exhausted lane).
 func (s *Server) botRoamTickLocked(b *botBrain, now float64) {
 	c, hs := b.c, b.c.huntState
-	if s.botShouldRetreatLocked(b, now) {
-		hx, hy := botHomeLocked(c)
-		s.botMoveTowardLocked(b, hx, hy, now)
-		return
-	}
 	if s.botConsiderHealLocked(b, now) {
 		return
 	}
+	if s.botShouldRetreatLocked(b, now) {
+		hx, hy := s.botRetreatPointLocked(b, now)
+		s.botMoveTowardLocked(b, hx, hy, now)
+		return
+	}
 	s.botConsiderWaveClearAbilityLocked(b, now)
+	s.botConsiderHarassAbilityLocked(b, now)
 	if hs.attackTarget != 0 {
 		return
 	}
@@ -46,13 +67,33 @@ func (s *Server) botRoamTickLocked(b *botBrain, now float64) {
 		s.startAttackLocked(c, target)
 		return
 	}
-	if ally := s.botNearestAllyLocked(b, now); ally != nil {
+	cx, cy := c.posAtLocked(float32(now))
+	if ally := s.botNearestAllyLocked(b, now); ally != nil && botIsActiveLocked(ally) {
 		ax, ay := ally.posAtLocked(float32(now))
-		s.botMoveTowardLocked(b, ax, ay, now)
-		return
+		if dist2(cx, cy, ax, ay) > 2*2 {
+			s.botMoveTowardLocked(b, ax, ay, now)
+			return
+		}
 	}
-	lx, ly := s.botLanePoint(b, now)
+	lane := s.botRedirectLaneLocked(b, now)
+	lx, ly := s.botPushPointLocked(b, lane, now)
 	s.botMoveTowardLocked(b, lx, ly, now)
+}
+
+// botNearestLaneToPointLocked returns the lane index whose polyline passes closest to
+// (x,y) -- the shared "which lane is this point on" geometry behind botPushLaneLocked and
+// botRedirectLaneLocked.
+func botNearestLaneToPointLocked(d *dotaState, x, y float32) int {
+	best, bestD := 0, math.Inf(1)
+	for i, lane := range d.m.Lanes {
+		for _, wp := range lane {
+			dd := math.Hypot(float64(float32(wp.X)-x), float64(float32(wp.Y)-y))
+			if dd < bestD {
+				bestD, best = dd, i
+			}
+		}
+	}
+	return best
 }
 
 // botPushLaneLocked returns the lane index closest to the grouped party's centroid --
@@ -60,7 +101,6 @@ func (s *Server) botRoamTickLocked(b *botBrain, now float64) {
 // bot's own assigned lane when nobody else is close enough to average in.
 func (s *Server) botPushLaneLocked(b *botBrain, now float64) int {
 	c := b.c
-	d := c.inst.dota
 	cx, cy := c.posAtLocked(float32(now))
 	sx, sy, n := cx, cy, float32(1)
 	for _, mem := range botLivingAllies(c) {
@@ -69,17 +109,26 @@ func (s *Server) botPushLaneLocked(b *botBrain, now float64) int {
 			sx, sy, n = sx+mx, sy+my, n+1
 		}
 	}
-	sx, sy = sx/n, sy/n
-	best, bestD := b.lane, math.Inf(1)
-	for i, lane := range d.m.Lanes {
-		for _, wp := range lane {
-			dd := math.Hypot(float64(float32(wp.X)-sx), float64(float32(wp.Y)-sy))
-			if dd < bestD {
-				bestD, best = dd, i
-			}
-		}
+	return botNearestLaneToPointLocked(c.inst.dota, sx/n, sy/n)
+}
+
+// botRedirectLaneLocked is botPushLaneLocked's un-gated twin: it averages EVERY living
+// teammate's position, not just whoever already happens to be within botGroupUpRadius of
+// the caller. botPushLaneLocked's own radius gate is exactly the wrong signal for a bot
+// that has nothing left to do and no useful ally nearby (see botRoamTickLocked) -- in that
+// situation the only teammate within range is typically another equally-stuck bot, so a
+// gated centroid just points back at the same dead spot. Averaging in every living
+// teammate regardless of distance points instead at wherever the team as a whole actually
+// still is.
+func (s *Server) botRedirectLaneLocked(b *botBrain, now float64) int {
+	c := b.c
+	cx, cy := c.posAtLocked(float32(now))
+	sx, sy, n := cx, cy, float32(1)
+	for _, mem := range botLivingAllies(c) {
+		mx, my := mem.posAtLocked(float32(now))
+		sx, sy, n = sx+mx, sy+my, n+1
 	}
-	return best
+	return botNearestLaneToPointLocked(c.inst.dota, sx/n, sy/n)
 }
 
 // botPushPointLocked mirrors botLanePoint but for the group's chosen push lane rather than
@@ -112,12 +161,12 @@ func (s *Server) botPushPointLocked(b *botBrain, lane int, now float64) (float32
 // the group itself is the tower-aggro soak a solo laner doesn't have.
 func (s *Server) botGroupTickLocked(b *botBrain, now float64) {
 	c, hs := b.c, b.c.huntState
-	if s.botShouldRetreatLocked(b, now) {
-		hx, hy := botHomeLocked(c)
-		s.botMoveTowardLocked(b, hx, hy, now)
+	if s.botConsiderHealLocked(b, now) {
 		return
 	}
-	if s.botConsiderHealLocked(b, now) {
+	if s.botShouldRetreatLocked(b, now) {
+		hx, hy := s.botRetreatPointLocked(b, now)
+		s.botMoveTowardLocked(b, hx, hy, now)
 		return
 	}
 	s.botConsiderWaveClearAbilityLocked(b, now)

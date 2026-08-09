@@ -111,6 +111,11 @@ type dotaState struct {
 	// early/late-game phase heuristic reads elapsed match time off it.
 	startedAt float64
 
+	// Periodic lane assignment accounts only for real players who have actually left
+	// their fountain, so an AFK player cannot reserve a lane slot forever.
+	nextLaneRebalanceAt float64
+	laneActiveHumans    map[int32]bool
+
 	// telemetry is this match's optional recording session (see telemetry.go),
 	// non-nil only when TANAT_BOT_TELEMETRY is set. nil-safe on every method, so
 	// every call site can use it unconditionally without an extra guard.
@@ -238,11 +243,12 @@ func newDotaInstance(s *Server, id, mapID int32) *huntInstance {
 		bots:           map[int32]*botBrain{},
 	}
 	d := &dotaState{
-		m:         dm,
-		nextSide:  gamedata.DotaSideHuman, // the first (or solo) joiner fights for «Собор»
-		nextWave:  map[int32]float64{},
-		nextCreep: dotaCreepIDBase,
-		startedAt: float64(s.battleTime()),
+		m:                dm,
+		nextSide:         gamedata.DotaSideHuman, // the first (or solo) joiner fights for «Собор»
+		nextWave:         map[int32]float64{},
+		nextCreep:        dotaCreepIDBase,
+		startedAt:        float64(s.battleTime()),
+		laneActiveHumans: map[int32]bool{},
 	}
 	if dir := botTelemetryDir(); dir != "" {
 		d.telemetry = newTelemetryRecorder(dir, mapID)
@@ -693,6 +699,15 @@ func (s *Server) dotaEndLocked(rep *conn, winner int32, now float64) {
 		s.settleCastleBattleLocked(rep.inst, d.castleID, winner)
 	}
 	s.telemetryRecordMatchEndLocked(d.telemetry, rep.inst, winner, d.telemetryMatchTimeLocked(now))
+	// telemetryRecordMatchEndLocked closed the recorder's channel, but the instance (and
+	// this dotaState) lives on after the match ends -- players linger to see the result,
+	// and runInstanceTicker keeps ticking every member, including its per-tick telemetry
+	// snapshot call. Every recording call site already nil-checks d.telemetry before
+	// using it; clearing it here is what makes that check mean "there is nothing left to
+	// record into", not just "there was something once". Without this, the very next
+	// tick's snapshot call sends on the closed channel and panics the whole server (crash
+	// observed live: "panic: send on closed channel" in telemetrySnapshotLocked).
+	d.telemetry = nil
 }
 
 // dotaCampWaveIDBase is the d.nextWave key space for standalone DotaCreepCamps
@@ -1151,7 +1166,8 @@ func (s *Server) dotaAttackLocked(rep *conn, m *mobState, target *dotaTarget, no
 
 // dotaDamageLocked applies creep/cannon damage to a structure or creep: armor
 // mitigation, RECEIVE_HIT, HP sync, and on death ON_KILL + a scheduled corpse removal
-// (no XP -- unit-vs-unit kills don't reward a player). Altar death ends the match.
+// Nearby heroes receive creep XP even when another unit lands the last hit; gold still
+// requires a hero last hit on the player damage path. Altar death ends the match.
 func (s *Server) dotaDamageLocked(rep *conn, victim *mobState, dmg float64, attackerID int32, now float64) {
 	if victim.dead {
 		return
@@ -1177,6 +1193,11 @@ func (s *Server) dotaDamageLocked(rep *conn, victim *mobState, dmg float64, atta
 	s.broadcastObjLocked(rep, victim.id, battleproto.CmdOnKill, amf.NewArray().
 		Set("killer", attackerID).Set("id", victim.id))
 	s.broadcastStatLocked(rep, victim.id, syncHealth, 0, float32(now))
+	if !victim.structure {
+		if attacker := rep.inst.mobs[attackerID]; attacker != nil && attacker.teamVal() != victim.teamVal() {
+			s.grantDotaProximityXPLocked(rep, attacker.teamVal(), victim.xpReward(), victim.x, victim.y)
+		}
+	}
 	// A creep/tower can land the final blow on an enemy cannon/barracks; credit the «Штурм» PvP
 	// tasks here too, or a team objective met by a friendly creep would strand (or falsely FAIL,
 	// for a timed task) the player's task. The player-landed twin is in hitMobFlagsLocked.
@@ -1224,6 +1245,9 @@ func (s *Server) dotaScheduleCorpseLocked(inst *huntInstance, mobID int32) {
 // base (its dtarget acquisition then engages the altar/structures).
 func (s *Server) dotaMarchLaneLocked(rep *conn, m *mobState, now float64) {
 	if m.laneIdx < 0 || m.laneIdx >= len(m.lane) {
+		if s.dotaMarchToAltarGuardLocked(rep, m, now) {
+			return
+		}
 		s.stopMobLocked(rep, m, now)
 		return
 	}
@@ -1235,12 +1259,59 @@ func (s *Server) dotaMarchLaneLocked(rep *conn, m *mobState, now float64) {
 			m.laneIdx--
 		}
 		if m.laneIdx < 0 || m.laneIdx >= len(m.lane) {
+			if s.dotaMarchToAltarGuardLocked(rep, m, now) {
+				return
+			}
 			s.stopMobLocked(rep, m, now)
 			return
 		}
 		wp = m.lane[m.laneIdx]
 	}
 	s.dotaMoveTowardLocked(rep, m, float32(wp.X), float32(wp.Y), now)
+}
+
+// dotaMarchToAltarGuardLocked: a creep that has run out of lane (arrived at the enemy
+// base) but found no target within dotaCreepAggro does not just plant itself at an altar
+// it cannot scratch -- dotaAcquireTargetLocked already refuses an altar still shielded by
+// its base cannons (altarVulnerableLocked), so a wave that finished off the ONE cannon on
+// its own lane fell through to stopMobLocked and idled there forever, even though the
+// altar's OTHER base cannon (guarding from a different lane, per AltarGuardGunIDs) was
+// still very much alive and killable -- exactly "крипы упираются в Алтарь... не идут
+// атаковать вторую пушку". This closes that gap: reach for whichever of the enemy altar's
+// guard cannons is still alive, regardless of aggro radius, so the wave finishes the guns
+// instead of stalling. Returns false (caller falls back to stopMobLocked) when there is no
+// enemy altar, it is already open, or every guard is already dead.
+func (s *Server) dotaMarchToAltarGuardLocked(rep *conn, m *mobState, now float64) bool {
+	d := rep.inst.dota
+	if d == nil {
+		return false
+	}
+	var altar *mobState
+	for _, o := range rep.inst.mobs {
+		if o.altar && !o.dead && o.enemyOf(m.teamVal()) {
+			altar = o
+			break
+		}
+	}
+	if altar == nil || d.altarVulnerableLocked(altar) {
+		return false
+	}
+	var nearest *mobState
+	bestD := math.Inf(1)
+	for _, gid := range d.altarGuards[altar.id] {
+		g := d.instMobs[gid]
+		if g == nil || g.dead {
+			continue
+		}
+		if dd := float64(dist2(m.x, m.y, g.x, g.y)); dd < bestD {
+			bestD, nearest = dd, g
+		}
+	}
+	if nearest == nil {
+		return false
+	}
+	s.dotaMoveTowardLocked(rep, m, nearest.x, nearest.y, now)
+	return true
 }
 
 // dotaMoveTowardLocked heads a creep toward (tx,ty) at its move speed, steering around

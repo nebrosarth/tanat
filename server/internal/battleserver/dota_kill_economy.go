@@ -26,8 +26,22 @@ func (s *Server) grantKillXPLocked(rep *conn, killer *conn, xp float64, x, y flo
 		s.grantXPLocked(killer, xp)
 		return []*conn{killer}
 	}
+	sharing := s.grantDotaProximityXPLocked(rep, killer.playerTeam(), xp, x, y)
+	if len(sharing) == 0 {
+		sharing = []*conn{killer} // the credited killer's own kill always counts
+		s.grantXPLocked(killer, xp)
+	}
+	return sharing
+}
+
+// grantDotaProximityXPLocked awards a DOTA unit death's XP to nearby living heroes on
+// team, independent of who delivered the last hit. Creep-vs-creep deaths use this helper;
+// gold remains exclusive to a hero last hit on the existing player damage path.
+func (s *Server) grantDotaProximityXPLocked(rep *conn, team int32, xp float64, x, y float32) []*conn {
+	if rep == nil || rep.inst == nil || rep.inst.dota == nil || xp <= 0 {
+		return nil
+	}
 	now := float64(s.battleTime())
-	team := killer.playerTeam()
 	var sharing []*conn
 	for _, mem := range rep.inst.members {
 		hs := mem.huntState
@@ -40,7 +54,7 @@ func (s *Server) grantKillXPLocked(rep *conn, killer *conn, xp float64, x, y flo
 		}
 	}
 	if len(sharing) == 0 {
-		sharing = []*conn{killer} // the killer's own kill always counts, even at a radius edge case
+		return nil
 	}
 	share := xp / float64(len(sharing))
 	for _, mem := range sharing {

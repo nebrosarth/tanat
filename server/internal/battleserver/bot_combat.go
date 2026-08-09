@@ -48,13 +48,16 @@ func (s *Server) botEnemyStructureDangerLocked(c *conn, x, y float32) bool {
 // issued an order, so the caller (botTickLocked) skips the phase-specific logic below it.
 func (s *Server) botCombatTickLocked(b *botBrain, now float64) bool {
 	c, hs := b.c, b.c.huntState
-	if s.botShouldRetreatLocked(b, now) {
-		return false
-	}
 	// A hurting ally (or self) always gets a heal/shield first, fight or no fight --
-	// this is what makes Ariana/Neirofim actually play their support role.
+	// this is what makes Ariana/Neirofim actually play their support role. Checked BEFORE
+	// the retreat gate below: retreating exits combat handling entirely (returns false),
+	// so a heal ready on the very tick a bot crosses the retreat threshold used to never
+	// fire at all -- the bot fled instead of spending its one instant self-save.
 	if s.botConsiderHealLocked(b, now) {
 		return true
+	}
+	if s.botShouldRetreatLocked(b, now) {
+		return false
 	}
 	enemies := botLivingEnemyHeroes(c, now)
 	if len(enemies) == 0 {
@@ -64,6 +67,7 @@ func (s *Server) botCombatTickLocked(b *botBrain, now float64) bool {
 	}
 	target := s.botPickEngageTargetLocked(b, enemies, now)
 	if target == nil {
+		wasEngaged := b.engageTarget != 0 || hs.pvpTarget != 0
 		b.engageTarget = 0
 		// The brain just decided this fight is no longer worth it (out of range,
 		// unfavourable numbers, or -- see botEnemyStructureDangerLocked -- about to walk
@@ -75,6 +79,11 @@ func (s *Server) botCombatTickLocked(b *botBrain, now float64) bool {
 		// actually dies/leaves/goes invisible -- it has no notion of "too deep," so the
 		// brain has to be the one pulling the plug every think tick it reconsiders.
 		s.stopPvpAttackLocked(c, false)
+		if wasEngaged {
+			tx, ty := s.botDisengagePointLocked(b, now)
+			s.botMoveTowardLocked(b, tx, ty, now)
+			return true
+		}
 		return false
 	}
 	b.engageTarget = target.objID
@@ -194,8 +203,21 @@ func (s *Server) botConsiderOffensiveAbilityLocked(b *botBrain, target *conn, no
 // heal/shield on.
 const botHealNeedFrac = 0.65
 
+// botSkillTargetsAlliesLocked reports whether a heal/hot/shield slot can actually be aimed
+// at (or land on) a hurt ally: an explicit FRIEND-flagged single-target cast, a
+// self-centered cast (Target==""/"SELF" -- e.g. Tangren's "Целительный тотем", an
+// AoE-on-self totem with On:"allies"), or a ground-targeted AoE (Target=="POINT" -- e.g.
+// Ariana's "Исцеление", aimed at the hurt ally's position). Without the latter two, an
+// entire class of real, already-balanced heals was structurally invisible to the bot: it
+// only ever considered the FRIEND-flagged case, so a hero whose sole heal is a self-AoE
+// totem or a ground-target AoE never cast it once, in any match, regardless of how hurt it
+// or its allies were.
+func botSkillTargetsAlliesLocked(def gamedata.Skill) bool {
+	return skillHasTargetFlag(def, "FRIEND") || def.Target == "" || def.Target == "SELF" || def.Target == "POINT"
+}
+
 // botFindHealTargetLocked returns the most hurt nearby ally (self included) below
-// botHealNeedFrac and a ready FRIEND-castable heal/shield/hot slot for it, or (nil, 0).
+// botHealNeedFrac and a ready ally-reaching heal/shield/hot slot for it, or (nil, 0).
 func (s *Server) botFindHealTargetLocked(b *botBrain, now float64) (*conn, int) {
 	c, hs := b.c, b.c.huntState
 	healSlot := 0
@@ -204,7 +226,7 @@ func (s *Server) botFindHealTargetLocked(b *botBrain, now float64) (*conn, int) 
 			continue
 		}
 		def := hs.skillDef(slot)
-		if !skillHasTargetFlag(def, "FRIEND") {
+		if !botSkillTargetsAlliesLocked(def) {
 			continue
 		}
 		if botSkillHasOp(def, gamedata.OpHeal) || botSkillHasOp(def, gamedata.OpHot) || botSkillHasOp(def, gamedata.OpShield) {
@@ -248,7 +270,25 @@ func (s *Server) botConsiderHealLocked(b *botBrain, now float64) bool {
 		return false
 	}
 	c := b.c
+	def := c.huntState.skillDef(slot)
 	tx, ty := target.posAtLocked(float32(now))
-	s.startSkillOrderLocked(c, slot, target.objID, tx, ty, true)
+	switch def.Target {
+	case "", "SELF":
+		// Self-centered (or self-only) cast: startSkillOrderLocked's own self-cast branch
+		// fires unconditionally on def.Target=="" || "SELF" and ignores target/position
+		// entirely, so this only needs to happen at all -- who it ends up helping (e.g.
+		// Tangren's totem healing whichever allies stand in its radius) is the skill's own
+		// business, not this call's.
+		s.startSkillOrderLocked(c, slot, 0, 0, 0, false)
+	case "POINT":
+		// Ground-targeted AoE heal (e.g. Ariana's "Исцеление"): must NOT carry the ally's
+		// objID -- startSkillOrderLocked only resolves an object target through the
+		// FRIEND-flagged ally path, and a bare POINT skill doesn't carry that flag, so
+		// passing target.objID here would silently fizzle the order (falls through to
+		// orderDoneLocked with nothing cast). Aim at the hurt ally's position instead.
+		s.startSkillOrderLocked(c, slot, 0, tx, ty, true)
+	default:
+		s.startSkillOrderLocked(c, slot, target.objID, tx, ty, true)
+	}
 	return true
 }

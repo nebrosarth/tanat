@@ -1,6 +1,7 @@
 package battleserver
 
 import (
+	"math"
 	"net"
 	"testing"
 
@@ -232,8 +233,8 @@ func TestDotaCreepTargetsEnemyNotAlly(t *testing.T) {
 	own := altarOf(inst, dotaPlayerTeam)
 	creep := &mobState{
 		id: 61000, mobIdx: inst.dota.m.ElfCreepMelee,
-		mob:  gamedata.Mobs()[inst.dota.m.ElfCreepMelee],
-		x:    own.x + 3, y: own.y,
+		mob: gamedata.Mobs()[inst.dota.m.ElfCreepMelee],
+		x:   own.x + 3, y: own.y,
 		team: dotaTeamElf,
 	}
 	inst.mobs[creep.id] = creep
@@ -323,8 +324,8 @@ func TestDotaCreepSkipsShieldedAltar(t *testing.T) {
 	// A player-side (team 1) creep standing right on the enemy altar while its cannons stand.
 	creep := &mobState{
 		id: 60009, mobIdx: inst.dota.m.HumanCreepMelee,
-		mob:  gamedata.Mobs()[inst.dota.m.HumanCreepMelee],
-		x:    enemyAltar.x - 2, y: enemyAltar.y,
+		mob: gamedata.Mobs()[inst.dota.m.HumanCreepMelee],
+		x:   enemyAltar.x - 2, y: enemyAltar.y,
 		team: dotaPlayerTeam,
 	}
 	inst.mobs[creep.id] = creep
@@ -348,6 +349,70 @@ func TestDotaCreepSkipsShieldedAltar(t *testing.T) {
 	tgt2 := s.dotaAcquireTargetLocked(c, creep, 50, float64(s.battleTime()))
 	if tgt2 == nil || tgt2.mob == nil || tgt2.mob.id != enemyAltar.id {
 		t.Fatalf("after the base cannons fell, creep should target the open altar, got %+v", tgt2)
+	}
+}
+
+// TestDotaCreepMarchesToSecondAltarGuard pins the fix for "creeps stall at the altar
+// instead of finishing the SECOND guarding cannon" (crepы упираются в Алтарь... не идут
+// атаковать вторую пушку): a creep that ran its lane out right where its own lane's guard
+// cannon stood, with that cannon already dead and the altar still shielded by the OTHER
+// base cannon, does not just stop dead -- it marches on the surviving cannon even though it
+// sits well outside dotaCreepAggro from where the creep is standing.
+func TestDotaCreepMarchesToSecondAltarGuard(t *testing.T) {
+	s, c, inst, cleanup := newDotaConn(t, "Avtr_Tank_Velial")
+	defer cleanup()
+	enemyAltar := altarOf(inst, dotaTeamElf)
+	guards := inst.dota.altarGuards[enemyAltar.id]
+	if len(guards) != 2 {
+		t.Fatalf("enemy altar guard set = %v, want exactly 2 base cannons", guards)
+	}
+	dead := inst.mobs[guards[0]]
+	alive := inst.mobs[guards[1]]
+	dead.dead = true // this lane's own guard cannon is already down
+
+	// The creep arrived at the end of its (now exhausted) lane right where the dead cannon
+	// stood -- far enough from the surviving cannon that ordinary aggro can't see it.
+	creep := &mobState{
+		id: 60010, mobIdx: inst.dota.m.HumanCreepMelee,
+		mob: gamedata.Mobs()[inst.dota.m.HumanCreepMelee],
+		x:   dead.x, y: dead.y,
+		team: dotaPlayerTeam,
+	}
+	inst.mobs[creep.id] = creep
+
+	c.lock()
+	defer c.unlock()
+	now := float64(s.battleTime())
+	if got := math.Hypot(float64(alive.x-creep.x), float64(alive.y-creep.y)); got <= dotaCreepAggro {
+		t.Fatalf("test setup: surviving guard is only %.1fu away, want > dotaCreepAggro (%.1f)", got, dotaCreepAggro)
+	}
+	if tgt := s.dotaAcquireTargetLocked(c, creep, dotaCreepAggro, now); tgt != nil {
+		t.Fatalf("test setup: creep already has a target %+v, expected none", tgt)
+	}
+	if !s.dotaMarchToAltarGuardLocked(c, creep, now) {
+		t.Fatal("creep with an exhausted lane and a shielded altar should march on the surviving guard cannon")
+	}
+	if creep.vx == 0 && creep.vy == 0 {
+		t.Fatal("creep did not start moving toward the surviving guard cannon")
+	}
+	wantX, wantY := alive.x-creep.x, alive.y-creep.y
+	if dot := float64(creep.vx)*float64(wantX) + float64(creep.vy)*float64(wantY); dot <= 0 {
+		t.Fatalf("creep heading (%.2f,%.2f) does not point toward the surviving guard cannon at (%.1f,%.1f) from (%.1f,%.1f)",
+			creep.vx, creep.vy, alive.x, alive.y, creep.x, creep.y)
+	}
+
+	// Same setup via the real dispatcher (dotaMarchLaneLocked with an exhausted lane) --
+	// not just the helper in isolation.
+	creep2 := &mobState{
+		id: 60011, mobIdx: inst.dota.m.HumanCreepMelee,
+		mob: gamedata.Mobs()[inst.dota.m.HumanCreepMelee],
+		x:   dead.x, y: dead.y,
+		team: dotaPlayerTeam,
+	}
+	inst.mobs[creep2.id] = creep2
+	s.dotaMarchLaneLocked(c, creep2, now)
+	if creep2.vx == 0 && creep2.vy == 0 {
+		t.Fatal("dotaMarchLaneLocked left the creep idle instead of marching it on the surviving guard cannon")
 	}
 }
 

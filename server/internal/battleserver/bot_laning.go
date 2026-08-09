@@ -61,6 +61,47 @@ func (s *Server) botFindLastHitLocked(b *botBrain, now float64) *mobState {
 	return best
 }
 
+// botCreepFightRiskyLocked reports whether fighting a creep from the bot's current
+// position (cx,cy) means standing in a living enemy structure's own attack range without
+// one of our own creeps actually soaking its aggro. A structure fires on whichever enemy
+// it finds nearest in range (dotaAcquireTargetLocked) -- "one of our creeps is somewhere
+// within botLaneEngageRadius" (ownCreepNearby, the requireCover gate above) is NOT the
+// same claim as "our creep is what the structure is actually shooting", so a solo laner
+// with a loosely-nearby wave could still be the structure's nearest target and get shot
+// down while focused entirely on a creep, never having weighed the structure's own threat
+// -- the same gap botEnemyStructureDangerLocked (bot_combat.go) already closes for a hero
+// chase, applied here to the plain laning fight-picker instead.
+func (s *Server) botCreepFightRiskyLocked(c *conn, cx, cy float32) bool {
+	hs := c.huntState
+	for _, m := range hs.mobs {
+		if m.dead || !m.structure || !m.enemyOf(c.playerTeam()) {
+			continue
+		}
+		rng := float32(m.mob.AttackRange)
+		if rng <= 0 {
+			continue // a non-shooting structure (e.g. a spring/generator) poses no threat
+		}
+		myD := dist2(cx, cy, m.x, m.y)
+		if myD > rng*rng {
+			continue
+		}
+		soaked := false
+		for _, o := range hs.mobs {
+			if o.dead || o.structure || o.team != c.playerTeam() {
+				continue
+			}
+			if dist2(o.x, o.y, m.x, m.y) < myD {
+				soaked = true
+				break
+			}
+		}
+		if !soaked {
+			return true
+		}
+	}
+	return false
+}
+
 // botFindLaneTargetLocked is the laning attack-target picker: a guaranteed last hit first,
 // else the nearest enemy creep worth trading with, else an enemy structure in reach --
 // gated on requireCover (our own creep wave standing here to soak its aggro) for a solo
@@ -91,6 +132,10 @@ func (s *Server) botFindLaneTargetLocked(b *botBrain, now float64, radius float6
 		}
 	}
 	if bestCreep != nil {
+		if requireCover && s.botCreepFightRiskyLocked(c, cx, cy) {
+			return nil // a live enemy structure is shooting from where we're standing, and
+			// none of our own creeps are between us and it -- see botCreepFightRiskyLocked.
+		}
 		return bestCreep
 	}
 	if requireCover && !ownCreepNearby {
@@ -153,6 +198,73 @@ func (s *Server) botConsiderWaveClearAbilityLocked(b *botBrain, now float64) {
 			return
 		}
 	}
+}
+
+// botHarassEngageRadius bounds how far outside a genuine hero-fight commitment a laning/
+// roaming bot will still poke a ready single-target ability at a visible enemy hero --
+// short enough to be a safe poke from the bot's own current position, not a step toward
+// the fuller engagement botPickEngageTargetLocked gates on headcount/HP for.
+const botHarassEngageRadius = 10.0
+
+// botConsiderHarassAbilityLocked casts a ready single-target offensive ability (CC or
+// damage; see botOffensiveOpPriority) at a nearby enemy hero encountered while laning or
+// roaming, WITHOUT the full hero-fight commitment botCombatTickLocked/
+// botPickEngageTargetLocked gates on (ally/enemy headcount, HP>50% when alone). Those
+// single-target actives are deliberately excluded from botConsiderWaveClearAbilityLocked
+// ("saved for hero fights"), but a genuine hero fight is rare -- most of a match is spent
+// laning/farming (measured: one real hero fight in an entire 9-minute match), so a slot
+// with a near-always-ready cooldown otherwise sits completely unused for the whole game.
+// This is a low-commitment poke, not an engage: it never issues a move or attack order,
+// only a cast, and skips entirely when the target is inside a living enemy structure's
+// kill zone (no reason to fish for a trade there). Reports whether it acted.
+func (s *Server) botConsiderHarassAbilityLocked(b *botBrain, now float64) bool {
+	c, hs := b.c, b.c.huntState
+	cx, cy := c.posAtLocked(float32(now))
+	var target *conn
+	bestD := math.Inf(1)
+	for _, e := range botLivingEnemyHeroes(c, now) {
+		ex, ey := e.posAtLocked(float32(now))
+		if d := math.Hypot(float64(ex-cx), float64(ey-cy)); d <= botHarassEngageRadius && d < bestD {
+			bestD, target = d, e
+		}
+	}
+	if target == nil {
+		return false
+	}
+	tx, ty := target.posAtLocked(float32(now))
+	if s.botEnemyStructureDangerLocked(c, tx, ty) {
+		return false
+	}
+	bestSlot, bestP := 0, -1
+	for slot := 1; slot <= 4; slot++ {
+		if !s.botAbilityReadyLocked(hs, slot, now) {
+			continue
+		}
+		def := hs.skillDef(slot)
+		if def.AoERadius > 0 {
+			continue // AoE actives are botConsiderWaveClearAbilityLocked's job
+		}
+		dist := float64(def.Distance)
+		if dist <= 0 {
+			dist = 6
+		}
+		if bestD > dist {
+			continue // enemy hero is outside this ability's own cast range
+		}
+		if p := botOffensiveOpPriority(def); p > bestP {
+			bestP, bestSlot = p, slot
+		}
+	}
+	if bestSlot == 0 || bestP <= 0 {
+		return false
+	}
+	def := hs.skillDef(bestSlot)
+	if def.Target == "" || def.Target == "SELF" {
+		s.startSkillOrderLocked(c, bestSlot, 0, 0, 0, false)
+	} else {
+		s.startSkillOrderLocked(c, bestSlot, 0, tx, ty, true)
+	}
+	return true
 }
 
 // botSkillHasOp reports whether a skill's op list includes at least one op of kind k.
@@ -228,15 +340,16 @@ func botLaneFrontLocked(c *conn, lane []gamedata.Vec2) (float32, float32, bool) 
 // with abilities when it pays off, last-hit or trade, else walk to the lane.
 func (s *Server) botLaneTickLocked(b *botBrain, now float64) {
 	c, hs := b.c, b.c.huntState
-	if s.botShouldRetreatLocked(b, now) {
-		hx, hy := botHomeLocked(c)
-		s.botMoveTowardLocked(b, hx, hy, now)
-		return
-	}
 	if s.botConsiderHealLocked(b, now) {
 		return
 	}
+	if s.botShouldRetreatLocked(b, now) {
+		hx, hy := s.botRetreatPointLocked(b, now)
+		s.botMoveTowardLocked(b, hx, hy, now)
+		return
+	}
 	s.botConsiderWaveClearAbilityLocked(b, now)
+	s.botConsiderHarassAbilityLocked(b, now)
 	if hs.attackTarget != 0 {
 		return // already swinging at something; let the timer chain run
 	}

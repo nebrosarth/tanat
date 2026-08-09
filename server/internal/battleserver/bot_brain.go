@@ -1,5 +1,10 @@
 package battleserver
 
+import (
+	"math"
+	"sort"
+)
+
 // The bot "mind": a small phase state machine (laning -> roam -> group/push) plus a
 // per-tick decision pass. Every decision is expressed by calling the SAME ...Locked entry
 // points a real client's packets drive (moveToLocked, startAttackLocked,
@@ -29,9 +34,9 @@ type botBrain struct {
 	c    *conn
 	slot int
 
-	// lane is this bot's default lane index into gamedata.DotaMap.Lanes, assigned once
-	// at spawn (assignBotLane) so the team's 5 bots spread roughly 2/1/2 instead of
-	// piling onto one lane -- see the constant's doc comment.
+	// lane is this bot's default lane index into gamedata.DotaMap.Lanes. It starts from
+	// assignBotLane and may be rebalanced when a real teammate never leaves base, so the
+	// active roster keeps the intended 2/1/2 spread instead of reserving an empty slot.
 	lane int
 
 	phase       botPhase
@@ -46,7 +51,24 @@ type botBrain struct {
 	// safe again -- see botShouldRetreatLocked. Latched (not re-evaluated from scratch
 	// every tick) so a bot doesn't oscillate exactly at the HP threshold.
 	retreating bool
+
+	// hpHistory is a short ring of (t, hpFrac) samples taken every world tick (200ms) by
+	// botRecordHPLocked -- see botCheckHPCrashLocked's doc comment for why this needs
+	// finer granularity than the 0.3s think cadence.
+	hpHistory [hpHistoryLen]hpSample
+	hpHistIdx int
 }
+
+// hpSample is one botBrain.hpHistory entry.
+type hpSample struct {
+	t    float64
+	frac float64
+}
+
+// hpHistoryLen: ~1.2s of samples at the 200ms world tick, comfortably spans one full
+// botThinkInterval (0.3s) window so a burst that unfolds entirely inside a single think
+// interval still leaves a trail botCheckHPCrashLocked can see.
+const hpHistoryLen = 6
 
 // newBotBrain builds a fresh bot mind and assigns its default lane from its ordinal
 // position on its own side (0-based: the 1st, 2nd, 3rd... bot/player to take that side).
@@ -61,6 +83,67 @@ var botLanePattern = []int{0, 2, 1, 0, 2}
 
 func assignBotLane(sideOrdinal int) int {
 	return botLanePattern[sideOrdinal%len(botLanePattern)]
+}
+
+const (
+	botHumanLaneGrace      = 25.0
+	botLaneRebalanceEvery  = 5.0
+	botHumanLeftBaseRadius = 10.0
+)
+
+// botRebalanceLanesLocked reapplies the team's 2/1/2 pattern after the opening grace
+// period, but only reserves pattern slots for real players who have actually left base.
+// Once a player has left, they stay active for lane accounting even when they later return
+// to heal; this prevents assignments oscillating on every fountain visit.
+func (s *Server) botRebalanceLanesLocked(inst *huntInstance, now float64) {
+	d := inst.dota
+	if d == nil || now < d.nextLaneRebalanceAt {
+		return
+	}
+	d.nextLaneRebalanceAt = now + botLaneRebalanceEvery
+	if d.laneActiveHumans == nil {
+		d.laneActiveHumans = map[int32]bool{}
+	}
+
+	for _, mem := range inst.members {
+		if mem.huntState == nil {
+			continue
+		}
+		if _, isBot := inst.bots[mem.objID]; isBot {
+			continue
+		}
+		mx, my := mem.posAtLocked(float32(now))
+		hx, hy := botHomeLocked(mem)
+		if dist2(mx, my, hx, hy) > botHumanLeftBaseRadius*botHumanLeftBaseRadius {
+			d.laneActiveHumans[mem.objID] = true
+		}
+	}
+
+	for _, team := range []int32{dotaTeamHuman, dotaTeamElf} {
+		activeHumans := 0
+		for _, mem := range inst.members {
+			if mem.huntState == nil || mem.playerTeam() != team {
+				continue
+			}
+			if _, isBot := inst.bots[mem.objID]; isBot {
+				continue
+			}
+			if now-d.startedAt < botHumanLaneGrace || d.laneActiveHumans[mem.objID] {
+				activeHumans++
+			}
+		}
+
+		var bots []*botBrain
+		for _, brain := range inst.bots {
+			if brain.c != nil && brain.c.playerTeam() == team {
+				bots = append(bots, brain)
+			}
+		}
+		sort.Slice(bots, func(i, j int) bool { return bots[i].slot < bots[j].slot })
+		for i, brain := range bots {
+			brain.lane = assignBotLane(activeHumans + i)
+		}
+	}
 }
 
 // botTickLocked is the per-bot entry point, called once per world tick (200ms) from
@@ -86,6 +169,24 @@ func (s *Server) botTickLocked(b *botBrain, now float64) {
 	// it for up to botThinkInterval.
 	s.botSpendSkillPointLocked(b)
 	s.botBuyItemsLocked(b, now)
+	s.botRecordHPLocked(b, now)
+	s.botRebalanceLanesLocked(c.inst, now)
+
+	// A burst of damage (a tower+wave combo, or a hero gank) can blow straight through
+	// botRetreatHPFrac's flat threshold faster than the next botThinkInterval
+	// reassessment would ever run -- measured live: a bot took 90%+ of its max HP in
+	// under 1.2s and never once evaluated retreat until it was already dead. This check
+	// runs every world tick specifically so the reaction isn't bottlenecked on think
+	// cadence. It only starts the recovery state; once latched, the regular think path
+	// remains reachable so heals can fire and safe-HP hysteresis can clear it again.
+	if s.botCheckHPCrashLocked(b, now) {
+		if s.botConsiderHealLocked(b, now) {
+			return
+		}
+		hx, hy := s.botRetreatPointLocked(b, now)
+		s.botMoveTowardLocked(b, hx, hy, now)
+		return
+	}
 
 	if now < b.nextThinkAt {
 		return
@@ -229,11 +330,81 @@ func (s *Server) botShouldRetreatLocked(b *botBrain, now float64) bool {
 	return b.retreating
 }
 
-// botHomeLocked is the bot's own base spawn -- the retreat destination.
+// botRecordHPLocked appends this tick's HP fraction to the bot's short rolling history.
+// Called every world tick (200ms) from botTickLocked, NOT gated behind botThinkInterval,
+// so botCheckHPCrashLocked has a trail to work from even when an entire burst unfolds
+// inside one 0.3s think window.
+func (s *Server) botRecordHPLocked(b *botBrain, now float64) {
+	b.hpHistIdx = (b.hpHistIdx + 1) % hpHistoryLen
+	b.hpHistory[b.hpHistIdx] = hpSample{t: now, frac: botHPFrac(b.c.huntState, now)}
+}
+
+// botHPCrashFrac/hpCrashWindow: losing at least this much of max HP within this many
+// seconds counts as burst damage worth reacting to immediately, even above
+// botRetreatHPFrac's flat threshold -- see botCheckHPCrashLocked.
+const (
+	botHPCrashFrac = 0.25
+	hpCrashWindow  = 1.0
+)
+
+// botCheckHPCrashLocked reports whether HP has dropped by at least botHPCrashFrac within
+// the last hpCrashWindow seconds: a tower-plus-wave combo or a hero gank that would
+// otherwise blow straight through botRetreatHPFrac's flat 30% floor before the next
+// botThinkInterval reassessment ever runs (measured live: two bots died with `retreating`
+// never latched, or latched only a fraction of a second before death, because the whole
+// burst landed inside one think interval). Latches b.retreating exactly like
+// botShouldRetreatLocked's own hysteresis, so a crash-triggered retreat still only clears
+// once HP recovers past botSafeHPFrac -- the two share one latch, not two competing ones.
+func (s *Server) botCheckHPCrashLocked(b *botBrain, now float64) bool {
+	if b.retreating {
+		return false
+	}
+	cur := botHPFrac(b.c.huntState, now)
+	for _, sample := range b.hpHistory {
+		if sample.t == 0 || now-sample.t > hpCrashWindow {
+			continue
+		}
+		if sample.frac-cur >= botHPCrashFrac {
+			b.retreating = true
+			return true
+		}
+	}
+	return false
+}
+
+// botHomeLocked is the bot's own base spawn -- the fallback retreat destination.
 func botHomeLocked(c *conn) (float32, float32) {
 	side := sideForTeam(c.playerTeam())
 	hx, hy := c.inst.dota.sideSpawn(side)
 	return float32(hx), float32(hy)
+}
+
+// botRetreatPointLocked is the recovery destination. Low HP and burst damage send the bot
+// to its fountain, where DOTA regen can lift it above botSafeHPFrac and end the retreat.
+func (s *Server) botRetreatPointLocked(b *botBrain, now float64) (float32, float32) {
+	return botHomeLocked(b.c)
+}
+
+// botDisengagePointLocked is a short tactical step-back after abandoning a chase. It
+// stays behind the friendly wave instead of turning every bad engagement into a full
+// fountain trip; recovery retreats above remain intentionally separate.
+func (s *Server) botDisengagePointLocked(b *botBrain, now float64) (float32, float32) {
+	c := b.c
+	hx, hy := botHomeLocked(c)
+	if b.lane < 0 || b.lane >= len(c.inst.dota.m.Lanes) {
+		return hx, hy
+	}
+	fx, fy, ok := botLaneFrontLocked(c, c.inst.dota.m.Lanes[b.lane])
+	if !ok || s.botEnemyStructureDangerLocked(c, fx, fy) {
+		return hx, hy
+	}
+	dx, dy := hx-fx, hy-fy
+	length := float32(math.Hypot(float64(dx), float64(dy)))
+	if length == 0 {
+		return hx, hy
+	}
+	const stepBack = float32(8)
+	return fx + dx/length*stepBack, fy + dy/length*stepBack
 }
 
 // botMoveTowardLocked issues a move order toward (tx,ty), skipping a redundant re-issue

@@ -1,6 +1,7 @@
 package battleserver
 
 import (
+	"sort"
 	"testing"
 
 	"tanatserver/internal/gamedata"
@@ -166,6 +167,88 @@ func TestBotRetreatsAtLowHP(t *testing.T) {
 	}
 }
 
+// TestBotCrashRetreatDoesNotBypassRecoveryStateMachine pins the telemetry regression:
+// once burst detection latched retreating, it used to return true forever and prevent the
+// normal think path from healing or clearing the latch at safe HP.
+func TestBotCrashRetreatDoesNotBypassRecoveryStateMachine(t *testing.T) {
+	s, human, _, cleanup := newDotaConn(t, "Avtr_Tank_Velial")
+	defer cleanup()
+	b := &botBrain{c: human, retreating: true}
+
+	human.lock()
+	defer human.unlock()
+	now := float64(s.battleTime())
+	if s.botCheckHPCrashLocked(b, now) {
+		t.Fatal("an already-latched retreat must not bypass the regular recovery think path")
+	}
+	human.huntState.hp = human.huntState.maxHPLocked(now) * botSafeHPFrac
+	if s.botShouldRetreatLocked(b, now) || b.retreating {
+		t.Fatal("retreat latch did not clear after reaching safe HP")
+	}
+}
+
+// TestBotRecoveryAlwaysHeadsToFountain ensures a friendly wave cannot trap a damaged bot
+// on the lane: lane fronts have no fountain regeneration and were the source of 200s+
+// retreats in telemetry.
+func TestBotRecoveryAlwaysHeadsToFountain(t *testing.T) {
+	s, human, inst, cleanup := newDotaConn(t, "Avtr_Tank_Velial")
+	defer cleanup()
+	b := &botBrain{c: human, lane: 0, retreating: true}
+	lane := inst.dota.m.Lanes[0]
+	wave := &mobState{id: 65150, team: dotaTeamHuman, lane: lane, laneIdx: 2, x: 50, y: 50, hp: 100}
+
+	human.lock()
+	defer human.unlock()
+	inst.mobs[wave.id] = wave
+	hx, hy := botHomeLocked(human)
+	rx, ry := s.botRetreatPointLocked(b, float64(s.battleTime()))
+	if rx != hx || ry != hy {
+		t.Fatalf("recovery point = (%.1f,%.1f), want fountain (%.1f,%.1f)", rx, ry, hx, hy)
+	}
+}
+
+// TestBotRebalancesAwayFromAFKHuman verifies that a real player still at the fountain
+// after the grace period stops reserving the first lane-pattern slot. Leaving base later
+// restores that slot and rebalances the bots once more.
+func TestBotRebalancesAwayFromAFKHuman(t *testing.T) {
+	s, human, inst, cleanup := newDotaConn(t, "Avtr_Tank_Velial")
+	defer cleanup()
+
+	human.lock()
+	defer human.unlock()
+	s.spawnDotaBotsLocked(inst, 10)
+	now := float64(s.battleTime())
+	inst.dota.startedAt = now - botHumanLaneGrace - 1
+	inst.dota.nextLaneRebalanceAt = 0
+	s.botRebalanceLanesLocked(inst, now)
+
+	var teamBots []*botBrain
+	for _, b := range inst.bots {
+		if b.c.playerTeam() == human.playerTeam() {
+			teamBots = append(teamBots, b)
+		}
+	}
+	sort.Slice(teamBots, func(i, j int) bool { return teamBots[i].slot < teamBots[j].slot })
+	for i, b := range teamBots {
+		if want := assignBotLane(i); b.lane != want {
+			t.Fatalf("AFK-human bot %d lane = %d, want %d", i, b.lane, want)
+		}
+	}
+
+	human.x += botHumanLeftBaseRadius + 5
+	human.snapT = float32(now + 1)
+	inst.dota.nextLaneRebalanceAt = 0
+	s.botRebalanceLanesLocked(inst, now+1)
+	if !inst.dota.laneActiveHumans[human.objID] {
+		t.Fatal("human was not marked lane-active after leaving base")
+	}
+	for i, b := range teamBots {
+		if want := assignBotLane(i + 1); b.lane != want {
+			t.Fatalf("active-human bot %d lane = %d, want %d", i, b.lane, want)
+		}
+	}
+}
+
 // TestBotRetreatCancelsOwnAttack: a bot that was already auto-attacking (mob or PvP) when
 // it drops to retreat HP must actually leave -- not have its own still-armed attack chase
 // walk it right back into the fight. Reported live: a low-HP bot tried to retreat and its
@@ -288,8 +371,8 @@ func TestBotBreaksOffChaseIntoEnemyStructureRange(t *testing.T) {
 	now := float64(s.battleTime())
 	acted := s.botCombatTickLocked(b, now)
 
-	if acted || human.huntState.pvpTarget != 0 {
-		t.Fatalf("bot kept chasing into its own target's structure range (pvpTarget=%d, acted=%v)",
+	if !acted || human.huntState.pvpTarget != 0 {
+		t.Fatalf("bot did not issue a tactical disengage from structure range (pvpTarget=%d, acted=%v)",
 			human.huntState.pvpTarget, acted)
 	}
 }
