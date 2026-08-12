@@ -21,6 +21,9 @@ const (
 	// every potion is a plain instant self-cast with no target/point selection.
 	// Free ids: trap anchor=900, drop chest=901 (drops.go).
 	itemUseActionProtoID int32 = 908
+	// Teleport has a target-aware prototype of its own. Human scroll targeting is
+	// intentionally not wired to DO_ACTION; bots use the server-side channel.
+	teleportActionProtoID int32 = 909
 
 	// itemBuffProtoBase anchors the per-item buff-icon proto id space (see
 	// itemBuffProtoID) -- deliberately far past every other range in use
@@ -47,6 +50,12 @@ func itemUseActionProtoDesc() string {
 	return effectProtoDesc("", "", "", "ACTIVE",
 		attrEnum("target", "")+attrEnum("targeting", "NONE")+
 			attrItem("distance", "0")+attrItem("aoeRadius", "0")+attrItem("aoeWidth", "0"))
+}
+
+func teleportActionProtoDesc() string {
+	return effectProtoDesc("", "", "", "ACTIVE",
+		attrEnum("target", "FRIEND")+attrEnum("targeting", "TARGET")+
+			attrItem("distance", "999")+attrItem("aoeRadius", "0")+attrItem("aoeWidth", "0"))
 }
 
 // potionBuffProtoDesc is a bare BUFF-type effector prototype for a potion's
@@ -85,6 +94,10 @@ func potionBuffProtoDesc(nameKey, icon string) string {
 // is an instant no-target use), mirroring how skills reference their own
 // PEffectDesc child proto.
 func itemProtoDesc(it gamedata.Item) string {
+	actionProtoID := itemUseActionProtoID
+	if it.Kind == gamedata.ItemTeleportScroll {
+		actionProtoID = teleportActionProtoID
+	}
 	return `<Proto>` +
 		`<PDesc>` +
 		`<Name value="` + xmlEsc(it.NameKey) + `"/>` +
@@ -98,7 +111,7 @@ func itemProtoDesc(it gamedata.Item) string {
 		`<Level value="1"/>` +
 		`<Article value="` + itoa(int(it.ArticleID)) + `"/>` +
 		`</PItem>` +
-		`<PTool><Action value="` + itoa(int(itemUseActionProtoID)) + `"/></PTool>` +
+		`<PTool><Action value="` + itoa(int(actionProtoID)) + `"/></PTool>` +
 		`</Proto>`
 }
 
@@ -206,6 +219,11 @@ func (s *Server) useItemLocked(c *conn, wireID int32, now float64) {
 	}
 	it, ok := gamedata.ItemByArticle(article)
 	if !ok {
+		return
+	}
+	if it.Kind == gamedata.ItemTeleportScroll {
+		// Teleport is a server-side bot action. A human cannot consume the
+		// battle-only article through the generic instant-item contract.
 		return
 	}
 	if hs.itemCooldownUntil == nil {

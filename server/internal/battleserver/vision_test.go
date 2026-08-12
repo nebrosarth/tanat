@@ -70,6 +70,73 @@ func TestDotaEnemyAvatarLeavingVisionIsHidden(t *testing.T) {
 	}
 }
 
+// Respawning is a local lifecycle event, not a fog reveal. A dead enemy that
+// returns at a distant checkpoint must stay absent from this viewer until the
+// ordinary vision pass sees the new position.
+func TestDotaRespawnDoesNotRevealHiddenEnemyAvatar(t *testing.T) {
+	s := New(session.NewStore())
+	dm := gamedata.DotaMaps()[0]
+	inst := newDotaInstance(s, dm.ID, dm.ID)
+	now := float64(s.battleTime())
+
+	human := dotaPlayerConn(t, s, inst, 1000, dotaTeamHuman, 0, 0)
+	elf := dotaPlayerConn(t, s, inst, 1001, dotaTeamElf, avatarViewRadius+200, 0)
+	elf.huntState.respawnX, elf.huntState.respawnY = elf.x, elf.y
+	elf.huntState.deadUntil = now + 1
+
+	elf.lock()
+	s.respawnPlayerLocked(elf, now)
+	elf.unlock()
+	if human.huntState.tr.index(elf.objID) >= 0 {
+		t.Fatal("enemy respawn leaked through fog before a vision pass")
+	}
+}
+
+func TestDotaGunRevealsInvisibleAvatar(t *testing.T) {
+	s := New(session.NewStore())
+	dm := gamedata.DotaMaps()[0]
+	inst := newDotaInstance(s, dm.ID, dm.ID)
+	now := float64(s.battleTime())
+
+	human := dotaPlayerConn(t, s, inst, 1000, dotaTeamHuman, 0, 0)
+	elf := dotaPlayerConn(t, s, inst, 1001, dotaTeamElf, 10, 0)
+	elf.huntState.invisibleUntil = now + 60
+
+	var gun *mobState
+	for _, m := range inst.mobs {
+		if !m.structure || m.teamVal() != dotaTeamHuman {
+			continue
+		}
+		if m.dotaRole == gamedata.DotaGun && gun == nil {
+			gun = m
+		}
+		m.dead = true
+	}
+	if gun == nil {
+		t.Fatal("precondition: no human-side gun")
+	}
+
+	human.mvMu.Lock()
+	s.dotaVisionPassLocked(inst, now)
+	human.mvMu.Unlock()
+	if human.huntState.tr.index(elf.objID) >= 0 {
+		t.Fatal("ordinary hero vision revealed an invisible enemy")
+	}
+
+	gun.dead = false
+	gun.x, gun.y = human.x, human.y
+	human.mvMu.Lock()
+	s.dotaVisionPassLocked(inst, now)
+	human.mvMu.Unlock()
+	if human.huntState.tr.index(elf.objID) < 0 {
+		t.Fatal("human-side gun did not reveal an invisible enemy")
+	}
+	if !botVisibleEnemyMemberLocked(inst, dotaTeamHuman, elf, now,
+		dotaTeamVisionSourcesLocked(inst, dotaTeamHuman, now)) {
+		t.Fatal("bot vision query did not inherit gun True Sight")
+	}
+}
+
 // TestDotaVisionHysteresisAvoidsBoundaryFlicker: a unit that just barely crosses the
 // bare reveal radius outward (but stays within the hysteresis margin) must stay
 // visible -- otherwise a unit walking the boundary line flickers CREATE_OBJECT/

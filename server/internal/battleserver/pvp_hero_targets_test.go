@@ -64,11 +64,57 @@ func TestPvpPullMovesEnemyHeroCloser(t *testing.T) {
 	human.lock()
 	defer human.unlock()
 	ops := []gamedata.Op{{Kind: gamedata.OpPull, Radius: 6}}
-	s.applyOpsLocked(human, ops, opCtx{slot: 1, level: 1, target: dotaHeroShadowLocked(elf, now)}, now)
+	s.applyOpsLocked(human, ops, opCtx{slot: 1, level: 1, target: dotaHeroShadowLocked(human, elf, now)}, now)
 
 	postDist := math.Hypot(float64(elf.x-human.x), float64(elf.y-human.y))
 	if postDist >= preDist {
 		t.Fatalf("enemy hero distance from caster = %.2f after OpPull, want less than the starting %.2f", postDist, preDist)
+	}
+}
+
+// TestPvpInvisibleHeroTargetRequiresVision pins the server-side target gate used by
+// direct, AoE and line skills: an invisible hero is not represented by a shadow until
+// the caster's vision reaches it. A DotaGun is true sight; an ordinary structure is
+// not, even though structures themselves remain visible through the fog.
+func TestPvpInvisibleHeroTargetRequiresVision(t *testing.T) {
+	s, human, inst, cleanup := newDotaConn(t, "Avtr_Tank_Velial")
+	defer cleanup()
+	now := float64(s.battleTime())
+	elf := dotaPlayerConn(t, s, inst, 1001, dotaTeamElf, human.x+250, human.y+250)
+	elf.huntState.invisibleUntil = now + 60
+
+	human.lock()
+	defer human.unlock()
+	if got := dotaHeroShadowLocked(human, elf, now); got != nil {
+		t.Fatal("ordinary hero vision exposed an invisible enemy to PvP targeting")
+	}
+
+	var gun, ordinary *mobState
+	for _, m := range inst.mobs {
+		if !m.structure || m.teamVal() != dotaTeamHuman {
+			continue
+		}
+		if m.dotaRole == gamedata.DotaGun && gun == nil {
+			gun = m
+		}
+		if m.dotaRole != gamedata.DotaGun && ordinary == nil {
+			ordinary = m
+		}
+		m.dead = true
+	}
+	if gun == nil || ordinary == nil {
+		t.Fatal("precondition: missing human-side gun or ordinary structure")
+	}
+	ordinary.dead = false
+	ordinary.x, ordinary.y = elf.x, elf.y
+	if got := dotaHeroShadowLocked(human, elf, now); got != nil {
+		t.Fatal("an ordinary structure incorrectly granted true sight for PvP targeting")
+	}
+
+	gun.dead = false
+	gun.x, gun.y = elf.x, elf.y
+	if got := dotaHeroShadowLocked(human, elf, now); got == nil {
+		t.Fatal("a nearby DotaGun did not grant true sight for PvP targeting")
 	}
 }
 
@@ -157,16 +203,65 @@ func TestRootedHeroChaseDoesNotMove(t *testing.T) {
 
 	elf.lock()
 	now := float64(s.battleTime())
-	elf.huntState.st.rootUntil = now + 5
 	startX, startY := elf.x, elf.y
+	// The CC must stop an already-running leg too; testing only a fresh chase
+	// would miss the arrival-timer path that used to keep walking on the client.
+	elf.moveToLocked(s, startX+50, startY)
+	if !elf.hasDest {
+		elf.unlock()
+		t.Fatal("setup: hero did not start a movement leg")
+	}
+	elf.huntState.st.rootUntil = now + 5
 	elf.chaseMoveLocked(s, startX+50, startY) // e.g. armPvpAttackTimer's own re-arm chasing a target
+	rootStopped := !elf.hasDest && elf.vx == 0 && elf.vy == 0
+	// Stun uses the same movement gate and must also reject a brand-new route.
+	elf.huntState.st.rootUntil = 0
+	elf.huntState.st.stunUntil = now + 5
+	elf.moveToLocked(s, startX+50, startY)
+	stunStopped := !elf.hasDest && elf.vx == 0 && elf.vy == 0
 	elf.unlock()
 
-	if elf.hasDest {
-		t.Fatal("rooted hero has a destination after chaseMoveLocked -- server-driven movement ignored the root")
+	if !rootStopped {
+		t.Fatal("rooted hero kept an existing movement leg after chaseMoveLocked -- server-driven movement ignored the root")
 	}
-	if elf.x != startX || elf.y != startY {
+	if !stunStopped {
+		t.Fatal("stunned hero accepted a new movement leg -- server movement gate ignored the stun")
+	}
+	if math.Hypot(float64(elf.x-startX), float64(elf.y-startY)) > 0.01 {
 		t.Fatalf("rooted hero moved to (%.1f,%.1f), want to stay at (%.1f,%.1f)", elf.x, elf.y, startX, startY)
+	}
+}
+
+// TestRootedBotDecisionDoesNotReissueMovement covers the bot-only movement path.
+// Unlike a real player's MOVE_PLAYER handler, botMoveTowardLocked calls moveToLocked
+// directly, so a rooted retreating bot could previously start walking again on its next
+// think tick even though the root helper had already stopped its current leg.
+func TestRootedBotDecisionDoesNotReissueMovement(t *testing.T) {
+	s, caster, inst, cleanup := newDotaConn(t, "Avtr_Tank_Velial")
+	defer cleanup()
+	victim := dotaPlayerConn(t, s, inst, 1001, dotaTeamElf, caster.x+2, caster.y)
+	b := &botBrain{c: victim, lane: 0, phase: botPhaseLane}
+	now := float64(s.battleTime())
+
+	victim.lock()
+	// Put the bot on an active retreat leg before the enemy spell lands.
+	s.botMoveTowardLocked(b, victim.x+40, victim.y, now)
+	if !victim.hasDest {
+		t.Fatal("setup: bot did not start a movement leg")
+	}
+	victim.unlock()
+
+	// This is the actual OpRoot target path used by PlusMinus skill 2.
+	caster.lock()
+	s.dotaRootHeroLocked(caster, victim, now+0.1, 3)
+	caster.unlock()
+
+	// The next brain decision must not overwrite the root with a new retreat order.
+	victim.lock()
+	defer victim.unlock()
+	s.botMoveTowardLocked(b, victim.x+80, victim.y, now+0.2)
+	if victim.hasDest || victim.vx != 0 || victim.vy != 0 {
+		t.Fatalf("rooted bot kept moving: hasDest=%v velocity=(%.2f,%.2f)", victim.hasDest, victim.vx, victim.vy)
 	}
 }
 

@@ -32,11 +32,25 @@ const heroShadowRadius = 0.6
 
 // dotaHeroShadowLocked builds a transient mobState standing in for mem's avatar, usable
 // anywhere a *mobState target is expected (damage/status ops), or nil if mem cannot
-// currently be targeted (dead, or hidden by an active invisibility). Caller holds the
-// world lock. The shadow is never inserted into inst.mobs -- see the file doc comment.
-func dotaHeroShadowLocked(mem *conn, now float64) *mobState {
+// currently be targeted (dead, or hidden by an active invisibility). Invisibility is
+// checked against the attacker's current Dota vision, so a nearby gun can reveal and
+// target the hero while an ordinary structure cannot. Caller holds the world lock. The
+// shadow is never inserted into inst.mobs -- see the file doc comment.
+func dotaHeroShadowLocked(viewer, mem *conn, now float64) *mobState {
+	if viewer == nil || viewer.inst == nil || mem == nil {
+		return nil
+	}
 	hs := mem.huntState
-	if hs == nil || hs.deadUntil > 0 || now < hs.invisibleUntil {
+	if hs == nil || hs.deadUntil > 0 {
+		return nil
+	}
+	if now < hs.invisibleUntil {
+		sources := dotaTeamVisionSourcesLocked(viewer.inst, viewer.playerTeam(), now)
+		if !dotaVisibleEnemyMemberLocked(viewer.inst, viewer.playerTeam(), mem, now, sources, false) {
+			return nil
+		}
+	}
+	if mem.playerTeam() == viewer.playerTeam() {
 		return nil
 	}
 	px, py := mem.posAtLocked(float32(now))
@@ -75,7 +89,7 @@ func (s *Server) dotaLivingEnemyHeroShadowsLocked(c *conn) []*mobState {
 		if mem == c || mem.huntState == nil || mem.playerTeam() == actingTeam {
 			continue
 		}
-		if sh := dotaHeroShadowLocked(mem, now); sh != nil {
+		if sh := dotaHeroShadowLocked(c, mem, now); sh != nil {
 			out = append(out, sh)
 		}
 	}
@@ -131,7 +145,7 @@ func (s *Server) dotaEnemyHeroShadowLocked(c *conn, objID int32, now float64) *m
 	if mem == nil || mem.huntState == nil || mem.playerTeam() == c.playerTeam() {
 		return nil
 	}
-	return dotaHeroShadowLocked(mem, now)
+	return dotaHeroShadowLocked(c, mem, now)
 }
 
 // ---- CC ops on a hero shadow: write straight to the real huntState.st, not the shadow ----
@@ -156,11 +170,7 @@ func (s *Server) ensureHeroStatusFxLocked(c *conn, mem *conn, slot *int32, fx st
 func (s *Server) freezeStunnedHeroLocked(mem *conn, now float64) {
 	s.stopAttackLocked(mem, true)
 	s.cancelOrderLocked(mem)
-	mem.stopArrivalLocked()
-	mem.hasDest = false
-	cx, cy := mem.posAtLocked(float32(now))
-	mem.x, mem.y, mem.vx, mem.vy, mem.snapT = cx, cy, 0, 0, float32(now)
-	mem.sendPosLocked(s, cx, cy, 0, 0, float32(now))
+	mem.stopMovementLocked(s, now)
 }
 
 // dotaStunHeroLocked applies OpStun to an enemy hero.
@@ -177,11 +187,7 @@ func (s *Server) dotaRootHeroLocked(c *conn, mem *conn, now, dur float64) {
 	hs := mem.huntState
 	hs.st.rootUntil = math.Max(hs.st.rootUntil, now+dur)
 	s.ensureHeroStatusFxLocked(c, mem, &hs.st.rootFx, "StunEffect")
-	mem.stopArrivalLocked()
-	mem.hasDest = false
-	cx, cy := mem.posAtLocked(float32(now))
-	mem.x, mem.y, mem.vx, mem.vy, mem.snapT = cx, cy, 0, 0, float32(now)
-	mem.sendPosLocked(s, cx, cy, 0, 0, float32(now))
+	mem.stopMovementLocked(s, now)
 }
 
 // dotaSlowHeroLocked applies OpSlow to an enemy hero -- the player-side twin of the
@@ -264,7 +270,7 @@ func (s *Server) dotaKnockbackHeroLocked(c *conn, mem *conn, dist float64, now f
 	mem.snapT = float32(now)
 	mem.sendPosLocked(s, fromX, fromY, float32(ux*knockbackSpeed), float32(uy*knockbackSpeed), float32(now))
 
-	time.AfterFunc(time.Duration(dur*float64(time.Second)), func() {
+	dotaSimulationAfter(time.Duration(dur*float64(time.Second)), func() {
 		mem.lock()
 		defer mem.unlock()
 		if mem.huntState == nil || mem.huntState.closed || mem.hasDest {

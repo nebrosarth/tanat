@@ -725,8 +725,9 @@ var mobs = []Mob{
 	// Mnst_Elf_Creep1..3). Creep1 = melee footman, Creep2 = ranged (ships a projectile);
 	// Creep3 is the siege unit (Катапультозавр / Осадный медведь) and is not rostered.
 	// Modest HP so a hero clears a wave but a lone hero can't solo a whole lane of
-	// cannons+creeps instantly. XP/coins low (lane farm, not boss bounty). Team is set
-	// per battle by the DOTA instance, not here.
+	// cannons+creeps instantly. XP is calibrated from measured «Штурм» progression:
+	// 72 per melee and 84 per ranged troop make a complete 3+1 wave worth 300 XP.
+	// Coins remain the small lane-farm reward; team is set per battle by the DOTA instance.
 	//
 	// These four were the ONLY roster entries whose name AND icon were both invented:
 	// the IDS_Mnst_* keys were never in the locale, and the icons never lived under
@@ -736,13 +737,13 @@ var mobs = []Mob{
 	// nameless and blank. The real keys and the real Gui/Creeps/Icons folder are below;
 	// side naming is the client's own: Sobor = Human, Apostate = Elf.
 	{NameKey: "IDS_DotaCreepMeleeSobor_Name", Prefab: "Mnst_Human_Creep1_prop01", Icon: "Gui/Creeps/Icons/Mnst_Sobor_Creep1",
-		Health: 200, DmgMin: 14, DmgMax: 20, AttackSpeed: 0.9, Speed: 4.0, XP: 12, Coins: 4, CollisionRadius: 0.6},
+		Health: 200, DmgMin: 14, DmgMax: 20, AttackSpeed: 0.9, Speed: 4.0, XP: 72, Coins: 4, CollisionRadius: 0.6},
 	{NameKey: "IDS_DotaCreepRangeSobor_Name", Prefab: "Mnst_Human_Creep2_prop01", Icon: "Gui/Creeps/Icons/Mnst_Sobor_Creep2",
-		Health: 130, DmgMin: 16, DmgMax: 22, AttackSpeed: 0.8, Speed: 4.0, XP: 14, Coins: 5, AttackRange: 9.0, CollisionRadius: 0.55},
+		Health: 130, DmgMin: 16, DmgMax: 22, AttackSpeed: 0.8, Speed: 4.0, XP: 84, Coins: 5, AttackRange: 9.0, CollisionRadius: 0.55},
 	{NameKey: "IDS_DotaCreepMeleeApostate_Name", Prefab: "Mnst_Elf_Creep1_prop01", Icon: "Gui/Creeps/Icons/Mnst_Apostate_Creep1",
-		Health: 200, DmgMin: 14, DmgMax: 20, AttackSpeed: 0.9, Speed: 4.0, XP: 12, Coins: 4, CollisionRadius: 0.6},
+		Health: 200, DmgMin: 14, DmgMax: 20, AttackSpeed: 0.9, Speed: 4.0, XP: 72, Coins: 4, CollisionRadius: 0.6},
 	{NameKey: "IDS_DotaCreepRangeApostate_Name", Prefab: "Mnst_Elf_Creep2_prop01", Icon: "Gui/Creeps/Icons/Mnst_Apostate_Creep2",
-		Health: 130, DmgMin: 16, DmgMax: 22, AttackSpeed: 0.8, Speed: 4.0, XP: 14, Coins: 5, AttackRange: 9.0, CollisionRadius: 0.55},
+		Health: 130, DmgMin: 16, DmgMax: 22, AttackSpeed: 0.8, Speed: 4.0, XP: 84, Coins: 5, AttackRange: 9.0, CollisionRadius: 0.55},
 }
 
 // Boss ability kits, one entry per distinctive VFX prefab in each boss bundle

@@ -20,7 +20,6 @@ package battleserver
 import (
 	"log"
 	"math"
-	"time"
 
 	"tanatserver/internal/amf"
 	"tanatserver/internal/battleproto"
@@ -116,11 +115,24 @@ type dotaState struct {
 	nextLaneRebalanceAt float64
 	laneActiveHumans    map[int32]bool
 
+	// teamPlans is rebuilt from the live world once before each member loop. The
+	// shared plan makes bot behavior independent of member map iteration order.
+	teamPlans            map[int32]botTeamPlan
+	teamPlanTelemetryKey map[int32]string
+
 	// telemetry is this match's optional recording session (see telemetry.go),
 	// non-nil only when TANAT_BOT_TELEMETRY is set. nil-safe on every method, so
 	// every call site can use it unconditionally without an extra guard.
 	telemetry *telemetryRecorder
+
+	// earlyCreepXPMisses is an acceptance metric for bot farm coverage. It counts
+	// lane-creep deaths during the first four simulated minutes for which no
+	// living teammate received proximity XP. It is updated at the authoritative
+	// XP-grant boundary, never inferred from an intended attack order.
+	earlyCreepXPMisses int
 }
+
+const dotaEarlyCreepXPMissWindow = 4 * 60.0
 
 // telemetryMatchTimeLocked is elapsed match time (dotaState.startedAt to now), the "t"
 // every telemetry event line carries.
@@ -243,12 +255,14 @@ func newDotaInstance(s *Server, id, mapID int32) *huntInstance {
 		bots:           map[int32]*botBrain{},
 	}
 	d := &dotaState{
-		m:                dm,
-		nextSide:         gamedata.DotaSideHuman, // the first (or solo) joiner fights for «Собор»
-		nextWave:         map[int32]float64{},
-		nextCreep:        dotaCreepIDBase,
-		startedAt:        float64(s.battleTime()),
-		laneActiveHumans: map[int32]bool{},
+		m:                    dm,
+		nextSide:             gamedata.DotaSideHuman, // the first (or solo) joiner fights for «Собор»
+		nextWave:             map[int32]float64{},
+		nextCreep:            dotaCreepIDBase,
+		startedAt:            float64(s.battleTime()),
+		laneActiveHumans:     map[int32]bool{},
+		teamPlans:            map[int32]botTeamPlan{},
+		teamPlanTelemetryKey: map[int32]string{},
 	}
 	if dir := botTelemetryDir(); dir != "" {
 		d.telemetry = newTelemetryRecorder(dir, mapID)
@@ -683,6 +697,72 @@ func (s *Server) dotaCheckWinLocked(rep *conn, now float64) {
 }
 
 // dotaEndLocked marks the match ended and broadcasts BATTLE_END{id: winner team}.
+// dotaFreezeLocked is the single authoritative match-end barrier. It tears down
+// every live player/unit action before the result scene is shown; the ticker's
+// ended guard then leaves that frozen scene untouched.
+func (s *Server) dotaFreezeLocked(inst *huntInstance, now float64) {
+	if inst == nil {
+		return
+	}
+	rep := repForInstanceLocked(inst)
+	for _, mem := range inst.members {
+		hs := mem.huntState
+		if hs == nil {
+			continue
+		}
+		if brain := inst.bots[mem.objID]; brain != nil {
+			s.cancelBotTeleportAtLocked(brain, "match_end", now)
+			brain.macroAssignment = botMacroAssignment{Mode: botMacroRecover, Lane: -1, Reason: "match_end"}
+		}
+		s.cancelOrderLocked(mem)
+		s.stopAttackLocked(mem, false)
+		s.stopPvpAttackLocked(mem, false)
+		mem.stopArrivalLocked()
+		x, y := mem.posAtLocked(float32(now))
+		mem.x, mem.y, mem.vx, mem.vy, mem.snapT = x, y, 0, 0, float32(now)
+		mem.hasDest = false
+		hs.castLockUntil, hs.dashUntil = 0, 0
+		for _, ch := range hs.channels {
+			for _, uid := range ch.fxUIDs {
+				s.fxEndLocked(mem, uid)
+			}
+			if ch.holdsTarget && ch.target != 0 {
+				if target := hs.mobs[ch.target]; target != nil && !target.dead {
+					target.st.rootUntil = math.Min(target.st.rootUntil, now)
+					target.st.silenceUntil = math.Min(target.st.silenceUntil, now)
+					target.st.atkSlowUntil = math.Min(target.st.atkSlowUntil, now)
+				}
+			}
+		}
+		hs.channels = nil
+		// Deferred casts/hits cannot mature after the result is authoritative.
+		hs.payloads = nil
+		hs.actionDones = nil
+		mem.sendPosLocked(s, x, y, 0, 0, float32(now))
+	}
+	for _, m := range inst.mobs {
+		if m == nil || rep == nil {
+			continue
+		}
+		s.closeMobSwingLocked(rep, m, now)
+		m.resetInFlight()
+		m.dtarget = 0
+		m.pf = pathState{}
+		m.vx, m.vy = 0, 0
+		s.broadcastPosLocked(rep, m.id, m.x, m.y, 0, 0, float32(now))
+	}
+}
+
+// repForInstanceLocked returns any member for shared-object fan-out.
+func repForInstanceLocked(inst *huntInstance) *conn {
+	for _, mem := range inst.members {
+		if mem != nil {
+			return mem
+		}
+	}
+	return nil
+}
+
 func (s *Server) dotaEndLocked(rep *conn, winner int32, now float64) {
 	d := rep.inst.dota
 	if d.ended {
@@ -690,6 +770,7 @@ func (s *Server) dotaEndLocked(rep *conn, winner int32, now float64) {
 	}
 	d.ended = true
 	d.winner = winner
+	s.dotaFreezeLocked(rep.inst, now)
 	log.Printf("battle: «Штурм» room=%d ended, winner team=%d", rep.inst.id, winner)
 	for _, mem := range rep.inst.members {
 		s.push(mem, battleproto.CmdBattleEnd, amf.NewArray().Set("id", winner))
@@ -855,6 +936,7 @@ func (s *Server) spawnCreepWaveLocked(rep *conn, x, z float64, side gamedata.Dot
 			hasProj: mob.AttackRange > 0,
 		}
 		rep.inst.mobs[cm.id] = cm
+		s.telemetryRecordCreepSpawnLocked(rep, cm, now)
 		// Render on the creep's own side immediately; the enemy only gets it once
 		// dotaVisionPassLocked (vision.go) finds it within vision, on a later tick -- the
 		// same fog delay a fresh wave gets in Dota. shown=true is still set here (same
@@ -1190,18 +1272,30 @@ func (s *Server) dotaDamageLocked(rep *conn, victim *mobState, dmg float64, atta
 	}
 	victim.hp = 0
 	victim.dead = true
+	var killer *conn
+	if rep.inst != nil {
+		killer = rep.inst.members[attackerID]
+	}
+	if !victim.structure {
+		s.telemetryRecordCreepDeathByIDLocked(rep, victim, attackerID, killer, now)
+	}
 	s.broadcastObjLocked(rep, victim.id, battleproto.CmdOnKill, amf.NewArray().
 		Set("killer", attackerID).Set("id", victim.id))
 	s.broadcastStatLocked(rep, victim.id, syncHealth, 0, float32(now))
 	if !victim.structure {
 		if attacker := rep.inst.mobs[attackerID]; attacker != nil && attacker.teamVal() != victim.teamVal() {
-			s.grantDotaProximityXPLocked(rep, attacker.teamVal(), victim.xpReward(), victim.x, victim.y)
+			s.grantDotaProximityXPLockedMeta(rep, attacker.teamVal(), victim.xpReward(), victim.x, victim.y, dotaXPGrantMeta{
+				source: "creep", sourceID: victim.id,
+			})
 		}
 	}
 	// A creep/tower can land the final blow on an enemy cannon/barracks; credit the «Штурм» PvP
 	// tasks here too, or a team objective met by a friendly creep would strand (or falsely FAIL,
 	// for a timed task) the player's task. The player-landed twin is in hitMobFlagsLocked.
 	s.creditPvpStructureKillLocked(rep.inst, victim)
+	if victim.structure && rep.inst.dota.telemetry != nil {
+		s.telemetryRecordStructureDestroyLocked(rep.inst.dota.telemetry, victim, killer, rep.inst.dota.telemetryMatchTimeLocked(now))
+	}
 	if victim.altar {
 		s.dotaEndLocked(rep, teamForVictorOver(victim.team), now)
 	}
@@ -1220,7 +1314,7 @@ func teamForVictorOver(loserTeam int32) int32 {
 // dotaScheduleCorpseLocked removes a dead structure/creep from every client and the
 // mob set after the corpse-display window.
 func (s *Server) dotaScheduleCorpseLocked(inst *huntInstance, mobID int32) {
-	time.AfterFunc(corpseDeleteDelay, func() {
+	dotaSimulationAfter(corpseDeleteDelay, func() {
 		inst.mu.Lock()
 		defer inst.mu.Unlock()
 		if inst.closed {

@@ -47,8 +47,8 @@ func TestOnDamagedProcsFlagged(t *testing.T) {
 		// атакующий теряет скорость атаки»), so the block and the slow are now a single
 		// OpBlockHit -- which is on-damaged and basic-attack-only by construction. See
 		// TestEdiliaForgetfulPollenBlocksAndSlows.
-		"Avtr_HK_Tangren": 2, // «Контратака»: pass-7, chance-gated own-attack counter
-		"Avtr_Sp_Neirofim":     2, // «Обращение энергии»: pass-8, SkillOnly reactive heal+mana+nova
+		"Avtr_HK_Tangren":  2, // «Контратака»: pass-7, chance-gated own-attack counter
+		"Avtr_Sp_Neirofim": 2, // «Обращение энергии»: pass-8, SkillOnly reactive heal+mana+nova
 	}
 	for prefab, slot := range want {
 		sk := skillOf(t, prefab, slot)
@@ -146,9 +146,9 @@ func TestNeirofimDevoursMagic(t *testing.T) {
 	}
 }
 
-// TestCcConventionRootSilence: the roll/short-circuit skills that «обездвиживают и не дают
-// использовать способности» use OpRoot+OpSilence, not a full OpStun.
-func TestCcConventionRootSilence(t *testing.T) {
+// TestPlusMinusShortCircuitIsAStun: the second skill must be a real stun, not
+// the weaker root+silence approximation.
+func TestPlusMinusShortCircuitIsAStun(t *testing.T) {
 	for _, tc := range []struct {
 		prefab string
 		slot   int
@@ -156,11 +156,11 @@ func TestCcConventionRootSilence(t *testing.T) {
 		{"Avtr_Dsb_PlusMinus", 2}, // «Короткое замыкание»
 	} {
 		sk := skillOf(t, tc.prefab, tc.slot)
-		if anyOp(sk.Ops, func(o Op) bool { return o.Kind == OpStun }) {
-			t.Errorf("%s slot %d («%s») should be root+silence, not a full stun", tc.prefab, tc.slot, sk.NameRu)
+		if !anyOp(sk.Ops, func(o Op) bool { return o.Kind == OpStun }) {
+			t.Errorf("%s slot %d («%s») must have a full OpStun", tc.prefab, tc.slot, sk.NameRu)
 		}
-		if !anyOp(sk.Ops, func(o Op) bool { return o.Kind == OpRoot }) || !anyOp(sk.Ops, func(o Op) bool { return o.Kind == OpSilence }) {
-			t.Errorf("%s slot %d («%s») must have both OpRoot and OpSilence", tc.prefab, tc.slot, sk.NameRu)
+		if anyOp(sk.Ops, func(o Op) bool { return o.Kind == OpRoot || o.Kind == OpSilence }) {
+			t.Errorf("%s slot %d («%s») must not duplicate the stun with root/silence", tc.prefab, tc.slot, sk.NameRu)
 		}
 	}
 }

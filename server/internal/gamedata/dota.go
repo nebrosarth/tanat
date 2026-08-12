@@ -60,20 +60,20 @@ type DotaStructure struct {
 // is INVULNERABLE until its side's cannons are gone (dotaAltarGuardedByGuns), the
 // core «Штурм» rule ("нельзя нанести повреждения алтарю, пока не уничтожены пушки").
 const (
-	DotaAltarHP      = 8000.0
-	DotaAltarArmor   = 20.0
-	DotaGunHP        = 1400.0
-	DotaGunArmor     = 12.0
-	DotaGunDmgMin    = 40
-	DotaGunDmgMax    = 55
-	DotaGunRange     = 11.0
-	DotaGunAtkSpeed  = 0.7
-	DotaTowerHP      = 1100.0
-	DotaTowerArmor   = 10.0
-	DotaTowerDmgMin  = 30
-	DotaTowerDmgMax  = 42
-	DotaTowerRange   = 10.0
-	DotaTowerAtk     = 0.7
+	DotaAltarHP     = 8000.0
+	DotaAltarArmor  = 20.0
+	DotaGunHP       = 1400.0
+	DotaGunArmor    = 12.0
+	DotaGunDmgMin   = 40
+	DotaGunDmgMax   = 55
+	DotaGunRange    = 11.0
+	DotaGunAtkSpeed = 0.7
+	DotaTowerHP     = 1100.0
+	DotaTowerArmor  = 10.0
+	DotaTowerDmgMin = 30
+	DotaTowerDmgMax = 42
+	DotaTowerRange  = 10.0
+	DotaTowerAtk    = 0.7
 )
 
 // dotaAltarGuardedByGuns: the enemy altar only takes damage once every gun on its
@@ -92,8 +92,10 @@ const dotaAltarGuardedByGuns = true
 // fields 12 -- three real lanes instead of one crowded one.
 const (
 	CreepWaveInterval = 30.0
-	CreepFirstWave    = 8.0
-	CreepsPerWave     = 4 // per barracks, i.e. per lane: mostly melee, ~1 archer
+	// Give avatars a full minute to leave base and reach their assigned lane
+	// before the first reinforcement wave is released.
+	CreepFirstWave = 60.0
+	CreepsPerWave  = 4 // per barracks, i.e. per lane: mostly melee, ~1 archer
 )
 
 // DotaMap is the «Штурм» arena.
@@ -171,7 +173,7 @@ type DotaBossSpawn struct {
 
 // map10 is the map_1_0 «Штурм» layout, ids/positions from the bundle extraction.
 var map10 = DotaMap{
-	ID:         101,
+	ID: 101,
 	// Name/Desc/WinDesc are client locale KEYS: SelectGameMenu runs each through
 	// GuiSystem.GetLocaleText (name at :81, desc/win_desc at :92-93), and a non-key renders
 	// as the literal "EMPTY!" -- which is exactly what the old "IDS_DOTA_Text" (a key the
@@ -197,9 +199,9 @@ var map10 = DotaMap{
 	// blows with whatever had pushed to the base, an endless spawn-camp brawl. Moved to
 	// the mirror position behind the altar (confirmed open, walkable ground all the way
 	// to the map edge -- see TestDotaStructuresAndSpawnsAreWalkable).
-	SpawnHuman: Vec2{X: -220, Y: -4},
-	SpawnElf:   Vec2{X: 209, Y: -11},
-	Nav:        navGrid10,
+	SpawnHuman:      Vec2{X: -220, Y: -4},
+	SpawnElf:        Vec2{X: 209, Y: -11},
+	Nav:             navGrid10,
 	HumanCreepMelee: mobHumanCreepMelee, HumanCreepRange: mobHumanCreepRange,
 	ElfCreepMelee: mobElfCreepMelee, ElfCreepRange: mobElfCreepRange,
 	// The three lanes, altar to altar. map_1_0 ships NO authored path of any kind --

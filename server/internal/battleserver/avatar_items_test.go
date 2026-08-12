@@ -64,18 +64,18 @@ func TestAvatarItemProtoDescCarriesArticle(t *testing.T) {
 	}
 }
 
-// TestBuyAvatarTreeItem drives the happy path: buying a root debits the hero's
-// gold, records ownership, and applies the item's stat as a permanent mod;
-// buying its child afterwards succeeds and both bonuses stack.
-func TestBuyAvatarTreeItem(t *testing.T) {
+// TestBuyAvatarTreeItemsFromDistinctTrees drives the happy path: buying roots
+// from two different trees debits the hero's gold, records both ownerships,
+// and applies both permanent stat bonuses.
+func TestBuyAvatarTreeItemsFromDistinctTrees(t *testing.T) {
 	s, c, u, cleanup := newHuntConnWithHero(t, "Avtr_Tank_Zamaran")
 	defer cleanup()
 
-	root, child := attackTreeRootAndChild(t)
-	// Root is DamageMin-only at stage 1; child adds more DamageMin (both -> dmg_flat).
+	root := avatarTreeChain(t, gamedata.AvatarTreeAttack, 1)[0]
+	other := avatarTreeChain(t, gamedata.AvatarTreeDefence, 1)[0]
 	startMoney, _, _ := s.Store.HeroMoney(u.ID)
-	if startMoney < root.Price+child.Price {
-		t.Fatalf("fixture: hero money %d too low for root+child %d", startMoney, root.Price+child.Price)
+	if startMoney < root.Price+other.Price {
+		t.Fatalf("fixture: hero money %d too low for two roots %d", startMoney, root.Price+other.Price)
 	}
 
 	s.handleBuy(c, buyPkt(root.ArticleID))
@@ -92,17 +92,17 @@ func TestBuyAvatarTreeItem(t *testing.T) {
 		t.Errorf("dmg_flat = %v after root, want %v", got, wantFlat)
 	}
 
-	// Child now unlocked (parent owned) and affordable.
-	s.handleBuy(c, buyPkt(child.ArticleID))
-	if !c.huntState.ownedTreeItems[child.ArticleID] {
-		t.Fatalf("child %s not owned after buy", child.NameKey)
+	// A root from a different tree is independently available and affordable.
+	s.handleBuy(c, buyPkt(other.ArticleID))
+	if !c.huntState.ownedTreeItems[other.ArticleID] {
+		t.Fatalf("root %s from a different tree was not owned after buy", other.NameKey)
 	}
-	if money, _, _ := s.Store.HeroMoney(u.ID); money != startMoney-root.Price-child.Price {
-		t.Errorf("money = %d after child buy, want %d", money, startMoney-root.Price-child.Price)
+	if money, _, _ := s.Store.HeroMoney(u.ID); money != startMoney-root.Price-other.Price {
+		t.Errorf("money = %d after two distinct roots, want %d", money, startMoney-root.Price-other.Price)
 	}
-	wantFlat += statSum(child.Stats, "DamageMin")
+	wantFlat += statSum(other.Stats, "DamageMin")
 	if got := c.huntState.st.modSum(now, "dmg_flat"); got != wantFlat {
-		t.Errorf("dmg_flat = %v after root+child, want %v (stacked)", got, wantFlat)
+		t.Errorf("dmg_flat = %v after two distinct roots, want %v (stacked)", got, wantFlat)
 	}
 }
 
@@ -179,6 +179,101 @@ func TestBuyAvatarTreeItemGates(t *testing.T) {
 	if money, _, _ := s.Store.HeroMoney(u.ID); money != afterFirst {
 		t.Errorf("re-buying an owned item spent gold again: %d -> %d", afterFirst, money)
 	}
+}
+
+func TestBuyAvatarTreeItemsCapsAtClientLimit(t *testing.T) {
+	s, c, u, cleanup := newHuntConnWithHero(t, "Avtr_Tank_Zamaran")
+	defer cleanup()
+
+	treeIDs := []int32{gamedata.AvatarTreeAttack, gamedata.AvatarTreeDefence, gamedata.AvatarTreeMagic, gamedata.AvatarTreeControl}
+	roots := make([]gamedata.AvatarItem, 0, len(treeIDs))
+	for _, treeID := range treeIDs {
+		roots = append(roots, avatarTreeChain(t, treeID, 1)[0])
+	}
+	if !s.Store.SetHeroMoney(u.ID, 1_000_000, 0) {
+		t.Fatal("fixture: failed to fund hero")
+	}
+
+	for _, it := range roots[:gamedata.AvatarTreeMaxItems] {
+		s.handleBuy(c, buyPkt(it.ArticleID))
+	}
+	if got := len(c.huntState.ownedTreeItems); got != gamedata.AvatarTreeMaxItems {
+		t.Fatalf("owned avatar items = %d after valid buys, want %d", got, gamedata.AvatarTreeMaxItems)
+	}
+
+	beforeMoney, _, _ := s.Store.HeroMoney(u.ID)
+	s.handleBuy(c, buyPkt(roots[gamedata.AvatarTreeMaxItems].ArticleID))
+	if c.huntState.ownedTreeItems[roots[gamedata.AvatarTreeMaxItems].ArticleID] {
+		t.Fatal("fourth avatar item was bought despite the three-item cap")
+	}
+	if got := len(c.huntState.ownedTreeItems); got != gamedata.AvatarTreeMaxItems {
+		t.Fatalf("owned avatar items = %d after fourth buy, want %d", got, gamedata.AvatarTreeMaxItems)
+	}
+	if afterMoney, _, _ := s.Store.HeroMoney(u.ID); afterMoney != beforeMoney {
+		t.Fatalf("fourth buy changed money: %d -> %d", beforeMoney, afterMoney)
+	}
+}
+
+func TestBuyAvatarTreeItemUpgradeReplacesActiveTreeSlot(t *testing.T) {
+	s, c, u, cleanup := newHuntConnWithHero(t, "Avtr_Tank_Zamaran")
+	defer cleanup()
+
+	chain := avatarTreeChain(t, gamedata.AvatarTreeAttack, 2)
+	if !s.Store.SetHeroMoney(u.ID, 1_000_000, 0) {
+		t.Fatal("fixture: failed to fund hero")
+	}
+	s.handleBuy(c, buyPkt(chain[0].ArticleID))
+	beforeMoney, _, _ := s.Store.HeroMoney(u.ID)
+
+	s.handleBuy(c, buyPkt(chain[1].ArticleID))
+	if !c.huntState.ownedTreeItems[chain[1].ArticleID] {
+		t.Fatal("upgrade from the same avatar tree was not bought")
+	}
+	if got := len(c.huntState.ownedTreeItems); got != 2 {
+		t.Fatalf("owned avatar items = %d after upgrade, want parent plus child", got)
+	}
+	if got := avatarTreeActiveLocked(c.huntState, chain[0].TreeID); got != chain[1].ArticleID {
+		t.Fatalf("active tree article = %d after upgrade, want %d", got, chain[1].ArticleID)
+	}
+	if got := c.huntState.st.modSum(float64(s.battleTime()), "dmg_flat"); got != statSum(chain[1].Stats, "DamageMin") {
+		t.Fatalf("active item damage bonus = %v after upgrade, want only tier-%d value %v", got, chain[1].Stage, statSum(chain[1].Stats, "DamageMin"))
+	}
+	if afterMoney, _, _ := s.Store.HeroMoney(u.ID); afterMoney != beforeMoney-chain[1].Price {
+		t.Fatalf("upgrade money = %d, want %d", afterMoney, beforeMoney-chain[1].Price)
+	}
+}
+
+func avatarTreeChain(t *testing.T, treeID int32, count int) []gamedata.AvatarItem {
+	t.Helper()
+	var current gamedata.AvatarItem
+	for _, it := range gamedata.AvatarItems() {
+		if it.TreeID == treeID && len(it.Parents) == 0 && (current.ArticleID == 0 || it.ArticleID < current.ArticleID) {
+			current = it
+		}
+	}
+	if current.ArticleID == 0 {
+		t.Fatalf("no root in avatar tree %d", treeID)
+	}
+
+	chain := make([]gamedata.AvatarItem, 0, count)
+	for len(chain) < count {
+		chain = append(chain, current)
+		if len(chain) == count {
+			break
+		}
+		var next gamedata.AvatarItem
+		for _, it := range gamedata.AvatarItems() {
+			if it.TreeID == treeID && len(it.Parents) == 1 && it.Parents[0] == current.ArticleID {
+				next = it
+				break
+			}
+		}
+		if next.ArticleID == 0 {
+			t.Fatalf("avatar tree %d root %d has no chain item %d", treeID, current.ArticleID, len(chain)+1)
+		}
+		current = next
+	}
+	return chain
 }
 
 func statSum(stats []gamedata.AvatarItemStat, name string) float64 {

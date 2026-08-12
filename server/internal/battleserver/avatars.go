@@ -18,6 +18,17 @@ import (
 // CREATE_OBJECT, the bind, and an initial position+stats SYNC. No-op if viewer already
 // tracks owner.
 func (s *Server) renderAvatarForLocked(viewer, owner *conn, now float64) {
+	s.renderAvatarForLockedWithStats(viewer, owner, now, false)
+}
+
+// renderAvatarWithStatsLocked is the fresh-registration path used when an avatar becomes
+// visible to a client. Hard-reset callers keep renderAvatarForLocked's packet contract, while
+// newly introduced/re-rendered avatars also receive the current PlayerStore status.
+func (s *Server) renderAvatarWithStatsLocked(viewer, owner *conn, now float64) {
+	s.renderAvatarForLockedWithStats(viewer, owner, now, true)
+}
+
+func (s *Server) renderAvatarForLockedWithStats(viewer, owner *conn, now float64, withStats bool) {
 	vh, oh := viewer.huntState, owner.huntState
 	if vh == nil || oh == nil || viewer == owner {
 		return
@@ -86,12 +97,57 @@ func (s *Server) renderAvatarForLocked(viewer, owner *conn, now float64) {
 			setFloats(syncViewRadius, idx, effectiveViewRadius(avatarViewRadius)).
 			setInt(syncTeam, idx, owner.playerTeam()).
 			build(vh.tr.count())))
+	// ADD_TO_INVENTORY is owner-local, while EnemyInfoWindow reads the remote
+	// Player.ActiveItems list. Replay the authoritative tree ownership after the
+	// avatar is registered so late reveals show the same items as live purchases.
+	s.replayAvatarItemsToViewerLocked(viewer, owner)
+	if withStats {
+		s.pushPlayerStatsToViewerLocked(viewer, owner)
+	}
+}
+
+func playerStatsArgs(owner *conn) *amf.MixedArray {
+	hs := owner.huntState
+	return amf.NewArray().
+		Set("id", owner.selfPlayerID).
+		Set("level", hs.level).
+		Set("kills", hs.frags).
+		Set("deaths", hs.deaths).
+		Set("killer", hs.lastKiller).
+		Set("assists", hs.assists)
+}
+
+func (s *Server) pushPlayerStatsToViewerLocked(viewer, owner *conn) {
+	if viewer == nil || owner == nil || viewer.huntState == nil || owner.huntState == nil {
+		return
+	}
+	if viewer.huntState.tr.index(owner.objID) < 0 {
+		return
+	}
+	s.push(viewer, battleproto.CmdPlayerStats, playerStatsArgs(owner))
 }
 
 // removeAvatarForLocked drops owner's avatar from viewer's client (owner left, or
 // the world is tearing down): tracker swap-remove + DELETE_OBJECT.
 func (s *Server) removeAvatarForLocked(viewer, owner *conn) {
 	s.untrackObjForMemberLocked(viewer, owner.objID, s.battleTime())
+}
+
+// hardResetAvatarForLocked recreates an owner's already-rendered avatar on every
+// remote viewer. A fresh object's first POSITION runs the client's render reset,
+// avoiding SmoothErrorCorrector catch-up after a hard relocation. The tracker
+// guard is intentional: an unseen avatar must stay unseen behind Dota fog.
+func (s *Server) hardResetAvatarForLocked(owner *conn, now float64) {
+	if owner == nil || owner.huntState == nil {
+		return
+	}
+	for _, viewer := range owner.members() {
+		if viewer == owner || viewer.huntState == nil || viewer.huntState.tr.index(owner.objID) < 0 {
+			continue
+		}
+		s.removeAvatarForLocked(viewer, owner)
+		s.renderAvatarForLocked(viewer, owner, now)
+	}
 }
 
 // introduceMemberLocked wires a freshly-joined member into the shared world's
@@ -111,8 +167,8 @@ func (s *Server) introduceMemberLocked(c *conn, now float64) {
 		if other == c || (dotaFog && arenaEnemies(c, other)) {
 			continue
 		}
-		s.renderAvatarForLocked(c, other, now) // existing player -> newcomer's client
-		s.renderAvatarForLocked(other, c, now) // newcomer -> existing player's client
+		s.renderAvatarWithStatsLocked(c, other, now) // existing player -> newcomer's client
+		s.renderAvatarWithStatsLocked(other, c, now) // newcomer -> existing player's client
 		// Show that player's live summons to the newcomer (the newcomer has none yet,
 		// so this is one-directional). sm.alive is the shared liveness test, and the
 		// lazily-set sm.dead flag alone would not do: a summon that took a lethal hit or

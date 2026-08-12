@@ -35,6 +35,9 @@ func TestDotaHeroKillCreditsKillDeathAssist(t *testing.T) {
 	if elf.huntState.deaths != 1 {
 		t.Errorf("victim deaths = %d, want 1", elf.huntState.deaths)
 	}
+	if elf.huntState.lastKiller != human.selfPlayerID {
+		t.Errorf("victim lastKiller = %d, want registered player id %d", elf.huntState.lastKiller, human.selfPlayerID)
+	}
 	if ally.huntState.assists != 1 {
 		t.Errorf("nearby ally assists = %d, want 1", ally.huntState.assists)
 	}

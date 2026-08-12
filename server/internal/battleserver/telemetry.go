@@ -17,10 +17,14 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"math"
 	"os"
 	"path/filepath"
+	"sort"
 	"sync/atomic"
 	"time"
+
+	"tanatserver/internal/gamedata"
 )
 
 // botTelemetryDir returns the directory a match's telemetry file should be written
@@ -141,23 +145,59 @@ type telemetryMatchStart struct {
 // Retreating) are omitted for a real player.
 type telemetrySnapshot struct {
 	telemetryEvent
-	ID           int32   `json:"id"`
-	Name         string  `json:"name"`
-	Avatar       string  `json:"avatar"`
-	IsBot        bool    `json:"is_bot"`
-	Team         int32   `json:"team"`
-	X            float32 `json:"x"`
-	Y            float32 `json:"y"`
-	HPFrac       float64 `json:"hp_frac"`
-	ManaFrac     float64 `json:"mana_frac"`
-	Level        int32   `json:"level"`
-	Dead         bool    `json:"dead"`
-	AttackTarget int32   `json:"attack_target,omitempty"`
-	PvpTarget    int32   `json:"pvp_target,omitempty"`
-	Phase        string  `json:"phase,omitempty"`
-	Lane         int     `json:"lane,omitempty"`
-	EngageTarget int32   `json:"engage_target,omitempty"`
-	Retreating   bool    `json:"retreating,omitempty"`
+	ID                 int32   `json:"id"`
+	Name               string  `json:"name"`
+	Avatar             string  `json:"avatar"`
+	IsBot              bool    `json:"is_bot"`
+	Team               int32   `json:"team"`
+	X                  float32 `json:"x"`
+	Y                  float32 `json:"y"`
+	HPFrac             float64 `json:"hp_frac"`
+	ManaFrac           float64 `json:"mana_frac"`
+	Level              int32   `json:"level"`
+	Dead               bool    `json:"dead"`
+	AttackTarget       int32   `json:"attack_target,omitempty"`
+	AttackActionActive bool    `json:"attack_action_active,omitempty"`
+	PvpTarget          int32   `json:"pvp_target,omitempty"`
+	Phase              string  `json:"phase,omitempty"`
+	Lane               int     `json:"lane,omitempty"`
+	EngageTarget       int32   `json:"engage_target,omitempty"`
+	Retreating         bool    `json:"retreating,omitempty"`
+	RetreatMode        string  `json:"retreat_mode,omitempty"`
+	PlanMode           string  `json:"plan_mode,omitempty"`
+	PlanLane           int     `json:"plan_lane"`
+	PlanObjective      int32   `json:"plan_objective"`
+	Assignment         string  `json:"assignment,omitempty"`
+	AssignmentReason   string  `json:"assignment_reason,omitempty"`
+	AssignmentLane     int     `json:"assignment_lane"`
+	Coverage           bool    `json:"coverage"`
+	XP                 float64 `json:"xp,omitempty"`
+	XPPerMinute        float64 `json:"xp_per_minute,omitempty"`
+	FarmDecision       string  `json:"farm_decision,omitempty"`
+	FarmTarget         int32   `json:"farm_target,omitempty"`
+	FarmScore          float64 `json:"farm_score,omitempty"`
+	FarmLane           int     `json:"farm_lane"`
+	FarmCatchUp        bool    `json:"farm_catch_up,omitempty"`
+	FarmLastHits       int     `json:"farm_last_hits,omitempty"`
+	FarmWaveClears     int     `json:"farm_wave_clears,omitempty"`
+	FarmXPEvents       int     `json:"farm_xp_events,omitempty"`
+	FarmLastXPTAt      float64 `json:"farm_last_xp_at,omitempty"`
+	FarmProgressAge    float64 `json:"farm_progress_age,omitempty"`
+	FarmTargetDistance float64 `json:"farm_target_distance,omitempty"`
+	FarmInXPRadius     bool    `json:"farm_in_xp_radius"`
+	FarmDebt           int     `json:"farm_debt,omitempty"`
+	FocusTarget        int32   `json:"focus_target,omitempty"`
+}
+
+// telemetryBotAttack records an attack that actually crossed the combat engine's
+// commit point. A snapshot's attack_target is only an intention; these events are the
+// authoritative distinction between a selected target and a visible swing/hit.
+type telemetryBotAttack struct {
+	telemetryEvent
+	BotID    int32   `json:"bot_id"`
+	TargetID int32   `json:"target_id"`
+	Damage   float64 `json:"damage,omitempty"`
+	Fatal    bool    `json:"fatal,omitempty"`
 }
 
 // telemetryCast is a genuinely-fired ability cast (mana/cooldown already passed --
@@ -185,6 +225,47 @@ type telemetryDamage struct {
 	AttackerIsBot  bool    `json:"attacker_is_bot,omitempty"`
 	Damage         float64 `json:"damage"`
 	Fatal          bool    `json:"fatal"`
+}
+
+// telemetryXPGrant is one recipient's share of a Dota reward. raw_xp is the full
+// source bounty before proximity splitting; received_xp is what this recipient actually
+// received after splitting and any active XP multiplier. Keeping both makes a match log
+// sufficient to distinguish farming efficiency from simple team stacking.
+type telemetryXPGrant struct {
+	telemetryEvent
+	RecipientID    int32   `json:"recipient_id"`
+	RecipientIsBot bool    `json:"recipient_is_bot"`
+	Team           int32   `json:"team"`
+	Source         string  `json:"source"`
+	SourceID       int32   `json:"source_id,omitempty"`
+	RawXP          float64 `json:"raw_xp"`
+	ReceivedXP     float64 `json:"received_xp"`
+	Recipients     int     `json:"recipients"`
+	VictimLevel    int32   `json:"victim_level,omitempty"`
+}
+
+// telemetryCreepLifecycle makes the farm denominator observable. XP grants
+// alone show what a bot received, but not how many lane creeps actually spawned
+// or died outside every bot's XP radius.
+type telemetryCreepLifecycle struct {
+	telemetryEvent
+	CreepID     int32   `json:"creep_id"`
+	MobIndex    int     `json:"mob_index"`
+	Team        int32   `json:"team"`
+	Lane        int     `json:"lane"`
+	LaneIndex   int     `json:"lane_index"`
+	X           float32 `json:"x"`
+	Y           float32 `json:"y"`
+	KillerID    int32   `json:"killer_id,omitempty"`
+	KillerIsBot bool    `json:"killer_is_bot,omitempty"`
+}
+
+type telemetryCreepXPMiss struct {
+	telemetryEvent
+	CreepID int32   `json:"creep_id"`
+	Team    int32   `json:"team"`
+	X       float32 `json:"x"`
+	Y       float32 `json:"y"`
 }
 
 type telemetryDeath struct {
@@ -228,6 +309,94 @@ type telemetryMatchEnd struct {
 	Final    []telemetryFinalStats `json:"final"`
 }
 
+// telemetryBotTeleport is the lifecycle record for a bot's battle-local
+// teleport channel. FX ids are retained on every transition so a JSONL reader
+// can correlate preparation/target visuals with the authoritative outcome.
+type telemetryBotTeleport struct {
+	telemetryEvent
+	BotID        int32   `json:"bot_id"`
+	TargetID     int32   `json:"target_id"`
+	TargetKind   string  `json:"target_kind"`
+	DestinationX float32 `json:"destination_x"`
+	DestinationY float32 `json:"destination_y"`
+	MarkerFX     int32   `json:"marker_fx"`
+	TargetFX     int32   `json:"target_fx"`
+	ArrivalFX    int32   `json:"arrival_fx"`
+	CancelReason string  `json:"cancel_reason,omitempty"`
+}
+
+// telemetryBotPurchase makes bot economy observable in the same match log as
+// movement, combat, and XP. A successful purchase is recorded after the
+// atomic debit and includes both balances, so a log reader can distinguish a
+// rejected affordability decision from a real item purchase.
+type telemetryBotPurchase struct {
+	telemetryEvent
+	BotID       int32 `json:"bot_id"`
+	ArticleID   int32 `json:"article_id"`
+	TreeID      int32 `json:"tree_id"`
+	Stage       int   `json:"stage"`
+	Price       int32 `json:"price"`
+	MoneyBefore int32 `json:"money_before"`
+	MoneyAfter  int32 `json:"money_after"`
+}
+
+// telemetryBotStructureEscape records a bot's geometric response to a live
+// enemy structure. It is deliberately independent of the teleport lifecycle
+// so disabled telemetry and tests can call the same nil-safe helper.
+type telemetryBotStructureEscape struct {
+	telemetryEvent
+	BotID        int32   `json:"bot_id"`
+	ThreatID     int32   `json:"threat_id"`
+	DestinationX float32 `json:"destination_x"`
+	DestinationY float32 `json:"destination_y"`
+	Reason       string  `json:"reason"`
+	HPFraction   float64 `json:"hp_fraction"`
+}
+
+type telemetryBotRetreatDestination struct {
+	X float32 `json:"x"`
+	Y float32 `json:"y"`
+}
+
+type telemetryBotRetreatUtility struct {
+	telemetryEvent
+	BotID       int32                           `json:"bot_id"`
+	Slot        int                             `json:"slot"`
+	TargetID    int32                           `json:"target_id"`
+	Reason      string                          `json:"reason"`
+	Category    string                          `json:"category"`
+	HPFraction  float64                         `json:"hp_fraction"`
+	Destination *telemetryBotRetreatDestination `json:"destination,omitempty"`
+}
+
+type telemetryBotAssignment struct {
+	BotID        int32  `json:"bot_id"`
+	Role         string `json:"role"`
+	Mode         string `json:"mode"`
+	Reason       string `json:"reason"`
+	Lane         int    `json:"lane"`
+	FarmLane     int    `json:"farm_lane"`
+	FarmLaneSet  bool   `json:"farm_lane_set"`
+	BaselineLane int    `json:"baseline_lane"`
+	Coverage     bool   `json:"coverage"`
+	Aggressive   bool   `json:"aggressive"`
+	Objective    int32  `json:"objective,omitempty"`
+}
+
+// telemetryBotTeamPlan is edge-triggered: a plan is recorded only when its
+// live-state mode/lane/objective or an assignment changes, avoiding per-tick spam.
+type telemetryBotTeamPlan struct {
+	telemetryEvent
+	Team          int32                    `json:"team"`
+	Mode          string                   `json:"mode"`
+	Lane          int                      `json:"lane"`
+	Objective     int32                    `json:"objective,omitempty"`
+	ObjectiveKind string                   `json:"objective_kind,omitempty"`
+	Reason        string                   `json:"reason"`
+	FocusTarget   int32                    `json:"focus_target,omitempty"`
+	Assignments   []telemetryBotAssignment `json:"assignments"`
+}
+
 // botPhaseName stringifies a bot's current phase for the snapshot stream.
 func botPhaseName(p botPhase) string {
 	switch p {
@@ -238,6 +407,103 @@ func botPhaseName(p botPhase) string {
 	default:
 		return "lane"
 	}
+}
+
+func botRetreatModeName(mode botRetreatMode) string {
+	if mode == botRetreatModeDisengage {
+		return "disengage"
+	}
+	return "recovery"
+}
+
+func (s *Server) telemetryRecordBotTeleportLocked(c *conn, typ string, now float64, targetID int32, targetKind string, x, y float32, markerFX, targetFX, arrivalFX int32, reason string) {
+	if c == nil || c.inst == nil || c.inst.dota == nil || c.inst.dota.telemetry == nil {
+		return
+	}
+	c.inst.dota.telemetry.record(telemetryBotTeleport{
+		telemetryEvent: newTelemetryEvent(typ, botMatchTime(c, now)),
+		BotID:          c.objID, TargetID: targetID, TargetKind: targetKind,
+		DestinationX: x, DestinationY: y,
+		MarkerFX: markerFX, TargetFX: targetFX, ArrivalFX: arrivalFX,
+		CancelReason: reason,
+	})
+}
+
+func (s *Server) telemetryRecordBotPurchaseLocked(c *conn, it gamedata.AvatarItem, moneyBefore, moneyAfter int32, now float64) {
+	if c == nil || !isBotConn(c) || c.inst == nil || c.inst.dota == nil || c.inst.dota.telemetry == nil {
+		return
+	}
+	c.inst.dota.telemetry.record(telemetryBotPurchase{
+		telemetryEvent: newTelemetryEvent("bot_item_purchase", botMatchTime(c, now)),
+		BotID:          c.objID, ArticleID: it.ArticleID, TreeID: it.TreeID, Stage: it.Stage,
+		Price: it.Price, MoneyBefore: moneyBefore, MoneyAfter: moneyAfter,
+	})
+}
+
+func (s *Server) telemetryRecordBotStructureEscapeLocked(c *conn, threat *mobState, x, y float32, reason string, now float64) {
+	if c == nil || c.inst == nil || c.inst.dota == nil || c.huntState == nil || c.inst.dota.telemetry == nil {
+		return
+	}
+	threatID := int32(0)
+	if threat != nil {
+		threatID = threat.id
+	}
+	c.inst.dota.telemetry.record(telemetryBotStructureEscape{
+		telemetryEvent: newTelemetryEvent("bot_structure_escape", botMatchTime(c, now)),
+		BotID:          c.objID, ThreatID: threatID,
+		DestinationX: x, DestinationY: y, Reason: reason,
+		HPFraction: botHPFrac(c.huntState, now),
+	})
+}
+
+func (s *Server) telemetryRecordBotRetreatUtilityLocked(c *conn, slot int, targetID int32, reason, category string, now float64, x, y float32, hasDestination bool) {
+	if c == nil || c.inst == nil || c.inst.dota == nil || c.huntState == nil || c.inst.dota.telemetry == nil {
+		return
+	}
+	var destination *telemetryBotRetreatDestination
+	if hasDestination {
+		destination = &telemetryBotRetreatDestination{X: x, Y: y}
+	}
+	c.inst.dota.telemetry.record(telemetryBotRetreatUtility{
+		telemetryEvent: newTelemetryEvent("bot_retreat_utility", botMatchTime(c, now)),
+		BotID:          c.objID, Slot: slot, TargetID: targetID, Reason: reason, Category: category,
+		HPFraction: botHPFrac(c.huntState, now), Destination: destination,
+	})
+}
+
+func (s *Server) telemetryRecordBotAttackStartLocked(c *conn, targetID int32, now float64) {
+	if c == nil || !isBotConn(c) || c.inst == nil || c.inst.dota == nil || c.inst.dota.telemetry == nil {
+		return
+	}
+	c.inst.dota.telemetry.record(telemetryBotAttack{
+		telemetryEvent: newTelemetryEvent("bot_attack_start", botMatchTime(c, now)),
+		BotID:          c.objID, TargetID: targetID,
+	})
+}
+
+func (s *Server) telemetryRecordBotAttackHitLocked(c *conn, targetID int32, damage float64, fatal bool, now float64) {
+	if c == nil || !isBotConn(c) || c.inst == nil || c.inst.dota == nil || c.inst.dota.telemetry == nil {
+		return
+	}
+	c.inst.dota.telemetry.record(telemetryBotAttack{
+		telemetryEvent: newTelemetryEvent("bot_attack_hit", botMatchTime(c, now)),
+		BotID:          c.objID, TargetID: targetID, Damage: damage, Fatal: fatal,
+	})
+}
+
+func (s *Server) telemetryRecordBotAttackCancelLocked(c *conn, targetID int32, reason string, now float64) {
+	if c == nil || !isBotConn(c) || c.inst == nil || c.inst.dota == nil || c.inst.dota.telemetry == nil {
+		return
+	}
+	c.inst.dota.telemetry.record(struct {
+		telemetryEvent
+		BotID    int32  `json:"bot_id"`
+		TargetID int32  `json:"target_id"`
+		Reason   string `json:"reason"`
+	}{
+		telemetryEvent: newTelemetryEvent("bot_attack_cancel", botMatchTime(c, now)),
+		BotID:          c.objID, TargetID: targetID, Reason: reason,
+	})
 }
 
 // ---- recording entry points (called from the real game-logic call sites) ----
@@ -267,17 +533,88 @@ func (s *Server) telemetrySnapshotLocked(rec *telemetryRecorder, c *conn, matchT
 		IsBot: isBotConn(c), Team: c.playerTeam(),
 		X: px, Y: py, HPFrac: hpFrac, ManaFrac: manaFrac, Level: hs.level,
 		Dead:         hs.deadUntil > 0,
-		AttackTarget: hs.attackTarget, PvpTarget: hs.pvpTarget,
+		AttackTarget: hs.attackTarget, AttackActionActive: hs.attackActionActive, PvpTarget: hs.pvpTarget,
 	}
 	if c.inst != nil {
 		if brain := c.inst.bots[c.objID]; brain != nil {
+			xpPerMinute := 0.0
+			if c.inst.dota != nil {
+				minutes := (now - c.inst.dota.startedAt) / 60
+				if minutes > 0 {
+					xpPerMinute = hs.xp / minutes
+				}
+			}
 			snap.Phase = botPhaseName(brain.phase)
 			snap.Lane = brain.lane
 			snap.EngageTarget = brain.engageTarget
 			snap.Retreating = brain.retreating
+			if brain.retreating {
+				snap.RetreatMode = botRetreatModeName(brain.retreatMode)
+			}
+			snap.PlanMode = brain.macroAssignment.Mode
+			snap.PlanLane = brain.macroAssignment.Lane
+			snap.PlanObjective = brain.macroAssignment.ObjectiveID
+			snap.Assignment = brain.macroAssignment.Role
+			snap.AssignmentReason = brain.macroAssignment.Reason
+			snap.AssignmentLane = brain.macroAssignment.Lane
+			snap.Coverage = brain.macroAssignment.Coverage
+			snap.XP, snap.XPPerMinute = hs.xp, xpPerMinute
+			snap.FarmDecision, snap.FarmTarget, snap.FarmScore = brain.farmDecision, brain.farmTarget, brain.farmTargetScore
+			snap.FarmLane, snap.FarmCatchUp = brain.farmLane, brain.farmCatchUp
+			snap.FarmLastHits, snap.FarmWaveClears = brain.farmLastHits, brain.farmWaveClears
+			snap.FarmXPEvents, snap.FarmLastXPTAt = brain.farmXPEvents, brain.farmLastXPTAt
+			if brain.farmLastXPTAt > 0 && now > brain.farmLastXPTAt {
+				snap.FarmProgressAge = now - brain.farmLastXPTAt
+			}
+			if brain.farmTarget != 0 {
+				if target := c.inst.mobs[brain.farmTarget]; target != nil && !target.dead {
+					cx, cy := c.posAtLocked(float32(now))
+					snap.FarmTargetDistance = math.Hypot(float64(target.x-cx), float64(target.y-cy))
+					snap.FarmInXPRadius = snap.FarmTargetDistance <= dotaXPShareRadius
+				}
+			}
+			snap.FarmDebt = botFarmDebtLocked(c.inst, brain)
+			if c.inst.dota != nil {
+				if plan, ok := c.inst.dota.teamPlans[c.playerTeam()]; ok {
+					snap.FocusTarget = plan.FocusTarget
+				}
+			}
 		}
 	}
 	rec.record(snap)
+}
+
+func (s *Server) telemetryRecordBotTeamPlanLocked(inst *huntInstance, plan botTeamPlan, now float64) {
+	if inst == nil || inst.dota == nil || inst.dota.telemetry == nil {
+		return
+	}
+	ids := make([]int32, 0, len(plan.Assignments))
+	for id := range plan.Assignments {
+		ids = append(ids, id)
+	}
+	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
+	assignments := make([]telemetryBotAssignment, 0, len(ids))
+	for _, id := range ids {
+		a := plan.Assignments[id]
+		assignments = append(assignments, telemetryBotAssignment{
+			BotID: id, Role: a.Role, Mode: a.Mode, Reason: a.Reason,
+			Lane: a.Lane, FarmLane: a.FarmLane, FarmLaneSet: a.FarmLaneSet,
+			BaselineLane: a.BaselineLane, Coverage: a.Coverage, Aggressive: a.Aggressive,
+			Objective: a.ObjectiveID,
+		})
+	}
+	inst.dota.telemetry.record(telemetryBotTeamPlan{
+		telemetryEvent: newTelemetryEvent("bot_team_plan", planTelemetryMatchTime(inst, now)),
+		Team:           plan.Team, Mode: plan.Mode, Lane: plan.Lane, Objective: plan.ObjectiveID,
+		ObjectiveKind: plan.Objective, Reason: plan.Reason, FocusTarget: plan.FocusTarget, Assignments: assignments,
+	})
+}
+
+func planTelemetryMatchTime(inst *huntInstance, now float64) float64 {
+	if inst == nil || inst.dota == nil {
+		return 0
+	}
+	return inst.dota.telemetryMatchTimeLocked(now)
 }
 
 // telemetryRecordCastLocked records a genuinely-fired ability cast (called from
@@ -303,6 +640,14 @@ func (s *Server) telemetryRecordCastLocked(rec *telemetryRecorder, c *conn, slot
 // matching death -- both from hitPlayerFromLocked, the single choke point for all
 // hero-received damage regardless of source (hero, creep, tower).
 func (s *Server) telemetryRecordDamageLocked(rec *telemetryRecorder, c *conn, damagerID int32, pvpAttacker *conn, dmg float64, fatal bool, matchTime, now float64) {
+	s.telemetryRecordDamageWithCreditLocked(rec, c, damagerID, pvpAttacker, nil, dmg, fatal, matchTime, now)
+}
+
+// telemetryRecordDamageWithCreditLocked keeps the raw visual damager (a creep in
+// the relevant case) while recording the hero that receives the authoritative kill
+// credit. This makes telemetry agree with PLAYER_STATS/ON_KILL instead of hiding a
+// corrected hero kill behind the creep's object id.
+func (s *Server) telemetryRecordDamageWithCreditLocked(rec *telemetryRecorder, c *conn, damagerID int32, pvpAttacker, creditedKiller *conn, dmg float64, fatal bool, matchTime, now float64) {
 	if rec == nil {
 		return
 	}
@@ -316,14 +661,76 @@ func (s *Server) telemetryRecordDamageLocked(rec *telemetryRecorder, c *conn, da
 	if !fatal {
 		return
 	}
+	killer := pvpAttacker
+	if creditedKiller != nil {
+		killer = creditedKiller
+	}
 	px, py := c.posAtLocked(float32(now))
 	rec.record(telemetryDeath{
 		telemetryEvent: newTelemetryEvent("death", matchTime),
 		VictimID:       c.objID, VictimIsBot: isBotConn(c),
-		KillerID: damagerID, KillerIsHero: pvpAttacker != nil,
-		KillerIsBot: pvpAttacker != nil && isBotConn(pvpAttacker),
-		X:           px, Y: py,
+		KillerID: func() int32 {
+			if killer != nil {
+				return killer.objID
+			}
+			return damagerID
+		}(),
+		KillerIsHero: killer != nil,
+		KillerIsBot:  killer != nil && isBotConn(killer),
+		X:            px, Y: py,
 	})
+}
+
+// telemetryRecordXPGrantLocked records only calibrated Dota rewards. Hunt and Arena
+// continue to use the same XP engine but intentionally do not enter this source-level
+// stream, so their telemetry remains semantically separate.
+func (s *Server) telemetryRecordXPGrantLocked(c *conn, team int32, source string, sourceID int32, rawXP, receivedXP float64, recipients int, victimLevel int32, now float64) {
+	if source == "" || c == nil || c.inst == nil || c.inst.dota == nil || c.inst.dota.telemetry == nil {
+		return
+	}
+	c.inst.dota.telemetry.record(telemetryXPGrant{
+		telemetryEvent: newTelemetryEvent("xp_grant", c.inst.dota.telemetryMatchTimeLocked(now)),
+		RecipientID:    c.objID, RecipientIsBot: isBotConn(c), Team: team,
+		Source: source, SourceID: sourceID, RawXP: rawXP, ReceivedXP: receivedXP,
+		Recipients: recipients, VictimLevel: victimLevel,
+	})
+}
+
+func (s *Server) telemetryRecordCreepSpawnLocked(c *conn, m *mobState, now float64) {
+	if c == nil || m == nil || m.structure || c.inst == nil || c.inst.dota == nil || c.inst.dota.telemetry == nil {
+		return
+	}
+	lane := botLaneForCreep(c, m)
+	c.inst.dota.telemetry.record(telemetryCreepLifecycle{
+		telemetryEvent: newTelemetryEvent("creep_spawn", c.inst.dota.telemetryMatchTimeLocked(now)),
+		CreepID:        m.id, MobIndex: m.mobIdx, Team: m.team, Lane: lane, LaneIndex: m.laneIdx,
+		X: m.x, Y: m.y,
+	})
+}
+
+func (s *Server) telemetryRecordCreepDeathLocked(c *conn, m *mobState, killer *conn, now float64) {
+	killerID := int32(0)
+	if killer != nil {
+		killerID = killer.objID
+	}
+	s.telemetryRecordCreepDeathByIDLocked(c, m, killerID, killer, now)
+}
+
+func (s *Server) telemetryRecordCreepDeathByIDLocked(c *conn, m *mobState, killerID int32, killer *conn, now float64) {
+	if c == nil || m == nil || m.structure || c.inst == nil || c.inst.dota == nil || c.inst.dota.telemetry == nil {
+		return
+	}
+	lane := botLaneForCreep(c, m)
+	ev := telemetryCreepLifecycle{
+		telemetryEvent: newTelemetryEvent("creep_death", c.inst.dota.telemetryMatchTimeLocked(now)),
+		CreepID:        m.id, MobIndex: m.mobIdx, Team: m.team, Lane: lane, LaneIndex: m.laneIdx,
+		X: m.x, Y: m.y,
+	}
+	if killerID != 0 {
+		ev.KillerID = killerID
+		ev.KillerIsBot = killer != nil && isBotConn(killer)
+	}
+	c.inst.dota.telemetry.record(ev)
 }
 
 // telemetryRecordStructureDestroyLocked records a structure's destruction (called from

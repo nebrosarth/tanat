@@ -7,6 +7,14 @@ package battleserver
 
 import "math"
 
+func botStrategicAllyLocked(c *conn, mem *conn) bool {
+	if c == nil || c.inst == nil || mem == nil {
+		return false
+	}
+	brain, isBot := c.inst.bots[mem.objID]
+	return !isBot || brain == nil || !brain.retreating
+}
+
 // botGroupEngageRadius is the group phase's attack/push search radius -- wider than solo
 // laning (botLaneEngageRadius) since a grouped push commits harder.
 const botGroupEngageRadius = 20.0
@@ -58,13 +66,27 @@ func (s *Server) botRoamTickLocked(b *botBrain, now float64) {
 		s.botMoveTowardLocked(b, hx, hy, now)
 		return
 	}
-	s.botConsiderWaveClearAbilityLocked(b, now)
-	s.botConsiderHarassAbilityLocked(b, now)
+	if b.macroAssignment.Reason == botMacroReasonMobilizationPreparation &&
+		(hs.attackTarget != 0 || (hs.attackActionActive && hs.pvpTarget == 0)) {
+		// A preparation transition can happen immediately after a previous
+		// full-mobilization attack. Clear that stale structure swing before the
+		// ordinary attack-state guard, otherwise the bot remains frozen on the
+		// old objective and can never walk to the staging point.
+		s.stopAttackLocked(c, false)
+	}
 	if hs.attackTarget != 0 {
+		return
+	}
+	// Roaming does not suspend lane economics: a multi-creep XP opportunity is
+	// converted before a single low-HP creep or a hero poke.
+	if s.botConsiderWaveClearAbilityLocked(b, now) {
 		return
 	}
 	if target := s.botFindLaneTargetLocked(b, now, botLaneEngageRadius, true); target != nil {
 		s.startAttackLocked(c, target)
+		return
+	}
+	if s.botConsiderHarassAbilityLocked(b, now) {
 		return
 	}
 	cx, cy := c.posAtLocked(float32(now))
@@ -100,10 +122,17 @@ func botNearestLaneToPointLocked(d *dotaState, x, y float32) int {
 // "which lane the group is actually standing on/heading toward" -- falling back to this
 // bot's own assigned lane when nobody else is close enough to average in.
 func (s *Server) botPushLaneLocked(b *botBrain, now float64) int {
+	if b.macroAssignment.Lane >= 0 && (b.macroAssignment.Mode == botMacroPush ||
+		b.macroAssignment.Mode == botMacroRally || b.macroAssignment.Mode == botMacroAltar) {
+		return b.macroAssignment.Lane
+	}
 	c := b.c
 	cx, cy := c.posAtLocked(float32(now))
 	sx, sy, n := cx, cy, float32(1)
 	for _, mem := range botLivingAllies(c) {
+		if !botStrategicAllyLocked(c, mem) {
+			continue
+		}
 		mx, my := mem.posAtLocked(float32(now))
 		if dist2(cx, cy, mx, my) <= float32(botGroupUpRadius*botGroupUpRadius) {
 			sx, sy, n = sx+mx, sy+my, n+1
@@ -121,10 +150,17 @@ func (s *Server) botPushLaneLocked(b *botBrain, now float64) int {
 // teammate regardless of distance points instead at wherever the team as a whole actually
 // still is.
 func (s *Server) botRedirectLaneLocked(b *botBrain, now float64) int {
+	if b.macroAssignment.Lane >= 0 && (b.macroAssignment.Mode == botMacroPush ||
+		b.macroAssignment.Mode == botMacroRally || b.macroAssignment.Mode == botMacroAltar) {
+		return b.macroAssignment.Lane
+	}
 	c := b.c
 	cx, cy := c.posAtLocked(float32(now))
 	sx, sy, n := cx, cy, float32(1)
 	for _, mem := range botLivingAllies(c) {
+		if !botStrategicAllyLocked(c, mem) {
+			continue
+		}
 		mx, my := mem.posAtLocked(float32(now))
 		sx, sy, n = sx+mx, sy+my, n+1
 	}
@@ -156,6 +192,93 @@ func (s *Server) botPushPointLocked(b *botBrain, lane int, now float64) (float32
 	return float32(pts[idx].X), float32(pts[idx].Y)
 }
 
+// botMacroObjectiveTickLocked is the execution half of the team orchestrator's
+// push decision.  A plan that names an enemy structure must eventually become an
+// attack order on that exact structure; walking to a lane front is only a rally
+// fallback and can otherwise leave a match farming forever once waves stop
+// advancing.  Cover assignments inherit the same objective through ObjectiveID,
+// while base-defense cover points at an allied structure and therefore fail the
+// enemy check below.
+func (s *Server) botMacroObjectiveTickLocked(b *botBrain, now float64) bool {
+	if b == nil || b.c == nil || b.c.inst == nil || b.c.huntState == nil {
+		return false
+	}
+	assignment := b.macroAssignment
+	if assignment.Mode != botMacroPush && assignment.Mode != botMacroAltar && assignment.Mode != botMacroCover {
+		return false
+	}
+	objective := b.c.inst.mobs[assignment.ObjectiveID]
+	if objective == nil || objective.dead || !objective.structure || !objective.enemyOf(b.c.playerTeam()) ||
+		b.c.altarShieldedLocked(objective) {
+		return false
+	}
+	cx, cy := b.c.posAtLocked(float32(now))
+	groupReady := botObjectiveFinishGroupReadyLocked(b.c.inst, b.c.playerTeam(), objective, now)
+	commitGroupReady := botMacroObjectiveCommitWindowLocked(objective) && groupReady
+	conversionCommit := assignment.Aggressive && assignment.Reason == "objective_conversion_ready" && groupReady
+	// Do not walk an ordinary push into structure range before the local
+	// conversion premise is true. Without this hold point, a bot reaches a
+	// full-health gun a few seconds before its wave, absorbs a shot, retreats,
+	// and repeats the same wasteful loop. A materially damaged objective in the
+	// finish window is the deliberate exception: the group may finish it without
+	// waiting for another wave. Full mobilization has already passed its own
+	// launch gate and is also allowed to commit.
+	if assignment.Reason != "" && assignment.Reason != botMacroReasonFullMobilization &&
+		!botMacroObjectiveFinishWindowLocked(objective) && !commitGroupReady && !conversionCommit &&
+		!s.botObjectiveConversionReadyLocked(b.c.inst, b.c.playerTeam(), objective, now) {
+		rx, ry, ok := botMobilizationRallyPointLocked(b.c.inst, b.c.playerTeam(), objective)
+		if ok {
+			distance := math.Hypot(float64(objective.x-cx), float64(objective.y-cy))
+			if distance <= b.c.huntState.effAttackRangeLocked(now)+float64(b.c.huntState.av.Radius())+objective.mob.Radius()+botMobilizationGatherRadius {
+				// The rally point is already inside the normal approach band; keep
+				// the bot there until the wave/group predicate becomes true.
+				s.botMoveTowardLocked(b, rx, ry, now)
+				return true
+			}
+		}
+	}
+	reach := b.c.huntState.effAttackRangeLocked(now) + float64(b.c.huntState.av.Radius()) + objective.mob.Radius()
+	if math.Hypot(float64(objective.x-cx), float64(objective.y-cy)) <= reach {
+		s.startAttackLocked(b.c, objective)
+	} else {
+		s.botMoveTowardLocked(b, objective.x, objective.y, now)
+	}
+	return true
+}
+
+// botMobilizationGatherTickLocked is the non-aggressive preparation phase of
+// a full team conversion. It deliberately issues no creep or structure attack:
+// healthy members walk to one staging point, while injured members go through
+// the normal fountain recovery route.
+func (s *Server) botMobilizationGatherTickLocked(b *botBrain, now float64) bool {
+	if b == nil || b.c == nil || b.c.inst == nil || b.c.huntState == nil {
+		return false
+	}
+	objective := b.c.inst.mobs[b.macroAssignment.ObjectiveID]
+	if objective == nil || objective.dead {
+		return false
+	}
+	if botHPFrac(b.c.huntState, now) < botSafeHPFrac {
+		if !b.retreating {
+			botSetRetreatModeLocked(b, botRetreatModeRecovery, now)
+		}
+		x, y := s.botRetreatPointLocked(b, now)
+		s.botMoveTowardLocked(b, x, y, now)
+		return true
+	}
+	rx, ry, ok := botMobilizationRallyPointLocked(b.c.inst, b.c.playerTeam(), objective)
+	if !ok {
+		return false
+	}
+	cx, cy := b.c.posAtLocked(float32(now))
+	if math.Hypot(float64(cx-rx), float64(cy-ry)) > botMobilizationGatherRadius {
+		s.botMoveTowardLocked(b, rx, ry, now)
+	} else {
+		b.c.stopMovementLocked(s, now)
+	}
+	return true
+}
+
 // botGroupTickLocked: with enough of the team grouped up (botPhaseGroup), press whatever
 // lane the party is on -- creeps, then structures without needing a creep escort, since
 // the group itself is the tower-aggro soak a solo laner doesn't have.
@@ -169,12 +292,63 @@ func (s *Server) botGroupTickLocked(b *botBrain, now float64) {
 		s.botMoveTowardLocked(b, hx, hy, now)
 		return
 	}
-	s.botConsiderWaveClearAbilityLocked(b, now)
+	objectiveFormation := b.macroAssignment.Reason == botMacroReasonObjectiveStaging ||
+		b.macroAssignment.Reason == "objective_conversion_ready" ||
+		b.macroAssignment.Reason == botMacroReasonFullMobilization
+	if (b.macroAssignment.Reason == botMacroReasonMobilizationPreparation || objectiveFormation) &&
+		(hs.attackTarget != 0 || (hs.attackActionActive && hs.pvpTarget == 0)) {
+		// Preparation and objective formation are synchronization/execution phases.
+		// A plan refresh can arrive immediately after an ordinary creep order; clear
+		// that stale swing before the attack-state guard, otherwise the bot stays
+		// frozen on the old target and never reaches the shared rally point or the
+		// named structure. The exact objective order is preserved if it is already
+		// the active target.
+		if b.macroAssignment.Reason == botMacroReasonMobilizationPreparation ||
+			hs.attackTarget == 0 || hs.attackTarget != b.macroAssignment.ObjectiveID {
+			s.stopAttackLocked(c, false)
+		}
+	}
 	if hs.attackTarget != 0 {
 		return
 	}
+	if b.macroAssignment.Reason == botMacroReasonMobilizationPreparation {
+		s.botMobilizationGatherTickLocked(b, now)
+		return
+	}
+	// Once an aggressive responder is within the objective commit radius, issue
+	// the exact structure order before considering nearby creeps. The ordinary
+	// farm-first order is valuable on the approach, but near the building it
+	// turns a winning push into another wave-clear loop.
+	// During staging/conversion the objective route itself is the order even when
+	// a creep is nearby; otherwise the group can remain farming forever at the
+	// rally point and never close the last distance to the gun.
+	if (objectiveFormation || s.botPushObjectiveHasPriorityLocked(b, now)) && s.botMacroObjectiveTickLocked(b, now) {
+		return
+	}
+	// A grouped push spends AoE on the live wave before selecting one creep. The
+	// XP grant is proximity-based, so deleting a cluster is strictly more useful
+	// than preserving a gold last-hit opportunity.
+	if s.botConsiderWaveClearAbilityLocked(b, now) {
+		return
+	}
+	// A grouped defender or responder can still be the only body covering its
+	// assigned lane. When no committed objective has priority, intercept that
+	// visible wave before falling back to the narrow group attack radius; this
+	// prevents a 30u approach gap from becoming a guaranteed XP miss.
+	if !objectiveFormation && !s.botPushObjectiveHasPriorityLocked(b, now) {
+		if s.botHoldFarmXPLocked(b, now) {
+			return
+		}
+		if target := s.botFarmApproachTargetLocked(b, now); target != nil {
+			s.botMoveTowardLocked(b, target.x, target.y, now)
+			return
+		}
+	}
 	if target := s.botFindLaneTargetLocked(b, now, botGroupEngageRadius, false); target != nil {
 		s.startAttackLocked(c, target)
+		return
+	}
+	if s.botMacroObjectiveTickLocked(b, now) {
 		return
 	}
 	lane := s.botPushLaneLocked(b, now)

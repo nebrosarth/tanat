@@ -1,6 +1,7 @@
 package battleserver
 
 import (
+	"math"
 	"sort"
 	"testing"
 
@@ -184,6 +185,284 @@ func TestBotCrashRetreatDoesNotBypassRecoveryStateMachine(t *testing.T) {
 	human.huntState.hp = human.huntState.maxHPLocked(now) * botSafeHPFrac
 	if s.botShouldRetreatLocked(b, now) || b.retreating {
 		t.Fatal("retreat latch did not clear after reaching safe HP")
+	}
+}
+
+func TestBotPredictiveRetreatUsesDamageTrendAndHeroPressure(t *testing.T) {
+	for _, tc := range []struct {
+		name              string
+		current, previous float64
+		enemyDistance     float32
+		want              bool
+	}{
+		{name: "losing close fight", current: 0.50, previous: 0.62, enemyDistance: 10, want: true},
+		{name: "same damage without hero pressure", current: 0.50, previous: 0.62, enemyDistance: 40, want: false},
+		{name: "harmless chip", current: 0.65, previous: 0.68, enemyDistance: 10, want: false},
+		{name: "high hp remains committed", current: 0.80, previous: 1.00, enemyDistance: 10, want: false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s, bot, inst, cleanup := newDotaConn(t, "Avtr_Tank_Velial")
+			defer cleanup()
+			b := &botBrain{c: bot, lane: 0, phase: botPhaseLane}
+			now := float64(s.battleTime()) + 10
+			bot.x, bot.y, bot.vx, bot.vy, bot.snapT = 0, 0, 0, 0, float32(now)
+			dotaPlayerConn(t, s, inst, 65980, dotaTeamElf, tc.enemyDistance, 0)
+			bot.huntState.hp = bot.huntState.maxHPLocked(now) * tc.current
+			b.hpHistory[0] = hpSample{t: now - 0.8, frac: tc.previous}
+
+			bot.lock()
+			got := s.botShouldRetreatLocked(b, now)
+			bot.unlock()
+			if got != tc.want {
+				t.Fatalf("predictive retreat = %v, want %v", got, tc.want)
+			}
+		})
+	}
+
+	t.Run("safe hp clears predictive latch", func(t *testing.T) {
+		s, bot, _, cleanup := newDotaConn(t, "Avtr_Tank_Velial")
+		defer cleanup()
+		b := &botBrain{c: bot}
+		now := float64(s.battleTime()) + 10
+		botSetRetreatModeLocked(b, botRetreatModeDisengage, now)
+		bot.huntState.hp = bot.huntState.maxHPLocked(now) * botSafeHPFrac
+		bot.lock()
+		got := s.botShouldRetreatLocked(b, now+botDisengageMinHold-0.01)
+		bot.unlock()
+		if !got || !b.retreating {
+			t.Fatal("predictive retreat cleared before its minimum hold expired")
+		}
+
+		bot.lock()
+		got = s.botShouldRetreatLocked(b, now+botDisengageMinHold+0.01)
+		bot.unlock()
+		if got || b.retreating {
+			t.Fatal("safe HP did not clear predictive retreat latch after its hold")
+		}
+	})
+}
+
+func TestBotPredictiveRetreatDisengagesBehindFriendlyWave(t *testing.T) {
+	s, bot, inst, cleanup := newDotaConn(t, "Avtr_Tank_Velial")
+	defer cleanup()
+	b := &botBrain{c: bot, lane: 0, phase: botPhaseLane}
+	now := float64(s.battleTime()) + 10
+	bot.x, bot.y, bot.snapT = 0, 0, float32(now)
+
+	lane := inst.dota.m.Lanes[b.lane]
+	wave := &mobState{
+		id: 65152, team: dotaTeamHuman, lane: lane, laneIdx: 4,
+		x: float32(lane[4].X), y: float32(lane[4].Y), hp: 100, maxHP: 100,
+	}
+	inst.mobs[wave.id] = wave
+	dotaPlayerConn(t, s, inst, 65982, dotaTeamElf, 10, 0)
+	bot.huntState.hp = bot.huntState.maxHPLocked(now) * 0.50
+	b.hpHistory[0] = hpSample{t: now - 0.8, frac: 0.62}
+
+	bot.lock()
+	defer bot.unlock()
+	if !s.botShouldRetreatLocked(b, now) {
+		t.Fatal("predictive damage trend did not enter retreat")
+	}
+	if b.retreatMode != botRetreatModeDisengage {
+		t.Fatalf("predictive retreat mode = %d, want disengage", b.retreatMode)
+	}
+
+	hx, hy := botHomeLocked(bot)
+	fx, fy, ok := botLaneFrontLocked(bot, lane)
+	if !ok {
+		t.Fatal("setup: friendly wave was not recognized as the lane front")
+	}
+	rx, ry := s.botRetreatPointLocked(b, now)
+	if rx == hx && ry == hy {
+		t.Fatalf("predictive disengage destination = fountain (%.1f,%.1f), want behind-wave step", rx, ry)
+	}
+	if dist2(rx, ry, hx, hy) >= dist2(fx, fy, hx, hy) {
+		t.Fatalf("disengage destination (%.1f,%.1f) is not behind friendly wave (%.1f,%.1f) toward home (%.1f,%.1f)",
+			rx, ry, fx, fy, hx, hy)
+	}
+}
+
+func TestBotRecoveryRetreatStateMachine(t *testing.T) {
+	t.Run("low hp enters recovery at fountain", func(t *testing.T) {
+		s, bot, _, cleanup := newDotaConn(t, "Avtr_Tank_Velial")
+		defer cleanup()
+		b := &botBrain{c: bot, lane: 0}
+		now := float64(s.battleTime())
+		bot.huntState.hp = bot.huntState.maxHPLocked(now) * 0.30
+
+		bot.lock()
+		defer bot.unlock()
+		if !s.botShouldRetreatLocked(b, now) {
+			t.Fatal("30% HP did not enter recovery retreat")
+		}
+		if b.retreatMode != botRetreatModeRecovery {
+			t.Fatalf("low-HP retreat mode = %d, want recovery", b.retreatMode)
+		}
+		hx, hy := botHomeLocked(bot)
+		rx, ry := s.botRetreatPointLocked(b, now)
+		if rx != hx || ry != hy {
+			t.Fatalf("recovery destination = (%.1f,%.1f), want fountain (%.1f,%.1f)", rx, ry, hx, hy)
+		}
+	})
+
+	t.Run("crash enters recovery at fountain", func(t *testing.T) {
+		s, bot, _, cleanup := newDotaConn(t, "Avtr_Tank_Velial")
+		defer cleanup()
+		b := &botBrain{c: bot}
+		now := float64(s.battleTime())
+		bot.huntState.hp = bot.huntState.maxHPLocked(now) * 0.65
+		b.hpHistory[0] = hpSample{t: now - 0.8, frac: 0.95}
+
+		bot.lock()
+		defer bot.unlock()
+		if !s.botCheckHPCrashLocked(b, now) {
+			t.Fatal("25% HP crash did not enter recovery retreat")
+		}
+		if b.retreatMode != botRetreatModeRecovery {
+			t.Fatalf("crash retreat mode = %d, want recovery", b.retreatMode)
+		}
+		hx, hy := botHomeLocked(bot)
+		rx, ry := s.botRetreatPointLocked(b, now)
+		if rx != hx || ry != hy {
+			t.Fatalf("crash recovery destination = (%.1f,%.1f), want fountain (%.1f,%.1f)", rx, ry, hx, hy)
+		}
+	})
+
+	t.Run("recovery clears at 55 percent", func(t *testing.T) {
+		s, bot, _, cleanup := newDotaConn(t, "Avtr_Tank_Velial")
+		defer cleanup()
+		b := &botBrain{c: bot, retreating: true, retreatMode: botRetreatModeRecovery}
+		now := float64(s.battleTime())
+		bot.huntState.hp = bot.huntState.maxHPLocked(now) * botSafeHPFrac
+
+		bot.lock()
+		defer bot.unlock()
+		if s.botShouldRetreatLocked(b, now) || b.retreating {
+			t.Fatal("recovery retreat did not clear at safe 55% HP")
+		}
+	})
+
+	t.Run("death resets any retreat mode", func(t *testing.T) {
+		s, bot, _, cleanup := newDotaConn(t, "Avtr_Tank_Velial")
+		defer cleanup()
+		b := &botBrain{c: bot, retreating: true, retreatMode: botRetreatModeDisengage, retreatHoldUntil: 99}
+		now := float64(s.battleTime())
+		bot.huntState.deadUntil = now + 5
+
+		bot.lock()
+		defer bot.unlock()
+		if s.botShouldRetreatLocked(b, now) || b.retreating {
+			t.Fatal("dead bot retained retreating state")
+		}
+		if b.retreatMode != botRetreatModeRecovery || b.retreatHoldUntil != 0 {
+			t.Fatalf("dead bot retreat state = mode %d hold %.2f, want recovery/0", b.retreatMode, b.retreatHoldUntil)
+		}
+	})
+}
+
+func TestBotPredictiveRetreatRecognizesRecentDamageInsideEnemyGunZone(t *testing.T) {
+	s, bot, inst, cleanup := newDotaConn(t, "Avtr_Tank_Velial")
+	defer cleanup()
+	gun := structOfSide(inst, gamedata.DotaGun, dotaTeamElf)
+	if gun == nil {
+		t.Fatal("setup: missing enemy gun")
+	}
+	now := float64(s.battleTime()) + 10
+	bot.x, bot.y, bot.vx, bot.vy, bot.snapT = gun.x, gun.y, 0, 0, float32(now)
+	bot.huntState.hp = bot.huntState.maxHPLocked(now) * 0.50
+	b := &botBrain{c: bot, lane: 0, phase: botPhaseGroup}
+	b.hpHistory[0] = hpSample{t: now - 0.8, frac: 0.62}
+
+	bot.lock()
+	defer bot.unlock()
+	if !s.botShouldRetreatLocked(b, now) || !b.retreating {
+		t.Fatal("recent damage inside an enemy gun zone did not trigger predictive retreat")
+	}
+}
+
+func TestBotPredictiveRetreatContinuesUnderPressure(t *testing.T) {
+	s, bot, inst, cleanup := newDotaConn(t, "Avtr_Tank_Velial")
+	defer cleanup()
+	b := &botBrain{c: bot}
+	now := float64(s.battleTime()) + 10
+	bot.x, bot.y, bot.snapT = 0, 0, float32(now)
+	dotaPlayerConn(t, s, inst, 65983, dotaTeamElf, 10, 0)
+	botSetRetreatModeLocked(b, botRetreatModeDisengage, now)
+	bot.huntState.hp = bot.huntState.maxHPLocked(now) * 0.50
+
+	bot.lock()
+	defer bot.unlock()
+	if !s.botShouldRetreatLocked(b, now+botDisengageMinHold+1) || !b.retreating {
+		t.Fatal("predictive retreat cleared despite continued nearby enemy pressure")
+	}
+}
+
+func TestBotDisengageEscalatesBeforeCriticalHPWhenPressurePersists(t *testing.T) {
+	s, bot, inst, cleanup := newDotaConn(t, "Avtr_Tank_Velial")
+	defer cleanup()
+	b := &botBrain{c: bot, retreating: true, retreatMode: botRetreatModeDisengage}
+	now := float64(s.battleTime()) + 10
+	bot.x, bot.y, bot.snapT = 0, 0, float32(now)
+	dotaPlayerConn(t, s, inst, 65984, dotaTeamElf, 10, 0)
+	bot.huntState.hp = bot.huntState.maxHPLocked(now) * 0.44
+	b.retreatHoldUntil = now - 1
+
+	bot.lock()
+	defer bot.unlock()
+	if !s.botShouldRetreatLocked(b, now) {
+		t.Fatal("persistent pressure did not keep the bot retreating")
+	}
+	if b.retreatMode != botRetreatModeRecovery {
+		t.Fatalf("persistent pressure mode = %d, want recovery before critical HP", b.retreatMode)
+	}
+	hx, hy := botHomeLocked(bot)
+	rx, ry := s.botRetreatPointLocked(b, now)
+	if rx != hx || ry != hy {
+		t.Fatalf("persistent-pressure destination=(%.1f,%.1f), want fountain=(%.1f,%.1f)", rx, ry, hx, hy)
+	}
+}
+
+func TestBotDisengageEscalatesToCriticalRecovery(t *testing.T) {
+	s, bot, inst, cleanup := newDotaConn(t, "Avtr_Tank_Velial")
+	defer cleanup()
+	b := &botBrain{
+		c:                bot,
+		lane:             0,
+		retreating:       true,
+		retreatMode:      botRetreatModeDisengage,
+		retreatHoldUntil: 99,
+	}
+	now := float64(s.battleTime())
+	lane := inst.dota.m.Lanes[b.lane]
+	wave := &mobState{
+		id: 65153, team: dotaTeamHuman, lane: lane, laneIdx: 4,
+		x: float32(lane[4].X), y: float32(lane[4].Y), hp: 100, maxHP: 100,
+	}
+	inst.mobs[wave.id] = wave
+	bot.huntState.hp = bot.huntState.maxHPLocked(now) * botRetreatHPFrac
+
+	bot.lock()
+	defer bot.unlock()
+	behindWaveX, behindWaveY := s.botRetreatPointLocked(b, now)
+	if !s.botShouldRetreatLocked(b, now) {
+		t.Fatal("critical HP cleared an active disengage instead of retaining retreat")
+	}
+	if b.retreatMode != botRetreatModeRecovery {
+		t.Fatalf("critical disengage mode = %d, want recovery", b.retreatMode)
+	}
+	if b.retreatHoldUntil != 0 {
+		t.Fatalf("critical recovery retained disengage hold until %.2f, want 0", b.retreatHoldUntil)
+	}
+
+	hx, hy := botHomeLocked(bot)
+	rx, ry := s.botRetreatPointLocked(b, now)
+	if rx != hx || ry != hy {
+		t.Fatalf("critical recovery destination = (%.1f,%.1f), want fountain/detour recovery at fountain (%.1f,%.1f)",
+			rx, ry, hx, hy)
+	}
+	if rx == behindWaveX && ry == behindWaveY {
+		t.Fatalf("critical recovery kept behind-wave disengage destination (%.1f,%.1f)", rx, ry)
 	}
 }
 
@@ -466,5 +745,163 @@ func TestBotHealsHurtAlly(t *testing.T) {
 	if ah.hp <= 1 && len(ah.st.hots) == 0 && ah.st.shield <= 0 {
 		t.Fatalf("ally shows no sign of being healed/shielded after the bot's cast (hp=%g hots=%d shield=%g)",
 			ah.hp, len(ah.st.hots), ah.st.shield)
+	}
+}
+
+// TestBotCommittedStructureFocusOnlySeesActiveGunOrTowerShots distinguishes a
+// structure's current dtarget from a committed shot. A generator/idle structure,
+// or a gun/tower whose committed shot is aimed at a creep, must not make this bot
+// flee; a live tower hitscan or cannon projectile aimed at the bot must.
+func TestBotCommittedStructureFocusOnlySeesActiveGunOrTowerShots(t *testing.T) {
+	tests := []struct {
+		name       string
+		role       gamedata.DotaRole
+		configure  func(*mobState, float64, int32)
+		wantThreat bool
+	}{
+		{
+			name: "idle gun target only",
+			role: gamedata.DotaGun,
+			configure: func(m *mobState, _ float64, botID int32) {
+				m.dtarget = botID
+			},
+		},
+		{
+			name: "tower committed on creep",
+			role: gamedata.DotaCreepTower,
+			configure: func(m *mobState, now float64, _ int32) {
+				m.hitAt, m.hitTarget = now+1, 61001
+			},
+		},
+		{
+			name: "tower hitscan on bot",
+			role: gamedata.DotaCreepTower,
+			configure: func(m *mobState, now float64, botID int32) {
+				m.hitAt, m.hitTarget = now+1, botID
+			},
+			wantThreat: true,
+		},
+		{
+			name: "gun projectile on bot",
+			role: gamedata.DotaGun,
+			configure: func(m *mobState, now float64, botID int32) {
+				m.projLaunchAt, m.projTarget = now+1, botID
+			},
+			wantThreat: true,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			s, bot, inst, cleanup := newDotaConn(t, "Avtr_Tank_Velial")
+			defer cleanup()
+			structure := structOfSide(inst, tc.role, dotaTeamElf)
+			if structure == nil || structure.mob.AttackRange <= 0 {
+				t.Fatalf("setup: no active %v structure", tc.role)
+			}
+			now := float64(s.battleTime())
+			tc.configure(structure, now, bot.objID)
+
+			bot.lock()
+			defer bot.unlock()
+			got := s.botCommittedStructureFocusLocked(bot, now)
+			if (got != nil) != tc.wantThreat {
+				t.Fatalf("committed structure focus = %v, want threat=%v", got, tc.wantThreat)
+			}
+			if tc.wantThreat && got != structure {
+				t.Fatalf("committed structure focus = %v, want structure %d", got, structure.id)
+			}
+		})
+	}
+}
+
+// TestBotEscapesCommittedHitscanAndProjectileFocus verifies the full healthy-bot
+// escape lifecycle for both active shot representations: cancel current attacks and
+// orders, move outside structure reach, hold that choice for two seconds without
+// entering the low-HP retreat state, then resume ordinary decisions after the shot
+// commitment expires.
+func TestBotEscapesCommittedHitscanAndProjectileFocus(t *testing.T) {
+	tests := []struct {
+		name      string
+		role      gamedata.DotaRole
+		configure func(*mobState, float64, int32)
+	}{
+		{
+			name: "hitscan tower",
+			role: gamedata.DotaCreepTower,
+			configure: func(m *mobState, now float64, botID int32) {
+				m.hitAt, m.hitTarget = now+0.4, botID
+			},
+		},
+		{
+			name: "projectile gun",
+			role: gamedata.DotaGun,
+			configure: func(m *mobState, now float64, botID int32) {
+				m.projLaunchAt, m.projTarget = now+0.4, botID
+			},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			s, bot, inst, cleanup := newDotaConn(t, "Avtr_Tank_Velial")
+			defer cleanup()
+			structure := structOfSide(inst, tc.role, dotaTeamElf)
+			if structure == nil || structure.mob.AttackRange <= 0 {
+				t.Fatalf("setup: no active %v structure", tc.role)
+			}
+			now := float64(s.battleTime())
+			bot.x, bot.y, bot.snapT = 0, 0, float32(now)
+			structure.x, structure.y = 10, 0
+			tc.configure(structure, now, bot.objID)
+
+			// Seed all three order forms the escape path must cancel. The ids do not
+			// need live targets: the cancellation boundary is the bot's own state.
+			bot.huntState.attackTarget = 61001
+			bot.huntState.pvpTarget = 61002
+			bot.huntState.order = &pendingCast{slot: 1}
+			b := &botBrain{c: bot, lane: 0}
+
+			bot.lock()
+			s.botTickLocked(b, now)
+			if got := s.botCommittedStructureFocusLocked(bot, now); got != structure {
+				t.Fatalf("setup focus = %v, want structure %d", got, structure.id)
+			}
+			if bot.huntState.attackTarget != 0 || bot.huntState.pvpTarget != 0 || bot.huntState.order != nil {
+				t.Fatalf("committed focus left attack/order state armed: attack=%d pvp=%d order=%v",
+					bot.huntState.attackTarget, bot.huntState.pvpTarget, bot.huntState.order)
+			}
+			if !bot.hasDest {
+				t.Fatal("committed focus did not issue a safe movement destination")
+			}
+			if s.botEnemyStructureDangerLocked(bot, bot.destX, bot.destY) {
+				t.Fatalf("escape destination (%.1f,%.1f) remains inside enemy structure danger radius", bot.destX, bot.destY)
+			}
+			if b.retreating {
+				t.Fatal("healthy committed-structure escape incorrectly entered fountain retreat")
+			}
+			if got, want := b.structureAvoidUntil, now+botStructureAvoidHold; math.Abs(got-want) > 0.01 {
+				t.Fatalf("structure hold expires at %.3f, want %.3f", got, want)
+			}
+			if b.structureAvoidTarget != structure.id {
+				t.Fatalf("structure hold target = %d, want %d", b.structureAvoidTarget, structure.id)
+			}
+
+			// The committed shot has now resolved. During the remaining hold the bot
+			// must keep the tactical escape, not re-enter its normal lane logic.
+			s.botTickLocked(b, now+1)
+			if b.structureAvoidTarget != structure.id || !bot.hasDest {
+				t.Fatal("bot resumed normal decisions before the two-second structure hold expired")
+			}
+
+			s.botTickLocked(b, now+botStructureAvoidHold+0.1)
+			if b.structureAvoidTarget != 0 {
+				t.Fatalf("structure hold target = %d after expiry, want cleared", b.structureAvoidTarget)
+			}
+			if b.nextThinkAt <= now+botStructureAvoidHold {
+				t.Fatalf("normal bot decisions did not resume after structure hold: nextThinkAt=%.3f", b.nextThinkAt)
+			}
+			bot.unlock()
+		})
 	}
 }

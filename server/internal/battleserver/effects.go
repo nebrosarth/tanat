@@ -158,8 +158,9 @@ func (s *Server) orderDoneLocked(c *conn, action int32) {
 // ---- cast pipeline ----
 
 // startSkillOrderLocked validates a DO_ACTION for a skill and either casts
-// now, or starts the approach chase. Caller holds mvMu.
-func (s *Server) startSkillOrderLocked(c *conn, slot int, target int32, px, py float32, hasPos bool) {
+// now, or starts the approach chase. It reports whether the order was accepted.
+// Caller holds mvMu.
+func (s *Server) startSkillOrderLocked(c *conn, slot int, target int32, px, py float32, hasPos bool) bool {
 	hs := c.huntState
 	def := hs.skillDef(slot)
 	now := float64(s.battleTime())
@@ -172,21 +173,22 @@ func (s *Server) startSkillOrderLocked(c *conn, slot int, target int32, px, py f
 
 	if hs.deadUntil > now || hs.st.stunned(now) || hs.st.silenced(now) {
 		s.orderDoneLocked(c, parent)
-		return
+		return false
 	}
 	if def.Type == "PASSIVE" {
 		s.orderDoneLocked(c, parent)
-		return
+		return false
 	}
 	if def.Type == "TOGGLE" {
+		wasOn := hs.toggleOn[slot-1]
 		s.toggleSkillLocked(c, slot)
-		return
+		return hs.toggleOn[slot-1] != wasOn
 	}
 	level := int(hs.skillLevel[slot-1])
 	// A rank-0 skill is UNLEARNED (the ult before avatar level 5) -- uncastable.
 	if level < 1 || now < hs.cooldownUntil[slot-1] || hs.mana < skillManaCost(float64(def.ManaCost[level-1])) {
 		s.orderDoneLocked(c, parent)
-		return
+		return false
 	}
 
 	// Self casts fire instantly on the caster, ignoring target/position. The
@@ -196,7 +198,7 @@ func (s *Server) startSkillOrderLocked(c *conn, slot int, target int32, px, py f
 	// toward the origin treating {0,0} as a ground-target point.
 	if def.Target == "" || def.Target == "SELF" {
 		s.execCastLocked(c, slot, nil, 0, 0, false, 0)
-		return
+		return true
 	}
 
 	// Resolve where the cast lands.
@@ -226,11 +228,11 @@ func (s *Server) startSkillOrderLocked(c *conn, slot int, target int32, px, py f
 				hasPos = true
 			} else {
 				s.orderDoneLocked(c, parent)
-				return
+				return false
 			}
 		case ms.dead:
 			s.orderDoneLocked(c, parent)
-			return
+			return false
 		default:
 			// «Штурм» friendly fire, single-target arm. The AoE scans filter allies
 			// themselves (mobsWithinLocked), but damageTargetsLocked hands an op with no
@@ -240,7 +242,7 @@ func (s *Server) startSkillOrderLocked(c *conn, slot int, target int32, px, py f
 			// creep/building; a hostile-only skill turns an ally target away.
 			if !ms.enemyOf(c.playerTeam()) && !skillHasTargetFlag(def, "FRIEND") {
 				s.orderDoneLocked(c, parent)
-				return
+				return false
 			}
 			tx, ty = ms.x, ms.y
 			hasPos = true
@@ -259,7 +261,7 @@ func (s *Server) startSkillOrderLocked(c *conn, slot int, target int32, px, py f
 	// A unit-target skill cast with no valid target/position: fire in place.
 	if ms == nil && allyObj == 0 && !hasPos {
 		s.execCastLocked(c, slot, nil, 0, 0, false, 0)
-		return
+		return true
 	}
 
 	// In range? Cast. Otherwise chase toward the cast point.
@@ -270,11 +272,12 @@ func (s *Server) startSkillOrderLocked(c *conn, slot int, target int32, px, py f
 	}
 	if math.Hypot(float64(tx-cx), float64(ty-cy)) <= maxDist+0.5 {
 		s.execCastLocked(c, slot, ms, tx, ty, hasPos, allyObj)
-		return
+		return true
 	}
 	hs.order = &pendingCast{slot: slot, target: target, allyObj: allyObj, px: px, py: py, hasPos: hasPos}
 	c.resetChaseLocked() // new chase session: path now, then throttle the tick re-issues
 	c.chaseMoveLocked(s, tx, ty)
+	return true
 }
 
 // tickOrderLocked advances the pending approach-cast (called from the tick).
@@ -482,16 +485,17 @@ func skillHasAnyBuffStat(def gamedata.Skill) bool {
 	return false
 }
 
-// skillHoldsTarget reports whether a skill both CHANNELS and pins its victim with a
-// root/silence -- i.e. the channel is a GRIP, and the crowd control is that grip made
-// visible rather than an independent debuff that should outlive it.
+// skillHoldsTarget reports whether a skill both CHANNELS and pins its victim with
+// crowd control -- root, silence, or a full stun. The channel is a GRIP, and the
+// crowd control is that grip made visible rather than an independent debuff that
+// should outlive it.
 func skillHoldsTarget(def gamedata.Skill) bool {
 	var channels, holds bool
 	for _, op := range def.Ops {
 		switch op.Kind {
 		case gamedata.OpChannel:
 			channels = true
-		case gamedata.OpRoot, gamedata.OpSilence:
+		case gamedata.OpRoot, gamedata.OpSilence, gamedata.OpStun:
 			holds = true
 		}
 	}
@@ -540,6 +544,46 @@ func (s *Server) breakInterruptibleChannelsLocked(c *conn) {
 	hs.channels = keep
 }
 
+// botHasBlockingChannelLocked reports whether a bot is currently sustaining a
+// self/unit channel and must not issue a new combat/movement order. A point channel
+// with no target is deliberately not blocking: its effect is already planted in the
+// world and is authored to continue while the caster acts elsewhere.
+func botHasBlockingChannelLocked(hs *huntState, now float64) bool {
+	if hs == nil {
+		return false
+	}
+	for _, ch := range hs.channels {
+		if now > ch.until {
+			continue
+		}
+		if ch.target > 0 || !ch.hasPos || ch.interruptible {
+			return true
+		}
+	}
+	return false
+}
+
+// botHasPendingBlockingChannelLocked closes the small cast-to-impact window of a
+// targeted channel. A channel is created by the payload, but the cast has already
+// committed the caster to standing still before that payload lands. Without this
+// guard the bot's next combat tick can arm a PvP chase during the PayloadDelay;
+// tickChannelsLocked then sees c.hasDest and correctly breaks the channel, which in
+// turn releases the victim's root/silence immediately.
+func botHasPendingBlockingChannelLocked(hs *huntState, now float64) bool {
+	if hs == nil {
+		return false
+	}
+	for _, p := range hs.payloads {
+		if p.at <= now || p.target <= 0 || p.slot < 1 || p.slot > len(hs.kit.Skills) {
+			continue
+		}
+		if skillHoldsTarget(hs.skillDef(p.slot)) {
+			return true
+		}
+	}
+	return false
+}
+
 // execCastLocked performs the actual cast: mana, packets, payload scheduling.
 func (s *Server) execCastLocked(c *conn, slot int, ms *mobState, px, py float32, hasPos bool, allyObj int32) {
 	hs := c.huntState
@@ -578,6 +622,18 @@ func (s *Server) execCastLocked(c *conn, slot int, ms *mobState, px, py float32,
 	// runs BEFORE the payload that would create THIS cast's own channel, so a
 	// channel skill never cancels itself.
 	s.breakInterruptibleChannelsLocked(c)
+	// A targeted channel owns the caster's action for the whole cast-to-impact
+	// transition as well as the sustained pulses. Cancel any already-armed attack
+	// timer before the delayed payload creates the channel; otherwise that timer can
+	// issue a chase in the gap and the new channel is born already interrupted.
+	if skillHasChannel(def) {
+		if hs.attackTarget != 0 || hs.attackActionActive {
+			s.stopAttackLocked(c, false)
+		}
+		if hs.pvpTarget != 0 || hs.attackActionActive {
+			s.stopPvpAttackLocked(c, false)
+		}
+	}
 
 	// Casting roots the avatar: stop any in-flight movement at the live position
 	// and push a velocity-0 sync so the client plays the cast in place instead of
@@ -2763,8 +2819,7 @@ func (s *Server) removeModsBySrcLocked(c *conn, src string, now float64) {
 // and animations track buffs live.
 func (s *Server) pushPlayerStatsLocked(c *conn, now float64) {
 	hs := c.huntState
-	idx := hs.tr.index(c.objID)
-	if idx < 0 {
+	if hs.tr.index(c.objID) < 0 {
 		return
 	}
 	a := hs.av
@@ -2792,21 +2847,28 @@ func (s *Server) pushPlayerStatsLocked(c *conn, now float64) {
 	if hs.mana > maxMana {
 		hs.mana = maxMana
 	}
-	b := newSyncBlob(float32(now)).
-		setFloats(syncDmgMin, idx, float32((float64(a.DmgMin)+dmgFlat)*dmgMul+missBonus)).
-		setFloats(syncDmgMax, idx, float32((float64(a.DmgMax)+dmgFlat)*dmgMul+missBonus)).
-		setFloats(syncAttackSpeed, idx, float32(atkSpeed*st.attackFactor(now))).
-		setFloats(syncMaxHealth, idx, float32(maxHP)).
-		setFloats(syncHealth, idx, float32(hs.hp/maxHP)).
-		setFloats(syncMaxMana, idx, float32(maxMana)).
-		setFloats(syncMana, idx, float32(hs.mana/maxMana)).
-		setFloats(syncPhysArmor, idx, float32((a.PhysArmor+st.modSum(now, "phys_armor"))*armMul)).
-		setFloats(syncMagicArmor, idx, float32((a.MagicArmor+st.modSum(now, "magic_armor"))*armMul)).
-		setFloats(syncSpellPower, idx, float32(hs.spellPowerLocked(now))).
-		setFloats(syncAttackRange, idx, float32(hs.effAttackRangeLocked(now))).
-		setFloats(syncSpeed, idx, float32(c.curSpeedLocked(now))).
-		setFloats(syncViewRadius, idx, effectiveViewRadius(avatarViewRadius*float32(st.modMul(now, "view_radius_pct"))))
-	s.push(c, battleproto.CmdSync, amf.NewArray().Set("data", b.build(hs.tr.count())))
+	// Stats are part of the shared avatar state. In particular, an item bought by
+	// a bot used to update only the bot's own connection; every already-rendering
+	// teammate kept the old max HP/damage/armor in its target card until a later
+	// re-render. Build the same payload for each viewer because every client has a
+	// different tracker index for this avatar.
+	c.mobViewersLocked(c.objID, func(viewer *conn, idx, count int) {
+		b := newSyncBlob(float32(now)).
+			setFloats(syncDmgMin, idx, float32((float64(a.DmgMin)+dmgFlat)*dmgMul+missBonus)).
+			setFloats(syncDmgMax, idx, float32((float64(a.DmgMax)+dmgFlat)*dmgMul+missBonus)).
+			setFloats(syncAttackSpeed, idx, float32(atkSpeed*st.attackFactor(now))).
+			setFloats(syncMaxHealth, idx, float32(maxHP)).
+			setFloats(syncHealth, idx, float32(hs.hp/maxHP)).
+			setFloats(syncMaxMana, idx, float32(maxMana)).
+			setFloats(syncMana, idx, float32(hs.mana/maxMana)).
+			setFloats(syncPhysArmor, idx, float32((a.PhysArmor+st.modSum(now, "phys_armor"))*armMul)).
+			setFloats(syncMagicArmor, idx, float32((a.MagicArmor+st.modSum(now, "magic_armor"))*armMul)).
+			setFloats(syncSpellPower, idx, float32(hs.spellPowerLocked(now))).
+			setFloats(syncAttackRange, idx, float32(hs.effAttackRangeLocked(now))).
+			setFloats(syncSpeed, idx, float32(c.curSpeedLocked(now))).
+			setFloats(syncViewRadius, idx, effectiveViewRadius(avatarViewRadius*float32(st.modMul(now, "view_radius_pct"))))
+		s.push(viewer, battleproto.CmdSync, amf.NewArray().Set("data", b.build(count)))
+	})
 	c.applySpeedLocked(s, now)
 }
 

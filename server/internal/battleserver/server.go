@@ -332,7 +332,7 @@ func (s *Server) handleConnect(c *conn, p battleproto.Packet) {
 // which the client feeds into BattleTimer.Sync (ServerTimeArgParser reads
 // "time").
 func (s *Server) handleGetTime(c *conn, p battleproto.Packet) {
-	t := time.Since(s.start).Seconds()
+	t := float64(s.battleTime())
 	args := amf.NewArray().Set("time", t)
 	if err := c.send(battleproto.Packet{
 		Cmd:       battleproto.CmdGetTime,
@@ -568,7 +568,7 @@ const (
 )
 
 func (s *Server) battleTime() float32 {
-	return float32(time.Since(s.start).Seconds())
+	return float32(time.Since(s.start).Seconds() * dotaSimulationSpeed())
 }
 
 // speedSync builds a SYNC "data" blob carrying just the SPEED stat for objID
@@ -635,12 +635,8 @@ func (s *Server) handleMove(c *conn, p battleproto.Packet) {
 	// (Op.Root/OpStun, now landable on a hero too -- see pvp_hero_targets.go) freezes
 	// the same way: without this a rooted player could still walk away by just
 	// clicking, since MOVE_PLAYER never consulted hs.st at all.
-	if hs := c.huntState; hs != nil && (float64(now) < hs.castLockUntil || hs.st.rooted(float64(now))) {
-		cx, cy := c.posAtLocked(now)
-		c.stopArrivalLocked()
-		c.hasDest = false
-		c.x, c.y, c.vx, c.vy, c.snapT = cx, cy, 0, 0, now
-		c.sendPosLocked(s, cx, cy, 0, 0, now)
+	if c.movementBlockedLocked(float64(now)) {
+		c.stopMovementLocked(s, float64(now))
 		return
 	}
 	// A manual move order breaks the auto-attack session and any pending cast.
@@ -650,14 +646,14 @@ func (s *Server) handleMove(c *conn, p battleproto.Packet) {
 		if hs.stealthBreaksOnMove {
 			s.breakInvisibilityLocked(c, float64(now))
 		}
-		if hs.attackTarget != 0 {
+		if hs.attackTarget != 0 || (hs.attackActionActive && hs.pvpTarget == 0) {
 			s.stopAttackLocked(c, false)
 		}
 		// PvP (hero-vs-hero) auto-attack: without this, the armPvpAttackTimer chain
 		// armed by an earlier right-click on an enemy hero stayed live through a move
 		// order and kept walking the avatar back to the enemy every ~250ms until back
 		// in range -- a click to flee mid-fight did nothing (see stopPvpAttackLocked).
-		if hs.pvpTarget != 0 {
+		if hs.pvpTarget != 0 || (hs.attackActionActive && hs.attackTarget == 0) {
 			s.stopPvpAttackLocked(c, false)
 		}
 		s.cancelOrderLocked(c)
@@ -700,6 +696,10 @@ func (s *Server) handleStop(c *conn, p battleproto.Packet) {
 // unchanged.
 func (c *conn) moveToLocked(s *Server, tx, ty float32) {
 	now := s.battleTime()
+	if c.movementBlockedLocked(float64(now)) {
+		c.stopMovementLocked(s, float64(now))
+		return
+	}
 	cx, cy := c.posAtLocked(now)
 	c.stopArrivalLocked()
 
@@ -731,6 +731,10 @@ func (c *conn) moveToLocked(s *Server, tx, ty float32) {
 // which pops the waypoint and either starts the next leg or halts. Empty/degenerate
 // waypoints are skipped. Caller holds mvMu.
 func (c *conn) startLegLocked(s *Server, now float32) {
+	if c.movementBlockedLocked(float64(now)) {
+		c.stopMovementLocked(s, float64(now))
+		return
+	}
 	for len(c.path) > 0 {
 		wp := c.path[0]
 		tx, ty := float32(wp.X), float32(wp.Y)
@@ -755,7 +759,7 @@ func (c *conn) startLegLocked(s *Server, now float32) {
 		// AfterFunc; stopArrivalLocked bumps moveGen on every re-issue/stop).
 		gen := c.moveGen
 		eta := time.Duration(float64(dist/speed) * float64(time.Second))
-		c.arrival = time.AfterFunc(eta, func() {
+		c.arrival = dotaSimulationAfter(eta, func() {
 			c.lock()
 			defer c.unlock()
 			if c.moveGen != gen {
@@ -803,13 +807,11 @@ func (c *conn) resetChaseLocked() {
 // mode aimAlong's throttle guards against for mobs).
 func (c *conn) chaseMoveLocked(s *Server, tx, ty float32) {
 	now := float64(s.battleTime())
-	// Rooted/stunned: no SERVER-DRIVEN movement either. handleMove already refuses the
-	// player's own click, but every chase re-arm (PvP auto-attack, mob auto-attack,
-	// approach-then-cast) calls this same function on its own retry cadence, bypassing
-	// that guard entirely -- a rooted hero still fighting back (auto-attacking someone)
-	// kept getting walked toward its target every ~250ms, which is exactly why a root
-	// looked like it "didn't work" whenever the victim had a chase already in flight.
-	if hs := c.huntState; hs != nil && hs.st.rooted(now) {
+	// Every server-driven chase funnels through the same movement gate as a manual
+	// click. This is deliberately a stop, not only a no-op: an arrival timer from the
+	// previous leg may already be moving the avatar when the CC lands.
+	if c.movementBlockedLocked(now) {
+		c.stopMovementLocked(s, now)
 		return
 	}
 	drift := math.Hypot(float64(tx-c.chaseGoalX), float64(ty-c.chaseGoalY))
@@ -819,6 +821,30 @@ func (c *conn) chaseMoveLocked(s *Server, tx, ty float32) {
 	c.chaseGoalX, c.chaseGoalY = tx, ty
 	c.chaseRepathAt = now
 	c.moveToLocked(s, tx, ty)
+}
+
+// movementBlockedLocked is the single authoritative gate for ordinary avatar
+// movement. Root includes stun in unitStatus, so one predicate covers both CCs;
+// castLockUntil is the short server-side cast wind-up lock. Ability-specific dashes
+// intentionally use moveStraightExLocked and are validated by the skill pipeline
+// separately rather than being silently treated as a walk order.
+func (c *conn) movementBlockedLocked(now float64) bool {
+	hs := c.huntState
+	return hs != nil && (now < hs.castLockUntil || hs.st.rooted(now))
+}
+
+// stopMovementLocked freezes an avatar at its authoritative live position and
+// invalidates every pending routed leg. It is safe to call from any movement choke
+// point; a POSITION packet is emitted only when there was movement to correct.
+func (c *conn) stopMovementLocked(s *Server, now float64) {
+	moving := c.hasDest || c.arrival != nil || len(c.path) != 0 || c.vx != 0 || c.vy != 0
+	cx, cy := c.posAtLocked(float32(now))
+	c.stopArrivalLocked()
+	c.hasDest = false
+	c.x, c.y, c.vx, c.vy, c.snapT = cx, cy, 0, 0, float32(now)
+	if moving {
+		c.sendPosLocked(s, cx, cy, 0, 0, float32(now))
+	}
 }
 
 // moveStraightLocked walks a single straight leg to (tx,ty), clipped to walkable

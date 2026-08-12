@@ -39,6 +39,11 @@ const (
 	AvatarTreeMagic   int32 = 3 // Mg
 	AvatarTreeControl int32 = 4 // Cn
 	AvatarTreeSupport int32 = 5 // Sp
+
+	// AvatarTreeMaxItems mirrors the client BattleItemMenu.mMaxItemsCount,
+	// initialized to three. The battle server enforces the same limit because
+	// the client cannot be trusted to enforce an economy rule by itself.
+	AvatarTreeMaxItems = 3
 )
 
 // avatarItemArticleBase anchors the tree-item article/proto id range. Chosen

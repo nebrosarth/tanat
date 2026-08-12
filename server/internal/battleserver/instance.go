@@ -231,6 +231,9 @@ func (inst *huntInstance) leaveInstanceLocked(c *conn) {
 		return
 	}
 	delete(inst.members, c.objID)
+	if inst.dota != nil {
+		inst.s.publishLiveFightLogLocked(inst)
+	}
 	now := float64(inst.s.battleTime())
 	// Tell everyone still here to remove the departing avatar and its summons.
 	for _, other := range inst.members {
@@ -265,7 +268,7 @@ func (inst *huntInstance) leaveInstanceLocked(c *conn) {
 // 200ms it runs each member's per-player upkeep and one shared mob pass, then
 // disposes the world once the last member has left.
 func (s *Server) runInstanceTicker(inst *huntInstance) {
-	t := time.NewTicker(tickInterval)
+	t := time.NewTicker(dotaSimulationTickerInterval())
 	defer t.Stop()
 	for range t.C {
 		inst.mu.Lock()
@@ -285,6 +288,16 @@ func (s *Server) runInstanceTicker(inst *huntInstance) {
 			return
 		}
 		now := float64(s.battleTime())
+		// A finished DOTA match is a frozen result scene. Do not run member upkeep,
+		// bot brains, or the shared world pass after the authoritative end latch.
+		if inst.dota != nil && inst.dota.ended {
+			inst.mu.Unlock()
+			continue
+		}
+		if inst.dota != nil {
+			s.botRebalanceLanesLocked(inst, now)
+			s.botPlanTeamsLocked(inst, now)
+		}
 		var rep *conn
 		for _, c := range inst.memberList() { // ready members only
 			if !c.huntState.closed {

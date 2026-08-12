@@ -121,7 +121,10 @@ const (
 	mobUnshadeRadius = 22.0 // clear shade once nearer than this
 	mobShadeFx       = "InvisibilityEffect"
 
-	respawnDelay = 6.0 // seconds from death to revive
+	// Level-one value retained for tests that construct a generic dead avatar
+	// directly. Player deaths use dotaHeroRespawnDelay, which follows Dota's
+	// level table below rather than this fixed value.
+	respawnDelay = 6.0
 	corpseHide   = 3.0 // seconds from death to SYNC-remove (death anim shows)
 
 	// Fountain regen: a LIVING player standing near their respawn point (base/checkpoint)
@@ -825,8 +828,13 @@ func (s *Server) tickChannelsLocked(c *conn, now float64) {
 		// A channel held ON a unit ends when that unit dies. Nothing is being channelled
 		// into a corpse -- and for a grip like «Короткое замыкание» or «Кабала» the beam
 		// would otherwise keep firing at a body for the rest of its nominal duration.
+		var target *mobState
 		if ch.target > 0 {
-			if ms := hs.mobs[ch.target]; ms == nil || ms.dead {
+			target = hs.mobs[ch.target]
+			if target == nil || target.dead {
+				target = s.dotaEnemyHeroShadowLocked(c, ch.target, now)
+			}
+			if target == nil {
 				broken = true
 			}
 		}
@@ -834,11 +842,15 @@ func (s *Server) tickChannelsLocked(c *conn, now float64) {
 		// contact snaps, stunning it -- «при сильном отдалении контакт разорвётся, оглушая
 		// цель». Only fires on a distance break, never on the natural full-duration end.
 		if !broken && ch.breakDist > 0 && ch.target > 0 {
-			if ms := hs.mobs[ch.target]; ms != nil && !ms.dead {
+			if target != nil {
 				cx, cy := c.posAtLocked(float32(now))
-				if math.Hypot(float64(ms.x-cx), float64(ms.y-cy)) > ch.breakDist {
+				if math.Hypot(float64(target.x-cx), float64(target.y-cy)) > ch.breakDist {
 					if ch.stunOnBreak > 0 {
-						s.stunMobLocked(c, ms, now, ch.stunOnBreak)
+						if target.heroOwner != nil {
+							s.dotaStunHeroLocked(c, target.heroOwner, now, ch.stunOnBreak)
+						} else {
+							s.stunMobLocked(c, target, now, ch.stunOnBreak)
+						}
 					}
 					continue // drop the channel: contact broken
 				}
@@ -856,10 +868,19 @@ func (s *Server) tickChannelsLocked(c *conn, now float64) {
 				// StunEffect/SilenceEffect visuals on the next pass, once the timers read
 				// expired, so no fx teardown is needed here.
 				if ch.holdsTarget && ch.target > 0 {
-					if ms := hs.mobs[ch.target]; ms != nil && !ms.dead {
-						ms.st.rootUntil = math.Min(ms.st.rootUntil, now)
-						ms.st.silenceUntil = math.Min(ms.st.silenceUntil, now)
-						ms.st.atkSlowUntil = math.Min(ms.st.atkSlowUntil, now)
+					if target != nil {
+						if target.heroOwner != nil {
+							st := &target.heroOwner.huntState.st
+							st.stunUntil = math.Min(st.stunUntil, now)
+							st.rootUntil = math.Min(st.rootUntil, now)
+							st.silenceUntil = math.Min(st.silenceUntil, now)
+							st.atkSlowUntil = math.Min(st.atkSlowUntil, now)
+						} else {
+							target.st.stunUntil = math.Min(target.st.stunUntil, now)
+							target.st.rootUntil = math.Min(target.st.rootUntil, now)
+							target.st.silenceUntil = math.Min(target.st.silenceUntil, now)
+							target.st.atkSlowUntil = math.Min(target.st.atkSlowUntil, now)
+						}
 					}
 				}
 			}
@@ -885,13 +906,6 @@ func (s *Server) tickChannelsLocked(c *conn, now float64) {
 				step = 0.4
 			}
 			ch.nextPulse += step
-			var ms *mobState
-			if ch.target > 0 {
-				ms = hs.mobs[ch.target]
-				if ms != nil && ms.dead {
-					ms = nil
-				}
-			}
 			dmgBonus := ch.growth * float64(ch.pulseCount)
 			if ch.growthSP > 0 {
 				dmgBonus += ch.growthSP * float64(ch.pulseCount) * hs.spellPowerLocked(now)
@@ -903,7 +917,7 @@ func (s *Server) tickChannelsLocked(c *conn, now float64) {
 				}
 				dmgBonus += ch.growthPerEnemy * float64(len(c.mobsWithinLocked(cx, cy, ch.growthRadius)))
 			}
-			ctx := opCtx{slot: ch.slot, level: ch.level, target: ms,
+			ctx := opCtx{slot: ch.slot, level: ch.level, target: target,
 				px: ch.px, py: ch.py, hasPos: ch.hasPos,
 				dmgBonus:    dmgBonus,
 				durBonus:    ch.stunGrowth * float64(ch.pulseCount),
@@ -3041,6 +3055,14 @@ func (s *Server) hitPlayerFromLocked(c *conn, damagerID int32, dmg float64, now 
 	if dmg <= 0 {
 		return
 	}
+	// A skill/DoT path can identify a hero by damagerID without passing the
+	// pvpAttacker pointer. Resolve that strictly from the instance; a creep id must
+	// never become a hero merely because creditConnLocked has a PvE fallback.
+	heroAttacker := pvpAttacker
+	if heroAttacker == nil {
+		heroAttacker = s.enemyHeroByObjIDLocked(c, damagerID)
+	}
+	s.noteHeroDamageLocked(c, heroAttacker, now)
 	// Rognar's «Канал смерти»: forward a share of the blow to the linked unit -- as magic
 	// damage to a linked enemy, or as healing to a linked friend.
 	if hs.deathLinkObj != 0 && now < hs.deathLinkUntil && hs.deathLinkFrac > 0 {
@@ -3072,23 +3094,31 @@ func (s *Server) hitPlayerFromLocked(c *conn, damagerID int32, dmg float64, now 
 		}
 	}
 	hs.hp -= dmg
+	creditedKiller := heroAttacker
+	if hs.hp <= 0 && creditedKiller == nil && c.inst != nil && c.inst.dota != nil {
+		creditedKiller = s.recentHeroKillCreditLocked(c, now)
+	}
 	s.broadcastAvatarObjLocked(c, battleproto.CmdReceiveHit, amf.NewArray().
 		Set("object", c.objID).
 		Set("damager", damagerID).
 		Set("flags", int32(0)).
 		Set("damage", dmg))
 	if c.inst != nil && c.inst.dota != nil && c.inst.dota.telemetry != nil {
-		s.telemetryRecordDamageLocked(c.inst.dota.telemetry, c, damagerID, pvpAttacker, dmg, hs.hp <= 0, c.inst.dota.telemetryMatchTimeLocked(now), now)
+		s.telemetryRecordDamageWithCreditLocked(c.inst.dota.telemetry, c, damagerID, heroAttacker, creditedKiller, dmg, hs.hp <= 0, c.inst.dota.telemetryMatchTimeLocked(now), now)
 	}
 	if hs.hp <= 0 {
 		hs.hp = 0
 		s.syncSelfLocked(c, syncHealth)
-		s.playerDieLocked(c, damagerID, now)
-		if pvpAttacker != nil {
+		killerID := damagerID
+		if creditedKiller != nil {
+			killerID = creditedKiller.objID
+		}
+		s.playerDieLocked(c, killerID, now)
+		if creditedKiller != nil {
 			if c.inst != nil && c.inst.dota != nil {
-				s.dotaCreditHeroKillLocked(pvpAttacker, c, now)
+				s.dotaCreditHeroKillLocked(creditedKiller, c, now)
 			} else {
-				s.arenaCreditKillLocked(pvpAttacker, c, now)
+				s.arenaCreditKillLocked(creditedKiller, c, now)
 			}
 		}
 		return
@@ -3273,10 +3303,26 @@ func (s *Server) playerDieLocked(c *conn, killer int32, now float64) {
 	if s.tryReviveLocked(c, now) {
 		return
 	}
-	hs.deadUntil = now + respawnDelay
+	// huntState.level is zero-based while Dota's table is indexed by the
+	// displayed level (1..20 in this game).
+	hs.deadUntil = now + dotaHeroRespawnDelay(hs)
 	hs.diedAt = now
 	hs.corpseHidden = false
 	hs.deaths++
+	hs.lastKiller = 0
+	// A new life must not inherit a pre-death hero tag and later hand a creep kill
+	// to an avatar from the previous life.
+	hs.lastHeroDamager = 0
+	hs.lastHeroDamageAt = 0
+	if c.inst != nil {
+		if killerConn := c.inst.members[killer]; killerConn != nil && killerConn != c {
+			hs.lastKiller = killerConn.selfPlayerID
+		}
+	}
+	s.broadcastPlayerStatsLocked(c)
+	if c.inst != nil && c.inst.dota != nil {
+		s.publishLiveFightLogLocked(c.inst)
+	}
 
 	// Gellar's «Порабощение»: «При смерти теряет половину из накопленных душ». Death also
 	// cleanses Hekata's kill-window (its +30% buff is dropped with the other timed mods
@@ -3424,13 +3470,24 @@ func (s *Server) respawnPlayerLocked(c *conn, now float64) {
 	s.push(c, battleproto.CmdRespawn, amf.NewArray().Set("id", c.selfPlayerID))
 	s.pushPlayerStatsLocked(c, now)
 	s.syncSelfLocked(c, syncHealth, syncMana)
+	s.broadcastPlayerStatsLocked(c)
 	s.sendEffectorsLocked(c, now)
-	// Re-show this avatar on every teammate's client (its corpse was removed from
-	// them on death); renderAvatarForLocked is a no-op for any who still track it.
+	// Re-show this avatar on teammates' clients (its corpse was removed from
+	// them on death). An enemy respawning hero is still subject to fog: the
+	// respawn packet is a local event, not a global reveal. The next vision pass
+	// will introduce it to an enemy viewer only if the spawn point is visible.
+	dotaFog := c.inst != nil && c.inst.dota != nil
 	for _, other := range c.members() {
-		if other != c {
-			s.renderAvatarForLocked(other, c, now)
+		if other == c || other.huntState == nil {
+			continue
 		}
+		if dotaFog && other.playerTeam() != c.playerTeam() {
+			visionSources := dotaTeamVisionSourcesLocked(c.inst, other.playerTeam(), now)
+			if !botVisibleEnemyMemberLocked(c.inst, other.playerTeam(), c, now, visionSources) {
+				continue
+			}
+		}
+		s.renderAvatarWithStatsLocked(other, c, now)
 	}
 	// Mobs lose interest in the fresh corpse walker until re-aggroed; and any pack
 	// dragged onto this checkpoint mid-fight is sent home, so the player never

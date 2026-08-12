@@ -747,6 +747,11 @@ type huntState struct {
 	// auto-attack session (player -> mob)
 	attackTarget int32
 	attackSeq    int
+	// attackActionActive tracks the swing currently visible on clients. The target
+	// can be cleared before the swing's scheduled ACTION_DONE (for example when a
+	// bot switches from farming to retreating), so target != 0 is not sufficient to
+	// know whether a remote avatar is still rendering an attack animation.
+	attackActionActive bool
 	// autoResumed marks the current auto-attack as SERVER-driven: it was started by
 	// resumeAutoAttackLocked after a cast, when the client has left its DEFENCE state
 	// and will NOT re-pick the next enemy on a kill. In this mode the server must
@@ -802,10 +807,22 @@ type huntState struct {
 	// ownedTreeItems is the set of avatar battle-tree item article ids this
 	// player has bought THIS MATCH (gamedata.AvatarItems). Server-authoritative:
 	// gates re-buys and the tree_parents unlock chain, and each purchase appends
-	// permanent (until=0) stat mods that survive death/respawn. Reset per match
+	// permanent (until=0) stat mods that survive death/respawn. Upgrade purchases
+	// keep their parents in this set so the client can render the unlocked path;
+	// only activeTreeItems contribute to the three active slots and live stats.
+	// Reset per match
 	// (never persisted) -- these are DotA-style in-battle items, not the hero's
 	// wearable inventory.
 	ownedTreeItems map[int32]bool
+	// activeTreeItems stores the currently equipped article for each occupied
+	// avatar tree. An upgrade replaces the article in the same slot, preserving
+	// the three-slot/different-tree rule while allowing the client tree to grow.
+	activeTreeItems map[int32]int32 // tree id -> active article id
+	// sentAvatarItems tracks ITEM_EQUIP articles already delivered to this
+	// viewer for each rendered avatar. The client keeps Player.ActiveItems when
+	// an avatar is hidden and later rebound, so replaying the full set on every
+	// fog reveal/respawn would make one purchase appear in multiple slots.
+	sentAvatarItems map[int32]map[int32]bool
 
 	// invisibleUntil / invisFxUID: an active Invisibility potion. While live, mobs
 	// ignore this avatar as a target candidate (mobTargetLocked) -- it suppresses
@@ -877,15 +894,22 @@ type huntState struct {
 	// every living teammate who shared its XP (grantKillXPLocked's radius) besides the
 	// credited killer -- «Арена» has no such notion of nearby-ally credit, so it always
 	// reports 0 assists there.
-	team    int32
-	frags   int32
-	deaths  int32
-	assists int32
+	team       int32
+	frags      int32
+	deaths     int32
+	assists    int32
+	lastKiller int32
 	// pvpTarget is the enemy avatar's objID this player is auto-attacking in «Арена» (0 =
 	// none). It is the player-vs-player twin of attackTarget, which only ever holds a mob
 	// id; keeping them separate means the mob attack loop and the PvP loop never confuse a
 	// mob id for an avatar id (both live in the 1000+/2000+ spaces).
 	pvpTarget int32
+
+	// lastHeroDamager is the most recent enemy avatar that landed damage on this
+	// avatar. It is used only when a creep/environmental hit delivers the lethal
+	// blow: the recent hero gets the hero-kill credit instead of the creep.
+	lastHeroDamager  int32
+	lastHeroDamageAt float64
 
 	closed bool
 }
@@ -1349,6 +1373,7 @@ func (s *Server) sendHuntWorldState(c *conn, name string) {
 	// (see itemProtoDesc's doc) -- without it, clicking any bag item is a
 	// total client-side no-op: no DO_ACTION packet is ever sent.
 	pkts = append(pkts, protoInfoPkt(itemUseActionProtoID, itemUseActionProtoDesc()))
+	pkts = append(pkts, protoInfoPkt(teleportActionProtoID, teleportActionProtoDesc()))
 	// Avatar battle-tree item prototypes: the client's item tree buys by mapping
 	// a Ctrl article id to its battle proto id (Battle.ArticleToProto), which is
 	// populated ONLY from a <PItem><Article> prototype -- without these, every
@@ -1577,6 +1602,10 @@ func (s *Server) sendHuntWorldState(c *conn, name string) {
 	// The world is fully built: join the shared tick + broadcast set now, so no
 	// mob/teammate packet could have raced ahead of this member's scene load.
 	hs.worldReady = true
+	s.pushPlayerStatsToViewerLocked(c, c)
+	if c.inst != nil && c.inst.dota != nil {
+		s.publishLiveFightLogLocked(c.inst)
+	}
 	// «Штурм»: hand this player their PvP battle-tasks and send the initial QUEST_TASK for each
 	// (no-op on Hunt/Арена). Done after worldReady so the client's task handler is live.
 	s.assignPvpTasksLocked(c)
@@ -1781,16 +1810,17 @@ func (s *Server) syncSelfLocked(c *conn, types ...uint64) {
 		case syncHealth:
 			b.setFloats(syncHealth, idx, hpFrac)
 		case syncMana:
-			b.setFloats(syncMana, idx, float32(hs.mana/hs.maxManaLocked(nowf)))
+			maxMana := hs.maxManaLocked(nowf)
+			b.setFloats(syncMana, idx, float32(hs.mana/maxMana)).
+				setFloats(syncMaxMana, idx, float32(maxMana))
 		case syncExperience:
 			b.setFloats(syncExperience, idx, float32(hs.xp))
 		}
 	}
 	s.push(c, battleproto.CmdSync, amf.NewArray().Set("data", b.build(hs.tr.count())))
 
-	// Health is the only self stat teammates render (the ally HP bar); mana/XP are
-	// private HUD. Fan the health fraction out to the other members, each with its
-	// own tracking index for this avatar (self already got the full blob above).
+	// Health and mana are rendered by teammate target cards. Fan both out to the other
+	// members, each with its own tracking index for this avatar.
 	for _, typ := range types {
 		if typ != syncHealth {
 			continue
@@ -1803,6 +1833,12 @@ func (s *Server) syncSelfLocked(c *conn, types ...uint64) {
 				newSyncBlob(now).setFloats(syncHealth, oidx, hpFrac).build(count)))
 		})
 		break
+	}
+	for _, typ := range types {
+		if typ == syncMana {
+			s.broadcastAvatarManaLocked(c, nowf)
+			break
+		}
 	}
 }
 
@@ -1898,12 +1934,22 @@ func (s *Server) startAttackLocked(c *conn, ms *mobState) {
 	if hs.deadUntil > 0 {
 		return
 	}
+	// Switching from a PvP target to a creep must close the old visible swing too;
+	// clearing pvpTarget alone only stops the timer chain, not an ACTION already on
+	// the client.
+	if hs.pvpTarget != 0 {
+		s.stopPvpAttackLocked(c, false)
+	}
+	if hs.attackTarget != 0 || hs.attackActionActive {
+		s.stopAttackLocked(c, false)
+	}
 	// Issuing an attack is "acting again": it cancels a caster-sustained interruptible
 	// channel (Morlokai's «Кабала» hold breaks if he starts attacking). Move/stun breaks
 	// are handled in the channel tick; a fresh CAST is handled at cast start.
 	s.breakInterruptibleChannelsLocked(c)
 	s.cancelOrderLocked(c)
 	hs.attackTarget = ms.id
+	s.botTrackAttackOrderLocked(c, ms.id, float64(s.battleTime()))
 	// Symmetric with startPvpAttackLocked clearing attackTarget: switching to attack a
 	// mob while mid-PvP-fight must drop the stale pvpTarget, or a later handleMove (or
 	// any other pvpTarget-aware check) could still see a "still fighting a hero" signal
@@ -2123,7 +2169,7 @@ func (hs *huntState) baseAttackLocked(now float64) float64 {
 }
 
 func (s *Server) armAttackTimer(c *conn, seq int, delay, interval time.Duration) {
-	time.AfterFunc(delay, func() {
+	dotaSimulationAfter(delay, func() {
 		c.lock()
 		defer c.unlock()
 		hs := c.huntState
@@ -2136,6 +2182,13 @@ func (s *Server) armAttackTimer(c *conn, seq int, delay, interval time.Duration)
 			return
 		}
 		now := s.battleTime()
+		if hs.st.stunned(float64(now)) {
+			// A committed swing may still resolve on its own timer, but a new swing
+			// or chase must not be created while the avatar is stunned. Keep the
+			// attack session alive so it can resume after the CC expires.
+			s.armAttackTimer(c, seq, 250*time.Millisecond, interval)
+			return
+		}
 		cx, cy := c.posAtLocked(now)
 		dist := math.Hypot(float64(ms.x-cx), float64(ms.y-cy))
 		// Reach = attack range + both body radii (matches the client's own
@@ -2164,6 +2217,8 @@ func (s *Server) armAttackTimer(c *conn, seq int, delay, interval time.Duration)
 		// targetObj is never dangling on a teammate's client.
 		actionArgs := newActionArgs(c.objID, attackProtoID(hs.av), ms.id, float64(now),
 			amf.NewArray().Set("x", 0.0).Set("y", 0.0))
+		hs.attackActionActive = true
+		s.botTrackAttackSwingLocked(c, ms.id, float64(now))
 		s.pushAvatarAllLocked(c, battleproto.CmdAction, actionArgs)
 		// Lirvein's «Неумолимость» speeds up the more you stay on one target, so recompute
 		// the swing interval each swing from the live streak. Scoped to that passive so no
@@ -2181,7 +2236,15 @@ func (s *Server) armAttackTimer(c *conn, seq int, delay, interval time.Duration)
 			release := time.Duration(hs.av.AttackWindup * float64(interval))
 			s.scheduleProjectileLocked(c, seq, ms.id, release)
 		} else {
-			s.scheduleHitLocked(c, seq, ms.id, interval/2)
+			// The server has already committed this bot swing after checking reach
+			// above.  A lane creep can move a fraction during the wind-up; applying
+			// the old hit-time range check made every melee swing miss in that case,
+			// leaving the bot visibly attacking while taking damage forever.
+			botMelee := c.inst != nil && c.inst.bots[c.objID] != nil
+			// Once a bot swing has started, its hit is committed in the same way as
+			// an already-launched projectile: a later retarget, movement decision, or
+			// attack-sequence bump must not erase the damage event.
+			s.scheduleHitAfterLocked(c, seq, ms.id, interval/2, botMelee, botMelee)
 		}
 		s.scheduleSwingDone(c, seq, interval)
 		s.armAttackTimer(c, seq, interval, interval)
@@ -2196,7 +2259,18 @@ func (s *Server) armAttackTimer(c *conn, seq int, delay, interval time.Duration)
 func (s *Server) scheduleProjectileLocked(c *conn, seq int, targetID int32, release time.Duration) {
 	launch := func() {
 		hs := c.huntState
-		if hs == nil || hs.closed || hs.attackSeq != seq || hs.deadUntil > 0 {
+		if hs == nil || hs.closed || hs.deadUntil > 0 {
+			return
+		}
+		// For a bot, the projectile is the visible consequence of a swing that
+		// already passed the authoritative range check in armAttackTimer. A
+		// planner/retarget tick may bump attackSeq during the wind-up, but that
+		// must not erase the shot: doing so leaves the client animation visible
+		// while the creep receives no damage. The arrival hit is already committed
+		// below, so the release boundary must use the same rule. Human/client
+		// attacks retain the normal pre-release cancellation semantics.
+		botProjectile := c.inst != nil && c.inst.bots[c.objID] != nil
+		if !botProjectile && hs.attackSeq != seq {
 			return
 		}
 		ms := hs.mobs[targetID]
@@ -2221,7 +2295,7 @@ func (s *Server) scheduleProjectileLocked(c *conn, seq int, targetID int32, rele
 		launch() // inline: caller holds the lock (snap shot, byte-identical to before)
 		return
 	}
-	time.AfterFunc(release, func() {
+	dotaSimulationAfter(release, func() {
 		c.lock()
 		defer c.unlock()
 		launch()
@@ -2238,13 +2312,17 @@ func (s *Server) scheduleProjectileLocked(c *conn, seq int, targetID int32, rele
 // OTHERS only: the owner's self animation is AvatarAI-driven and must not change.
 func (s *Server) scheduleSwingDone(c *conn, seq int, interval time.Duration) {
 	// Fire at 85% of the swing interval: after this swing's ACTION, before the next.
-	time.AfterFunc(interval*85/100, func() {
+	dotaSimulationAfter(interval*85/100, func() {
 		c.lock()
 		defer c.unlock()
 		hs := c.huntState
 		if hs == nil || hs.closed || hs.attackSeq != seq {
 			return // attack stopped/retargeted; stopAttackLocked closes the final swing
 		}
+		if !hs.attackActionActive {
+			return
+		}
+		hs.attackActionActive = false
 		s.broadcastAvatarToOthersLocked(c, battleproto.CmdActionDone, amf.NewArray().
 			Set("id", c.objID).
 			Set("action", attackProtoID(hs.av)).
@@ -2257,18 +2335,18 @@ func (s *Server) scheduleSwingDone(c *conn, seq int, interval time.Duration) {
 // being live (attackSeq unchanged) -- a melee swing interrupted before it connects
 // deals no damage.
 func (s *Server) scheduleHitLocked(c *conn, seq int, targetID int32, windup time.Duration) {
-	s.scheduleHitAfterLocked(c, seq, targetID, windup, false)
+	s.scheduleHitAfterLocked(c, seq, targetID, windup, false, false)
 }
 
 // scheduleProjectileHitLocked lands the hit for a bolt already in flight: it is
 // COMMITTED (seq is not checked), so a projectile that visibly reaches the mob still
 // deals its damage even if the player cancels or retargets during the flight.
 func (s *Server) scheduleProjectileHitLocked(c *conn, targetID int32, windup time.Duration) {
-	s.scheduleHitAfterLocked(c, 0, targetID, windup, true)
+	s.scheduleHitAfterLocked(c, 0, targetID, windup, true, false)
 }
 
-func (s *Server) scheduleHitAfterLocked(c *conn, seq int, targetID int32, windup time.Duration, committed bool) {
-	time.AfterFunc(windup, func() {
+func (s *Server) scheduleHitAfterLocked(c *conn, seq int, targetID int32, windup time.Duration, committed, rangeCommitted bool) {
+	dotaSimulationAfter(windup, func() {
 		c.lock()
 		defer c.unlock()
 		hs := c.huntState
@@ -2285,7 +2363,7 @@ func (s *Server) scheduleHitAfterLocked(c *conn, seq int, targetID int32, windup
 		}
 		now := s.battleTime()
 		cx, cy := c.posAtLocked(now)
-		if !hs.hasProjectile && math.Hypot(float64(ms.x-cx), float64(ms.y-cy)) > hs.effAttackRangeLocked(float64(now))+av.Radius()+ms.mob.Radius()+0.3 {
+		if !hs.hasProjectile && !rangeCommitted && math.Hypot(float64(ms.x-cx), float64(ms.y-cy)) > hs.effAttackRangeLocked(float64(now))+av.Radius()+ms.mob.Radius()+0.3 {
 			return
 		}
 		// +attack from avatar tree items, plus any banked on-kill attack (Gellar's souls /
@@ -2332,7 +2410,13 @@ func (s *Server) scheduleHitAfterLocked(c *conn, seq int, targetID int32, windup
 			dmg *= 1.5 + hs.st.modSum(float64(now), "crit_dmg_pct")
 			hitFlags = 2
 		}
+		// The hit is authoritative even when it does not kill. This closes the
+		// bot's pending-swing window so the watchdog measures real attack progress
+		// instead of treating a landed ranged/melee hit as a stalled order.
+		s.botTrackAttackHitLocked(c, ms.id, float64(now))
+		beforeDead := ms.dead
 		s.hitMobFlagsLocked(c, ms, dmg, c.objID, hitFlags)
+		s.telemetryRecordBotAttackHitLocked(c, ms.id, dmg, ms.dead && !beforeDead, float64(now))
 		// BlackDragon's «Неистовство»: while armed, this swing also cleaves every OTHER
 		// enemy within cleaveRadius of the primary target for the same damage.
 		if float64(now) < hs.cleaveUntil && hs.cleaveRadius > 0 {
@@ -2641,12 +2725,18 @@ func (s *Server) runDefenseProcsLocked(c *conn, attacker *mobState, dmg float64,
 
 func (s *Server) stopAttackLocked(c *conn, silent bool) {
 	hs := c.huntState
-	if hs.attackTarget == 0 {
+	if hs.attackTarget == 0 && !hs.attackActionActive {
 		return
 	}
 	hs.attackTarget = 0
 	hs.attackSeq++
+	hs.attackActionActive = false
+	s.botClearAttackWatchdogLocked(c)
 	if !silent {
+		// Keep the historical ACTION_DONE on target cancellation even when the
+		// swing has not started yet: it also tells the owning client to leave its
+		// auto-attack state. If a swing is already visible, this closes it
+		// immediately instead of waiting for the old timer.
 		doneArgs := amf.NewArray().
 			Set("id", c.objID).
 			Set("action", attackProtoID(hs.av)).
@@ -2777,6 +2867,9 @@ func (s *Server) hitMobFlagsLocked(c *conn, ms *mobState, dmg float64, damager i
 	killer := s.creditConnLocked(c, damager)
 	ms.hp = 0
 	ms.dead = true
+	if c.inst != nil && c.inst.dota != nil && !ms.structure {
+		s.telemetryRecordCreepDeathLocked(c, ms, killer, float64(s.battleTime()))
+	}
 	if ms.structure && c.inst != nil && c.inst.dota != nil && c.inst.dota.telemetry != nil {
 		var attributedKiller *conn
 		if killer != nil && killer.objID == damager {
@@ -2846,7 +2939,13 @@ func (s *Server) hitMobFlagsLocked(c *conn, ms *mobState, dmg float64, damager i
 			s.resumeAutoAttackLocked(killer, float64(s.battleTime()), 0)
 		}
 	}
-	s.grantKillXPLocked(c, killer, ms.xpReward(), ms.x, ms.y)
+	if c.inst != nil && c.inst.dota != nil && !ms.structure {
+		s.grantKillXPLockedMeta(c, killer, ms.xpReward(), ms.x, ms.y, dotaXPGrantMeta{
+			source: "creep", sourceID: ms.id,
+		})
+	} else {
+		s.grantKillXPLocked(c, killer, ms.xpReward(), ms.x, ms.y)
+	}
 	s.awardCoinsLocked(killer, ms.id, ms.coinReward())
 	// Advance any accepted PvE quest whose objective is a kill on this Hunt map.
 	s.creditQuestKillLocked(killer, ms)
@@ -2870,6 +2969,12 @@ func (s *Server) hitMobFlagsLocked(c *conn, ms *mobState, dmg float64, damager i
 	// loot rights. Bosses always drop; trash rolls a flat 1-in-N chance.
 	if s.rollDropLocked(c, ms) {
 		s.spawnDropLocked(c, ms.x, ms.y, float64(s.battleTime()))
+	}
+	// Hero/unit damage uses this path for an altar kill. Finalize synchronously
+	// after kill credit/side effects but before any later tick can observe a dead
+	// altar; dotaEndLocked is idempotent for the twin unit-driven path.
+	if ms.altar && c.inst != nil && c.inst.dota != nil {
+		s.dotaEndLocked(c, teamForVictorOver(ms.team), now)
 	}
 
 	// Schedule the revive: every HOMED creature -- trash and boss alike -- respawns
@@ -2898,7 +3003,7 @@ func (s *Server) hitMobFlagsLocked(c *conn, ms *mobState, dmg float64, damager i
 	if extra := time.Duration((anchorUntil - float64(s.battleTime()) + 0.5) * float64(time.Second)); extra > corpseDelay {
 		corpseDelay = extra
 	}
-	time.AfterFunc(corpseDelay, func() {
+	dotaSimulationAfter(corpseDelay, func() {
 		c.lock()
 		defer c.unlock()
 		hs := c.huntState
@@ -3054,6 +3159,10 @@ func (s *Server) grantXPLocked(c *conn, xp float64) {
 	}
 	if leveled {
 		s.pushPlayerStatsLocked(c, now) // re-sync level-scaled dmg / maxHP / maxMana / spellpower
+		s.broadcastPlayerStatsLocked(c)
+		if c.inst != nil && c.inst.dota != nil {
+			s.publishLiveFightLogLocked(c.inst)
+		}
 	}
 }
 

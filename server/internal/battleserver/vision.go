@@ -1,5 +1,7 @@
 package battleserver
 
+import "tanatserver/internal/gamedata"
+
 // «Штурм» fog-of-war: reported live as "I see enemy heroes and creeps through the
 // fog". The map bakes a real WarFogPlane (see the avatarViewRadius doc comment in
 // hunt.go), but the plane only ever dims the GROUND texture -- nothing in the client
@@ -38,16 +40,18 @@ const dotaVisionHysteresis float32 = 4.0
 
 // dotaVisionSource is one living unit granting its team a circle of vision.
 type dotaVisionSource struct {
-	x, y, r float32
+	x, y      float32
+	r         float32
+	trueSight bool
 }
 
-// dotaVisionSourcesLocked collects every vision source `team` currently owns: its
+// dotaTeamVisionSourcesLocked collects every vision source `team` currently owns: its
 // living heroes (avatarViewRadius, matching what their own avatar reveal sync
 // carries), their living summons (summonViewRadius), living creeps (creepViewRadius)
 // and living structures (structViewRadius, matching dotaRevealStructureLocked). A dead
 // hero grants no vision -- it neither moves nor fights, so there is nothing to look
 // from until it respawns.
-func (s *Server) dotaVisionSourcesLocked(inst *huntInstance, team int32, now float64) []dotaVisionSource {
+func dotaTeamVisionSourcesLocked(inst *huntInstance, team int32, now float64) []dotaVisionSource {
 	var out []dotaVisionSource
 	bt := float32(now)
 	for _, mem := range inst.members {
@@ -56,10 +60,10 @@ func (s *Server) dotaVisionSourcesLocked(inst *huntInstance, team int32, now flo
 			continue
 		}
 		px, py := mem.posAtLocked(bt)
-		out = append(out, dotaVisionSource{px, py, avatarViewRadius})
+		out = append(out, dotaVisionSource{x: px, y: py, r: avatarViewRadius})
 		for _, sm := range hs.summons {
 			if sm.alive(now) {
-				out = append(out, dotaVisionSource{sm.x, sm.y, summonViewRadius})
+				out = append(out, dotaVisionSource{x: sm.x, y: sm.y, r: summonViewRadius})
 			}
 		}
 	}
@@ -71,15 +75,74 @@ func (s *Server) dotaVisionSourcesLocked(inst *huntInstance, team int32, now flo
 		if m.structure {
 			r = structViewRadius
 		}
-		out = append(out, dotaVisionSource{m.x, m.y, r})
+		out = append(out, dotaVisionSource{
+			x: m.x, y: m.y, r: r,
+			// «Пушки» (DotaGun) carry True Sight. Other structures remain
+			// globally visible, but do not reveal an invisible hero.
+			trueSight: m.structure && m.dotaRole == gamedata.DotaGun,
+		})
 	}
 	return out
+}
+
+// dotaVisionSourcesLocked is the server-facing wrapper used by the client reveal
+// pass. Keeping the source construction receiver-free also lets the bot director
+// apply the exact same information boundary to its strategic decisions.
+func (s *Server) dotaVisionSourcesLocked(inst *huntInstance, team int32, now float64) []dotaVisionSource {
+	return dotaTeamVisionSourcesLocked(inst, team, now)
+}
+
+func dotaVisibleEnemyMemberLocked(inst *huntInstance, team int32, mem *conn, now float64, sources []dotaVisionSource, already bool) bool {
+	if inst == nil || mem == nil || mem.huntState == nil || mem.playerTeam() == team ||
+		mem.huntState.deadUntil > 0 {
+		return false
+	}
+	x, y := mem.posAtLocked(float32(now))
+	if now < mem.huntState.invisibleUntil {
+		return dotaTrueSightVisibleLocked(sources, x, y, already)
+	}
+	if inst.dota == nil {
+		return true
+	}
+	return dotaVisibleLocked(sources, x, y, already)
+}
+
+func botVisibleEnemyMemberLocked(inst *huntInstance, team int32, mem *conn, now float64, sources []dotaVisionSource) bool {
+	return dotaVisibleEnemyMemberLocked(inst, team, mem, now, sources, false)
+}
+
+func botVisibleEnemyMobLocked(team int32, mob *mobState, sources []dotaVisionSource) bool {
+	if mob == nil || mob.dead || mob.teamVal() == team {
+		return false
+	}
+	// Dota structures remain on the map through fog. Enemy lane units do not.
+	if mob.structure {
+		return true
+	}
+	return dotaVisibleLocked(sources, mob.x, mob.y, false)
 }
 
 // dotaVisibleLocked reports whether (x,y) sits inside any source's vision circle.
 // already widens every circle by dotaVisionHysteresis first -- see its doc comment.
 func dotaVisibleLocked(sources []dotaVisionSource, x, y float32, already bool) bool {
 	for _, src := range sources {
+		r := src.r
+		if already {
+			r += dotaVisionHysteresis
+		}
+		dx, dy := x-src.x, y-src.y
+		if dx*dx+dy*dy <= r*r {
+			return true
+		}
+	}
+	return false
+}
+
+func dotaTrueSightVisibleLocked(sources []dotaVisionSource, x, y float32, already bool) bool {
+	for _, src := range sources {
+		if !src.trueSight {
+			continue
+		}
 		r := src.r
 		if already {
 			r += dotaVisionHysteresis
@@ -104,12 +167,11 @@ func (s *Server) dotaApplyTeamVisionLocked(inst *huntInstance, viewerTeam int32,
 			if other == mem || other.huntState == nil || other.playerTeam() == viewerTeam {
 				continue
 			}
-			ox, oy := other.posAtLocked(bt)
 			tracked := mem.huntState.tr.index(other.objID) >= 0
 			switch {
-			case dotaVisibleLocked(sources, ox, oy, tracked) && !tracked:
-				s.renderAvatarForLocked(mem, other, now)
-			case !dotaVisibleLocked(sources, ox, oy, tracked) && tracked:
+			case dotaVisibleEnemyMemberLocked(inst, viewerTeam, other, now, sources, tracked) && !tracked:
+				s.renderAvatarWithStatsLocked(mem, other, now)
+			case !dotaVisibleEnemyMemberLocked(inst, viewerTeam, other, now, sources, tracked) && tracked:
 				s.removeAvatarForLocked(mem, other)
 			}
 			for _, sm := range other.huntState.summons {

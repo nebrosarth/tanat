@@ -97,8 +97,8 @@ func TestPlusMinusShortCircuitIsAChannel(t *testing.T) {
 	if len(ch.fxUIDs) == 0 {
 		t.Fatal("the channel adopted no fx: breaking it could not stop the looping beam")
 	}
-	if m.st.rootUntil <= now || m.st.silenceUntil <= now {
-		t.Fatalf("victim not held: root=%g silence=%g", m.st.rootUntil, m.st.silenceUntil)
+	if m.st.stunUntil <= now {
+		t.Fatalf("victim not stunned: stun=%g", m.st.stunUntil)
 	}
 
 	c.hasDest = true // the caster walks
@@ -106,8 +106,8 @@ func TestPlusMinusShortCircuitIsAChannel(t *testing.T) {
 	if len(hs.channels) != 0 {
 		t.Fatal("moving must break the channel")
 	}
-	if m.st.rootUntil > now+0.2 || m.st.silenceUntil > now+0.2 {
-		t.Fatalf("the broken beam left the victim held: root=%g silence=%g", m.st.rootUntil, m.st.silenceUntil)
+	if m.st.stunUntil > now+0.2 {
+		t.Fatalf("the broken beam left the victim stunned: stun=%g", m.st.stunUntil)
 	}
 }
 

@@ -1,10 +1,9 @@
 package session
 
-// FightLogEntry is one hero's row in a just-ended match's scoreboard: the wire shape
+// FightLogEntry is one hero's row in a live or just-ended match's scoreboard: the wire shape
 // ctrlserver's fight|log handler serves and the client's FightLogArgParser/GameEndMenu
-// consume (BattleEndData). Built once, at match end, by battleserver (see
-// battleserver/rating.go's settleMatchLocked) and handed to the Store because ctrlserver
-// and battleserver share nothing else -- Store is the one thing both sides already hold.
+// consume (BattleEndData). Live snapshots are provisional and never change rating; the
+// final settlement overwrites them authoritatively when the match ends.
 type FightLogEntry struct {
 	// AvatarID is the AVATAR TYPE id (gamedata.Avatar.ID -- the same id space
 	// fight|select_avatar's avatar_id and gamedata.AvatarByID use), NOT the player/user
@@ -32,12 +31,22 @@ type FightLogEntry struct {
 	OldRating, NewRating int32
 }
 
+// SetLiveFightLog publishes a provisional scoreboard under battleID. It deliberately does
+// not apply or change rating; settleMatchLocked later overwrites it with final rows.
+func (s *Store) SetLiveFightLog(battleID int32, entries map[int32]FightLogEntry) {
+	s.setFightLog(battleID, entries)
+}
+
 // SetFightLog publishes a finished match's full scoreboard under battleID -- the
 // CONNECT-issued id (see battleserver conn.battleID) the client that just received
 // BATTLE_END will ask for by that exact number (fight|log's "fight_id"). Every
 // participant's own connection got a DIFFERENT battleID at CONNECT time, so
 // settleMatchLocked calls this once per participant, all with the same entries map.
 func (s *Store) SetFightLog(battleID int32, entries map[int32]FightLogEntry) {
+	s.setFightLog(battleID, entries)
+}
+
+func (s *Store) setFightLog(battleID int32, entries map[int32]FightLogEntry) {
 	if battleID == 0 {
 		return
 	}
@@ -46,7 +55,11 @@ func (s *Store) SetFightLog(battleID int32, entries map[int32]FightLogEntry) {
 	if s.fightLogs == nil {
 		s.fightLogs = map[int32]map[int32]FightLogEntry{}
 	}
-	s.fightLogs[battleID] = entries
+	copyEntries := make(map[int32]FightLogEntry, len(entries))
+	for id, entry := range entries {
+		copyEntries[id] = entry
+	}
+	s.fightLogs[battleID] = copyEntries
 	// Bound the map: battleID only ever increments and is never otherwise consumed (a
 	// client may ask for its scoreboard more than once, or never), so without this it
 	// grows for the life of the process. Evicting the oldest handful once it's clearly
@@ -82,5 +95,12 @@ func (s *Store) FightLog(battleID int32) (map[int32]FightLogEntry, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	entries, ok := s.fightLogs[battleID]
-	return entries, ok
+	if !ok {
+		return nil, false
+	}
+	copyEntries := make(map[int32]FightLogEntry, len(entries))
+	for id, entry := range entries {
+		copyEntries[id] = entry
+	}
+	return copyEntries, true
 }

@@ -36,6 +36,7 @@ const (
 	ItemCritStrikePotion
 	ItemAntiPhysArmorPotion
 	ItemAntiMagicArmorPotion
+	ItemTeleportScroll
 )
 
 // Item is an authored consumable definition. ArticleID is the stable catalog
@@ -75,6 +76,9 @@ type Item struct {
 	// Duration is how long the (buff/HoT) effect lasts, in seconds. Always 10
 	// for every Health/Mana potion and flask in the real data.
 	Duration float64
+	// Preparation is the channel time before a non-instant consumable resolves.
+	// It is zero for the existing instant potion families.
+	Preparation float64
 	// Cooldown is how long, in seconds, before THIS SPECIFIC item can be used
 	// again -- a real per-item value (30-40s for Health/Mana, scaling down at
 	// higher level brackets; a flat 150s for every other family), replacing an
@@ -95,6 +99,11 @@ type Item struct {
 const potionArticleBase int32 = 50000
 
 var items []Item
+
+// battleOnlyItems are authored consumables used by server-controlled battle
+// actors only. They have catalog articles for battle prototypes, but must not
+// enter the persistent human/shop consumable catalog returned by Items().
+var battleOnlyItems []Item
 var itemsByArticle map[int32]Item
 
 // rarityColor is the quality/rarity axis shared by every 4-tier potion family
@@ -106,10 +115,22 @@ var itemsByArticle map[int32]Item
 var rarityColor = [4]string{"Grey", "Green", "Blue", "Violet"}
 
 func addItem(kind ItemKind, tier int, nameKey, descKey, icon string, value, value2, duration, cooldown float64) {
+	addItemWithPreparation(kind, tier, nameKey, descKey, icon, value, value2, duration, cooldown, 0)
+}
+
+func addItemWithPreparation(kind ItemKind, tier int, nameKey, descKey, icon string, value, value2, duration, cooldown, preparation float64) {
 	items = append(items, Item{
 		ArticleID: potionArticleBase + int32(len(items)),
 		Kind:      kind, Tier: tier, NameKey: nameKey, DescKey: descKey, Icon: icon,
-		Value: value, Value2: value2, Duration: duration, Cooldown: cooldown,
+		Value: value, Value2: value2, Duration: duration, Preparation: preparation, Cooldown: cooldown,
+	})
+}
+
+func addBattleOnlyItemWithPreparation(kind ItemKind, tier int, nameKey, descKey, icon string, value, value2, duration, cooldown, preparation float64) {
+	battleOnlyItems = append(battleOnlyItems, Item{
+		ArticleID: potionArticleBase + int32(len(items)+len(battleOnlyItems)),
+		Kind:      kind, Tier: tier, NameKey: nameKey, DescKey: descKey, Icon: icon,
+		Value: value, Value2: value2, Duration: duration, Preparation: preparation, Cooldown: cooldown,
 	})
 }
 
@@ -154,7 +175,7 @@ func addRegenFamily(kind ItemKind, family string, tiers []regenTier) {
 
 // rarityTier is one cell of a 4-tier (rarity-only) potion family.
 type rarityTier struct {
-	color                    string
+	color                   string
 	value, value2, duration float64
 }
 
@@ -239,8 +260,17 @@ func init() {
 		{"Grey", 6, 0, 10}, {"Green", 10, 0, 12}, {"Blue", 20, 0, 14}, {"Violet", 25, 0, 16},
 	}, 150)
 
-	itemsByArticle = make(map[int32]Item, len(items))
+	// Tier-I teleport scroll: the bot-only battle action channels for 10 seconds
+	// before relocating, then remains on its own article cooldown for 80 seconds.
+	addBattleOnlyItemWithPreparation(ItemTeleportScroll, 1,
+		"IDS_Scroll_Teleport_Grey_Name", "IDS_Scroll_Teleport_Grey_LongDesc",
+		"neutral/potion/scroll_teleport_grey", 0, 0, 0, 80, 10)
+
+	itemsByArticle = make(map[int32]Item, len(items)+len(battleOnlyItems))
 	for _, it := range items {
+		itemsByArticle[it.ArticleID] = it
+	}
+	for _, it := range battleOnlyItems {
 		itemsByArticle[it.ArticleID] = it
 	}
 }
@@ -268,6 +298,11 @@ func (it Item) IconPath() string {
 func ItemsByKind(kind ItemKind) []Item {
 	var out []Item
 	for _, it := range items {
+		if it.Kind == kind {
+			out = append(out, it)
+		}
+	}
+	for _, it := range battleOnlyItems {
 		if it.Kind == kind {
 			out = append(out, it)
 		}

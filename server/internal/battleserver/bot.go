@@ -19,6 +19,7 @@ import (
 
 	"tanatserver/internal/battleproto"
 	"tanatserver/internal/gamedata"
+	"tanatserver/internal/session"
 )
 
 // botIDBase is the reserved objID/selfPlayerID space for bots, clear of every other id
@@ -212,6 +213,10 @@ func (s *Server) newBotConnLocked(inst *huntInstance, slot int, side gamedata.Do
 		}
 	}()
 	s.Store.CreateBotHero(id, botName(slot))
+	// Hero.Money is stored in bronze units. The requested bot allowance is 100
+	// gold, not 100 bronze (the latter is only one silver and cannot even buy
+	// the cheapest avatar-tree item).
+	s.Store.SetHeroMoney(id, 100*session.BronzePerGold, 0)
 
 	now := float64(s.battleTime())
 	team := teamForSide(side)
@@ -257,8 +262,11 @@ func (s *Server) newBotConnLocked(inst *huntInstance, slot int, side gamedata.Do
 
 	inst.members[id] = c
 	s.dotaWorldSetupLocked(c, now)
+	s.seedBotTeleportScrollLocked(c)
 	s.introduceMemberLocked(c, now)
 	s.sendInitialMoneyLocked(c)
+	s.pushPlayerStatsToViewerLocked(c, c)
+	s.publishLiveFightLogLocked(inst)
 
 	inst.bots[id] = newBotBrain(c, slot, sideOrdinal)
 

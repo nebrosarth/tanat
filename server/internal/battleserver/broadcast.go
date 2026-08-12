@@ -126,6 +126,40 @@ func (s *Server) broadcastAvatarObjLocked(c *conn, cmd battleproto.CmdID, args *
 	s.broadcastObjLocked(c, c.objID, cmd, args)
 }
 
+// broadcastPlayerStatsLocked sends the authoritative scoreboard status for owner to every
+// client currently rendering owner's avatar, including the owner and bot viewers. The
+// id is the same selfPlayerID used by PLAYER_REG/PlayerStore, not the object id.
+func (s *Server) broadcastPlayerStatsLocked(owner *conn) {
+	if owner == nil || owner.huntState == nil {
+		return
+	}
+	args := playerStatsArgs(owner)
+	owner.mobViewersLocked(owner.objID, func(viewer *conn, _, _ int) {
+		s.push(viewer, battleproto.CmdPlayerStats, args)
+	})
+}
+
+// broadcastAvatarManaLocked refreshes both the mana fraction and authoritative max pool for
+// every client rendering an avatar. Respawn and level scaling can change either value.
+func (s *Server) broadcastAvatarManaLocked(owner *conn, now float64) {
+	if owner == nil || owner.huntState == nil {
+		return
+	}
+	hs := owner.huntState
+	maxMana := hs.maxManaLocked(now)
+	frac := float32(0)
+	if maxMana > 0 {
+		frac = float32(hs.mana / maxMana)
+	}
+	owner.mobViewersLocked(owner.objID, func(viewer *conn, idx, count int) {
+		s.push(viewer, battleproto.CmdSync, amf.NewArray().Set("data",
+			newSyncBlob(float32(now)).
+				setFloats(syncMana, idx, frac).
+				setFloats(syncMaxMana, idx, float32(maxMana)).
+				build(count)))
+	})
+}
+
 // broadcastAvatarToOthersLocked replays an avatar-owned packet (ACTION,
 // ACTION_DONE, SET_PROJECTILE) to every OTHER member that renders this player's
 // avatar. The owner already pushed the packet to itself, so this only adds the

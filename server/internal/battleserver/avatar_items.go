@@ -1,6 +1,7 @@
 package battleserver
 
 import (
+	"log"
 	"math"
 	"strconv"
 
@@ -140,6 +141,102 @@ func (s *Server) applyAvatarItemStatsLocked(c *conn, it gamedata.AvatarItem, now
 	s.pushPlayerStatsLocked(c, now)
 }
 
+// avatarItemEquipArgs is the client-side active-item notification. The decompiled
+// ItemEquipedArgParser reads the exact wire keys id/item/proto/equip; the client then
+// passes proto to Player.Equip, which is what populates Player.ActiveItems for the
+// avatar card. Tree articles are also the battle prototype ids in our catalog.
+func avatarItemEquipArgs(ownerObjID, articleID int32, equip bool) *amf.MixedArray {
+	return amf.NewArray().
+		Set("id", ownerObjID).
+		Set("item", articleID).
+		Set("proto", articleID).
+		Set("equip", equip)
+}
+
+// sendAvatarItemStateToViewerLocked delivers one active-item state transition
+// to a viewer. The client keeps Player.ActiveItems as a list, so upgrades must
+// explicitly unequip the old article before equipping the replacement; sending
+// only the new article would create a fourth visible slot after an upgrade.
+func (s *Server) sendAvatarItemStateToViewerLocked(viewer, owner *conn, articleID int32, equip bool) {
+	if viewer == nil || owner == nil || viewer.huntState == nil || owner.huntState == nil {
+		return
+	}
+	if viewer != owner && viewer.huntState.tr.index(owner.objID) < 0 {
+		return
+	}
+	if viewer.huntState.sentAvatarItems == nil {
+		viewer.huntState.sentAvatarItems = map[int32]map[int32]bool{}
+	}
+	sent := viewer.huntState.sentAvatarItems[owner.objID]
+	if sent == nil {
+		sent = map[int32]bool{}
+		viewer.huntState.sentAvatarItems[owner.objID] = sent
+	}
+	if equip {
+		if sent[articleID] {
+			return
+		}
+		s.push(viewer, battleproto.CmdItemEquip, avatarItemEquipArgs(owner.objID, articleID, true))
+		sent[articleID] = true
+		return
+	}
+	if !sent[articleID] {
+		return
+	}
+	s.push(viewer, battleproto.CmdItemEquip, avatarItemEquipArgs(owner.objID, articleID, false))
+	delete(sent, articleID)
+}
+
+// sendAvatarItemToViewerLocked is the idempotent equip/replay wrapper retained
+// for callers and tests that only need to introduce an active article.
+func (s *Server) sendAvatarItemToViewerLocked(viewer, owner *conn, articleID int32) {
+	s.sendAvatarItemStateToViewerLocked(viewer, owner, articleID, true)
+}
+
+// pushAvatarItemEquipAllLocked is the live-purchase path. It mirrors
+// pushAvatarAllLocked's owner-plus-currently-rendering-viewers fan-out while
+// retaining the per-viewer de-duplication used by late reveals.
+func (s *Server) pushAvatarItemEquipAllLocked(owner *conn, articleID int32) {
+	if owner == nil {
+		return
+	}
+	for _, viewer := range owner.members() {
+		s.sendAvatarItemToViewerLocked(viewer, owner, articleID)
+	}
+}
+
+func (s *Server) pushAvatarItemUnequipAllLocked(owner *conn, articleID int32) {
+	if owner == nil {
+		return
+	}
+	for _, viewer := range owner.members() {
+		s.sendAvatarItemStateToViewerLocked(viewer, owner, articleID, false)
+	}
+}
+
+// replayAvatarItemsToViewerLocked restores any not-yet-delivered active
+// battle-tree items when an avatar is introduced or re-created on a client.
+// ADD_TO_INVENTORY is owner-local; ITEM_EQUIP is the shared-world packet that
+// fills the remote Player.ActiveItems list used by EnemyInfoWindow.
+func (s *Server) replayAvatarItemsToViewerLocked(viewer, owner *conn) {
+	if viewer == nil || owner == nil || owner.huntState == nil {
+		return
+	}
+	if len(owner.huntState.activeTreeItems) > 0 {
+		for _, articleID := range owner.huntState.activeTreeItems {
+			s.sendAvatarItemToViewerLocked(viewer, owner, articleID)
+		}
+		return
+	}
+	// Compatibility for older test fixtures that seed ownedTreeItems directly.
+	// Production sessions populate activeTreeItems on the first purchase.
+	for _, it := range gamedata.AvatarItems() {
+		if owner.huntState.ownedTreeItems[it.ArticleID] {
+			s.sendAvatarItemToViewerLocked(viewer, owner, it.ArticleID)
+		}
+	}
+}
+
 // handleBuy serves the Battle BUY (13) the item tree sends. It validates the
 // purchase server-side (real item, not already owned, parents owned, affordable),
 // atomically debits the hero's gold, marks the item owned, and reflects it with
@@ -173,6 +270,16 @@ func (s *Server) buyItemLocked(c *conn, article int32) bool {
 	if hs.ownedTreeItems[it.ArticleID] {
 		return false // already bought this match
 	}
+	activeArticle := avatarTreeActiveLocked(hs, it.TreeID)
+	if activeArticle == it.ArticleID {
+		return false // already the active item in this slot
+	}
+	if activeArticle == 0 && avatarEquippedTreeCountLocked(hs) >= gamedata.AvatarTreeMaxItems {
+		return false // the client has three active battle-item slots
+	}
+	if activeArticle != 0 && len(it.Parents) == 0 {
+		return false // an occupied tree can only move forward/up a branch
+	}
 	for _, par := range it.Parents {
 		if !hs.ownedTreeItems[par] {
 			return false // parent not owned -> still LOCKED
@@ -182,14 +289,28 @@ func (s *Server) buyItemLocked(c *conn, article int32) bool {
 	if !ok {
 		return false // no hero, or can't afford
 	}
+	moneyBefore := money + it.Price
+	now := float64(s.battleTime())
 
 	if hs.ownedTreeItems == nil {
 		hs.ownedTreeItems = map[int32]bool{}
 	}
+	if hs.activeTreeItems == nil {
+		hs.activeTreeItems = map[int32]int32{}
+	}
+	upgradedFrom := activeArticle
+	if upgradedFrom != 0 {
+		// The catalog values are total values for the current tier, not deltas.
+		// Remove the old active item's permanent mods before applying the new tier.
+		s.replaceAvatarItemStatsLocked(c, upgradedFrom, it, now)
+		s.pushAvatarItemUnequipAllLocked(c, upgradedFrom)
+	} else {
+		s.applyAvatarItemStatsLocked(c, it, now)
+	}
 	hs.ownedTreeItems[it.ArticleID] = true
+	hs.activeTreeItems[it.TreeID] = it.ArticleID
 	hs.nextBagID++
 	invID := hs.nextBagID
-	now := float64(s.battleTime())
 
 	// New balance so the tree re-evaluates affordability of the rest.
 	s.push(c, battleproto.CmdSetMoney, amf.NewArray().
@@ -198,7 +319,122 @@ func (s *Server) buyItemLocked(c *conn, article int32) bool {
 	// This is what marks the slot USED and unlocks its children client-side.
 	s.push(c, battleproto.CmdAddToInv, amf.NewArray().
 		Set("id", invID).Set("proto", it.ArticleID).Set("count", int32(1)))
-	// Permanent stat bonuses + re-sync.
-	s.applyAvatarItemStatsLocked(c, it, now)
+	// ADD_TO_INVENTORY updates only the buyer's own bag. ITEM_EQUIP updates the
+	// avatar's ActiveItems list on the owner and every client that renders this avatar.
+	s.pushAvatarItemEquipAllLocked(c, it.ArticleID)
+	if isBotConn(c) {
+		log.Printf("battle: bot %d bought avatar item article=%d tree=%d stage=%d price=%d money=%d->%d upgrade_from=%d", c.objID, it.ArticleID, it.TreeID, it.Stage, it.Price, moneyBefore, money, upgradedFrom)
+		s.telemetryRecordBotPurchaseLocked(c, it, moneyBefore, money, now)
+	}
 	return true
+}
+
+// replaceAvatarItemStatsLocked changes one active slot from old to new. Item
+// stats are authored as the complete value of a tier, so only the difference
+// in Health/Mana tops up the current pools instead of stacking every tier.
+func (s *Server) replaceAvatarItemStatsLocked(c *conn, oldArticle int32, newItem gamedata.AvatarItem, now float64) {
+	hs := c.huntState
+	oldItem, ok := gamedata.AvatarItemByArticle(oldArticle)
+	if !ok {
+		s.applyAvatarItemStatsLocked(c, newItem, now)
+		return
+	}
+	removePermanentItemModsBySrcLocked(hs, itemModSrc(oldArticle))
+	var hpDelta, manaDelta float64
+	for _, st := range newItem.Stats {
+		modName := avatarItemModStat(st.Name)
+		if modName == "" {
+			continue
+		}
+		hs.st.mods = append(hs.st.mods, statMod{stat: modName, value: st.Value, until: 0, src: itemModSrc(newItem.ArticleID)})
+		switch st.Name {
+		case "Health":
+			hpDelta += st.Value - avatarItemStatValue(oldItem, "Health")
+		case "Mana":
+			manaDelta += st.Value - avatarItemStatValue(oldItem, "Mana")
+		}
+	}
+	if hpDelta > 0 {
+		hs.hp = math.Min(hs.maxHPLocked(now), hs.hp+hpDelta)
+	}
+	if manaDelta > 0 {
+		hs.mana = math.Min(hs.maxManaLocked(now), hs.mana+manaDelta)
+	}
+	s.pushPlayerStatsLocked(c, now)
+}
+
+func removePermanentItemModsBySrcLocked(hs *huntState, src string) {
+	if hs == nil {
+		return
+	}
+	keep := hs.st.mods[:0]
+	for _, mod := range hs.st.mods {
+		if mod.src != src {
+			keep = append(keep, mod)
+		}
+	}
+	hs.st.mods = keep
+}
+
+func avatarItemStatValue(it gamedata.AvatarItem, name string) float64 {
+	for _, st := range it.Stats {
+		if st.Name == name {
+			return st.Value
+		}
+	}
+	return 0
+}
+
+// avatarTreeOwnedLocked reports whether this avatar already owns an item from
+// treeID. The caller holds the hunt connection lock. Tree membership is derived
+// from the authoritative article catalog, so the rule also covers old state
+// reconstructed from a saved/test fixture.
+func avatarTreeOwnedLocked(hs *huntState, treeID int32) bool {
+	return avatarTreeActiveLocked(hs, treeID) != 0
+}
+
+func avatarTreeActiveLocked(hs *huntState, treeID int32) int32 {
+	if hs == nil {
+		return 0
+	}
+	if hs.activeTreeItems != nil {
+		if article := hs.activeTreeItems[treeID]; article != 0 {
+			return article
+		}
+	}
+	// Legacy fixtures may only seed ownedTreeItems. Choose the highest purchased
+	// tier as the active article so the upgrade path remains deterministic.
+	var best gamedata.AvatarItem
+	for article, owned := range hs.ownedTreeItems {
+		if !owned {
+			continue
+		}
+		it, ok := gamedata.AvatarItemByArticle(article)
+		if !ok || it.TreeID != treeID {
+			continue
+		}
+		if best.ArticleID == 0 || it.Stage > best.Stage || (it.Stage == best.Stage && it.ArticleID > best.ArticleID) {
+			best = it
+		}
+	}
+	return best.ArticleID
+}
+
+func avatarEquippedTreeCountLocked(hs *huntState) int {
+	if hs == nil {
+		return 0
+	}
+	if hs.activeTreeItems != nil {
+		return len(hs.activeTreeItems)
+	}
+	trees := map[int32]bool{}
+	for article, owned := range hs.ownedTreeItems {
+		if !owned {
+			continue
+		}
+		if it, ok := gamedata.AvatarItemByArticle(article); ok {
+			trees[it.TreeID] = true
+		}
+	}
+	return len(trees)
 }

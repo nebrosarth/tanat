@@ -20,6 +20,43 @@ import (
 // point rather than a derived constant.
 const ratingKFactor = 32.0
 
+// publishLiveFightLogLocked publishes the current DOTA roster without touching rating.
+// The same provisional snapshot is stored under each real participant's own battleID;
+// bots remain rows in the snapshot but do not have a Ctrl battleID of their own.
+func (s *Server) publishLiveFightLogLocked(inst *huntInstance) {
+	if inst == nil || inst.dota == nil || inst.dota.ended {
+		return
+	}
+	entries := make(map[int32]session.FightLogEntry, len(inst.members))
+	for _, mem := range inst.members {
+		if mem == nil || mem.huntState == nil {
+			continue
+		}
+		entries[mem.selfPlayerID] = s.liveFightLogEntryLocked(mem)
+	}
+	for _, mem := range inst.members {
+		if mem != nil && mem.battleID != 0 {
+			s.Store.SetLiveFightLog(mem.battleID, entries)
+		}
+	}
+}
+
+func (s *Server) liveFightLogEntryLocked(mem *conn) session.FightLogEntry {
+	hs := mem.huntState
+	rating := session.RatingDefault
+	if !isBotConn(mem) {
+		if current, ok := s.Store.HeroRating(mem.selfPlayerID); ok {
+			rating = current
+		}
+	}
+	money, _, _ := s.Store.HeroMoney(mem.selfPlayerID)
+	return session.FightLogEntry{
+		AvatarID: hs.av.ID, Nick: mem.name, Team: mem.playerTeam(),
+		Kills: hs.frags, Assists: hs.assists, Deaths: hs.deaths, Level: hs.level,
+		Money: money, OldRating: rating, NewRating: rating,
+	}
+}
+
 // settleMatchLocked builds this match's fight-log rows for every participant and, if both
 // sides are non-empty, adjusts every REAL (non-bot) participant's persistent rating.
 // Caller holds inst.mu (both callers are already deep inside the world lock).

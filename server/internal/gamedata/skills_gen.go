@@ -1570,10 +1570,11 @@ func init() {
 				// share 0.2 -- five pulses then add up to exactly the 1×SP the card promises,
 				// and it stays 1× at every rank because the count never changes.
 				Ops: []Op{
-					// «не позволяющий цели двигаться и использовать способности» = root+silence,
-					// for the beam's full nominal duration -- cut short with it if it breaks.
-					{Kind: OpRoot, Dur: PerLevel{2.5, 3, 3.5, 4, 4.5}},
-					{Kind: OpSilence, Dur: PerLevel{2.5, 3, 3.5, 4, 4.5}},
+					// The second skill is a real stun: the target cannot move, attack, or
+					// cast for the beam's full nominal duration. A single OpStun also
+					// drives the server's hard movement/action lock, unlike a visual-only
+					// root+silence approximation.
+					{Kind: OpStun, Dur: PerLevel{2.5, 3, 3.5, 4, 4.5}},
 					{Kind: OpChannel, Count: PerLevel{5, 5, 5, 5, 5}, Dur: PerLevel{2.5, 3, 3.5, 4, 4.5},
 						Intervals: PerLevel{0.5, 0.6, 0.7, 0.8, 0.9}, Ops: []Op{
 							{Kind: OpDamage, Value: PerLevel{15, 25, 35, 45, 55}, Scale: "magic", PerSP: 0.2},

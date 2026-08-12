@@ -163,13 +163,21 @@ func (s *Server) startPvpAttackLocked(c *conn, victim *conn) {
 	if hs.deadUntil > 0 {
 		return
 	}
+	// Switching from a creep to an enemy avatar must close any visible PvE swing;
+	// clearing attackTarget alone would leave the old ACTION on remote clients.
+	if hs.attackTarget != 0 || hs.attackActionActive {
+		s.stopAttackLocked(c, false)
+	}
 	s.cancelOrderLocked(c)
 	hs.attackTarget = 0
 	hs.pvpTarget = victim.objID
 	c.resetChaseLocked()
 	hs.attackSeq++
-	s.armPvpAttackTimer(c, hs.attackSeq, victim.objID, 0,
-		time.Duration(float64(time.Second)/s.attackPeriodLocked(hs)))
+	// PvP and creep attacks must use the same effective swing cadence, including
+	// attack-speed items and live status modifiers. Keeping a separate raw
+	// attack-period path made a bot appear responsive against heroes but sluggish
+	// while farming creeps as soon as its effective speed differed from the base.
+	s.armPvpAttackTimer(c, hs.attackSeq, victim.objID, 0, s.swingIntervalLocked(hs))
 }
 
 // stopPvpAttackLocked cancels an in-progress PvP (hero-vs-hero) attack -- the pvpTarget
@@ -181,11 +189,12 @@ func (s *Server) startPvpAttackLocked(c *conn, victim *conn) {
 // walked them back and resumed swinging the moment they were back in range.
 func (s *Server) stopPvpAttackLocked(c *conn, silent bool) {
 	hs := c.huntState
-	if hs.pvpTarget == 0 {
+	if hs.pvpTarget == 0 && !hs.attackActionActive {
 		return
 	}
 	hs.pvpTarget = 0
 	hs.attackSeq++
+	hs.attackActionActive = false
 	if !silent {
 		s.pushAvatarAllLocked(c, battleproto.CmdActionDone, amf.NewArray().
 			Set("id", c.objID).
@@ -200,7 +209,7 @@ func (s *Server) stopPvpAttackLocked(c *conn, silent bool) {
 // close twin of armAttackTimer; the differences are that the target is resolved from
 // inst.members (not hs.mobs) and its liveness is deadUntil, not a dead flag.
 func (s *Server) armPvpAttackTimer(c *conn, seq int, targetID int32, delay, interval time.Duration) {
-	time.AfterFunc(delay, func() {
+	dotaSimulationAfter(delay, func() {
 		c.lock()
 		defer c.unlock()
 		hs := c.huntState
@@ -215,6 +224,12 @@ func (s *Server) armPvpAttackTimer(c *conn, seq int, targetID int32, delay, inte
 			return
 		}
 		now := s.battleTime()
+		if hs.st.stunned(float64(now)) {
+			// Do not emit a fresh PvP swing or chase during stun. The attack order
+			// remains armed and is retried after the control effect expires.
+			s.armPvpAttackTimer(c, seq, targetID, 250*time.Millisecond, interval)
+			return
+		}
 		cx, cy := c.posAtLocked(now)
 		vx, vy := victim.posAtLocked(now)
 		reach := hs.effAttackRangeLocked(float64(now)) + hs.av.Radius() + victim.huntState.av.Radius()
@@ -231,6 +246,7 @@ func (s *Server) armPvpAttackTimer(c *conn, seq int, targetID int32, delay, inte
 		}
 		actionArgs := newActionArgs(c.objID, attackProtoID(hs.av), targetID, float64(now),
 			amf.NewArray().Set("x", 0.0).Set("y", 0.0))
+		hs.attackActionActive = true
 		s.pushAvatarAllLocked(c, battleproto.CmdAction, actionArgs)
 		if hs.hasProjectile {
 			release := time.Duration(hs.av.AttackWindup * float64(interval))
@@ -246,7 +262,7 @@ func (s *Server) armPvpAttackTimer(c *conn, seq int, targetID int32, delay, inte
 // schedulePvpProjectileLocked flies a ranged avatar's basic-attack bolt at an enemy
 // avatar, landing the hit on arrival. Mirrors scheduleProjectileLocked's avatar path.
 func (s *Server) schedulePvpProjectileLocked(c *conn, seq int, targetID int32, release time.Duration) {
-	time.AfterFunc(release, func() {
+	dotaSimulationAfter(release, func() {
 		c.lock()
 		defer c.unlock()
 		hs := c.huntState
@@ -279,7 +295,7 @@ func (s *Server) schedulePvpHitLocked(c *conn, seq int, targetID int32, windup t
 // reusing the exact avatar damage math the PvE path uses (dmg roll, dmg_pct, power, crit,
 // lifesteal). committed=true skips the seq check for an in-flight projectile.
 func (s *Server) schedulePvpHitAfterLocked(c *conn, seq int, targetID int32, windup time.Duration, committed bool) {
-	time.AfterFunc(windup, func() {
+	dotaSimulationAfter(windup, func() {
 		c.lock()
 		defer c.unlock()
 		hs := c.huntState

@@ -41,6 +41,220 @@ func TestTelemetryRecorderNilSafe(t *testing.T) {
 	r.close() // must not panic on a nil channel
 }
 
+// TestTelemetryBotTeleportLifecycleJSONL records both a cancelled and a successful
+// bot channel, then parses the actual JSONL output. The refresh must carry a new
+// target-FX UID, cancellation must preserve its reason, and success must expose a
+// distinct arrival FX UID alongside the target kind/ID and destination.
+func TestTelemetryBotTeleportLifecycleJSONL(t *testing.T) {
+	s, bot, inst, cleanup := newDotaConn(t, "Avtr_Tank_Velial")
+	defer cleanup()
+	dir := t.TempDir()
+	rec := newTelemetryRecorder(dir, inst.dota.m.ID)
+	if rec == nil {
+		t.Fatal("newTelemetryRecorder returned nil against a writable temp dir")
+	}
+	inst.dota.telemetry = rec
+	now := float64(s.battleTime())
+
+	s.telemetryRecordBotTeleportLocked(bot, "bot_teleport_start", now,
+		61001, "creep", 12, -3, 101, 102, 0, "")
+	s.telemetryRecordBotTeleportLocked(bot, "bot_teleport_destination_refresh", now+2,
+		61001, "creep", 13, -2, 101, 103, 0, "")
+	s.telemetryRecordBotTeleportLocked(bot, "bot_teleport_cancel", now+2.1,
+		61001, "creep", 13, -2, 101, 103, 0, "target_invalid")
+	s.telemetryRecordBotTeleportLocked(bot, "bot_teleport_start", now+3,
+		50022, "structure", 80, 40, 201, 202, 0, "")
+	s.telemetryRecordBotTeleportLocked(bot, "bot_teleport_success", now+5,
+		50022, "structure", 81, 41, 201, 202, 203, "")
+	inst.dota.telemetry = nil
+	rec.close()
+
+	got := readTelemetryLines(t, dir)
+	if len(got) != 5 {
+		t.Fatalf("got %d teleport lifecycle lines, want 5", len(got))
+	}
+	wantTypes := []string{
+		"bot_teleport_start",
+		"bot_teleport_destination_refresh",
+		"bot_teleport_cancel",
+		"bot_teleport_start",
+		"bot_teleport_success",
+	}
+	for i, want := range wantTypes {
+		if got[i]["type"] != want {
+			t.Errorf("line %d type = %v, want %q", i, got[i]["type"], want)
+		}
+		if got[i]["bot_id"] != float64(bot.objID) {
+			t.Errorf("line %d bot_id = %v, want %d", i, got[i]["bot_id"], bot.objID)
+		}
+	}
+
+	start := got[0]
+	if start["target_id"] != float64(61001) || start["target_kind"] != "creep" ||
+		start["destination_x"] != float64(12) || start["destination_y"] != float64(-3) ||
+		start["marker_fx"] != float64(101) || start["target_fx"] != float64(102) || start["arrival_fx"] != float64(0) {
+		t.Errorf("start = %+v, want creep target/destination and initial FX UIDs", start)
+	}
+	refresh := got[1]
+	if refresh["target_id"] != float64(61001) || refresh["target_kind"] != "creep" ||
+		refresh["destination_x"] != float64(13) || refresh["destination_y"] != float64(-2) ||
+		refresh["marker_fx"] != float64(101) || refresh["target_fx"] != float64(103) ||
+		refresh["target_fx"] == start["target_fx"] {
+		t.Errorf("refresh = %+v, want changed target FX UID and destination", refresh)
+	}
+	cancel := got[2]
+	if cancel["target_id"] != float64(61001) || cancel["target_kind"] != "creep" ||
+		cancel["cancel_reason"] != "target_invalid" {
+		t.Errorf("cancel = %+v, want creep target and reason=target_invalid", cancel)
+	}
+	success := got[4]
+	if success["target_id"] != float64(50022) || success["target_kind"] != "structure" ||
+		success["destination_x"] != float64(81) || success["destination_y"] != float64(41) ||
+		success["marker_fx"] != float64(201) || success["target_fx"] != float64(202) ||
+		success["arrival_fx"] != float64(203) || success["arrival_fx"] == success["target_fx"] {
+		t.Errorf("success = %+v, want structure target/destination and distinct arrival FX UID", success)
+	}
+
+	// The production helper must also be safe when telemetry is disabled, not only
+	// when callers hold a nil recorder directly.
+	s.telemetryRecordBotTeleportLocked(bot, "bot_teleport_cancel", now+6,
+		50022, "structure", 81, 41, 201, 202, 0, "telemetry_disabled")
+}
+
+func TestTelemetryBotPurchaseJSONL(t *testing.T) {
+	s, bot, inst, cleanup := newDotaConn(t, "Avtr_Tank_Velial")
+	defer cleanup()
+
+	const botID = botIDBase + 1
+	bot.objID = botID
+	bot.selfPlayerID = botID
+	s.Store.CreateBotHero(botID, "purchase-test-bot")
+	const startingMoney int32 = 1000000
+	if !s.Store.SetHeroMoney(botID, startingMoney, 0) {
+		t.Fatal("setup: failed to create bot wallet")
+	}
+
+	var item gamedata.AvatarItem
+	for _, candidate := range gamedata.AvatarItems() {
+		if len(candidate.Parents) == 0 {
+			item = candidate
+			break
+		}
+	}
+	if item.ArticleID == 0 {
+		t.Fatal("setup: avatar item catalog has no root item")
+	}
+
+	dir := t.TempDir()
+	rec := newTelemetryRecorder(dir, inst.dota.m.ID)
+	if rec == nil {
+		t.Fatal("newTelemetryRecorder returned nil")
+	}
+	inst.dota.telemetry = rec
+
+	now := float64(s.battleTime())
+	bot.lock()
+	ok := s.buyItemLocked(bot, item.ArticleID)
+	bot.unlock()
+	if !ok {
+		t.Fatalf("buyItemLocked(%d) failed for affordable root item", item.ArticleID)
+	}
+	inst.dota.telemetry = nil
+	rec.close()
+
+	got := readTelemetryLines(t, dir)
+	if len(got) != 1 {
+		t.Fatalf("got %d telemetry lines, want one purchase line", len(got))
+	}
+	line := got[0]
+	if line["type"] != "bot_item_purchase" || line["bot_id"] != float64(botID) ||
+		line["article_id"] != float64(item.ArticleID) || line["tree_id"] != float64(item.TreeID) ||
+		line["stage"] != float64(item.Stage) || line["price"] != float64(item.Price) ||
+		line["money_before"] != float64(startingMoney) || line["money_after"] != float64(startingMoney-item.Price) {
+		t.Fatalf("purchase telemetry = %+v, want item=%d price=%d money=%d->%d", line, item.ArticleID, item.Price, startingMoney, startingMoney-item.Price)
+	}
+	if line["t"] != float64(now-inst.dota.startedAt) {
+		t.Errorf("purchase telemetry t = %v, want match time near %v", line["t"], now-inst.dota.startedAt)
+	}
+}
+
+func TestTelemetryBotStructureEscapeJSONLAndNilSafe(t *testing.T) {
+	s, bot, inst, cleanup := newDotaConn(t, "Avtr_Tank_Velial")
+	defer cleanup()
+	dir := t.TempDir()
+	rec := newTelemetryRecorder(dir, inst.dota.m.ID)
+	if rec == nil {
+		t.Fatal("newTelemetryRecorder returned nil")
+	}
+	inst.dota.telemetry = rec
+	now := float64(s.battleTime())
+	threat := structOfSide(inst, gamedata.DotaCreepTower, dotaTeamElf)
+	if threat == nil {
+		t.Fatal("setup: no enemy tower")
+	}
+	bot.huntState.hp = bot.huntState.maxHPLocked(now) * 0.42
+	s.telemetryRecordBotStructureEscapeLocked(bot, threat, 8, 3, "retreat_detour", now)
+	inst.dota.telemetry = nil
+	// Nil recorder and nil threat must both remain harmless.
+	s.telemetryRecordBotStructureEscapeLocked(bot, nil, 0, 0, "nil-threat", now+1)
+	rec.close()
+
+	got := readTelemetryLines(t, dir)
+	if len(got) != 1 {
+		t.Fatalf("got %d telemetry lines, want one structure escape line", len(got))
+	}
+	line := got[0]
+	if line["type"] != "bot_structure_escape" || line["bot_id"] != float64(bot.objID) || line["threat_id"] != float64(threat.id) {
+		t.Fatalf("structure escape identity = %+v", line)
+	}
+	if line["destination_x"] != float64(8) || line["destination_y"] != float64(3) || line["reason"] != "retreat_detour" {
+		t.Errorf("structure escape destination/reason = %+v", line)
+	}
+	if line["hp_fraction"] != 0.42 {
+		t.Errorf("structure escape hp_fraction = %v, want 0.42", line["hp_fraction"])
+	}
+}
+
+func TestTelemetryBotRetreatUtilityJSONFieldsAndNilSafe(t *testing.T) {
+	s, bot, inst, cleanup := newDotaConn(t, "Avtr_HK_Astarot")
+	defer cleanup()
+	dir := t.TempDir()
+	rec := newTelemetryRecorder(dir, inst.dota.m.ID)
+	if rec == nil {
+		t.Fatal("newTelemetryRecorder returned nil")
+	}
+	inst.dota.telemetry = rec
+	now := float64(s.battleTime())
+	s.telemetryRecordBotRetreatUtilityLocked(bot, 2, 0, "retreat_home_dash", "point_dash", now, 4, -6, true)
+	s.telemetryRecordBotRetreatUtilityLocked(bot, 3, 7001, "retreat_pursuer_control", "nearby_control", now+1, 0, 0, false)
+	var nilConn *conn
+	s.telemetryRecordBotRetreatUtilityLocked(nilConn, 1, 0, "nil", "nil", now, 0, 0, false)
+	inst.dota.telemetry = nil
+	rec.close()
+
+	got := readTelemetryLines(t, dir)
+	if len(got) != 2 {
+		t.Fatalf("got %d retreat utility lines, want 2", len(got))
+	}
+	first := got[0]
+	if first["type"] != "bot_retreat_utility" || first["bot_id"] != float64(bot.objID) ||
+		first["slot"] != float64(2) || first["target_id"] != float64(0) ||
+		first["reason"] != "retreat_home_dash" || first["category"] != "point_dash" {
+		t.Fatalf("retreat utility identity = %+v", first)
+	}
+	destination, ok := first["destination"].(map[string]any)
+	if !ok || destination["x"] != float64(4) || destination["y"] != float64(-6) {
+		t.Fatalf("retreat utility destination = %#v, want x=4 y=-6", first["destination"])
+	}
+	second := got[1]
+	if second["target_id"] != float64(7001) || second["reason"] != "retreat_pursuer_control" || second["category"] != "nearby_control" {
+		t.Fatalf("pursuer-control telemetry = %+v", second)
+	}
+	if _, ok := second["destination"]; ok {
+		t.Fatalf("nil destination was not omitted: %+v", second)
+	}
+}
+
 // TestTelemetryRecorderWritesJSONL drives the real writer goroutine end to end:
 // created against a temp dir, fed a couple of events, closed, then the file is read
 // back and each line must parse as the exact JSON shape recorded.
@@ -128,6 +342,55 @@ func TestTelemetrySnapshotLocked(t *testing.T) {
 	}
 	if snap["x"] != float64(5) || snap["y"] != float64(-3) {
 		t.Errorf("snapshot position = (%v,%v), want (5,-3)", snap["x"], snap["y"])
+	}
+}
+
+func TestTelemetrySnapshotRetreatModes(t *testing.T) {
+	s := New(session.NewStore())
+	dm := gamedata.DotaMaps()[0]
+	inst := newDotaInstance(s, dm.ID, dm.ID)
+
+	disengaging := dotaPlayerConn(t, s, inst, 900001, dotaTeamHuman, 5, -3)
+	recovering := dotaPlayerConn(t, s, inst, 900002, dotaTeamHuman, 6, -3)
+	cleared := dotaPlayerConn(t, s, inst, 900003, dotaTeamHuman, 7, -3)
+	inst.bots[disengaging.objID] = &botBrain{c: disengaging, retreating: true, retreatMode: botRetreatModeDisengage}
+	inst.bots[recovering.objID] = &botBrain{c: recovering, retreating: true, retreatMode: botRetreatModeRecovery}
+	// An inactive brain may retain a stale mode value internally, but snapshots must
+	// omit retreat_mode unless retreating is currently active.
+	inst.bots[cleared.objID] = &botBrain{c: cleared, retreatMode: botRetreatModeDisengage}
+
+	dir := t.TempDir()
+	rec := newTelemetryRecorder(dir, dm.ID)
+	now := float64(s.battleTime())
+	for _, bot := range []*conn{disengaging, recovering, cleared} {
+		bot.mvMu.Lock()
+		s.telemetrySnapshotLocked(rec, bot, 12.5, now)
+		bot.mvMu.Unlock()
+	}
+	rec.close()
+
+	got := readTelemetryLines(t, dir)
+	if len(got) != 3 {
+		t.Fatalf("got %d snapshots, want 3", len(got))
+	}
+	wantModes := map[float64]string{
+		float64(disengaging.objID): "disengage",
+		float64(recovering.objID):  "recovery",
+	}
+	for _, snap := range got {
+		id, ok := snap["id"].(float64)
+		if !ok {
+			t.Fatalf("snapshot has no numeric id: %+v", snap)
+		}
+		if want, active := wantModes[id]; active {
+			if snap["retreating"] != true || snap["retreat_mode"] != want {
+				t.Errorf("active retreat snapshot for id %.0f = %+v, want retreating=true mode=%q", id, snap, want)
+			}
+			continue
+		}
+		if _, present := snap["retreat_mode"]; present {
+			t.Errorf("inactive retreat_mode was serialized for id %.0f: %+v", id, snap)
+		}
 	}
 }
 
