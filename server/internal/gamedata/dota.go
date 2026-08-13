@@ -96,6 +96,12 @@ const (
 	// before the first reinforcement wave is released.
 	CreepFirstWave = 60.0
 	CreepsPerWave  = 4 // per barracks, i.e. per lane: mostly melee, ~1 archer
+
+	// Siege creeps follow the requested Assault cadence: the first one arrives at
+	// 05:00, then one reinforcement per living lane every five minutes. The
+	// schedule is match-time based and independent of player/bot count.
+	SiegeCreepFirstWave    = 5 * 60.0
+	SiegeCreepWaveInterval = 5 * 60.0
 )
 
 // DotaMap is the «Штурм» arena.
@@ -124,9 +130,15 @@ type DotaMap struct {
 	// waypoint is picked per spawner (see laneEntryIdx), not assumed to be index 0.
 	Lanes [][]Vec2
 
-	// CreepMelee/CreepRange are the mob-roster indices of each side's troops.
-	HumanCreepMelee, HumanCreepRange int
-	ElfCreepMelee, ElfCreepRange     int
+	// CreepMelee/CreepRange/CreepSiege are the mob-roster indices of each side's
+	// troops. Siege indices are only configured for the regular Assault map.
+	HumanCreepMelee, HumanCreepRange, HumanCreepSiege int
+	ElfCreepMelee, ElfCreepRange, ElfCreepSiege       int
+
+	// SiegeCreepWaves enables the Assault-mode siege schedule. Castle War uses a
+	// different, single-lane reinforcement recipe and must not inherit it merely
+	// because it reuses the DOTA simulation.
+	SiegeCreepWaves bool
 
 	// Nav is the walkability oracle for this arena (nil = unrestricted movement), the
 	// same contract HuntMap.Nav has. Its Spawn() is NOT used: «Штурм» starts each
@@ -203,7 +215,10 @@ var map10 = DotaMap{
 	SpawnElf:        Vec2{X: 209, Y: -11},
 	Nav:             navGrid10,
 	HumanCreepMelee: mobHumanCreepMelee, HumanCreepRange: mobHumanCreepRange,
-	ElfCreepMelee: mobElfCreepMelee, ElfCreepRange: mobElfCreepRange,
+	HumanCreepSiege: mobHumanCreepSiege,
+	ElfCreepMelee:   mobElfCreepMelee, ElfCreepRange: mobElfCreepRange,
+	ElfCreepSiege:   mobElfCreepSiege,
+	SiegeCreepWaves: true,
 	// The three lanes, altar to altar. map_1_0 ships NO authored path of any kind --
 	// the scene's 16,919 GameObjects contain no lane/waypoint marker and no path
 	// script, and the client has no class that would read one (the whole route is the
@@ -315,19 +330,19 @@ var map10 = DotaMap{
 // research, it's the actual ceiling of what the client ships: exactly the same
 // situation «Штурм»'s own creep waves were already in (dota.go's CreepWaveInterval/
 // CreepsPerWave are server-tuned, not client data), so the same recipe applies here:
-// - CreepCamps: both markers reinforce the ATTACKER (they sit right by the attacker's
-//   own entry corridor) marching the map's one lane toward the guns, using the SAME
-//   racial-troop roster «Штурм» already uses (mobHumanCreepMelee/Range) rather than
-//   inventing a new unit.
-// - Boss: Cerber (mobBossCerber, an existing hand-tuned Hunt boss -- 10000 HP, 48-66
-//   dmg, 294 coins/3000 XP, exempt from level scaling) planted at the boss-spawn point
-//   on the DEFENDER side. He is NOT a structure in the simulation sense but is
-//   modelled through the stationary-attacker pipeline a cannon uses (see
-//   battleserver's newDotaBossGuard) -- the DOTA tick has no leash/homing logic for a
-//   roaming melee unit, so "planted guard" is the reliable path. He sits at the FAR
-//   east end near the defender rally, well clear of the gun cluster (x=186-356), so he
-//   is a rich optional risk/reward target, never a gate on the win condition (only the
-//   5 guns are checked by castleCheckWinLocked).
+//   - CreepCamps: both markers reinforce the ATTACKER (they sit right by the attacker's
+//     own entry corridor) marching the map's one lane toward the guns, using the SAME
+//     racial-troop roster «Штурм» already uses (mobHumanCreepMelee/Range) rather than
+//     inventing a new unit.
+//   - Boss: Cerber (mobBossCerber, an existing hand-tuned Hunt boss -- 10000 HP, 48-66
+//     dmg, 294 coins/3000 XP, exempt from level scaling) planted at the boss-spawn point
+//     on the DEFENDER side. He is NOT a structure in the simulation sense but is
+//     modelled through the stationary-attacker pipeline a cannon uses (see
+//     battleserver's newDotaBossGuard) -- the DOTA tick has no leash/homing logic for a
+//     roaming melee unit, so "planted guard" is the reliable path. He sits at the FAR
+//     east end near the defender rally, well clear of the gun cluster (x=186-356), so he
+//     is a rich optional risk/reward target, never a gate on the win condition (only the
+//     5 guns are checked by castleCheckWinLocked).
 //
 // Spawns: the map's single corridor carries 5 Reborn_point_protection/_place pairs
 // spanning x=30.8 (west) to x=434.1 (east, just past the walkable boundary -- the
@@ -547,4 +562,16 @@ func (m DotaMap) CreepMobIdx(side DotaSide) (melee, ranged int) {
 		return m.ElfCreepMelee, m.ElfCreepRange
 	}
 	return m.HumanCreepMelee, m.HumanCreepRange
+}
+
+// SiegeCreepMobIdx returns the side's siege-creep roster index, or -1 for maps
+// that intentionally do not run the Assault siege schedule (currently Castle War).
+func (m DotaMap) SiegeCreepMobIdx(side DotaSide) int {
+	if !m.SiegeCreepWaves {
+		return -1
+	}
+	if side == DotaSideElf {
+		return m.ElfCreepSiege
+	}
+	return m.HumanCreepSiege
 }

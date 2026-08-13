@@ -723,7 +723,8 @@ var mobs = []Mob{
 	// «Штурм» racial troops (mobHumanCreepMelee..mobElfCreepRange). Prefabs verified in
 	// data/Characters/Creeps (H_Creep*/Elf_Creep* bundles expose Mnst_Human_Creep1..3 /
 	// Mnst_Elf_Creep1..3). Creep1 = melee footman, Creep2 = ranged (ships a projectile);
-	// Creep3 is the siege unit (Катапультозавр / Осадный медведь) and is not rostered.
+	// Creep3 is the siege unit (Катапультозавр / Осадный медведь) and is rostered
+	// below for the Assault schedule.
 	// Modest HP so a hero clears a wave but a lone hero can't solo a whole lane of
 	// cannons+creeps instantly. XP is calibrated from measured «Штурм» progression:
 	// 72 per melee and 84 per ranged troop make a complete 3+1 wave worth 300 XP.
@@ -740,10 +741,20 @@ var mobs = []Mob{
 		Health: 200, DmgMin: 14, DmgMax: 20, AttackSpeed: 0.9, Speed: 4.0, XP: 72, Coins: 4, CollisionRadius: 0.6},
 	{NameKey: "IDS_DotaCreepRangeSobor_Name", Prefab: "Mnst_Human_Creep2_prop01", Icon: "Gui/Creeps/Icons/Mnst_Sobor_Creep2",
 		Health: 130, DmgMin: 16, DmgMax: 22, AttackSpeed: 0.8, Speed: 4.0, XP: 84, Coins: 5, AttackRange: 9.0, CollisionRadius: 0.55},
+	// Siege units are deliberately sturdy but slow. Their basic damage is moderate;
+	// the battleserver applies the classic siege bonus against buildings so they are
+	// valuable pushes without becoming hero killers. Both factions use the same
+	// numbers; only the prefab/name differs.
+	{NameKey: "IDS_DotaCreepSiegeSobor_Name", Prefab: "Mnst_Human_Creep3_prop01", Icon: "Gui/Creeps/Icons/Mnst_Sobor_Creep3",
+		Health: 500, DmgMin: 46, DmgMax: 62, AttackSpeed: 0.65, Speed: 3.0, XP: 160, Coins: 15, PhysArmor: 6,
+		AttackRange: 11.0, CollisionRadius: 0.9},
 	{NameKey: "IDS_DotaCreepMeleeApostate_Name", Prefab: "Mnst_Elf_Creep1_prop01", Icon: "Gui/Creeps/Icons/Mnst_Apostate_Creep1",
 		Health: 200, DmgMin: 14, DmgMax: 20, AttackSpeed: 0.9, Speed: 4.0, XP: 72, Coins: 4, CollisionRadius: 0.6},
 	{NameKey: "IDS_DotaCreepRangeApostate_Name", Prefab: "Mnst_Elf_Creep2_prop01", Icon: "Gui/Creeps/Icons/Mnst_Apostate_Creep2",
 		Health: 130, DmgMin: 16, DmgMax: 22, AttackSpeed: 0.8, Speed: 4.0, XP: 84, Coins: 5, AttackRange: 9.0, CollisionRadius: 0.55},
+	{NameKey: "IDS_DotaCreepSiegeApostate_Name", Prefab: "Mnst_Elf_Creep3_prop01", Icon: "Gui/Creeps/Icons/Mnst_Apostate_Creep3",
+		Health: 500, DmgMin: 46, DmgMax: 62, AttackSpeed: 0.65, Speed: 3.0, XP: 160, Coins: 15, PhysArmor: 6,
+		AttackRange: 11.0, CollisionRadius: 0.9},
 }
 
 // Boss ability kits, one entry per distinctive VFX prefab in each boss bundle
@@ -836,8 +847,10 @@ const (
 	// Creeps). They march a lane and fight; team is assigned per-battle, not here.
 	mobHumanCreepMelee
 	mobHumanCreepRange
+	mobHumanCreepSiege
 	mobElfCreepMelee
 	mobElfCreepRange
+	mobElfCreepSiege
 )
 
 // demonFamily lists every demon-type mob index (used to test demon coverage in

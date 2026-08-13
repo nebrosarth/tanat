@@ -36,9 +36,10 @@ const (
 	dotaStructProtoBase     int32 = 960 // building proto = base + DotaStructure.ID
 
 	// Combat tuning.
-	dotaCreepAggro  = 13.0 // a creep engages an enemy within this radius, else marches
-	dotaMeleeReach  = 2.2  // melee attack reach added to the two body radii
-	dotaWaypointHit = 3.0  // a creep advances to the next lane waypoint within this
+	dotaCreepAggro                     = 13.0 // a creep engages an enemy within this radius, else marches
+	dotaMeleeReach                     = 2.2  // melee attack reach added to the two body radii
+	dotaWaypointHit                    = 3.0  // a creep advances to the next lane waypoint within this
+	dotaSiegeStructureDamageMultiplier = 1.75
 
 	// Team model. «Штурм» is ABSOLUTE-team, not player-relative: the Human base
 	// («Собор») and everything fighting for it are team 1, the Elf base
@@ -77,6 +78,11 @@ type dotaState struct {
 	nextWave   map[int32]float64 // generator objID -> next creep-wave battle-time
 	nextCreep  int32             // rolling creep objID
 	waveParity int               // alternates melee/ranged bias per wave
+
+	// nextSiegeWaveAt is a single match-time schedule shared by all lanes. When it
+	// is due, one siege creep is released from every living lane on both sides.
+	// Zero means the map does not use Assault siege waves.
+	nextSiegeWaveAt float64
 
 	// instMobs aliases the instance's mob map (Go maps are references, so it stays
 	// current as creeps are added/removed) -- lets altarVulnerableLocked scan the
@@ -264,6 +270,9 @@ func newDotaInstance(s *Server, id, mapID int32) *huntInstance {
 		teamPlans:            map[int32]botTeamPlan{},
 		teamPlanTelemetryKey: map[int32]string{},
 	}
+	if dm.SiegeCreepWaves {
+		d.nextSiegeWaveAt = d.startedAt + gamedata.SiegeCreepFirstWave
+	}
 	if dir := botTelemetryDir(); dir != "" {
 		d.telemetry = newTelemetryRecorder(dir, mapID)
 		d.telemetry.record(telemetryMatchStart{
@@ -423,11 +432,19 @@ func (s *Server) dotaWorldSetupLocked(mem *conn, now float64) {
 	}
 }
 
-// creepMobIdxs returns the four creep roster indices used by this map.
+// creepMobIdxs returns the creep roster indices used by this map, including
+// scheduled siege units when the map is regular Assault.
 func (d *dotaState) creepMobIdxs() []int {
 	hm, hr := d.m.CreepMobIdx(gamedata.DotaSideHuman)
 	em, er := d.m.CreepMobIdx(gamedata.DotaSideElf)
-	return []int{hm, hr, em, er}
+	idxs := []int{hm, hr, em, er}
+	if siege := d.m.SiegeCreepMobIdx(gamedata.DotaSideHuman); siege >= 0 {
+		idxs = append(idxs, siege)
+	}
+	if siege := d.m.SiegeCreepMobIdx(gamedata.DotaSideElf); siege >= 0 {
+		idxs = append(idxs, siege)
+	}
+	return idxs
 }
 
 // dotaStructHP returns a role's authored HP (for the prototype's declared max).
@@ -642,7 +659,11 @@ func (s *Server) dotaTargetPosLocked(rep *conn, objID int32, now float64) (float
 // dotaLandHitLocked applies a committed swing's damage to whatever it was aimed at.
 func (s *Server) dotaLandHitLocked(rep *conn, m *mobState, now float64) {
 	if victim := rep.inst.mobs[m.hitTarget]; victim != nil {
-		s.dotaDamageLocked(rep, victim, m.hitDmg, m.id, now)
+		dmg := m.hitDmg
+		if m.siege && victim.structure {
+			dmg *= dotaSiegeStructureDamageMultiplier
+		}
+		s.dotaDamageLocked(rep, victim, dmg, m.id, now)
 		return
 	}
 	if mem := rep.inst.members[m.hitTarget]; mem != nil && mem.huntState != nil {
@@ -824,6 +845,51 @@ func (s *Server) dotaSpawnWavesLocked(rep *conn, now float64) {
 		d.nextWave[key] = now + gamedata.CreepWaveInterval
 		s.dotaSpawnCreepWaveFromCampLocked(rep, camp, now)
 	}
+	s.dotaSpawnSiegeWavesLocked(rep, now)
+}
+
+// dotaSpawnSiegeWavesLocked releases one siege creep from every living lane on
+// both sides when the shared Assault schedule is due. A lane without its
+// barracks is intentionally silent, matching ordinary wave production.
+func (s *Server) dotaSpawnSiegeWavesLocked(rep *conn, now float64) {
+	d := rep.inst.dota
+	if d.nextSiegeWaveAt <= 0 {
+		return
+	}
+	for now >= d.nextSiegeWaveAt {
+		s.dotaSpawnSiegeWaveLocked(rep, now)
+		d.nextSiegeWaveAt += gamedata.SiegeCreepWaveInterval
+	}
+}
+
+func (s *Server) dotaSpawnSiegeWaveLocked(rep *conn, now float64) {
+	d := rep.inst.dota
+	for _, side := range []gamedata.DotaSide{gamedata.DotaSideHuman, gamedata.DotaSideElf} {
+		idx := d.m.SiegeCreepMobIdx(side)
+		if idx < 0 {
+			continue
+		}
+		for li := range d.m.Lanes {
+			var bar gamedata.DotaStructure
+			found := false
+			for _, candidate := range d.m.Structures {
+				if candidate.Role != gamedata.DotaCreepTower || candidate.Side != side || d.m.LaneFor(candidate) != li {
+					continue
+				}
+				live := rep.inst.mobs[dotaStructIDBase+candidate.ID]
+				if live == nil || live.dead {
+					break
+				}
+				bar, found = candidate, true
+				break
+			}
+			if !found {
+				continue
+			}
+			entry := laneEntryIdx(d.m.Lanes[li], bar.X, bar.Z, side == gamedata.DotaSideHuman)
+			s.spawnDotaSiegeCreepLocked(rep, idx, bar.X, bar.Z, side, li, entry, now)
+		}
+	}
 }
 
 // archerEveryNth: one creep in three carries a bow. Kept apart from CreepsPerWave so
@@ -947,6 +1013,28 @@ func (s *Server) spawnCreepWaveLocked(rep *conn, x, z float64, side gamedata.Dot
 		s.dotaRevealCreepToOwnTeamLocked(rep, cm, now)
 	}
 	d.waveParity++
+}
+
+// spawnDotaSiegeCreepLocked creates the one Creep3 unit released for a lane's
+// scheduled siege wave. It intentionally shares the ordinary creep reveal and
+// telemetry paths, while marking the unit for building-focused combat below.
+func (s *Server) spawnDotaSiegeCreepLocked(rep *conn, idx int, x, z float64, side gamedata.DotaSide, li, laneIndex int, now float64) {
+	d := rep.inst.dota
+	mob := gamedata.MobByIndex(idx)
+	d.nextCreep++
+	cm := &mobState{
+		id: d.nextCreep, mobIdx: idx, mob: mob,
+		x: float32(x), y: float32(z), spawnX: float32(x), spawnY: float32(z),
+		homed: false, hp: mob.Health, maxHP: mob.Health,
+		dmgMin: float64(mob.DmgMin), dmgMax: float64(mob.DmgMax),
+		xp: mob.XP, coins: mob.Coins,
+		team: teamForSide(side), lane: d.m.Lanes[li],
+		laneFwd: side == gamedata.DotaSideHuman, laneIdx: laneIndex,
+		siege: true, lastSync: now, hasProj: mob.AttackRange > 0,
+	}
+	rep.inst.mobs[cm.id] = cm
+	s.telemetryRecordCreepSpawnLocked(rep, cm, now)
+	s.dotaRevealCreepToOwnTeamLocked(rep, cm, now)
 }
 
 // dotaCreepTickLocked drives one creep: engage the nearest enemy in reach (attack) or
@@ -1123,10 +1211,17 @@ func (s *Server) dotaAcquireTargetLocked(rep *conn, m *mobState, radius, now flo
 	r2 := radius * radius
 	var best *dotaTarget
 	bestD := math.Inf(1)
-	consider := func(t *dotaTarget) {
+	bestPriority := 99
+	consider := func(t *dotaTarget, priority int) {
 		d := float64(dist2(m.x, m.y, t.x, t.y))
-		if d <= r2 && d < bestD {
-			bestD, best = d, t
+		if d > r2 {
+			return
+		}
+		// A siege creep does not abandon an exposed structure for a hero that
+		// happens to be a little closer. Structures are its strategic target;
+		// ordinary units retain nearest-target behavior.
+		if priority < bestPriority || (priority == bestPriority && d < bestD) {
+			bestPriority, bestD, best = priority, d, t
 		}
 	}
 	// enemy mobs (creeps + structures)
@@ -1143,7 +1238,11 @@ func (s *Server) dotaAcquireTargetLocked(rep *conn, m *mobState, radius, now flo
 		if o.altar && dota != nil && !dota.altarVulnerableLocked(o) {
 			continue
 		}
-		consider(&dotaTarget{mob: o, x: o.x, y: o.y, radius: float32(o.mob.Radius())})
+		priority := 0
+		if m.siege && !o.structure {
+			priority = 1
+		}
+		consider(&dotaTarget{mob: o, x: o.x, y: o.y, radius: float32(o.mob.Radius())}, priority)
 	}
 	// enemy players AND their summons: a creep/cannon strikes any player whose side
 	// differs from its own -- Human units hunt Elf heroes and vice versa (true PvP), and
@@ -1157,7 +1256,11 @@ func (s *Server) dotaAcquireTargetLocked(rep *conn, m *mobState, radius, now flo
 		}
 		if hs.deadUntil == 0 && now >= hs.invisibleUntil {
 			px, py := mem.posAtLocked(float32(now))
-			consider(&dotaTarget{player: mem, x: px, y: py, radius: float32(hs.av.Radius())})
+			priority := 0
+			if m.siege {
+				priority = 1
+			}
+			consider(&dotaTarget{player: mem, x: px, y: py, radius: float32(hs.av.Radius())}, priority)
 		}
 		// Summons live in their owner's map, never in inst.mobs, so the mob scan above
 		// cannot see them. Only the Hunt driver was ever taught that, which made a pet
@@ -1168,7 +1271,11 @@ func (s *Server) dotaAcquireTargetLocked(rep *conn, m *mobState, radius, now flo
 			if !sm.alive(now) {
 				continue
 			}
-			consider(&dotaTarget{summon: sm, x: sm.x, y: sm.y, radius: summonRadius})
+			priority := 0
+			if m.siege {
+				priority = 1
+			}
+			consider(&dotaTarget{summon: sm, x: sm.x, y: sm.y, radius: summonRadius}, priority)
 		}
 	}
 	return best
