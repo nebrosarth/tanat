@@ -1049,7 +1049,7 @@ type mobState struct {
 	skillCY        float32
 	skillTargetObj int32 // objID a single-target boss skill was aimed at
 
-	pf pathState // routed chase waypoints when the straight line is wall-blocked
+	pf pathState // cached route waypoints; «Штурм» creeps use it for every movement leg
 
 	// «Штурм» (DOTA) fields. team is the object's in-battle team: 1 = the player's
 	// side (allies), -1 = enemies (Hunt's convention; teamVal falls back to -1 so a
@@ -1070,6 +1070,9 @@ type mobState struct {
 	lane    []gamedata.Vec2
 	laneIdx int
 	laneFwd bool
+	// siege marks an Assault siege creep. It keeps the ordinary lane driver but
+	// gets building priority and bonus damage against structures.
+	siege   bool
 	dtarget int32
 
 	// hasProj marks a unit whose CLIENT prefab actually ships a projectile pool

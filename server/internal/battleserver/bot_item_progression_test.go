@@ -14,7 +14,7 @@ func TestBotItemShoppingFollowsThreeItemCapAndSpeedCap(t *testing.T) {
 		t.Fatal("setup: failed to give bot the test wallet")
 	}
 	b := newBotBrain(bot, 0, 0)
-	bot.huntState.level = 0 // level must not gate the three affordable root items
+	bot.huntState.level = 0 // character level 1; each preferred tree has a tier-1 root
 	now := float64(s.battleTime())
 
 	bot.lock()
@@ -36,6 +36,9 @@ func TestBotItemShoppingFollowsThreeItemCapAndSpeedCap(t *testing.T) {
 		it, ok := gamedata.AvatarItemByArticle(article)
 		if !ok {
 			t.Fatalf("bot owns unknown avatar item %d", article)
+		}
+		if it.Stage != 1 {
+			t.Fatalf("bot bought tier-%d item at displayed level 1: %s", it.Stage, it.NameKey)
 		}
 		if trees[it.TreeID] {
 			t.Fatalf("bot bought two items from avatar tree %d", it.TreeID)
@@ -66,10 +69,10 @@ func TestBotItemShoppingUpgradesFilledSlotAtUnlockedTier(t *testing.T) {
 		t.Fatalf("active tree count at start = %d, want %d", got, gamedata.AvatarTreeMaxItems)
 	}
 
-	// Internal level 4 is displayed as level 5, the first level at which the
+	// Internal level 9 is displayed as level 10, the first level at which the
 	// bot stage policy opens tier 3. A filled three-slot build must progress,
 	// rather than being blocked by the active-slot cap.
-	bot.huntState.level = 4
+	bot.huntState.level = 9
 	for i := 0; i < gamedata.AvatarTreeMaxItems; i++ {
 		s.botBuyItemsLocked(b, now)
 	}
@@ -89,5 +92,39 @@ func TestBotItemShoppingUpgradesFilledSlotAtUnlockedTier(t *testing.T) {
 	}
 	if got := avatarEquippedTreeCountLocked(bot.huntState); got != gamedata.AvatarTreeMaxItems {
 		t.Fatalf("active tree count after upgrades = %d, want %d", got, gamedata.AvatarTreeMaxItems)
+	}
+}
+
+func TestBotItemShoppingUpgradesTierTwoAtLevelFive(t *testing.T) {
+	s, bot, _, cleanup := newDotaConn(t, "Avtr_HK_Tangren")
+	defer cleanup()
+	s.Store.CreateBotHero(bot.selfPlayerID, "tier-two-bot")
+	if !s.Store.SetHeroMoney(bot.selfPlayerID, 1_000_000, 0) {
+		t.Fatal("setup: failed to give bot the test wallet")
+	}
+	b := newBotBrain(bot, 0, 0)
+	now := float64(s.battleTime())
+
+	// The opening purchase fills three distinct trees with their central T1 roots.
+	for i := 0; i < gamedata.AvatarTreeMaxItems; i++ {
+		s.botBuyItemsLocked(b, now)
+	}
+	bot.huntState.level = 4 // displayed level 5 unlocks T2
+	for i := 0; i < gamedata.AvatarTreeMaxItems; i++ {
+		s.botBuyItemsLocked(b, now)
+	}
+
+	upgraded := 0
+	for _, article := range bot.huntState.activeTreeItems {
+		it, ok := gamedata.AvatarItemByArticle(article)
+		if !ok {
+			t.Fatalf("active item %d is absent from the catalog", article)
+		}
+		if it.Stage == 2 {
+			upgraded++
+		}
+	}
+	if upgraded == 0 {
+		t.Fatalf("bot did not buy a tier-2 upgrade at displayed level 5: active=%v owned=%v", bot.huntState.activeTreeItems, bot.huntState.ownedTreeItems)
 	}
 }

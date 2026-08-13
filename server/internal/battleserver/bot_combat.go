@@ -702,6 +702,8 @@ func (s *Server) botCombatTickLocked(b *botBrain, now float64) bool {
 	}
 	enemies := botLivingEnemyHeroes(c, now)
 	immediateThreat := s.botImmediateHeroThreatLocked(b, enemies, now)
+	directHeroThreat := immediateThreat != nil && immediateThreat.huntState != nil &&
+		(immediateThreat.huntState.pvpTarget == c.objID || immediateThreat.huntState.attackTarget == c.objID)
 	if s.botAltarFinishPriorityLocked(b) && (immediateThreat == nil || immediateThreat.objID != c.objID) {
 		// An ally being chased is not allowed to pull the terminal assault away
 		// from an altar that is already close to destruction. The threatened ally
@@ -712,30 +714,68 @@ func (s *Server) botCombatTickLocked(b *botBrain, now float64) bool {
 			return true
 		}
 	}
-	if immediateThreat == nil {
-		// A visible uncovered wave is a hard local XP obligation. Clear an
-		// optional hero order and move to the exact creep instead of letting a
-		// focus target strand the last farm body outside the reward radius.
+	// A visible uncovered wave is a hard local XP obligation. It outranks an
+	// optional hero focus and even a rescue of a nearby ally; only a hero that
+	// is directly hitting this bot may pre-empt it. Otherwise the cover body
+	// walks to the exact creep and preserves the next proximity-XP event.
+	if !directHeroThreat {
 		if farmTarget := s.botUrgentFarmCoverageTargetLocked(b, now); farmTarget != nil {
 			b.engageTarget = 0
 			s.stopPvpAttackLocked(c, false)
 			cx, cy := c.posAtLocked(float32(now))
 			distance := math.Hypot(float64(farmTarget.x-cx), float64(farmTarget.y-cy))
 			attackReach := hs.effAttackRangeLocked(now) + hs.av.Radius() + farmTarget.mob.Radius()
-			if distance <= attackReach {
+			// Ranged attack reach is not XP reach. A farm rescue must first
+			// enter the authoritative proximity radius; otherwise the bot can
+			// hit a creep from 25u away and still miss its XP on death.
+			// Combat has first refusal, but a creep rescue still obeys the
+			// farm safety invariant. Only a genuinely weak creep is attacked;
+			// otherwise the helper holds the rear XP anchor instead of walking
+			// into the wave just because it was selected as urgent.
+			if !s.botMoveToFarmTargetLocked(b, farmTarget, now) &&
+				distance <= attackReach && distance <= dotaXPShareRadius &&
+				s.botFarmMayAttackCreepLocked(b, now) {
 				s.startAttackLocked(c, farmTarget)
-			} else {
-				s.botMoveTowardLocked(b, farmTarget.x, farmTarget.y, now)
 			}
 			return true
 		}
+	}
+	// Before the first visible wave, a zero-XP farm owner must stage on its
+	// assigned lane instead of taking an optional hero duel. This is a live
+	// obligation (no XP yet + lane wave pending), not a match-clock phase.
+	if immediateThreat == nil && botFirstFarmWavePendingLocked(b, now) {
+		b.engageTarget = 0
+		s.stopPvpAttackLocked(c, false)
+		return false
 	}
 	if immediateThreat != nil && immediateThreat.huntState != nil &&
 		(immediateThreat.huntState.pvpTarget == c.objID || immediateThreat.huntState.attackTarget == c.objID) {
 		assignment := b.macroAssignment
 		farmOwnerUnderPressure := assignment.FarmLaneSet && assignment.FarmLane >= 0 &&
 			(assignment.Mode == botMacroLane || assignment.Mode == botMacroCover || assignment.Mode == botMacroBase) &&
-			!assignment.Aggressive
+			!assignment.Aggressive && s.botFarmApproachTargetLocked(b, now) != nil
+		if farmOwnerUnderPressure && !botLastStandObjectiveLocked(b, now) {
+			// A farm owner is not a duelist. Once an enemy hero has committed
+			// contact on a lane with a live wave, preserve the avatar and let the
+			// orchestrator hand the XP obligation to a healthy cover body. Walking
+			// into a fair-looking PvP exchange here is strategically dominated by
+			// the death/recovery gap it creates for the next creep wave.
+			botSetRetreatModeLocked(b, botRetreatModeDisengage, now)
+			hx, hy := s.botRetreatPointLocked(b, now)
+			s.botMoveTowardLocked(b, hx, hy, now)
+			return true
+		}
+		// A targeted spell may be the only authoritative evidence of contact.
+		// Treat recent landed hero damage as a predictive disengage trigger for
+		// every ordinary assignment, including push responders; a farm bot that
+		// loses 30% more HP before its next thought is already too late to cover
+		// the following wave.
+		if !botLastStandObjectiveLocked(b, now) && botHPFrac(hs, now) <= botPredictiveRetreatHPFrac {
+			botSetRetreatModeLocked(b, botRetreatModeDisengage, now)
+			hx, hy := s.botRetreatPointLocked(b, now)
+			s.botMoveTowardLocked(b, hx, hy, now)
+			return true
+		}
 		if farmOwnerUnderPressure && botHPFrac(hs, now) <= botSafeHPFrac {
 			// A farm owner is strategically replaceable; a death creates an
 			// unrecoverable XP gap. Leave an active hero contact once HP has
@@ -762,6 +802,9 @@ func (s *Server) botCombatTickLocked(b *botBrain, now float64) bool {
 		}
 	}
 	if s.botShouldRetreatLocked(b, now) {
+		if s.botFarmXPShadowTickLocked(b, now) {
+			return true
+		}
 		return s.botConsiderRetreatUtilityLocked(b, now)
 	}
 	// Preparation is a synchronization phase. A bot may answer an enemy that
@@ -921,6 +964,16 @@ func (s *Server) botImmediateHeroThreatLocked(b *botBrain, enemies []*conn, now 
 		return nil
 	}
 	c := b.c
+	// Skills can land damage without arming the normal PvP attack order. The
+	// authoritative last-damager record closes that gap: after a targeted hit,
+	// the bot knows which enemy just made contact even if that enemy's next
+	// order has not been installed yet.
+	if c.huntState.lastHeroDamager != 0 && now-c.huntState.lastHeroDamageAt <= botRecentHeroDamageThreatWindow {
+		if attacker := c.pvpMember(c.huntState.lastHeroDamager); attacker != nil && attacker.huntState != nil &&
+			attacker.huntState.deadUntil == 0 && arenaEnemies(attacker, c) {
+			return attacker
+		}
+	}
 	for _, enemy := range enemies {
 		if enemy == nil || enemy.huntState == nil || enemy.huntState.deadUntil > 0 {
 			continue
@@ -1152,9 +1205,15 @@ func (s *Server) botShouldProtectFarmFromOptionalFightLocked(b *botBrain, target
 	// wave simply because another ally happened to receive the previous creep's
 	// XP.  The rule is state-driven (live target + coverage assignment), not a
 	// match-time opening window.
-	coverageNeedsFarm := assignment.Mode == botMacroCover && assignment.Coverage &&
-		assignment.FarmLaneSet && assignment.FarmLane >= 0
-	if !coverageNeedsFarm && botFarmDebtLocked(b.c.inst, b) < 1 {
+	farmRoute := assignment.FarmLaneSet && assignment.FarmLane >= 0 &&
+		(assignment.Mode == botMacroLane || assignment.Mode == botMacroCover || assignment.Mode == botMacroBase)
+	coverageNeedsFarm := assignment.Mode == botMacroCover && assignment.Coverage && farmRoute
+	// A live wave is itself a farm obligation, even when this bot has not yet
+	// accumulated measurable XP debt. Otherwise a healthy lane owner can take
+	// an optional duel simply because an ally happened to receive the previous
+	// proximity grant, and the resulting retreat/death strands the next wave.
+	liveWaveNeedsFarm := s.botFarmApproachTargetLocked(b, now) != nil
+	if !farmRoute && !coverageNeedsFarm && !liveWaveNeedsFarm && botFarmDebtLocked(b.c.inst, b) < 1 {
 		return false
 	}
 	// A hero that is actively hitting this bot is not an optional fight. The
@@ -1162,7 +1221,7 @@ func (s *Server) botShouldProtectFarmFromOptionalFightLocked(b *botBrain, target
 	if target.huntState.pvpTarget == b.c.objID || target.huntState.attackTarget == b.c.objID {
 		return false
 	}
-	if s.botFarmApproachTargetLocked(b, now) == nil {
+	if !farmRoute && !liveWaveNeedsFarm {
 		return false
 	}
 	return botHPFrac(b.c.huntState, now) > botRetreatHPFrac

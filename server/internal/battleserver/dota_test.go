@@ -42,6 +42,7 @@ func newDotaConn(t *testing.T, prefab string) (*Server, *conn, *huntInstance, fu
 	hs.worldReady = true
 	c.huntState = hs
 	c.inst = inst
+	c.nav = inst.nav
 	c.lk = &inst.mu
 	inst.members[c.objID] = c
 	cleanup := func() { srv.Close(); cli.Close() }

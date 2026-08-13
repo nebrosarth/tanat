@@ -56,6 +56,68 @@ func TestAvatarItemCount(t *testing.T) {
 	}
 }
 
+func TestAvatarItemStageLevelGates(t *testing.T) {
+	wantByStage := map[int]int32{1: 1, 2: 5, 3: 10, 4: 15, 5: 20}
+	wantSlots := map[[2]int]int32{
+		{2, 1}: 0,
+		{1, 2}: 1, {3, 2}: 3,
+		{1, 3}: 4, {2, 3}: 5, {3, 3}: 6,
+		{1, 4}: 7, {2, 4}: 8, {3, 4}: 9,
+		{1, 5}: 10, {2, 5}: 11, {3, 5}: 12,
+	}
+	magicStageOne := 0
+	for _, it := range AvatarItems() {
+		want, ok := wantByStage[it.Stage]
+		if !ok {
+			t.Fatalf("%s has unexpected stage %d", it.NameKey, it.Stage)
+		}
+		if it.MinAvaLvl != want {
+			t.Errorf("%s min avatar level = %d, want %d", it.NameKey, it.MinAvaLvl, want)
+		}
+		if slot, ok := wantSlots[[2]int{it.Line, it.Stage}]; !ok || it.TreeSlot != slot {
+			t.Errorf("%s tree slot = %d, want %d", it.NameKey, it.TreeSlot, slot)
+		}
+		if it.Class == "Mg" && it.Stage == 1 {
+			magicStageOne++
+			if it.NameKey != "IDS_ItemAvtr_Mg_Ln2_St1_Name" {
+				t.Errorf("Magic tier-1 item = %s, want IDS_ItemAvtr_Mg_Ln2_St1_Name", it.NameKey)
+			}
+		}
+	}
+	if magicStageOne != 1 {
+		t.Fatalf("Magic tree has %d tier-1 items, want exactly one", magicStageOne)
+	}
+}
+
+func TestAvatarItemTierTwoBranchesFromCentralRoot(t *testing.T) {
+	for treeID := AvatarTreeDefence; treeID <= AvatarTreeSupport; treeID++ {
+		var root AvatarItem
+		var tierTwo []AvatarItem
+		for _, it := range AvatarItems() {
+			if it.TreeID != treeID {
+				continue
+			}
+			if it.Stage == 1 {
+				root = it
+			}
+			if it.Stage == 2 {
+				tierTwo = append(tierTwo, it)
+			}
+		}
+		if root.ArticleID == 0 {
+			t.Fatalf("tree %d has no tier-1 root", treeID)
+		}
+		if len(tierTwo) != 2 {
+			t.Fatalf("tree %d has %d tier-2 branches, want 2", treeID, len(tierTwo))
+		}
+		for _, it := range tierTwo {
+			if len(it.Parents) != 1 || it.Parents[0] != root.ArticleID {
+				t.Errorf("%s parents = %v, want central root %d", it.NameKey, it.Parents, root.ArticleID)
+			}
+		}
+	}
+}
+
 // TestAvatarItemArticleIDsUnique: ids are unique, in the authored 60000-range,
 // and do not collide with the potion article range (50000..) that shares the
 // same client connection's prototype id space.
@@ -76,8 +138,9 @@ func TestAvatarItemArticleIDsUnique(t *testing.T) {
 }
 
 // TestAvatarItemTreeGrid: each of the 5 trees has exactly 12 items filling the
-// 3x4 grid slots 1..12 with no duplicate slot (a duplicate slot inside one tree
-// makes the client drop the button with a Log.Error).
+// central root slot 0 plus progression slots 1..12 (with slot 2 intentionally
+// empty) and no duplicate slot. A duplicate slot inside one tree makes the
+// client drop the button with a Log.Error.
 func TestAvatarItemTreeGrid(t *testing.T) {
 	byTree := map[int32][]AvatarItem{}
 	for _, it := range AvatarItems() {
@@ -95,8 +158,8 @@ func TestAvatarItemTreeGrid(t *testing.T) {
 		}
 		slots := map[int32]bool{}
 		for _, it := range items {
-			if it.TreeSlot < 1 || it.TreeSlot > 12 {
-				t.Errorf("%s tree_slot %d out of 1..12", it.NameKey, it.TreeSlot)
+			if it.TreeSlot < 0 || it.TreeSlot > 12 {
+				t.Errorf("%s tree_slot %d out of 0..12", it.NameKey, it.TreeSlot)
 			}
 			if slots[it.TreeSlot] {
 				t.Errorf("tree %d duplicate slot %d", tid, it.TreeSlot)

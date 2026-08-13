@@ -175,6 +175,13 @@ func (s *Server) startSkillOrderLocked(c *conn, slot int, target int32, px, py f
 		s.orderDoneLocked(c, parent)
 		return false
 	}
+	if abilityUseBlockedByChannelLocked(hs, now) {
+		// A Blade Fury-style channel keeps movement available but owns the
+		// ability bar until it naturally expires. Do not spend mana or cooldown
+		// and close the rejected client order cleanly.
+		s.orderDoneLocked(c, parent)
+		return false
+	}
 	if def.Type == "PASSIVE" {
 		s.orderDoneLocked(c, parent)
 		return false
@@ -372,7 +379,25 @@ func channelSustainsThroughDisruption(prefab string, slot int) bool {
 	// pulse is one banked soul being spent, not the caster actively sustaining a beam/
 	// hold), so it is not something walking or being stunned should be able to cut off.
 	return (prefab == "Avtr_DPS_BlackDragon" && slot == 4) ||
-		(prefab == "Avtr_DPS_Gellar" && slot == 4)
+		(prefab == "Avtr_DPS_Gellar" && slot == 4) ||
+		// Tangren's «Стальной ураган» is the Juggernaut-style spinning channel:
+		// movement is part of the ability, so walking must not cancel its pulses.
+		(prefab == "Avtr_HK_Tangren" && slot == 1)
+}
+
+// channelAllowsMovement reports channels whose caster may issue ordinary movement
+// orders while the channel is active. This is intentionally narrower than
+// channelSustainsThroughDisruption: a channel can survive a stun/movement event in
+// the effect engine without necessarily being allowed to move during its cast lock.
+func channelAllowsMovement(prefab string, slot int) bool {
+	return prefab == "Avtr_HK_Tangren" && slot == 1
+}
+
+// channelBlocksOtherAbilities reports a channel that owns the caster's ability bar
+// until it ends. Tangren's «Стальной ураган» follows Juggernaut's Blade Fury rule:
+// the caster can move, but cannot start another ability while spinning.
+func channelBlocksOtherAbilities(prefab string, slot int) bool {
+	return prefab == "Avtr_HK_Tangren" && slot == 1
 }
 
 // channelWavePulseFx names the fx to fire on a channel's Nth pulse (pulseCount, 0-based,
@@ -556,7 +581,34 @@ func botHasBlockingChannelLocked(hs *huntState, now float64) bool {
 		if now > ch.until {
 			continue
 		}
+		if channelAllowsMovement(hs.av.Prefab, ch.slot) {
+			// A movement channel is still active, but it must not freeze the bot's
+			// route planner. The server-side skill gate separately rejects new
+			// abilities while this channel is running.
+			continue
+		}
 		if ch.target > 0 || !ch.hasPos || ch.interruptible {
+			return true
+		}
+	}
+	return false
+}
+
+// abilityUseBlockedByChannelLocked is the ability-only counterpart to
+// botHasBlockingChannelLocked. It also covers the short cast-to-payload window so
+// a delayed channel cannot be replaced by another ability before its channelState
+// is created.
+func abilityUseBlockedByChannelLocked(hs *huntState, now float64) bool {
+	if hs == nil {
+		return false
+	}
+	for _, ch := range hs.channels {
+		if now <= ch.until && channelBlocksOtherAbilities(hs.av.Prefab, ch.slot) {
+			return true
+		}
+	}
+	for _, p := range hs.payloads {
+		if p.at > now && channelBlocksOtherAbilities(hs.av.Prefab, p.slot) {
 			return true
 		}
 	}
@@ -740,15 +792,22 @@ func (s *Server) execCastLocked(c *conn, slot int, ms *mobState, px, py float32,
 	// deliberately NOT CastFxDur -- that is how long the VFX lingers, not how long
 	// the character is animating, and locking for it felt ~0.5s too long. Capped
 	// so an unusually long wind-up never freezes the player excessively.
-	const castRecovery = 0.0
-	lockDur := def.PayloadDelay + castRecovery
-	if lockDur < doneAt {
-		lockDur = doneAt
+	if channelAllowsMovement(hs.av.Prefab, slot) {
+		// Tangren's spinning skill is a movement channel, not a rooted cast.
+		// The opening action still stops the previous route above, but a new
+		// movement order is accepted immediately after the spin starts.
+		hs.castLockUntil = 0
+	} else {
+		const castRecovery = 0.0
+		lockDur := def.PayloadDelay + castRecovery
+		if lockDur < doneAt {
+			lockDur = doneAt
+		}
+		if lockDur > 2.0 {
+			lockDur = 2.0
+		}
+		hs.castLockUntil = now + lockDur
 	}
-	if lockDur > 2.0 {
-		lockDur = 2.0
-	}
-	hs.castLockUntil = now + lockDur
 }
 
 // payload is a scheduled skill impact.

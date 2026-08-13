@@ -409,6 +409,57 @@ func (c *conn) aimAlong(ps *pathState, fx, fy, tx, ty float32, blocked bool, now
 	return tx, ty // route failed or fully consumed — head straight (clamp keeps it legal)
 }
 
+// aimAlongAStar is the strict route-following variant used by «Штурм» creeps.
+// Unlike the generic Hunt chaser, a lane creep must not fall back to a direct
+// heading when its target is behind geometry: that fallback is exactly how a
+// creep could enter a forest pocket and then grind against the exit wall.
+//
+// Nav.Path still has its own clear-line fast path, so an unobstructed leg is one
+// waypoint, but every leg is validated by the map path service and a failed
+// route means "hold", never "walk straight through the obstacle".
+func (c *conn) aimAlongAStar(ps *pathState, fx, fy, tx, ty float32, now float64) (float32, float32, bool) {
+	if c.nav == nil {
+		return 0, 0, false
+	}
+	stale := now-ps.at > 1.0
+	drift := math.Hypot(float64(tx-ps.goalX), float64(ty-ps.goalY)) > 2.0
+	recompute := !ps.tried || stale
+	if len(ps.pts) > 0 {
+		recompute = ps.idx >= len(ps.pts) || stale || drift
+	}
+	if recompute {
+		ps.pts = c.nav.Path(float64(fx), float64(fy), float64(tx), float64(ty))
+		ps.idx = 0
+		ps.fromX, ps.fromY = fx, fy
+		ps.goalX, ps.goalY = tx, ty
+		ps.at = now
+		ps.tried = true
+	}
+	for ps.idx < len(ps.pts) {
+		wp := ps.pts[ps.idx]
+		dxw := float64(fx) - wp.X
+		dyw := float64(fy) - wp.Y
+		reached := dxw*dxw+dyw*dyw < 0.36
+		if !reached {
+			tdx := wp.X - float64(ps.fromX)
+			tdy := wp.Y - float64(ps.fromY)
+			if tdx*tdx+tdy*tdy > 1e-6 && dxw*tdx+dyw*tdy >= 0 {
+				reached = true
+			}
+		}
+		if reached {
+			ps.fromX, ps.fromY = float32(wp.X), float32(wp.Y)
+			ps.idx++
+			continue
+		}
+		return float32(wp.X), float32(wp.Y), true
+	}
+	// A route can be consumed while the creep is already inside the goal cell.
+	// Holding here is safe; the next movement decision will recompute if the goal
+	// has moved or the route has become stale.
+	return fx, fy, true
+}
+
 // procState is a registered passive on-hit proc.
 type procState struct {
 	slot   int

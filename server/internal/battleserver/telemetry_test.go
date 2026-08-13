@@ -129,6 +129,7 @@ func TestTelemetryBotPurchaseJSONL(t *testing.T) {
 	bot.objID = botID
 	bot.selfPlayerID = botID
 	s.Store.CreateBotHero(botID, "purchase-test-bot")
+	bot.huntState.level = 4 // the first catalog root selected below is tier 2
 	const startingMoney int32 = 1000000
 	if !s.Store.SetHeroMoney(botID, startingMoney, 0) {
 		t.Fatal("setup: failed to create bot wallet")

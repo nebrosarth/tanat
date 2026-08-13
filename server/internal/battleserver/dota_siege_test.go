@@ -47,6 +47,9 @@ func TestAssaultSiegeCreepCadenceAndDirections(t *testing.T) {
 		if m.mob.Health != 500 {
 			t.Errorf("siege creep %d has %.0f HP, want 500", m.id, m.mob.Health)
 		}
+		if m.mob.Speed != 4.0 {
+			t.Errorf("siege creep %d has speed %.1f, want 4.0", m.id, m.mob.Speed)
+		}
 		if m.mob.AttackRange <= 0 || !m.hasProj {
 			t.Errorf("siege creep %d is not a ranged projectile unit: range=%.1f hasProj=%v", m.id, m.mob.AttackRange, m.hasProj)
 		}

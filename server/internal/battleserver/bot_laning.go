@@ -114,9 +114,11 @@ func (s *Server) botCreepFightRiskyLocked(c *conn, cx, cy float32) bool {
 }
 
 // botFindLaneTargetLocked is the laning attack-target picker: first the XP-aware live-wave
-// director, then the nearest enemy creep worth trading with, else an enemy structure in
-// reach -- gated on requireCover (our own creep wave standing here to soak its aggro) for
-// a solo laner, ungated for a grouped push (the party itself is the aggro soak).
+// director, then the nearest enemy creep worth trading with. It deliberately never falls
+// back to an enemy structure. Structure attacks belong to botMacroObjectiveTickLocked,
+// where the team orchestrator has named the exact objective and established a conversion
+// window. A farm/cover/recovery bot must not turn an empty local wave into an unsolicited
+// tower dive: that damages the bot, causes a retreat, and abandons the next XP radius.
 func (s *Server) botFindLaneTargetLocked(b *botBrain, now float64, radius float64, requireCover bool) *mobState {
 	if target := s.botFarmTargetLocked(b, now, radius, requireCover); target != nil {
 		return target
@@ -128,15 +130,11 @@ func (s *Server) botFindLaneTargetLocked(b *botBrain, now float64, radius float6
 
 	var bestCreep *mobState
 	bestCreepD := math.Inf(1)
-	ownCreepNearby := false
 	for _, m := range botSortedMobs(c.inst) {
 		if m.dead {
 			continue
 		}
 		d := math.Hypot(float64(m.x-cx), float64(m.y-cy))
-		if !m.structure && m.team == c.playerTeam() && botLaneForCreep(c, m) == farmLane && d <= radius {
-			ownCreepNearby = true
-		}
 		if m.structure || !m.enemyOf(c.playerTeam()) || d > radius ||
 			!botVisibleEnemyMobLocked(c.playerTeam(), m, visionSources) {
 			continue
@@ -155,21 +153,8 @@ func (s *Server) botFindLaneTargetLocked(b *botBrain, now float64, radius float6
 		}
 		return bestCreep
 	}
-	if requireCover && !ownCreepNearby {
-		return nil // no creep of ours to soak tower aggro -- don't dive alone
-	}
-	var bestStruct *mobState
-	bestStructD := math.Inf(1)
-	for _, m := range botSortedMobs(c.inst) {
-		if m.dead || !m.structure || !m.enemyOf(c.playerTeam()) || c.altarShieldedLocked(m) {
-			continue
-		}
-		d := math.Hypot(float64(m.x-cx), float64(m.y-cy))
-		if d <= radius && (d < bestStructD || (d == bestStructD && (bestStruct == nil || m.id < bestStruct.id))) {
-			bestStructD, bestStruct = d, m
-		}
-	}
-	return bestStruct
+	_ = requireCover // kept in the signature for the creep-safety policy at the call sites
+	return nil
 }
 
 func (s *Server) botFarmApproachTargetLocked(b *botBrain, now float64) *mobState {
@@ -233,6 +218,12 @@ func (s *Server) botConsiderWaveClearAbilityLocked(b *botBrain, now float64) boo
 			}
 		}
 		if bestCount >= 2 {
+			// Clearing a wave from outside the proximity radius can kill the
+			// creeps without granting this bot XP. Move into the reward envelope
+			// first; farm abilities are optional, XP coverage is not.
+			if math.Hypot(float64(bestX-cx), float64(bestY-cy)) > dotaXPShareRadius {
+				continue
+			}
 			b.farmDecision = "wave_clear_ability"
 			b.farmTargetScore = float64(bestCount * 24)
 			b.farmWaveClears++
@@ -367,10 +358,13 @@ func (s *Server) botLanePoint(b *botBrain, now float64) (float32, float32) {
 // Waiting for the first enemy creep to become visible was too late on
 // accelerated simulation: the creep could die while the cover bot was still
 // 20-30 units away, just outside the authoritative 20-unit XP share radius.
-// The midpoint is derived from the lane polyline, not from a match clock or an
-// unseen unit position, so it remains valid when wave cadence or visibility
-// changes. This only predicts a map waypoint; it does not select or attack an
-// unseen enemy unit.
+// The rendezvous is shifted toward the bot's own side by a safe aggro margin.
+// That leaves the body close enough to enter the reward envelope as the wave
+// rounds the lane, while still giving the live-wave anchor room to pull it to
+// the rear edge. The shift is map geometry plus the authoritative aggro
+// distance, not a match clock or an unseen unit position. This only predicts a
+// map waypoint; it does not
+// select or attack an unseen enemy unit.
 func (s *Server) botFarmPrestagePointLocked(b *botBrain, laneIndex int, _ float64) (float32, float32, bool) {
 	if b == nil || b.c == nil || b.c.inst == nil || b.c.inst.dota == nil ||
 		laneIndex < 0 || laneIndex >= len(b.c.inst.dota.m.Lanes) {
@@ -391,6 +385,27 @@ func (s *Server) botFarmPrestagePointLocked(b *botBrain, laneIndex int, _ float6
 		return float32(lane[0].X), float32(lane[0].Y), true
 	}
 	remaining := total * 0.5
+	// Stage just behind the first safe aggro boundary. Using the full outer
+	// XP radius left a bot 20-30u behind a wave after the creeps rounded the
+	// lane bend; the handoff then arrived after the first death. The aggro
+	// distance is a map/economy invariant, not a match-time opening constant.
+	// The meeting point must remain inside the reward envelope while the wave
+	// is still hidden. A full aggro-width offset left the body behind a moving
+	// wave by just over XP range at the first collision. Keep only a small
+	// rear-side safety margin; once the creep is visible, the live safe-anchor
+	// logic takes over and keeps the body outside aggro.
+	prestageOffset := dotaCreepAggro * 0.35
+	if b.c.playerTeam() == dotaTeamHuman {
+		remaining -= prestageOffset
+	} else {
+		remaining += prestageOffset
+	}
+	if remaining < 0 {
+		remaining = 0
+	}
+	if remaining > total {
+		remaining = total
+	}
 	for i := 0; i+1 < len(lane); i++ {
 		x, y := lane[i].X, lane[i].Y
 		tx, ty := lane[i+1].X, lane[i+1].Y
@@ -450,7 +465,12 @@ func (s *Server) botLaneTickLocked(b *botBrain, now float64) {
 		return
 	}
 	if hs.attackTarget != 0 {
-		return // already swinging at something; let the timer chain run
+		if target := hs.mobs[hs.attackTarget]; target != nil && !target.structure &&
+			target.enemyOf(c.playerTeam()) && !s.botFarmMayAttackCreepLocked(b, now) {
+			s.stopAttackLocked(c, false)
+		} else {
+			return // hero/structure fight, or an isolated optional last hit
+		}
 	}
 	if botFirstFarmWavePendingLocked(b, now) {
 		// Pre-stage before the wave exists. Waiting at the fountain made the
@@ -479,12 +499,16 @@ func (s *Server) botLaneTickLocked(b *botBrain, now float64) {
 		return
 	}
 	target := s.botFarmTargetLocked(b, now, botLaneEngageRadius, false)
-	if px, py, ok := s.botFarmCoveragePointLocked(b, now); ok {
+	if px, py, ok := s.botFarmTargetSafePointLocked(b, target, now); ok {
 		cx, cy := c.posAtLocked(float32(now))
 		if math.Hypot(float64(px-cx), float64(py-cy)) > dotaXPShareRadius*0.5 &&
 			!s.botEnemyStructureDangerLocked(c, px, py) && !s.botIncomingPressureLocked(b, now) {
-			s.botMoveTowardLocked(b, px, py, now)
-			return
+			if target != nil && s.botMoveToFarmTargetLocked(b, target, now) {
+				return
+			}
+			if s.botMoveToFarmCoverageLocked(b, now) {
+				return
+			}
 		}
 	}
 	// Resolve the live farm target before a coverage-centre move so telemetry
@@ -496,36 +520,65 @@ func (s *Server) botLaneTickLocked(b *botBrain, now float64) {
 	// without committing to a chase.
 	if target != nil {
 		cx, cy := c.posAtLocked(float32(now))
-		if math.Hypot(float64(target.x-cx), float64(target.y-cy)) <=
-			hs.effAttackRangeLocked(now)+hs.av.Radius()+target.mob.Radius() {
+		distance := math.Hypot(float64(target.x-cx), float64(target.y-cy))
+		if distance <= hs.effAttackRangeLocked(now)+hs.av.Radius()+target.mob.Radius() &&
+			distance <= dotaXPShareRadius &&
+			s.botFarmMayAttackCreepLocked(b, now) {
 			s.startAttackLocked(c, target)
 			return
 		}
+		if distance <= dotaXPShareRadius && !s.botFarmMayAttackCreepLocked(b, now) {
+			// The owner is already under pressure; preserve the XP body instead
+			// of holding an attack order that would chase the wave.
+			if s.botMoveToFarmCoverageLocked(b, now) {
+				return
+			}
+		}
 	}
-	if px, py, ok := s.botFarmCoveragePointLocked(b, now); ok {
+	if px, py, ok := s.botFarmTargetSafePointLocked(b, target, now); ok {
 		cx, cy := c.posAtLocked(float32(now))
 		if math.Hypot(float64(px-cx), float64(py-cy)) > dotaXPShareRadius*0.5 &&
 			!s.botEnemyStructureDangerLocked(c, px, py) {
-			s.botMoveTowardLocked(b, px, py, now)
-			return
+			if target != nil && s.botMoveToFarmTargetLocked(b, target, now) {
+				return
+			}
+			if s.botMoveToFarmCoverageLocked(b, now) {
+				return
+			}
 		}
 	}
 	if s.botConsiderHarassAbilityLocked(b, now) {
 		return
 	}
 	if target := s.botFindLaneTargetLocked(b, now, botLaneEngageRadius, true); target != nil {
-		s.startAttackLocked(c, target)
-		return
+		// A generic lane target is still a farm target. Do not turn the
+		// fallback selector into a creep chase: gold is not scarce for bots and
+		// walking into a full-health wave is exactly how they lose HP and then
+		// abandon the next proximity-XP event.
+		if s.botMoveToFarmTargetLocked(b, target, now) {
+			return
+		}
 	}
 	if target := s.botFarmApproachTargetLocked(b, now); target != nil {
-		s.botMoveTowardLocked(b, target.x, target.y, now)
-		return
+		if s.botMoveToFarmTargetLocked(b, target, now) {
+			return
+		}
 	}
 	if b.farmLane >= 0 && b.farmLane != b.lane {
-		lx, ly := s.botPushPointLocked(b, b.farmLane, now)
-		s.botMoveTowardLocked(b, lx, ly, now)
+		if lx, ly, ok := s.botFarmPrestagePointLocked(b, b.farmLane, now); ok &&
+			!s.botEnemyStructureDangerLocked(c, lx, ly) {
+			s.botMoveTowardLocked(b, lx, ly, now)
+		} else {
+			lx, ly := s.botPushPointLocked(b, b.farmLane, now)
+			s.botMoveTowardLocked(b, lx, ly, now)
+		}
 		return
 	}
-	lx, ly := s.botLanePoint(b, now)
-	s.botMoveTowardLocked(b, lx, ly, now)
+	if lx, ly, ok := s.botFarmPrestagePointLocked(b, b.lane, now); ok &&
+		!s.botEnemyStructureDangerLocked(c, lx, ly) {
+		s.botMoveTowardLocked(b, lx, ly, now)
+	} else {
+		lx, ly := s.botLanePoint(b, now)
+		s.botMoveTowardLocked(b, lx, ly, now)
+	}
 }

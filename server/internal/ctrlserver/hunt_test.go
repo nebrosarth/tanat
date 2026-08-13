@@ -376,6 +376,9 @@ func TestItemsAmfCarriesAvatarTreeArticles(t *testing.T) {
 		if pr, _ := entry.GetInt("price"); pr != want.Price {
 			t.Errorf("%s price = %d, want %d", want.NameKey, pr, want.Price)
 		}
+		if lvl, _ := entry.GetInt("min_ava_level"); lvl != want.MinAvaLvl {
+			t.Errorf("%s min_ava_level = %d, want %d", want.NameKey, lvl, want.MinAvaLvl)
+		}
 		// tree_parents: dense array of ints matching the authored edges.
 		tp, ok := entry.GetArray("tree_parents")
 		if !ok {

@@ -270,6 +270,9 @@ func (s *Server) buyItemLocked(c *conn, article int32) bool {
 	if hs.ownedTreeItems[it.ArticleID] {
 		return false // already bought this match
 	}
+	if it.MinAvaLvl > hs.level+1 {
+		return false // catalog uses the displayed 1-based avatar level
+	}
 	activeArticle := avatarTreeActiveLocked(hs, it.TreeID)
 	if activeArticle == it.ArticleID {
 		return false // already the active item in this slot

@@ -24,7 +24,9 @@ import "strconv"
 //     (CtrlServerConnection.GetGroupedItems groups by Article.mTreeId, keeps
 //     mTreeSlot != -1). No PShop object is needed.
 //   - tree_id must be BattleItemMenu.TreeType (1..5) or the item lands in no tab.
-//   - tree_slot must be 1..12 (the 3-col x 4-row grid); duplicates within one
+//   - tree_slot 0 is the central starting item; slots 1..12 are the four-row,
+//     three-column progression grid. Slot 2 is intentionally empty: the two
+//     tier-2 branches sit on either side of the root. Duplicates within one
 //     tree are dropped by the client with a Log.Error.
 //   - A root (empty tree_parents) is always available; a child is LOCKED until
 //     its parent is OWNED. tree_parents must be an acyclic DAG (the client walks
@@ -86,7 +88,7 @@ type AvatarItem struct {
 	TreeID    int32  // AvatarTree* (BattleItemMenu.TreeType)
 	Line      int    // 1..3 (grid column)
 	Stage     int    // 1..5 (progression tier within the line)
-	TreeSlot  int32  // 1..12 grid slot
+	TreeSlot  int32  // 0 is the central root; 1..12 are the progression grid
 	Parents   []int32
 	NameKey   string
 	DescKey   string
@@ -116,15 +118,34 @@ var avatarItemStatLadder = map[string][6]float64{
 // walks from a cheap stage-1/2 root up to an expensive stage-5 tip.
 var avatarItemPriceByStage = [6]int32{0, 150, 280, 600, 1050, 1650}
 
+// avatarItemMinAvatarLevelByStage is the level gate shown and enforced by the
+// client BattleItemMenu. Avatar levels are 1-based in the Ctrl catalog, while
+// the battle simulation stores them as 0-based values. The five authored tiers
+// therefore open at levels 1, 5, 10, 15 and 20.
+var avatarItemMinAvatarLevelByStage = [6]int32{0, 1, 5, 10, 15, 20}
+
 // avatarTreeLines lists, per line (grid column 1..3), the stages present
 // top-to-bottom (grid row order). Transcribed from the baked cells: line 2
 // holds the only stage-1 item and skips stage 2; lines 1 and 3 start at stage 2.
-// The 12 cells map bijectively onto the client's 3-col x 4-row grid:
-// slot = 1 + (line-1) + row*3.
+// Both stage-2 branches are children of the central stage-1 root; later stages
+// continue from the preceding item in their own branch.
+// The client reserves slot 0 for the central root. Tier 2 occupies the two
+// outer sockets (1 and 3), leaving socket 2 empty to preserve the branch
+// geometry. Tiers 3..5 occupy rows 4..6, 7..9 and 10..12 respectively.
 var avatarTreeLines = [3][4]int{
 	{2, 3, 4, 5}, // line 1
 	{1, 3, 4, 5}, // line 2 (stage-1 root here)
 	{2, 3, 4, 5}, // line 3
+}
+
+func avatarItemTreeSlot(line, stage int) int32 {
+	if stage == 1 {
+		return 0
+	}
+	// Stage 2 has only the left and right branches, so line 1/3 map to
+	// slots 1/3. For stages 3..5, line 1/2/3 map to the three sockets in
+	// the corresponding row: 4..6, 7..9 and 10..12.
+	return int32((stage-2)*3 + line)
 }
 
 // avatarTree is one class's tree: its baked-id prefix, its tab, and the stat
@@ -238,7 +259,14 @@ func init() {
 						" Ln" + strconv.Itoa(line) + "_St" + strconv.Itoa(stage))
 				}
 				var parents []int32
-				if row > 0 {
+				switch {
+				case stage == 1:
+					// The single central item is the root of the tree.
+				case stage == 2:
+					// The baked tree has two tier-2 side branches. They both
+					// unlock from the central tier-1 item at avatar level 5.
+					parents = []int32{idByCell[[2]int{2, 1}]}
+				case row > 0:
 					prevStage := avatarTreeLines[line-1][row-1]
 					parents = []int32{idByCell[[2]int{line, prevStage}]}
 				}
@@ -257,13 +285,13 @@ func init() {
 					TreeID:    tc.treeID,
 					Line:      line,
 					Stage:     stage,
-					TreeSlot:  int32(1 + (line - 1) + row*3),
+					TreeSlot:  avatarItemTreeSlot(line, stage),
 					Parents:   parents,
 					NameKey:   "IDS_ItemAvtr_" + suffix + "_Name",
 					DescKey:   "IDS_ItemAvtr_" + suffix + "_LongDesc",
 					Icon:      "ItemAvatar/Icon_ItemAvtr_" + suffix,
 					Price:     avatarItemPriceByStage[stage],
-					MinAvaLvl: 0,
+					MinAvaLvl: avatarItemMinAvatarLevelByStage[stage],
 					Stats:     stats,
 				})
 			}

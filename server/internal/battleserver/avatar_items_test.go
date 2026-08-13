@@ -70,6 +70,7 @@ func TestAvatarItemProtoDescCarriesArticle(t *testing.T) {
 func TestBuyAvatarTreeItemsFromDistinctTrees(t *testing.T) {
 	s, c, u, cleanup := newHuntConnWithHero(t, "Avtr_Tank_Zamaran")
 	defer cleanup()
+	c.huntState.level = 4 // displayed character level 5 unlocks the selected tier-2 roots
 
 	root := avatarTreeChain(t, gamedata.AvatarTreeAttack, 1)[0]
 	other := avatarTreeChain(t, gamedata.AvatarTreeDefence, 1)[0]
@@ -106,11 +107,61 @@ func TestBuyAvatarTreeItemsFromDistinctTrees(t *testing.T) {
 	}
 }
 
+func TestBuyAvatarTreeItemsRespectAvatarLevelGates(t *testing.T) {
+	s, c, u, cleanup := newHuntConnWithHero(t, "Avtr_Tank_Zamaran")
+	defer cleanup()
+	if !s.Store.SetHeroMoney(u.ID, 1_000_000, 0) {
+		t.Fatal("fixture: failed to fund hero")
+	}
+
+	var magicTierOne, magicTierTwo gamedata.AvatarItem
+	for _, it := range gamedata.AvatarItems() {
+		if it.TreeID != gamedata.AvatarTreeMagic {
+			continue
+		}
+		if it.Stage == 1 {
+			magicTierOne = it
+		}
+		if it.Stage == 2 && magicTierTwo.ArticleID == 0 {
+			magicTierTwo = it
+		}
+	}
+	if magicTierOne.ArticleID == 0 || magicTierTwo.ArticleID == 0 {
+		t.Fatal("fixture: Magic tree is missing tier-1 or tier-2 item")
+	}
+
+	// The first Magic-tier item is available at the starting character level.
+	s.handleBuy(c, buyPkt(magicTierOne.ArticleID))
+	if !c.huntState.ownedTreeItems[magicTierOne.ArticleID] {
+		t.Fatal("Magic tier-1 item was not buyable at character level 1")
+	}
+
+	// A fresh connection is used so the level-gate check starts with a clean
+	// tree. Buy the central T1 first: T2 is an upgrade branch, not a second root.
+	s2, c2, u2, cleanup2 := newHuntConnWithHero(t, "Avtr_Tank_Zamaran")
+	defer cleanup2()
+	if !s2.Store.SetHeroMoney(u2.ID, 1_000_000, 0) {
+		t.Fatal("fixture: failed to fund second hero")
+	}
+	s2.handleBuy(c2, buyPkt(magicTierOne.ArticleID))
+	s2.handleBuy(c2, buyPkt(magicTierTwo.ArticleID))
+	if c2.huntState.ownedTreeItems[magicTierTwo.ArticleID] {
+		t.Fatal("Magic tier-2 item was bought below character level 5")
+	}
+
+	c2.huntState.level = 4 // displayed character level 5
+	s2.handleBuy(c2, buyPkt(magicTierTwo.ArticleID))
+	if !c2.huntState.ownedTreeItems[magicTierTwo.ArticleID] {
+		t.Fatal("Magic tier-2 item was not buyable at character level 5")
+	}
+}
+
 // TestBuyAvatarTreeItemMaxHP: buying a Health item raises max HP by exactly the
 // authored amount and tops the current pool up too.
 func TestBuyAvatarTreeItemMaxHP(t *testing.T) {
 	s, c, _, cleanup := newHuntConnWithHero(t, "Avtr_Tank_Zamaran")
 	defer cleanup()
+	c.huntState.level = 4 // the selected defence root is tier 2
 	hs := c.huntState
 	now := float64(s.battleTime())
 
@@ -144,6 +195,7 @@ func TestBuyAvatarTreeItemMaxHP(t *testing.T) {
 func TestBuyAvatarTreeItemGates(t *testing.T) {
 	s, c, u, cleanup := newHuntConnWithHero(t, "Avtr_Tank_Zamaran")
 	defer cleanup()
+	c.huntState.level = 4 // the selected attack root is tier 2
 	root, child := attackTreeRootAndChild(t)
 
 	// 1. Child before its parent -> LOCKED, rejected, no spend.
@@ -184,6 +236,7 @@ func TestBuyAvatarTreeItemGates(t *testing.T) {
 func TestBuyAvatarTreeItemsCapsAtClientLimit(t *testing.T) {
 	s, c, u, cleanup := newHuntConnWithHero(t, "Avtr_Tank_Zamaran")
 	defer cleanup()
+	c.huntState.level = 4 // all selected roots are tier 2
 
 	treeIDs := []int32{gamedata.AvatarTreeAttack, gamedata.AvatarTreeDefence, gamedata.AvatarTreeMagic, gamedata.AvatarTreeControl}
 	roots := make([]gamedata.AvatarItem, 0, len(treeIDs))
@@ -217,6 +270,7 @@ func TestBuyAvatarTreeItemsCapsAtClientLimit(t *testing.T) {
 func TestBuyAvatarTreeItemUpgradeReplacesActiveTreeSlot(t *testing.T) {
 	s, c, u, cleanup := newHuntConnWithHero(t, "Avtr_Tank_Zamaran")
 	defer cleanup()
+	c.huntState.level = 4 // unlock the tier-2 root selected by avatarTreeChain
 
 	chain := avatarTreeChain(t, gamedata.AvatarTreeAttack, 2)
 	if !s.Store.SetHeroMoney(u.ID, 1_000_000, 0) {
@@ -225,6 +279,7 @@ func TestBuyAvatarTreeItemUpgradeReplacesActiveTreeSlot(t *testing.T) {
 	s.handleBuy(c, buyPkt(chain[0].ArticleID))
 	beforeMoney, _, _ := s.Store.HeroMoney(u.ID)
 
+	c.huntState.level = 9 // displayed character level 10 unlocks the tier-3 upgrade
 	s.handleBuy(c, buyPkt(chain[1].ArticleID))
 	if !c.huntState.ownedTreeItems[chain[1].ArticleID] {
 		t.Fatal("upgrade from the same avatar tree was not bought")

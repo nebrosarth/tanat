@@ -15,12 +15,17 @@ const botMaxItemMoveSpeedFactor = 1.35
 // elapsed match time: a bot can spend freely when it has earned the level, but
 // cannot buy late-game movement multipliers at spawn.
 func botItemStageLimit(level int32) int {
+	characterLevel := level + 1 // battle state is 0-based; catalog gates are 1-based
 	switch {
-	case level < 4:
+	case characterLevel < 1:
+		return 0
+	case characterLevel < 5:
+		return 1
+	case characterLevel < 10:
 		return 2
-	case level < 9:
+	case characterLevel < 15:
 		return 3
-	case level < 14:
+	case characterLevel < 20:
 		return 4
 	default:
 		return 5
@@ -200,7 +205,7 @@ func (s *Server) botBuyItemsLocked(b *botBrain, now float64) {
 		if it.TreeID != trees[0] && it.TreeID != trees[1] && it.TreeID != trees[2] {
 			continue
 		}
-		if hs.ownedTreeItems[it.ArticleID] || it.Price > money || it.Stage > botItemStageLimit(hs.level) || !botItemSpeedAllowedLocked(hs, it) {
+		if hs.ownedTreeItems[it.ArticleID] || it.Price > money || it.MinAvaLvl > hs.level+1 || it.Stage > botItemStageLimit(hs.level) || !botItemSpeedAllowedLocked(hs, it) {
 			continue
 		}
 		activeArticle := avatarTreeActiveLocked(hs, it.TreeID)

@@ -125,6 +125,9 @@ type dotaState struct {
 	// shared plan makes bot behavior independent of member map iteration order.
 	teamPlans            map[int32]botTeamPlan
 	teamPlanTelemetryKey map[int32]string
+	// botAIVersionByTeam is sampled at match creation. Team 1 is Собор and
+	// team 2 is Изгнанники; a missing entry means the default AI-20 profile.
+	botAIVersionByTeam map[int32]int
 
 	// telemetry is this match's optional recording session (see telemetry.go),
 	// non-nil only when TANAT_BOT_TELEMETRY is set. nil-safe on every method, so
@@ -269,6 +272,10 @@ func newDotaInstance(s *Server, id, mapID int32) *huntInstance {
 		laneActiveHumans:     map[int32]bool{},
 		teamPlans:            map[int32]botTeamPlan{},
 		teamPlanTelemetryKey: map[int32]string{},
+		botAIVersionByTeam: map[int32]int{
+			dotaTeamHuman: botAIVersionForTeam(dotaTeamHuman),
+			dotaTeamElf:   botAIVersionForTeam(dotaTeamElf),
+		},
 	}
 	if dm.SiegeCreepWaves {
 		d.nextSiegeWaveAt = d.startedAt + gamedata.SiegeCreepFirstWave
@@ -313,6 +320,8 @@ func newDotaInstance(s *Server, id, mapID int32) *huntInstance {
 		}
 	}
 	log.Printf("battle: created «Штурм» (DOTA) instance room=%d map=%d structures=%d", id, mapID, len(dm.Structures))
+	log.Printf("battle: bot AI profiles room=%d team1=AI-%d team2=AI-%d", id,
+		d.botAIVersionByTeam[dotaTeamHuman], d.botAIVersionByTeam[dotaTeamElf])
 	return inst
 }
 
@@ -1043,6 +1052,7 @@ func (s *Server) dotaCreepTickLocked(rep *conn, m *mobState, now float64) {
 	// Integrate the creep's position from its last velocity (client dead-reckons the
 	// same way, so they stay aligned between heading syncs).
 	dt := now - m.lastSync
+	clampedToMap := false
 	if dt > 0 && (m.vx != 0 || m.vy != 0) {
 		px0, py0 := m.x, m.y
 		m.x += m.vx * float32(dt)
@@ -1055,9 +1065,23 @@ func (s *Server) dotaCreepTickLocked(rep *conn, m *mobState, now float64) {
 		if rep.nav != nil && !rep.nav.Walkable(float64(m.x), float64(m.y)) {
 			cx, cy := rep.nav.Clip(float64(px0), float64(py0), float64(m.x), float64(m.y))
 			m.x, m.y = float32(cx), float32(cy)
+			// The server position is now clamped at the last walkable point. The
+			// client, however, dead-reckons from the last POSITION packet; leaving
+			// the old velocity alive makes its model continue through the boundary
+			// even though the authoritative server has stopped there. Publish the
+			// clamp and stop atomically so the visual and authoritative positions
+			// cannot diverge at the map edge.
+			m.vx, m.vy = 0, 0
+			s.broadcastPosLocked(rep, m.id, m.x, m.y, 0, 0, float32(now))
+			clampedToMap = true
 		}
 	}
 	m.lastSync = now
+	if clampedToMap {
+		// Do not immediately issue the same blocked heading again below. The next
+		// tick will choose a fresh lane/chase direction from this valid position.
+		return
+	}
 
 	// Knockback glide (see knockbackMobLocked): the shove already moved the creep to its
 	// landing spot and broadcast a client-side glide there. Hold its AI until the window
@@ -1138,14 +1162,23 @@ func (s *Server) dotaSidestepLocked(rep *conn, m *mobState, now float64) bool {
 		return false
 	}
 	vx, vy := sepx/sn*speed, sepy/sn*speed
-	// The step is lateral, so guard the map exactly as dotaMoveTowardLocked does: drop the
-	// step rather than shuffle into rock (the integration clamp would only drag it back).
-	if rep.nav != nil {
-		step := float32(tickInterval.Seconds())
-		if !rep.nav.Walkable(float64(m.x+vx*step), float64(m.y+vy*step)) {
-			return false
-		}
+	// Even the short separation step goes through the map path service. This
+	// prevents a lateral crowding correction from cutting into a forest wall.
+	if rep.nav == nil {
+		return false
 	}
+	step := float32(tickInterval.Seconds())
+	stepRoute := rep.nav.Path(float64(m.x), float64(m.y), float64(m.x+vx*step), float64(m.y+vy*step))
+	if len(stepRoute) == 0 {
+		return false
+	}
+	wp := stepRoute[0]
+	dx, dy := float32(wp.X)-m.x, float32(wp.Y)-m.y
+	d := float32(math.Hypot(float64(dx), float64(dy)))
+	if d < 0.01 {
+		return false
+	}
+	vx, vy = dx/d*speed, dy/d*speed
 	// Same throttle as the march arm: sync a material change or a stale heading, otherwise
 	// leave m.vx/m.vy alone so server integration keeps riding the velocity the client was
 	// last told. Coming out of a stop (m.vx==0) headingChanged is true, so the first step
@@ -1538,6 +1571,20 @@ func (s *Server) dotaMoveTowardLocked(rep *conn, m *mobState, tx, ty float32, no
 	if speed <= 0 {
 		speed = 4.0
 	}
+	// All «Штурм» creep movement goes through A*: lane waypoints, target chases,
+	// and structure approaches use the same cached route. A failed route stops the
+	// creep instead of falling back to a direct heading into the obstacle.
+	gx, gy, ok := rep.aimAlongAStar(&m.pf, m.x, m.y, tx, ty, now)
+	if !ok {
+		s.stopMobLocked(rep, m, now)
+		return
+	}
+	dx, dy = gx-m.x, gy-m.y
+	dist = float32(math.Hypot(float64(dx), float64(dy)))
+	if dist < 0.01 {
+		s.stopMobLocked(rep, m, now)
+		return
+	}
 	ux, uy := dx/dist, dy/dist
 	// Every creep of a wave chases the same target's exact centre and files down the
 	// same lane, so without a push they converge by construction.
@@ -1548,14 +1595,16 @@ func (s *Server) dotaMoveTowardLocked(rep *conn, m *mobState, tx, ty float32, no
 		stx, sty, sn = ux, uy, 1
 	}
 	vx, vy := stx/sn*speed, sty/sn*speed
-	// A push is lateral, so it can aim a creep at ground the straight heading never
-	// touched. Nothing clips a creep's step -- the lanes are authored walkable and a
-	// chase runs at whatever it is chasing -- so a push into rock would be a NEW way to
-	// leave the map. Prefer the unpushed heading over taking it.
-	if rep.nav != nil && (sepx != 0 || sepy != 0) {
+	// Separation is only a steering correction. Keep its one-tick endpoint on
+	// the map; if it is not, use the already path-validated route heading.
+	if rep.nav != nil {
 		step := float32(tickInterval.Seconds())
 		if !rep.nav.Walkable(float64(m.x+vx*step), float64(m.y+vy*step)) {
 			vx, vy = ux*speed, uy*speed
+			if !rep.nav.Walkable(float64(m.x+vx*step), float64(m.y+vy*step)) {
+				s.stopMobLocked(rep, m, now)
+				return
+			}
 		}
 	}
 	// Sync a material course change at once; let a slight one wait for the staleness

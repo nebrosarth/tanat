@@ -108,7 +108,13 @@ func (s *Server) botMaybeStartTeleportLocked(b *botBrain, now float64) bool {
 	var target *mobState
 	var destX, destY float32
 	firstFarmRedeploy := false
+	coverageRedeploy := false
+	// A base-plan cover is still a lane owner. It remains a reserve in the
+	// assignment, but must not enter the structure-redeploy branch: doing so
+	// moves the body to the objective and leaves its authored wave uncovered.
+	// The actual defender is the only base responder allowed to use this route.
 	macroRedeploy := !recovery && botBaseDefenseResponderAssignment(b.macroAssignment) &&
+		!(b.macroAssignment.Role == "cover" && b.macroAssignment.FarmLaneSet) &&
 		botHPFrac(hs, now) >= botSafeHPFrac
 	if recovery {
 		if !s.botRecoveryTeleportReadyLocked(b, now) {
@@ -140,10 +146,26 @@ func (s *Server) botMaybeStartTeleportLocked(b *botBrain, now float64) bool {
 		// A stale base objective is still authoritative for this decision. If a
 		// test or a live plan has only changed Mode while keeping ObjectiveID, do
 		// not fall through into the opening-farm teleport branch.
-		farmRedeployAllowed := b.macroAssignment.ObjectiveID == 0 &&
-			!botBaseDefenseResponderAssignment(b.macroAssignment)
+		baseFarmCoverageRedeploy := false
+		if b.macroAssignment.Mode == botMacroBase && b.macroAssignment.Role == "cover" &&
+			b.macroAssignment.FarmLaneSet && b.macroAssignment.ObjectiveID != 0 {
+			objective := c.inst.mobs[b.macroAssignment.ObjectiveID]
+			// A base cover is a reserve owner, not the primary defender. It may
+			// use its farm scroll when the structure has no visible hero contact;
+			// creep pressure is handled by the structure while the reserve closes
+			// the live XP gap on its assigned lane.
+			baseFarmCoverageRedeploy = objective == nil || objective.dead ||
+				!s.botVisibleEnemyHeroNearObjectiveLocked(c.inst, c.playerTeam(), objective, now)
+		}
+		farmRedeployAllowed := (b.macroAssignment.ObjectiveID == 0 &&
+			!botBaseDefenseResponderAssignment(b.macroAssignment)) || baseFarmCoverageRedeploy
 		if farmRedeployAllowed {
-			if firstTarget, firstX, firstY, _, firstOK := s.botFirstFarmTeleportTargetLocked(b, now); firstOK &&
+			if coverageTarget, coverageX, coverageY, _, coverageOK := s.botFarmCoverageTeleportTargetLocked(b, now); coverageOK &&
+				s.botFirstFarmTeleportMateriallyFasterLocked(b, now, coverageX, coverageY, it) {
+				target, destX, destY = coverageTarget, coverageX, coverageY
+				coverageRedeploy = true
+				b.farmLaneArrivalPending = false
+			} else if firstTarget, firstX, firstY, _, firstOK := s.botFirstFarmTeleportTargetLocked(b, now); firstOK &&
 				s.botFirstFarmTeleportMateriallyFasterLocked(b, now, firstX, firstY, it) {
 				target, destX, destY = firstTarget, firstX, firstY
 				firstFarmRedeploy = true
@@ -191,6 +213,8 @@ func (s *Server) botMaybeStartTeleportLocked(b *botBrain, now float64) bool {
 		targetKind = "recovery_structure"
 	} else if macroRedeploy {
 		targetKind = "base_structure"
+	} else if coverageRedeploy {
+		targetKind = "farm_coverage"
 	} else if firstFarmRedeploy {
 		targetKind = "first_farm_rendezvous"
 	}
@@ -233,9 +257,12 @@ func (s *Server) botFirstFarmTeleportTargetLocked(b *botBrain, now float64) (*mo
 }
 
 func (s *Server) botFarmHandoffTeleportTargetLocked(b *botBrain, now float64) (*mobState, float32, float32, float64, bool) {
-	if b == nil || !b.farmLaneArrivalPending || b.c == nil || b.c.huntState == nil || b.retreating ||
+	if b == nil || b.c == nil || b.c.huntState == nil || b.retreating ||
 		b.c.huntState.attackTarget != 0 || b.c.huntState.pvpTarget != 0 ||
 		botNearbyEnemyHeroPressureLocked(b, now) > 0 {
+		return nil, 0, 0, 0, false
+	}
+	if !b.farmLaneArrivalPending {
 		return nil, 0, 0, 0, false
 	}
 	return s.botFarmTeleportTargetLocked(b, now)
@@ -271,6 +298,59 @@ func (s *Server) botFarmTeleportTargetLocked(b *botBrain, now float64) (*mobStat
 		return nil, 0, 0, 0, false
 	}
 	return best, bestX, bestY, bestRemaining, true
+}
+
+// botFarmCoverageTeleportTargetLocked chooses a living allied creep that is
+// spatially adjacent to the currently visible enemy wave. A structure-based
+// hand-off can still leave a bot outside the XP radius when the wave has
+// advanced; this route spends a scroll only when the orchestrator has changed
+// the farm lane and a live creep provides a materially better rendezvous.
+func (s *Server) botFarmCoverageTeleportTargetLocked(b *botBrain, now float64) (*mobState, float32, float32, float64, bool) {
+	if b == nil || b.c == nil || b.c.inst == nil || b.c.huntState == nil ||
+		b.retreating || !b.farmLaneArrivalPending || !b.macroAssignment.FarmLaneSet ||
+		botNearbyEnemyHeroPressureLocked(b, now) > 0 {
+		return nil, 0, 0, 0, false
+	}
+	enemyWave := s.botFarmShadowTargetLocked(b, now)
+	if enemyWave == nil || s.botEnemyStructureDangerLocked(b.c, enemyWave.x, enemyWave.y) {
+		return nil, 0, 0, 0, false
+	}
+	lane := botFarmLaneLocked(b)
+	if lane < 0 || lane >= len(b.c.inst.dota.m.Lanes) {
+		return nil, 0, 0, 0, false
+	}
+	bestDistance := math.Inf(1)
+	bestWalk := math.Inf(1)
+	var best *mobState
+	var bestX, bestY float32
+	for _, mob := range botSortedMobs(b.c.inst) {
+		if mob == nil || mob.dead || mob.structure || mob.team != b.c.playerTeam() ||
+			!botTeleportLaneCreep(mob) || botLaneForCreep(b.c, mob) != lane ||
+			!s.botTeleportTargetValidLocked(b, mob) {
+			continue
+		}
+		destX, destY, ok := s.botTeleportDestinationLocked(b.c, mob)
+		if !ok || s.botEnemyStructureDangerLocked(b.c, destX, destY) {
+			continue
+		}
+		waveDistance := math.Hypot(float64(destX-enemyWave.x), float64(destY-enemyWave.y))
+		if waveDistance > dotaXPShareRadius*2.5 {
+			continue
+		}
+		if _, reliable := s.botTeleportCreepReliabilityLocked(b.c, mob, now); !reliable {
+			continue
+		}
+		walk := s.botTeleportWalkDistanceLocked(b.c, destX, destY, now)
+		if waveDistance < bestDistance ||
+			(waveDistance == bestDistance && (walk < bestWalk ||
+				(walk == bestWalk && (best == nil || mob.id < best.id)))) {
+			best, bestX, bestY, bestDistance, bestWalk = mob, destX, destY, waveDistance, walk
+		}
+	}
+	if best == nil {
+		return nil, 0, 0, 0, false
+	}
+	return best, bestX, bestY, bestWalk, true
 }
 
 func (s *Server) botFirstFarmTeleportMateriallyFasterLocked(b *botBrain, now float64, destX, destY float32, it gamedata.Item) bool {
@@ -326,6 +406,14 @@ func (s *Server) botBaseDefenseTeleportReadyLocked(b *botBrain, now float64) boo
 	if b == nil || b.c == nil || b.c.huntState == nil || b.retreating ||
 		!botBaseDefenseResponderAssignment(b.macroAssignment) ||
 		botHPFrac(b.c.huntState, now) < botSafeHPFrac {
+		return false
+	}
+	// A base-plan cover is a farm owner, not the structure responder. Its
+	// strategic objective is only a reserve assignment; teleporting it to that
+	// objective silently abandons the authored lane while the real defender is
+	// still present. The cover body may use ordinary farm hand-off logic, but it
+	// must not consume a scroll for the defensive overlay.
+	if b.macroAssignment.Role == "cover" && b.macroAssignment.FarmLaneSet {
 		return false
 	}
 	if s.botBaseDefenseTeleportValidityReasonLocked(b, b.macroAssignment.ObjectiveID, 0, now) != "" {

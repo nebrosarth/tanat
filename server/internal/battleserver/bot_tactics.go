@@ -83,8 +83,9 @@ func (s *Server) botRoamTickLocked(b *botBrain, now float64) {
 		return
 	}
 	if target := s.botFindLaneTargetLocked(b, now, botLaneEngageRadius, true); target != nil {
-		s.startAttackLocked(c, target)
-		return
+		if s.botMoveToFarmTargetLocked(b, target, now) {
+			return
+		}
 	}
 	if s.botConsiderHarassAbilityLocked(b, now) {
 		return
@@ -340,13 +341,15 @@ func (s *Server) botGroupTickLocked(b *botBrain, now float64) {
 			return
 		}
 		if target := s.botFarmApproachTargetLocked(b, now); target != nil {
-			s.botMoveTowardLocked(b, target.x, target.y, now)
-			return
+			if s.botMoveToFarmTargetLocked(b, target, now) {
+				return
+			}
 		}
 	}
 	if target := s.botFindLaneTargetLocked(b, now, botGroupEngageRadius, false); target != nil {
-		s.startAttackLocked(c, target)
-		return
+		if s.botMoveToFarmTargetLocked(b, target, now) {
+			return
+		}
 	}
 	if s.botMacroObjectiveTickLocked(b, now) {
 		return

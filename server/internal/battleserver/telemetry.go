@@ -150,6 +150,7 @@ type telemetrySnapshot struct {
 	Avatar             string  `json:"avatar"`
 	IsBot              bool    `json:"is_bot"`
 	Team               int32   `json:"team"`
+	AIVersion          int     `json:"ai_version,omitempty"`
 	X                  float32 `json:"x"`
 	Y                  float32 `json:"y"`
 	HPFrac             float64 `json:"hp_frac"`
@@ -387,6 +388,7 @@ type telemetryBotAssignment struct {
 // live-state mode/lane/objective or an assignment changes, avoiding per-tick spam.
 type telemetryBotTeamPlan struct {
 	telemetryEvent
+	AIVersion     int                      `json:"ai_version"`
 	Team          int32                    `json:"team"`
 	Mode          string                   `json:"mode"`
 	Lane          int                      `json:"lane"`
@@ -537,6 +539,12 @@ func (s *Server) telemetrySnapshotLocked(rec *telemetryRecorder, c *conn, matchT
 	}
 	if c.inst != nil {
 		if brain := c.inst.bots[c.objID]; brain != nil {
+			snap.AIVersion = botAIVersionForBrain(brain)
+			if !botAIProfileForBrain(brain).UsesTeamOrchestrator() {
+				snap.PlanMode = "legacy_local"
+				snap.Assignment = "local_brain"
+				snap.AssignmentReason = "ai0_no_orchestrator"
+			}
 			xpPerMinute := 0.0
 			if c.inst.dota != nil {
 				minutes := (now - c.inst.dota.startedAt) / 60
@@ -605,7 +613,7 @@ func (s *Server) telemetryRecordBotTeamPlanLocked(inst *huntInstance, plan botTe
 	}
 	inst.dota.telemetry.record(telemetryBotTeamPlan{
 		telemetryEvent: newTelemetryEvent("bot_team_plan", planTelemetryMatchTime(inst, now)),
-		Team:           plan.Team, Mode: plan.Mode, Lane: plan.Lane, Objective: plan.ObjectiveID,
+		Team:           plan.Team, AIVersion: botPlanAIVersionLocked(inst, &plan), Mode: plan.Mode, Lane: plan.Lane, Objective: plan.ObjectiveID,
 		ObjectiveKind: plan.Objective, Reason: plan.Reason, FocusTarget: plan.FocusTarget, Assignments: assignments,
 	})
 }

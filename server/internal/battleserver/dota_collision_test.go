@@ -7,6 +7,49 @@ import (
 	"tanatserver/internal/gamedata"
 )
 
+// boundaryNav is a minimal map oracle for the client/server desync regression:
+// x < 1 is ground and x >= 1 is outside the map. Clip returns the last ground
+// point, exactly like the real NavGrid does at a wall or map boundary.
+type boundaryNav struct{}
+
+func (boundaryNav) Walkable(x, y float64) bool { return x < 1 && x > -100 && y > -100 && y < 100 }
+func (boundaryNav) Spawn() (float64, float64)  { return 0, 0 }
+func (boundaryNav) Clip(fx, fy, tx, ty float64) (float64, float64) {
+	nav := boundaryNav{}
+	if !nav.Walkable(fx, fy) {
+		return fx, fy
+	}
+	if nav.Walkable(tx, ty) {
+		return tx, ty
+	}
+	return 0.5, fy
+}
+func (boundaryNav) Path(fx, fy, tx, ty float64) []gamedata.Vec2 {
+	if (boundaryNav{}).Walkable(tx, ty) {
+		return []gamedata.Vec2{{X: tx, Y: ty}}
+	}
+	return nil
+}
+
+type alwaysRouteNav struct {
+	pathCalls int
+	noRoute   bool
+}
+
+func (n *alwaysRouteNav) Walkable(float64, float64) bool { return true }
+func (n *alwaysRouteNav) Spawn() (float64, float64)      { return 0, 0 }
+func (n *alwaysRouteNav) Clip(_, _, tx, ty float64) (float64, float64) {
+	return tx, ty
+}
+func (n *alwaysRouteNav) Path(fx, fy, tx, ty float64) []gamedata.Vec2 {
+	n.pathCalls++
+	if n.noRoute {
+		return nil
+	}
+	// Deliberately force a visible two-leg detour even though the test map is open.
+	return []gamedata.Vec2{{X: fx, Y: fy + 10}, {X: tx, Y: ty}}
+}
+
 // The gap these tests exist to close: mobsep_test.go proves the separation HELPER works,
 // and proved it for a year while «Штурм» never called it. A helper test cannot see a
 // missing call. Everything here drives the real tick and asserts on where the units end
@@ -132,6 +175,78 @@ func TestStormCreepsSeparateOnWalkableGroundOnly(t *testing.T) {
 					m.id, m.x, m.y, i)
 			}
 		}
+	}
+}
+
+// TestStormCreepClampStopsTheClientToo guards the reported "creep leaves the
+// map" symptom. The authoritative server already clipped the position, but
+// without a zero-velocity POSITION sync the client kept dead-reckoning the old
+// heading and rendered the creep outside the map.
+func TestStormCreepClampStopsTheClientToo(t *testing.T) {
+	s, c, inst, _, _ := newDotaCaptureConn(t)
+	now := float64(s.battleTime())
+	c.nav = boundaryNav{}
+
+	mi := inst.dota.m.HumanCreepMelee
+	creep := &mobState{
+		id: 63001, mobIdx: mi, mob: gamedata.Mobs()[mi],
+		x: 0, y: 0, hp: 500, maxHP: 500, dmgMin: 5, dmgMax: 8,
+		team: dotaTeamHuman, lastSync: now, active: true, shown: true,
+		vx: 6, vy: 0,
+	}
+	inst.mobs[creep.id] = creep
+
+	c.lock()
+	s.dotaCreepTickLocked(c, creep, now+tickInterval.Seconds())
+	c.unlock()
+
+	if !c.nav.Walkable(float64(creep.x), float64(creep.y)) {
+		t.Fatalf("creep was left outside the map at (%.2f, %.2f)", creep.x, creep.y)
+	}
+	if creep.vx != 0 || creep.vy != 0 {
+		t.Fatalf("clamped creep kept velocity (%.2f, %.2f), so the client can dead-reckon it off-map", creep.vx, creep.vy)
+	}
+}
+
+// TestStormCreepMovementAlwaysUsesAStar protects the stronger contract for
+// «Штурм»: a creep must follow Nav.Path even when the current leg looks clear,
+// and a failed route must stop rather than walk directly into an obstacle.
+func TestStormCreepMovementAlwaysUsesAStar(t *testing.T) {
+	s, c, inst, _, _ := newDotaCaptureConn(t)
+	now := float64(s.battleTime())
+	nav := &alwaysRouteNav{}
+	c.nav, inst.nav = nav, nav
+	inst.mobs = map[int32]*mobState{}
+	inst.dota.instMobs = inst.mobs
+	c.huntState.mobs = inst.mobs
+
+	mi := inst.dota.m.HumanCreepMelee
+	creep := &mobState{
+		id: 63002, mobIdx: mi, mob: gamedata.Mobs()[mi],
+		x: 0, y: 0, hp: 500, maxHP: 500, dmgMin: 5, dmgMax: 8,
+		team: dotaTeamHuman, lastSync: now, active: true, shown: true,
+	}
+	inst.mobs[creep.id] = creep
+
+	c.lock()
+	s.dotaMoveTowardLocked(c, creep, 10, 0, now)
+	c.unlock()
+
+	if nav.pathCalls == 0 {
+		t.Fatal("creep movement did not query Nav.Path")
+	}
+	if creep.vy <= 0 || math.Abs(float64(creep.vx)) > 0.1 {
+		t.Fatalf("creep ignored the routed first leg: velocity=(%.2f, %.2f)", creep.vx, creep.vy)
+	}
+
+	creep.pf = pathState{}
+	creep.vx, creep.vy = 4, 0
+	nav.noRoute = true
+	c.lock()
+	s.dotaMoveTowardLocked(c, creep, 10, 0, now+0.2)
+	c.unlock()
+	if creep.vx != 0 || creep.vy != 0 {
+		t.Fatalf("creep walked after A* failed: velocity=(%.2f, %.2f)", creep.vx, creep.vy)
 	}
 }
 

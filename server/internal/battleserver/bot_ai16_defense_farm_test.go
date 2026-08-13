@@ -1,6 +1,7 @@
 package battleserver
 
 import (
+	"math"
 	"testing"
 
 	"tanatserver/internal/gamedata"
@@ -73,7 +74,7 @@ func TestAI16BaseDefenderInterceptsWaveInsidePredictiveRing(t *testing.T) {
 	if b.farmTarget != wave.id || b.farmDecision != "defense_intercept" {
 		t.Fatalf("defense intercept state = target %d/decision %q, want wave %d/defense_intercept", b.farmTarget, b.farmDecision, wave.id)
 	}
-	if !bot.hasDest || bot.destX != wave.x || bot.destY != wave.y {
-		t.Fatalf("defender destination = (%.1f, %.1f), want approaching wave (%.1f, %.1f)", bot.destX, bot.destY, wave.x, wave.y)
+	if !bot.hasDest || math.Hypot(float64(bot.destX-wave.x), float64(bot.destY-wave.y)) > dotaXPShareRadius {
+		t.Fatalf("defender destination = (%.1f, %.1f), want a safe point within XP of wave (%.1f, %.1f)", bot.destX, bot.destY, wave.x, wave.y)
 	}
 }

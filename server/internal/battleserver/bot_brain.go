@@ -44,9 +44,15 @@ type botBrain struct {
 	c    *conn
 	slot int
 
-	// macroAssignment is written by the side orchestrator before the member loop.
-	// It owns both the strategic objective and the farm lane; local combat,
-	// retreat, recovery, and safety gates remain authoritative in this brain.
+	// aiVersion is the cumulative decision profile selected for this bot's
+	// team when the match was created. It is immutable for the whole match so
+	// A/B comparisons cannot change mid-game.
+	aiVersion    int
+	aiVersionSet bool
+
+	// macroAssignment is written by the side orchestrator for AI-10/AI-20. AI-0
+	// deliberately leaves it empty and runs the legacy local phase brain; local
+	// combat, retreat, recovery, and safety gates remain authoritative in all cases.
 	macroAssignment botMacroAssignment
 
 	// lane is this bot's default lane index into gamedata.DotaMap.Lanes. It starts from
@@ -171,7 +177,11 @@ const hpHistoryLen = 6
 // newBotBrain builds a fresh bot mind and assigns its default lane from its ordinal
 // position on its own side (0-based: the 1st, 2nd, 3rd... bot/player to take that side).
 func newBotBrain(c *conn, slot, sideOrdinal int) *botBrain {
-	return &botBrain{c: c, slot: slot, lane: assignBotLane(sideOrdinal), phase: botPhaseLane}
+	version := botAIVersionDefault
+	if c != nil && c.inst != nil {
+		version = botTeamAIVersionLocked(c.inst, c.playerTeam())
+	}
+	return &botBrain{c: c, slot: slot, aiVersion: version, aiVersionSet: true, lane: assignBotLane(sideOrdinal), phase: botPhaseLane}
 }
 
 // botAttackWatchdogLocked releases an attack order that has stopped making progress.
@@ -486,6 +496,23 @@ func (s *Server) botTickLocked(b *botBrain, now float64) {
 	s.botBuyItemsLocked(b, now)
 	s.botRecordHPLocked(b, now)
 	s.botShouldRetreatLocked(b, now)
+	// A farm attack is wave maintenance, not a last-hit chase. Keep it only while
+	// the creep remains inside both the real attack reach and the XP envelope;
+	// once it moves out, release the order so the safe farm anchor takes over.
+	if hs.attackTarget != 0 {
+		if target := hs.mobs[hs.attackTarget]; target != nil && !target.structure &&
+			target.enemyOf(c.playerTeam()) {
+			cx, cy := c.posAtLocked(float32(now))
+			distance := math.Hypot(float64(target.x-cx), float64(target.y-cy))
+			attackReach := hs.effAttackRangeLocked(now) + hs.av.Radius() + target.mob.Radius()
+			if distance > dotaXPShareRadius || distance > attackReach {
+				s.stopAttackLocked(c, false)
+			}
+		}
+	}
+	if b.retreating && s.botFarmXPShadowTickLocked(b, now) {
+		return
+	}
 	if s.botAttackWatchdogLocked(b, now) {
 		// A stale order was released. Re-open the decision pass immediately so the bot
 		// can select another live target instead of waiting for the next think slot.
@@ -509,6 +536,9 @@ func (s *Server) botTickLocked(b *botBrain, now float64) {
 	// cadence. It only starts the recovery state; once latched, the regular think path
 	// remains reachable so heals can fire and safe-HP hysteresis can clear it again.
 	if s.botCheckHPCrashLocked(b, now) {
+		if s.botFarmXPShadowTickLocked(b, now) {
+			return
+		}
 		if s.botConsiderRetreatUtilityLocked(b, now) {
 			return
 		}
@@ -528,6 +558,9 @@ func (s *Server) botTickLocked(b *botBrain, now float64) {
 		// made a low-HP bot keep swinging in place while creeps and a pursuer
 		// finished it. A safe self-defense utility may fire first, but movement
 		// toward the recovery destination always wins over optional combat.
+		if s.botFarmXPShadowTickLocked(b, now) {
+			return
+		}
 		if s.botConsiderRetreatUtilityLocked(b, now) {
 			return
 		}
@@ -538,10 +571,38 @@ func (s *Server) botTickLocked(b *botBrain, now float64) {
 		s.botMoveTowardLocked(b, hx, hy, now)
 		return
 	}
-	if s.botCombatTickLocked(b, now) {
+	// Farm coverage is a team-level obligation. A locally attractive hero poke
+	// must not pull the assigned lane owner out of XP range while a visible
+	// creep wave is still uncovered; that was the route that turned a healthy
+	// farmer into a retreating body and caused the next creep to die without XP.
+	// The orchestrator still owns the lane assignment, so this only suppresses
+	// optional combat for a bot that actually carries a farm lane.
+	farmCoverageRequired := botAIProfileForBrain(b).UsesTeamOrchestrator() &&
+		s.botTeamFarmCoverageRequiredLocked(c.inst, c.playerTeam(), now)
+	if (!farmCoverageRequired || !b.macroAssignment.FarmLaneSet) && s.botCombatTickLocked(b, now) {
 		return // an enemy hero is being fought/chased/kited -- that IS this tick's order
 	}
 	if b.macroAssignment.Mode == botMacroBase {
+		// A base defender that also carries a farm lane must not abandon the
+		// XP envelope merely because a creep wave is touching the structure.
+		// The wave is handled from the same safe rear anchor; only a visible
+		// enemy avatar near the objective justifies the dedicated defense tick.
+		if b.macroAssignment.FarmLaneSet && farmCoverageRequired {
+			objective := c.inst.mobs[b.macroAssignment.ObjectiveID]
+			if objective == nil || !s.botVisibleEnemyHeroNearObjectiveLocked(c.inst, c.playerTeam(), objective, now) {
+				s.botCoverageTickLocked(b, now)
+				return
+			}
+		}
+		// The macro keeps a cover responder in the base plan so it can be
+		// promoted to defense without rebuilding the whole team assignment. It
+		// is nevertheless still the farm owner of FarmLane; routing it through
+		// the defender tick sends it to the objective lane and leaves its line
+		// uncovered while the promotion is only precautionary.
+		if b.macroAssignment.Role == "cover" && b.macroAssignment.FarmLaneSet {
+			s.botCoverageTickLocked(b, now)
+			return
+		}
 		s.botBaseDefenseTickLocked(b, now)
 		return
 	}
@@ -718,6 +779,11 @@ const (
 	// recovery floor. This is deliberately only a tactical disengage; the 30%
 	// threshold still escalates to a fountain recovery.
 	botPressureRetreatHPFrac = 0.45
+	// A targeted spell can deal damage without arming pvpTarget/attackTarget.
+	// Keep that attacker as an immediate threat for a short combat-local window
+	// so the bot can disengage before the next pulse instead of waiting for the
+	// generic HP trend to catch up.
+	botRecentHeroDamageThreatWindow = 2.5
 )
 
 func botClearRetreatLocked(b *botBrain) {
@@ -748,9 +814,22 @@ func (s *Server) botShouldRetreatLocked(b *botBrain, now float64) bool {
 	// the objective instead of walking away and leaving a one-hit building alive.
 	// This never overrides a critically low HP state and does not apply to an
 	// ordinary lane/push assignment.
-	if botLastStandObjectiveLocked(b, now) {
+	// A finish-window objective may justify holding a recoverable attacker, but
+	// it must never override the hard survival floor. The previous ordering let a
+	// 27%-HP bot keep walking through a structure fight and die, which then left
+	// its authored lane without an XP body for the next wave.
+	if botHPFrac(hs, now) > botRetreatHPFrac && botLastStandObjectiveLocked(b, now) {
 		botClearRetreatLocked(b)
 		return false
+	}
+	// A landed hero hit is an authoritative contact signal even when fog or the
+	// attack-order lifecycle has not yet exposed the attacker to this bot's
+	// ordinary combat query. React on the first meaningful hit, before a second
+	// burst can remove the only XP owner from the lane.
+	if hs.lastHeroDamager != 0 && hs.lastHeroDamageAt > 0 && now-hs.lastHeroDamageAt <= botRecentHeroDamageThreatWindow &&
+		botHPFrac(hs, now) <= botPredictiveRetreatHPFrac {
+		botSetRetreatModeLocked(b, botRetreatModeDisengage, now)
+		return true
 	}
 	frac := botHPFrac(hs, now)
 	if b.retreating {
@@ -787,6 +866,12 @@ func (s *Server) botShouldRetreatLocked(b *botBrain, now float64) bool {
 		// Preserve a healthy proximity-XP body only while it is not taking active
 		// damage. botFarmGuardianHoldLocked deliberately yields to creep pressure.
 		return false
+	} else if frac <= botPredictiveRetreatHPFrac && s.botFarmCoveragePressureLocked(b, now) {
+		// A farm owner should leave a pressured creep pack before its recent
+		// damage trend reaches the hard recovery floor, while remaining close
+		// enough for the XP shadow hand-off. This is live-state pressure, not an
+		// opening-time rule.
+		botSetRetreatModeLocked(b, botRetreatModeDisengage, now)
 	} else if frac <= botPressureRetreatHPFrac && s.botIncomingPressureLocked(b, now) {
 		botSetRetreatModeLocked(b, botRetreatModeDisengage, now)
 	} else if s.botPredictiveRetreatLocked(b, now, frac) {
@@ -1025,6 +1110,7 @@ func (s *Server) botIncomingPressureLocked(b *botBrain, now float64) bool {
 	if botNearbyEnemyHeroPressureLocked(b, now) > 0 {
 		return true
 	}
+	loss, rate := botRecentHPLossLocked(b, now)
 	// A cannon can finish its hit and clear hitTarget before the next bot think
 	// tick, so the live-target loop below is not sufficient evidence by itself.
 	// Combine the authoritative recent HP trajectory with the visible structure
@@ -1032,12 +1118,28 @@ func (s *Server) botIncomingPressureLocked(b *botBrain, now float64) bool {
 	// is under pressure even when the gun's one-shot timer has just resolved.
 	cx, cy := b.c.posAtLocked(float32(now))
 	if s.botEnemyStructureDangerLocked(b.c, cx, cy) {
-		loss, rate := botRecentHPLossLocked(b, now)
 		if loss >= botPredictiveRetreatLossFrac || rate >= botPredictiveRetreatLossRate {
 			return true
 		}
 	}
 	visionSources := dotaTeamVisionSourcesLocked(b.c.inst, b.c.playerTeam(), now)
+	// Creep projectiles/melee hits are short-lived state: hitTarget can already
+	// be cleared by the time a bot thinks again. A recent material HP loss while
+	// a visible enemy creep is still close is therefore authoritative pressure,
+	// just like a structure hit. Without this fallback a retreating bot can be
+	// sent back into the same wave by XP-shadow logic and lose most of its HP
+	// before the next live hit is observable.
+	if loss >= botPredictiveRetreatLossFrac || rate >= botPredictiveRetreatLossRate {
+		for _, mob := range b.c.inst.mobs {
+			if mob == nil || mob.dead || mob.structure || !mob.enemyOf(b.c.playerTeam()) ||
+				!botVisibleEnemyMobLocked(b.c.playerTeam(), mob, visionSources) {
+				continue
+			}
+			if math.Hypot(float64(mob.x-cx), float64(mob.y-cy)) <= dotaXPShareRadius+12 {
+				return true
+			}
+		}
+	}
 	for _, mob := range b.c.inst.mobs {
 		if mob == nil || mob.dead || !mob.enemyOf(b.c.playerTeam()) ||
 			!botVisibleEnemyMobLocked(b.c.playerTeam(), mob, visionSources) {
@@ -1112,7 +1214,7 @@ func (s *Server) botRetreatPointLocked(b *botBrain, now float64) (float32, float
 		// damage is still landing, that point moves with the creep front and the
 		// bot can retreat forever without creating distance. Escalate to the
 		// stable recovery route while pressure is live.
-		if !s.botIncomingPressureLocked(b, now) {
+		if !s.botNoSafeDisengagePressureLocked(b, now) {
 			return s.botDisengagePointLocked(b, now)
 		}
 	}
@@ -1121,6 +1223,42 @@ func (s *Server) botRetreatPointLocked(b *botBrain, now float64) (float32, float
 		return waypoint.x, waypoint.y
 	}
 	return hx, hy
+}
+
+// botNoSafeDisengagePressureLocked distinguishes a nearby, not-yet-committed
+// hero from actual contact. A visible hero can make the short step-back safer
+// than a fountain trip; an active hero order or a creep currently landing hits
+// still forces the stable recovery route.
+func (s *Server) botNoSafeDisengagePressureLocked(b *botBrain, now float64) bool {
+	if b == nil || b.c == nil || b.c.inst == nil || b.c.huntState == nil {
+		return true
+	}
+	if botNearbyEnemyHeroPressureLocked(b, now) > 0 {
+		for _, enemy := range b.c.inst.members {
+			if enemy == nil || enemy == b.c || enemy.huntState == nil || enemy.huntState.deadUntil > 0 || enemy.playerTeam() == b.c.playerTeam() {
+				continue
+			}
+			if enemy.huntState.attackTarget == b.c.objID || enemy.huntState.pvpTarget == b.c.objID ||
+				b.c.huntState.pvpTarget == enemy.objID {
+				return true
+			}
+		}
+		if b.c.huntState.lastHeroDamager != 0 && b.c.huntState.lastHeroDamageAt > 0 &&
+			now-b.c.huntState.lastHeroDamageAt <= botRecentHeroDamageThreatWindow {
+			return true
+		}
+	}
+	visionSources := dotaTeamVisionSourcesLocked(b.c.inst, b.c.playerTeam(), now)
+	for _, mob := range b.c.inst.mobs {
+		if mob == nil || mob.dead || !mob.enemyOf(b.c.playerTeam()) ||
+			!botVisibleEnemyMobLocked(b.c.playerTeam(), mob, visionSources) {
+			continue
+		}
+		if mob.hitTarget == b.c.objID || mob.projTarget == b.c.objID || mob.dtarget == b.c.objID {
+			return true
+		}
+	}
+	return false
 }
 
 // botDisengagePointLocked is a short tactical step-back after abandoning a chase. It

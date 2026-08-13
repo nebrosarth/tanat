@@ -31,6 +31,24 @@ func TestBotLaneLastHitRespectsTowerDangerWhenRequireCover(t *testing.T) {
 	}
 }
 
+func TestBotLaneFarmNeverFallsBackToEnemyStructure(t *testing.T) {
+	s, bot, inst, cleanup := newDotaConn(t, "Avtr_Tank_Velial")
+	defer cleanup()
+	now := float64(s.battleTime())
+	tower := structOfSide(inst, gamedata.DotaCreepTower, dotaTeamElf)
+	if tower == nil {
+		t.Fatal("setup: enemy tower is missing")
+	}
+	bot.x, bot.y, bot.snapT = tower.x+2, tower.y, float32(now)
+	b := &botBrain{c: bot, lane: 0, phase: botPhaseLane}
+
+	bot.lock()
+	defer bot.unlock()
+	if got := s.botFindLaneTargetLocked(b, now, botLaneEngageRadius, false); got != nil {
+		t.Fatalf("empty-wave lane target = %d, want nil instead of enemy structure", got.id)
+	}
+}
+
 func TestBotCommittedStructureFocusUsesLowestThreatID(t *testing.T) {
 	s, bot, inst, cleanup := newDotaConn(t, "Avtr_Tank_Velial")
 	defer cleanup()

@@ -42,14 +42,16 @@ type botMacroAssignment struct {
 }
 
 type botTeamPlan struct {
-	Team        int32
-	Mode        string
-	Lane        int
-	ObjectiveID int32
-	Objective   string
-	Reason      string
-	FocusTarget int32
-	Assignments map[int32]botMacroAssignment
+	Team         int32
+	AIVersion    int
+	AIVersionSet bool
+	Mode         string
+	Lane         int
+	ObjectiveID  int32
+	Objective    string
+	Reason       string
+	FocusTarget  int32
+	Assignments  map[int32]botMacroAssignment
 }
 
 const (
@@ -92,6 +94,14 @@ func (s *Server) botPlanTeamsLocked(inst *huntInstance, now float64) {
 		d.teamPlanTelemetryKey = map[int32]string{}
 	}
 	for _, team := range []int32{dotaTeamHuman, dotaTeamElf} {
+		if !botAIProfileForVersion(botTeamAIVersionLocked(inst, team)).UsesTeamOrchestrator() {
+			// AI-0 is intentionally outside the team-planning system. Remove any
+			// stale state defensively, then leave the bot brains untouched so their
+			// local phase/laning logic remains authoritative.
+			delete(d.teamPlans, team)
+			delete(d.teamPlanTelemetryKey, team)
+			continue
+		}
 		plan := s.botPlanTeamLocked(inst, team, now)
 		d.teamPlans[team] = plan
 		key := botTeamPlanKey(plan)
@@ -107,15 +117,23 @@ func (s *Server) botPlanTeamsLocked(inst *huntInstance, now float64) {
 			previousAssignment := brain.macroAssignment
 			baselineCoverage := assignment.Role == "lane_cover" && assignment.Reason == "baseline_lane_coverage"
 			baseDefense := assignment.Mode == botMacroBase && assignment.Lane >= 0
+			coverageHandoff := baselineCoverage && (previousAssignment.Mode != botMacroLane &&
+				previousAssignment.Mode != botMacroCover || previousAssignment.Role != "lane_cover")
+			baseFarmCoverageHandoff := assignment.Mode == botMacroBase && assignment.Role == "cover" &&
+				assignment.FarmLaneSet && previousAssignment.Mode != botMacroBase
 			farmLaneChanged := assignment.FarmLaneSet &&
 				(!previousAssignment.FarmLaneSet || previousAssignment.FarmLane != assignment.FarmLane)
-			if (baselineCoverage || baseDefense) && assignment.Lane >= 0 && brain.farmLane != assignment.Lane {
+			farmAssignmentLane := assignment.Lane
+			if (baselineCoverage || baseDefense) && assignment.FarmLaneSet && assignment.FarmLane >= 0 {
+				farmAssignmentLane = assignment.FarmLane
+			}
+			if (baselineCoverage || baseDefense) && farmAssignmentLane >= 0 && brain.farmLane != farmAssignmentLane {
 				// A live coverage hand-off must invalidate the previous movement
 				// leg immediately. Leaving the old FarmLane/waypoint alive for one
 				// think interval made a bot appear assigned to lane 0 while it kept
 				// walking toward lane 1, which is enough to miss the next creep XP
 				// event under the 20u proximity rule.
-				brain.farmLane = assignment.Lane
+				brain.farmLane = farmAssignmentLane
 				brain.farmTarget = 0
 				brain.farmDecision = "lane_reassigned"
 				brain.c.stopArrivalLocked()
@@ -124,7 +142,8 @@ func (s *Server) botPlanTeamsLocked(inst *huntInstance, now float64) {
 			// spatial hand-off, including a base defender. A defender still has
 			// an XP obligation on its authored line; without this flag it keeps
 			// walking from the old lane while the next wave reaches the new one.
-			if farmLaneChanged && (baselineCoverage || baseDefense || assignment.Mode == botMacroLane || assignment.Mode == botMacroCover || assignment.Role == "defender") {
+			if (farmLaneChanged || coverageHandoff || baseFarmCoverageHandoff) &&
+				(baselineCoverage || baseDefense || assignment.Mode == botMacroLane || assignment.Mode == botMacroCover || assignment.Role == "defender") {
 				brain.farmLaneArrivalPending = true
 			}
 			brain.macroAssignment = assignment
@@ -133,12 +152,18 @@ func (s *Server) botPlanTeamsLocked(inst *huntInstance, now float64) {
 }
 
 func (s *Server) botPlanTeamLocked(inst *huntInstance, team int32, now float64) botTeamPlan {
-	plan := botTeamPlan{Team: team, Lane: -1, Assignments: map[int32]botMacroAssignment{}}
+	plan := botTeamPlan{Team: team, AIVersion: botTeamAIVersionLocked(inst, team), AIVersionSet: true, Lane: -1, Assignments: map[int32]botMacroAssignment{}}
 	if focus := botSelectTeamFocusTargetLocked(inst, team, now); focus != nil {
 		plan.FocusTarget = focus.objID
 	}
 	previous, hasPrevious := inst.dota.teamPlans[team]
 	hasPrevious = hasPrevious && len(previous.Assignments) > 0
+	// Plan hysteresis and farm-lane retention were introduced after AI-10. The
+	// baseline profile intentionally recomputes these decisions from live state,
+	// which makes an AI-10 vs AI-20 match a real behavioural comparison.
+	if !botAIProfileForVersion(plan.AIVersion).UsesPlanHysteresis() {
+		hasPrevious = false
+	}
 	var bots []*botBrain
 	active := 0
 	for _, mem := range inst.members {
@@ -244,8 +269,10 @@ func (s *Server) botPlanTeamLocked(inst *huntInstance, team int32, now float64) 
 				plan.ObjectiveID = objective.id
 				plan.Objective = botMacroObjectiveName(objective)
 			}
-			farmRescue := s.botTeamFarmRescueRequiredLocked(inst, team)
-			farmCoverageRequired := s.botTeamFarmCoverageRequiredLocked(inst, team, now)
+			farmRescue := botAIProfileForVersion(plan.AIVersion).UsesFarmRescue() &&
+				s.botTeamFarmRescueRequiredLocked(inst, team)
+			farmCoverageRequired := botAIProfileForVersion(plan.AIVersion).UsesFarmSafeWave() &&
+				s.botTeamFarmCoverageRequiredLocked(inst, team, now)
 			if farmRescue && hasPrevious && (previous.Mode == botMacroPush || previous.Mode == botMacroRally) &&
 				previous.ObjectiveID != 0 && objective != nil && previous.ObjectiveID == objective.id &&
 				botMacroObjectiveDamaged(objective) {
@@ -366,12 +393,24 @@ func (s *Server) botPlanTeamLocked(inst *huntInstance, team int32, now float64) 
 				!farmRescue && partialWindow {
 				partialMobilizationRequested = true
 			}
+			// Coverage is a hard tactical prerequisite. If a visible wave has no
+			// living teammate inside the authoritative XP radius, suspend every
+			// optional objective/mobilization route until the orchestrator has
+			// restored that presence. This is state-based: the gate opens again as
+			// soon as the live wave is covered, with no opening-minute constant.
+			if farmCoverageRequired {
+				farmRescue = true
+				mobilizationRequested = false
+				partialMobilizationRequested = false
+				objectiveRally = false
+				objectiveStaging = false
+			}
 			// A visible enemy wave is an immediate XP obligation. Do not let a ready
 			// objective, a mobilization continuation, or a conversion window pull the
 			// last farm body out of an uncovered lane. The objective can wait for the
 			// next covered wave; lost proximity XP cannot be recovered later.
-			forceObjectivePush := criticalFinish || (!farmCoverageRequired &&
-				(mobilizationRequested || partialMobilizationRequested || conversionReady))
+			forceObjectivePush := !farmCoverageRequired && (criticalFinish ||
+				mobilizationRequested || partialMobilizationRequested || conversionReady)
 			if mobilizationRequested && !farmCoverageRequired {
 				// A live finish window is a conversion commitment. Do not let a
 				// marginal farm-debt rescue dissolve the group after it has already
@@ -594,6 +633,53 @@ func (s *Server) botFarmCoverageDistanceLocked(brain *botBrain, lane int, team i
 	return bestOwn
 }
 
+// botFarmLaneHeroPressureLocked marks a lane owner as temporarily unavailable
+// when a visible enemy avatar is already contesting that lane. The owner pass
+// can then hand the lane to a spare before the retreating body leaves the XP
+// radius. Active attack state is accepted as evidence even when the ordinary
+// hero vision circle has just flickered at the boundary.
+func (s *Server) botFarmLaneHeroPressureLocked(brain *botBrain, lane int, now float64) bool {
+	if brain == nil || brain.c == nil || brain.c.inst == nil || brain.c.huntState == nil {
+		return false
+	}
+	c := brain.c
+	visionSources := dotaTeamVisionSourcesLocked(c.inst, c.playerTeam(), now)
+	cx, cy := c.posAtLocked(float32(now))
+	for _, enemy := range c.inst.members {
+		if enemy == nil || enemy == c || enemy.huntState == nil || enemy.huntState.deadUntil > 0 || enemy.playerTeam() == c.playerTeam() {
+			continue
+		}
+		ex, ey := enemy.posAtLocked(float32(now))
+		active := enemy.huntState.pvpTarget == c.objID || enemy.huntState.attackTarget == c.objID ||
+			c.huntState.pvpTarget == enemy.objID
+		if !active && !botVisibleEnemyMemberLocked(c.inst, c.playerTeam(), enemy, now, visionSources) {
+			continue
+		}
+		if botNearestLaneToPointLocked(c.inst.dota, ex, ey) != lane {
+			continue
+		}
+		if active || math.Hypot(float64(cx-ex), float64(cy-ey)) <= botRetreatPressureRadius {
+			return true
+		}
+	}
+	return false
+}
+
+// botFarmOwnerUnavailableLocked starts a handoff before a lane owner reaches
+// the hard retreat floor. A low-health body can still be alive and technically
+// eligible, but keeping it as the formal owner delays the replacement until
+// the next creep is already dying. This is live survivability/pressure state,
+// not a match-clock rule.
+func (s *Server) botFarmOwnerUnavailableLocked(brain *botBrain, lane int, now float64) bool {
+	if brain == nil || brain.c == nil || brain.c.huntState == nil || brain.c.huntState.deadUntil > 0 || brain.retreating {
+		return true
+	}
+	if botHPFrac(brain.c.huntState, now) <= botSafeHPFrac {
+		return true
+	}
+	return s.botFarmLaneHeroPressureLocked(brain, lane, now)
+}
+
 // botLaneHasLivingEnemyBarracksLocked is a map-state guarantee, not a vision
 // shortcut: a living enemy barracks means this lane will keep producing enemy
 // creeps even while the next wave is outside the team's sight. The caller may
@@ -620,8 +706,11 @@ func (s *Server) botEnforceBaselineFarmCoverageLocked(plan *botTeamPlan, bots []
 	}
 	// A full mobilization is an explicit all-roster commitment. Its launch gate
 	// has already established the exceptional premise that permits the farm
-	// coverage overlay to be suspended for the named objective.
-	if botAnyMobilizationReason(plan.Reason) || plan.Mode == botMacroAltar {
+	// coverage overlay to be suspended for the named objective. Partial
+	// mobilization is not such an exception: it must still leave one live owner
+	// on every active lane, otherwise its strike group simply converts one
+	// structure while the other lanes lose XP.
+	if botMobilizationReason(plan.Reason) || plan.Mode == botMacroAltar {
 		return
 	}
 	// Ordinary conversion is still subordinate to live XP coverage. A wave that
@@ -682,6 +771,14 @@ func (s *Server) botEnforceBaselineFarmCoverageLocked(plan *botTeamPlan, bots []
 		}
 		assignment := plan.Assignments[brain.c.objID]
 		lane := assignment.BaselineLane
+		// A duplicate-baseline spare may be carrying a stable handoff to a
+		// different line whose owner is recovering. Preserve that FarmLane here;
+		// otherwise this coverage pass would immediately erase the handoff that
+		// botAssignFarmLanesWithPreviousAtLocked just selected.
+		if assignment.Role == "lane_cover" && assignment.FarmLaneSet &&
+			assignment.FarmLane >= 0 && assignment.FarmLane != assignment.BaselineLane {
+			lane = assignment.FarmLane
+		}
 		if lane < 0 || lane >= len(activeLanes) {
 			lane = brain.lane
 		}
@@ -755,7 +852,11 @@ func (s *Server) botEnforceBaselineFarmCoverageLocked(plan *botTeamPlan, bots []
 			continue
 		}
 		assignment := plan.Assignments[brain.c.objID]
-		if assignment.Mode != botMacroLane && assignment.Mode != botMacroCover {
+		farmBorrowablePush := plan.Mode == botMacroPush && assignment.Mode == botMacroPush &&
+			(assignment.Reason == botMacroReasonPartialMobilization || assignment.Reason == "objective_conversion_ready")
+		baseFarmOwner := assignment.Mode == botMacroBase &&
+			(assignment.Role == "defender" || assignment.Role == "cover") && assignment.FarmLaneSet
+		if assignment.Mode != botMacroLane && assignment.Mode != botMacroCover && assignment.Role != botMacroCounterPushRole && !farmBorrowablePush && !baseFarmOwner {
 			continue
 		}
 		// Baseline ownership is the stable movement contract. FarmLane may be
@@ -764,6 +865,9 @@ func (s *Server) botEnforceBaselineFarmCoverageLocked(plan *botTeamPlan, bots []
 		// and the objective lane every 200ms. Only use FarmLane when the authored
 		// baseline is unavailable (for example after a lane's barracks is gone).
 		lane := assignment.BaselineLane
+		if baseFarmOwner && assignment.Role == "cover" && assignment.FarmLane >= 0 {
+			lane = assignment.FarmLane
+		}
 		// BaselineLane is the stable authored route. Keep it even during a
 		// visibility gap when its barracks is still alive; otherwise the farm
 		// allocator alternates 0->1->0 every planner tick as waves enter/leave
@@ -782,14 +886,68 @@ func (s *Server) botEnforceBaselineFarmCoverageLocked(plan *botTeamPlan, bots []
 		if lane < 0 || !activeLanes[lane] || owner[lane] != 0 {
 			continue
 		}
+		if baseFarmOwner {
+			// A base defender is also a farm owner on its authored line. Keep the
+			// strategic objective assignment intact; botBaseDefenseTickLocked still
+			// intercepts the threatened structure, but the owner ledger must not
+			// manufacture a spare-lane handoff every planner tick.
+			if assignment.Role == "defender" {
+				// The authored lane is the source of truth for a defender. A stale
+				// FarmLane from an earlier rescue pass must not make the defender
+				// appear to cover one lane while its behavior walks to another.
+				assignment.FarmLane = lane
+				assignment.FarmLaneSet = true
+			}
+			plan.Assignments[brain.c.objID] = assignment
+			owner[lane] = brain.c.objID
+			chosen[brain.c.objID] = true
+			continue
+		}
 		coverageDistance := s.botFarmCoverageDistanceLocked(brain, lane, plan.Team, visionSources, now)
+		if s.botFarmOwnerUnavailableLocked(brain, lane, now) {
+			// The lane owner is about to disengage or is already being chased. Do
+			// not retain it as a formal owner while a spare can begin the handoff.
+			continue
+		}
 		// A standing enemy barracks is enough to retain a distant owner while
 		// the next wave is hidden, but not after a visible wave has materialized.
 		// In that case the distance is concrete XP debt: release the stale owner
 		// so the nearest healthy spare can take the hand-off immediately.
-		if coverageDistance > 64.0 &&
+		handoffDistance := 64.0
+		if visibleEnemyLanes[lane] {
+			// A visible wave is an immediate XP obligation. The old broad
+			// hand-off ring treated a body 20-30u away as covered and waited
+			// until the creep had already died. Future/hidden waves retain the
+			// wider stability ring so ownership does not oscillate in fog.
+			handoffDistance = dotaXPShareRadius * 0.95
+		}
+		if coverageDistance > handoffDistance &&
 			(!botLaneHasLivingEnemyBarracksLocked(inst, plan.Team, lane) || visibleEnemyLanes[lane]) {
-			continue
+			// Do not move the only remaining farm-capable body just because a
+			// different visible lane is currently closer. With no spare, that
+			// creates a map-iteration-dependent 0->2->0 oscillation and abandons
+			// both waves. Keep the authored owner on its route; a real spare will
+			// take the hand-off on a later pass.
+			hasSpare := false
+			for _, candidate := range bots {
+				if candidate == nil || candidate == brain || candidate.c == nil || candidate.c.huntState == nil ||
+					candidate.c.huntState.deadUntil > 0 || candidate.retreating ||
+					botHPFrac(candidate.c.huntState, now) <= botSafeHPFrac || chosen[candidate.c.objID] {
+					continue
+				}
+				candidateAssignment := plan.Assignments[candidate.c.objID]
+				farmBorrowablePush := plan.Mode == botMacroPush && candidateAssignment.Mode == botMacroPush &&
+					(candidateAssignment.Reason == botMacroReasonPartialMobilization || candidateAssignment.Reason == "objective_conversion_ready")
+				if candidateAssignment.Mode == botMacroBase || candidateAssignment.Mode == botMacroRecover || candidateAssignment.Role == "defender" ||
+					(botAnyMobilizationReason(candidateAssignment.Reason) && !farmBorrowablePush) {
+					continue
+				}
+				hasSpare = true
+				break
+			}
+			if hasSpare {
+				continue
+			}
 		}
 		// A cover responder selected for the objective is still a farm owner
 		// only if its execution assignment is removed. Leaving ObjectiveID and
@@ -830,11 +988,15 @@ func (s *Server) botEnforceBaselineFarmCoverageLocked(plan *botTeamPlan, bots []
 		bestDistance := func(lane int) float64 {
 			best := math.Inf(1)
 			for _, brain := range bots {
-				if brain == nil || brain.c == nil || brain.c.huntState == nil || brain.c.huntState.deadUntil > 0 || brain.retreating || chosen[brain.c.objID] {
+				if brain == nil || brain.c == nil || brain.c.huntState == nil || brain.c.huntState.deadUntil > 0 ||
+					brain.retreating || botHPFrac(brain.c.huntState, now) <= botSafeHPFrac || chosen[brain.c.objID] {
 					continue
 				}
 				assignment := plan.Assignments[brain.c.objID]
-				if assignment.Mode == botMacroBase || assignment.Mode == botMacroRecover || assignment.Role == "defender" || assignment.Role == botMacroCounterPushRole || botAnyMobilizationReason(assignment.Reason) {
+				farmBorrowablePush := plan.Mode == botMacroPush && assignment.Mode == botMacroPush &&
+					(assignment.Reason == botMacroReasonPartialMobilization || assignment.Reason == "objective_conversion_ready")
+				if assignment.Mode == botMacroBase || assignment.Mode == botMacroRecover || assignment.Role == "defender" ||
+					(botAnyMobilizationReason(assignment.Reason) && !farmBorrowablePush) {
 					continue
 				}
 				if distance := s.botFarmCoverageDistanceLocked(brain, lane, plan.Team, visionSources, now); distance < best {
@@ -856,11 +1018,15 @@ func (s *Server) botEnforceBaselineFarmCoverageLocked(plan *botTeamPlan, bots []
 		var best *botBrain
 		bestDistance := math.Inf(1)
 		for _, brain := range bots {
-			if brain == nil || brain.c == nil || brain.c.huntState == nil || brain.c.huntState.deadUntil > 0 || brain.retreating || chosen[brain.c.objID] {
+			if brain == nil || brain.c == nil || brain.c.huntState == nil || brain.c.huntState.deadUntil > 0 ||
+				brain.retreating || botHPFrac(brain.c.huntState, now) <= botSafeHPFrac || chosen[brain.c.objID] {
 				continue
 			}
 			assignment := plan.Assignments[brain.c.objID]
-			if assignment.Mode == botMacroBase || assignment.Mode == botMacroRecover || assignment.Role == "defender" || assignment.Role == botMacroCounterPushRole || botAnyMobilizationReason(assignment.Reason) {
+			farmBorrowablePush := plan.Mode == botMacroPush && assignment.Mode == botMacroPush &&
+				(assignment.Reason == botMacroReasonPartialMobilization || assignment.Reason == "objective_conversion_ready")
+			if assignment.Mode == botMacroBase || assignment.Mode == botMacroRecover || assignment.Role == "defender" ||
+				(botAnyMobilizationReason(assignment.Reason) && !farmBorrowablePush) {
 				continue
 			}
 			distance := s.botFarmCoverageDistanceLocked(brain, lane, plan.Team, visionSources, now)
@@ -896,7 +1062,8 @@ func (s *Server) botEnforceBaselineFarmCoverageLocked(plan *botTeamPlan, bots []
 		var best *botBrain
 		bestDistance := math.Inf(1)
 		for _, brain := range bots {
-			if brain == nil || brain.c == nil || brain.c.huntState == nil || brain.c.huntState.deadUntil > 0 || brain.retreating || chosen[brain.c.objID] {
+			if brain == nil || brain.c == nil || brain.c.huntState == nil || brain.c.huntState.deadUntil > 0 ||
+				brain.retreating || botHPFrac(brain.c.huntState, now) <= botSafeHPFrac || chosen[brain.c.objID] {
 				continue
 			}
 			assignment := plan.Assignments[brain.c.objID]
@@ -937,14 +1104,16 @@ func (s *Server) botEnforceBaselineFarmCoverageLocked(plan *botTeamPlan, bots []
 		}
 		if plan.Mode == botMacroBase {
 			objective := botPlanObjectiveLocked(inst, plan.Team, *plan)
-			if objective != nil && s.botDefenseStructureThreatSeverityLocked(inst, plan.Team, objective, now) > 0 {
+			if objective != nil && objective.dotaRole != gamedata.DotaGun &&
+				s.botDefenseStructureThreatSeverityLocked(inst, plan.Team, objective, now) > 0 {
 				continue
 			}
 		}
 		var best *botBrain
 		bestDistance := math.Inf(1)
 		for _, brain := range bots {
-			if brain == nil || brain.c == nil || brain.c.huntState == nil || brain.c.huntState.deadUntil > 0 || brain.retreating || chosen[brain.c.objID] {
+			if brain == nil || brain.c == nil || brain.c.huntState == nil || brain.c.huntState.deadUntil > 0 ||
+				brain.retreating || botHPFrac(brain.c.huntState, now) <= botSafeHPFrac || chosen[brain.c.objID] {
 				continue
 			}
 			assignment := plan.Assignments[brain.c.objID]
@@ -1010,6 +1179,12 @@ func (s *Server) botEnforceBaselineFarmCoverageLocked(plan *botTeamPlan, bots []
 		})
 		ownerBrain := candidates[0]
 		assignment := plan.Assignments[ownerBrain.c.objID]
+		if assignment.FarmLaneSet && assignment.FarmLane != lane {
+			// This baseline body is currently a deliberate handoff spare. Its
+			// FarmLane is the uncovered route, so repairing the authored baseline
+			// here would reintroduce the same oscillation on the next tick.
+			continue
+		}
 		assignment.Lane = lane
 		assignment.FarmLane = lane
 		assignment.FarmLaneSet = true
@@ -1031,7 +1206,8 @@ func (s *Server) botEnforceBaselineFarmCoverageLocked(plan *botTeamPlan, bots []
 func (s *Server) botAssignFarmReserveLocked(plan *botTeamPlan, bots []*botBrain, inst *huntInstance, now float64) bool {
 	if plan == nil || inst == nil || inst.dota == nil ||
 		(plan.Mode != botMacroPush && plan.Mode != botMacroRally) ||
-		botAnyMobilizationReason(plan.Reason) {
+		botAnyMobilizationReason(plan.Reason) ||
+		!botAIProfileForPlanLocked(inst, plan).UsesFarmDebt() {
 		return false
 	}
 	candidate := botMostIndebtedLivingBotLocked(inst, plan.Team)
@@ -1124,7 +1300,7 @@ func (s *Server) botTeamFarmRescueRequiredLocked(inst *huntInstance, team int32)
 		var weakest *botBrain
 		for _, brain := range inst.bots {
 			if brain == nil || brain.c == nil || brain.c.huntState == nil || brain.c.playerTeam() != team ||
-				brain.c.huntState.deadUntil > 0 || brain.retreating {
+				brain.c.huntState.deadUntil > 0 {
 				continue
 			}
 			if botFarmPriorityLessLocked(brain, weakest) {
@@ -1242,7 +1418,7 @@ func (s *Server) botTeamFarmCoverageRequiredLocked(inst *huntInstance, team int3
 		covered := false
 		for _, brain := range inst.bots {
 			if brain == nil || brain.c == nil || brain.c.huntState == nil || brain.c.playerTeam() != team ||
-				brain.c.huntState.deadUntil > 0 {
+				brain.c.huntState.deadUntil > 0 || brain.retreating {
 				continue
 			}
 			x, y := brain.c.posAtLocked(float32(now))
@@ -1638,6 +1814,24 @@ func (s *Server) botAssignFarmLanesWithPreviousAtLocked(plan *botTeamPlan, previ
 	if len(eligible) == 0 {
 		return
 	}
+	version := botPlanAIVersionLocked(inst, plan)
+	if !botAIProfileForVersion(version).UsesFarmLanePlan() {
+		// AI-10 keeps the authored 2/1/2 lane identity and has no live-wave
+		// rotation. Strategic assignments remain authoritative; this only
+		// supplies the baseline farm lane consumed by local movement.
+		for _, brain := range eligible {
+			assignment := plan.Assignments[brain.c.objID]
+			assignment.FarmLane = brain.lane
+			assignment.FarmLaneSet = brain.lane >= 0 && brain.lane < len(inst.dota.m.Lanes)
+			plan.Assignments[brain.c.objID] = assignment
+		}
+		return
+	}
+	if !botAIProfileForVersion(version).UsesFarmStability() {
+		// AI-18 still allocates farm lanes, but AI-19 introduced stable live-wave
+		// handoffs across planner recomputations.
+		hasPrevious = false
+	}
 	weakest := botWeakestEligibleFarmBotLocked(inst, plan.Team, eligible)
 	occupancy := make([]int, len(inst.dota.m.Lanes))
 	activeWaveLanes := make([]bool, len(occupancy))
@@ -1681,6 +1875,147 @@ func (s *Server) botAssignFarmLanesWithPreviousAtLocked(plan *botTeamPlan, previ
 		}
 	}
 	if len(distinctBaselines) > 1 {
+		// Real matches have authored lane ownership (the normal 2/1/2 split).
+		// Keep that ownership stable and use a spare only to replace a baseline
+		// bot that is currently unavailable. Re-solving all eligible bodies from
+		// visible wave scores made a healthy spare bounce between lines every
+		// planner tick, so it arrived at neither line in time for XP.
+		baselineOwners := make(map[int]int, len(distinctBaselines))
+		needed := make(map[int]bool, len(occupancy))
+		for lane := range occupancy {
+			needed[lane] = activeWaveLanes[lane] || ownWaveLanes[lane] ||
+				botLaneHasLivingEnemyBarracksLocked(inst, plan.Team, lane)
+		}
+		for _, brain := range eligible {
+			baseline := brain.lane
+			if baseline >= 0 && baseline < len(occupancy) && needed[baseline] &&
+				!s.botFarmOwnerUnavailableLocked(brain, baseline, now) {
+				baselineOwners[baseline]++
+			}
+		}
+		missing := make(map[int]bool, len(occupancy))
+		for lane := range occupancy {
+			if needed[lane] && baselineOwners[lane] == 0 {
+				missing[lane] = true
+			}
+		}
+		assigned := make(map[int32]bool, len(eligible))
+		// A materially farm-indebted bot may catch up on a live wave when its
+		// authored line has no current own or visible enemy creep. This is the
+		// only normal exception to stable ownership; it is driven by live wave
+		// presence and debt, not by elapsed match time.
+		if weakest != nil {
+			baseline := weakest.lane
+			baselineLive := baseline >= 0 && baseline < len(occupancy) &&
+				(activeWaveLanes[baseline] || ownWaveLanes[baseline])
+			if !baselineLive {
+				bestLane, bestScore := -1, 0
+				for lane := range occupancy {
+					score := botFarmLaneWaveScoreAtLocked(inst, plan.Team, lane, now)
+					if score > bestScore || (score == bestScore && score > 0 && (bestLane < 0 || lane == baseline)) {
+						bestLane, bestScore = lane, score
+					}
+				}
+				if bestLane >= 0 {
+					assignment := plan.Assignments[weakest.c.objID]
+					assignment.FarmLane = bestLane
+					assignment.FarmLaneSet = true
+					plan.Assignments[weakest.c.objID] = assignment
+					assigned[weakest.c.objID] = true
+				}
+			}
+		}
+		// Preserve an existing handoff while the original baseline owner is
+		// unavailable. This is the spatially stable replacement for a retreating
+		// lane owner; it is released automatically when the baseline lane has a
+		// living eligible owner again.
+		if hasPrevious {
+			for _, brain := range eligible {
+				old, ok := previous.Assignments[brain.c.objID]
+				if !ok || !old.FarmLaneSet || !missing[old.FarmLane] {
+					continue
+				}
+				assignment := plan.Assignments[brain.c.objID]
+				assignment.FarmLane = old.FarmLane
+				assignment.FarmLaneSet = true
+				plan.Assignments[brain.c.objID] = assignment
+				assigned[brain.c.objID] = true
+				missing[old.FarmLane] = false
+			}
+		}
+		// A duplicate-baseline spare that has already been handed to a live
+		// line keeps that handoff until the line loses its future wave source.
+		// Reverting it as soon as the original owner briefly becomes eligible
+		// creates a route flapping loop: the spare turns around before reaching
+		// the lane, the owner retreats again, and the next creep dies uncovered.
+		// The barracks/active-wave check is the state-based release condition;
+		// no elapsed-match exception is involved.
+		if hasPrevious {
+			for _, brain := range eligible {
+				if assigned[brain.c.objID] {
+					continue
+				}
+				old, ok := previous.Assignments[brain.c.objID]
+				if !ok || !old.FarmLaneSet || old.FarmLane < 0 || old.FarmLane >= len(occupancy) || old.FarmLane == brain.lane {
+					continue
+				}
+				if !activeWaveLanes[old.FarmLane] && !ownWaveLanes[old.FarmLane] &&
+					!botLaneHasLivingEnemyBarracksLocked(inst, plan.Team, old.FarmLane) {
+					continue
+				}
+				assignment := plan.Assignments[brain.c.objID]
+				assignment.FarmLane = old.FarmLane
+				assignment.FarmLaneSet = true
+				plan.Assignments[brain.c.objID] = assignment
+				assigned[brain.c.objID] = true
+			}
+		}
+		// Every remaining eligible bot stays on its authored lane. A duplicate
+		// baseline is intentionally retained as the spare pool for the handoff.
+		for _, brain := range eligible {
+			if assigned[brain.c.objID] {
+				continue
+			}
+			assignment := plan.Assignments[brain.c.objID]
+			assignment.FarmLane = brain.lane
+			assignment.FarmLaneSet = brain.lane >= 0 && brain.lane < len(occupancy)
+			plan.Assignments[brain.c.objID] = assignment
+			assigned[brain.c.objID] = true
+		}
+		// Fill still-missing lines from duplicate-baseline spares. If several
+		// lines are simultaneously uncovered, prefer the one with a visible wave
+		// and then the closest available body; all choices remain state-based.
+		for lane := range occupancy {
+			if !missing[lane] {
+				continue
+			}
+			var best *botBrain
+			bestDistance := math.Inf(1)
+			for _, brain := range eligible {
+				if brain == nil || !assigned[brain.c.objID] {
+					continue
+				}
+				assignment := plan.Assignments[brain.c.objID]
+				if assignment.FarmLane != brain.lane || baselineOwners[brain.lane] < 2 {
+					continue
+				}
+				distance := s.botFarmCoverageDistanceLocked(brain, lane, plan.Team, dotaTeamVisionSourcesLocked(inst, plan.Team, now), now)
+				if distance < bestDistance || (distance == bestDistance && (best == nil || brain.c.objID < best.c.objID)) {
+					best, bestDistance = brain, distance
+				}
+			}
+			if best == nil {
+				continue
+			}
+			assignment := plan.Assignments[best.c.objID]
+			assignment.FarmLane = lane
+			assignment.FarmLaneSet = true
+			plan.Assignments[best.c.objID] = assignment
+			missing[lane] = false
+		}
+		return
+	}
+	if len(distinctBaselines) > 1 {
 		for _, brain := range eligible {
 			baseline := brain.lane
 			// A weakest bot may still be redirected to a different live wave when
@@ -1713,11 +2048,17 @@ func (s *Server) botAssignFarmLanesWithPreviousAtLocked(plan *botTeamPlan, previ
 			if !ok || !old.FarmLaneSet || old.FarmLane < 0 || old.FarmLane >= len(occupancy) {
 				continue
 			}
-			// Retain at most one previous owner per currently live lane. This
-			// preserves tactical continuity without allowing a former one-lane
-			// stack to starve a newly spawned wave on another line. Extra bots are
-			// assigned only after every active lane has a guaranteed owner.
-			canRetain := !anyActiveWave || (activeWaveLanes[old.FarmLane] && !retainedLane[old.FarmLane])
+			// Retain a previous owner while its lane has a live wave source. The
+			// barracks is the state-based persistence signal: a brief visibility
+			// gap must not make a reserve bot bounce 0->2->1->0 before it reaches
+			// the next lane. A second owner is allowed on that persistent lane;
+			// it is cheaper than abandoning the bot's current route and can be
+			// borrowed only after a real lane hand-off is required.
+			lanePersistent := botLaneHasLivingEnemyBarracksLocked(inst, plan.Team, old.FarmLane)
+			canRetain := !anyActiveWave || activeWaveLanes[old.FarmLane] || lanePersistent
+			if canRetain && retainedLane[old.FarmLane] && !lanePersistent {
+				canRetain = false
+			}
 			if canRetain {
 				assignment := plan.Assignments[brain.c.objID]
 				assignment.FarmLane = old.FarmLane
@@ -2522,6 +2863,14 @@ func (s *Server) botAssignMacroRespondersLocked(plan *botTeamPlan, previous botT
 		}
 		if i > 0 {
 			assignment.Role = "cover"
+			if plan.Mode == botMacroBase {
+				// Base cover is an emergency reserve, not a second defender.
+				// Keep its route on the baseline farm lane so the reserve does
+				// not abandon the lane while the named defender handles the
+				// structure. Promotion can still overwrite this lane later if
+				// the responder is actually needed.
+				assignment.Lane = brain.lane
+			}
 			if plan.Mode != botMacroBase {
 				assignment.Mode = botMacroCover
 				assignment.Aggressive = false
@@ -3255,6 +3604,8 @@ func botMacroObjectiveName(m *mobState) string {
 
 func botTeamPlanKey(plan botTeamPlan) string {
 	var b strings.Builder
+	b.WriteString(strconv.Itoa(plan.AIVersion))
+	b.WriteByte(':')
 	b.WriteString(plan.Mode)
 	b.WriteByte(':')
 	b.WriteString(strconv.Itoa(plan.Lane))
@@ -3305,7 +3656,12 @@ func botTeamPlanKey(plan botTeamPlan) string {
 func (s *Server) botBaseDefenseTickLocked(b *botBrain, now float64) {
 	c, hs := b.c, b.c.huntState
 	if hs.attackTarget != 0 {
-		return
+		if target := hs.mobs[hs.attackTarget]; target != nil && !target.structure &&
+			target.enemyOf(c.playerTeam()) && !s.botFarmMayAttackCreepLocked(b, now) {
+			s.stopAttackLocked(c, false)
+		} else {
+			return
+		}
 	}
 	_ = s.botFarmApproachTargetLocked(b, now)
 	// A wave in the predictive ring is not yet an ordinary farm target, but a
@@ -3313,6 +3669,23 @@ func (s *Server) botBaseDefenseTickLocked(b *botBrain, now float64) {
 	if target := s.botBarracksInterceptTargetLocked(b, now); target != nil {
 		cx, cy := c.posAtLocked(float32(now))
 		if math.Hypot(float64(target.x-cx), float64(target.y-cy)) > botBarracksImmediateRadius*2 {
+			// Predictive defense used to walk directly to the front creep. That
+			// put the defender on the enemy side of the wave: the rear creep could
+			// die outside XP range while the defender was taking avoidable aggro.
+			// Intercept the wave from the home-side safe point, exactly like every
+			// other farm route. The objective remains the macro anchor; only the
+			// local approach geometry changes.
+			if px, py, safe := s.botFarmTargetSafePointLocked(b, target, now); safe &&
+				s.botBaseFarmPointSafeLocked(b, px, py, now) {
+				b.farmTarget = target.id
+				b.farmDecision = "defense_intercept"
+				b.farmLane = botLaneForCreep(c, target)
+				b.farmCatchUp = botFarmCatchUpLocked(b)
+				s.botMoveTowardLocked(b, px, py, now)
+				return
+			}
+			// If the map cannot produce a safe point, preserve the old direct
+			// intercept as a last-resort structure-defense action.
 			b.farmTarget = target.id
 			b.farmDecision = "defense_intercept"
 			b.farmLane = botLaneForCreep(c, target)
@@ -3322,25 +3695,62 @@ func (s *Server) botBaseDefenseTickLocked(b *botBrain, now float64) {
 		}
 	}
 	target := s.botFarmTargetLocked(b, now, botLaneApproachRadius, false)
-	if px, py, ok := s.botFarmCoveragePointLocked(b, now); ok {
+	if px, py, ok := s.botFarmTargetSafePointLocked(b, target, now); ok {
 		cx, cy := c.posAtLocked(float32(now))
 		if math.Hypot(float64(px-cx), float64(py-cy)) > dotaXPShareRadius*0.5 &&
 			s.botBaseFarmPointSafeLocked(b, px, py, now) && !s.botIncomingPressureLocked(b, now) {
-			s.botMoveTowardLocked(b, px, py, now)
-			return
+			if target != nil && b.macroAssignment.Role == "defender" &&
+				s.botBaseFarmTargetSafeLocked(b, target, now) {
+				distance := math.Hypot(float64(target.x-cx), float64(target.y-cy))
+				attackReach := hs.effAttackRangeLocked(now) + hs.av.Radius() + target.mob.Radius()
+				if distance <= attackReach && distance <= dotaXPShareRadius &&
+					s.botFarmMayAttackCreepLocked(b, now) {
+					s.startAttackLocked(c, target)
+				} else if distance <= dotaXPShareRadius*1.25 {
+					// A defender may clear a wave under its own structure, but
+					// the last step into the XP envelope still uses the same rear
+					// anchor as an ordinary laner. The wider direct intercept is
+					// reserved for genuinely distant predictive defense.
+					s.botMoveToFarmTargetLocked(b, target, now)
+				} else {
+					s.botMoveTowardLocked(b, target.x, target.y, now)
+				}
+				return
+			}
+			if target != nil && s.botMoveToFarmTargetLocked(b, target, now) {
+				return
+			}
+			if s.botMoveToFarmCoverageLocked(b, now) {
+				return
+			}
 		}
 	}
 	if target != nil &&
 		s.botBaseFarmTargetSafeLocked(b, target, now) {
-		cx, cy := c.posAtLocked(float32(now))
-		distance := math.Hypot(float64(target.x-cx), float64(target.y-cy))
-		attackReach := hs.effAttackRangeLocked(now) + hs.av.Radius() + target.mob.Radius()
-		if distance <= attackReach {
-			s.startAttackLocked(c, target)
-		} else {
-			s.botMoveTowardLocked(b, target.x, target.y, now)
+		if b.macroAssignment.Role == "defender" {
+			// The primary defender is already operating inside its own
+			// structure's protected ring. Preserve the explicit intercept order
+			// here; the XP-safe anchor governs lane/cover bodies, while this role
+			// must still clear a wave that has reached the objective.
+			cx, cy := c.posAtLocked(float32(now))
+			distance := math.Hypot(float64(target.x-cx), float64(target.y-cy))
+			attackReach := hs.effAttackRangeLocked(now) + hs.av.Radius() + target.mob.Radius()
+			if distance <= attackReach && distance <= dotaXPShareRadius {
+				if s.botFarmMayAttackCreepLocked(b, now) {
+					s.startAttackLocked(c, target)
+				} else {
+					s.botMoveToFarmTargetLocked(b, target, now)
+				}
+			} else if distance <= dotaXPShareRadius*1.25 {
+				s.botMoveToFarmTargetLocked(b, target, now)
+			} else {
+				s.botMoveTowardLocked(b, target.x, target.y, now)
+			}
+			return
 		}
-		return
+		if s.botMoveToFarmTargetLocked(b, target, now) {
+			return
+		}
 	}
 	// A defender must keep the objective as its strategic anchor, but a live wave
 	// already inside the local defense radius is free XP. Multi-creep clear comes
@@ -3348,24 +3758,30 @@ func (s *Server) botBaseDefenseTickLocked(b *botBrain, now float64) {
 	if s.botConsiderWaveClearAbilityLocked(b, now) {
 		return
 	}
-	if px, py, ok := s.botFarmCoveragePointLocked(b, now); ok {
+	if px, py, ok := s.botFarmTargetSafePointLocked(b, target, now); ok {
 		cx, cy := c.posAtLocked(float32(now))
 		if math.Hypot(float64(px-cx), float64(py-cy)) > dotaXPShareRadius*0.5 &&
 			s.botBaseFarmPointSafeLocked(b, px, py, now) {
-			s.botMoveTowardLocked(b, px, py, now)
-			return
+			if target != nil && s.botMoveToFarmTargetLocked(b, target, now) {
+				return
+			}
+			if s.botMoveToFarmCoverageLocked(b, now) {
+				return
+			}
 		}
 	}
 	if target := s.botFindLaneTargetLocked(b, now, botGroupEngageRadius, false); target != nil {
-		s.startAttackLocked(c, target)
-		return
+		if s.botMoveToFarmTargetLocked(b, target, now) {
+			return
+		}
 	}
 	// Defense is an anchor, not an idle waypoint. If the threatened lane has a
 	// nearby safe wave, close on it and convert the defense assignment into XP;
 	// only fall back to the barracks when no local farm target is available.
 	if target := s.botFarmApproachTargetLocked(b, now); target != nil {
-		s.botMoveTowardLocked(b, target.x, target.y, now)
-		return
+		if s.botMoveToFarmTargetLocked(b, target, now) {
+			return
+		}
 	}
 	// The macro premise intentionally survives in a wider release ring than the
 	// local farm radius.  In that gap, returning to the already-safe barracks
@@ -3424,15 +3840,23 @@ func (s *Server) botBaseFarmPointSafeLocked(b *botBrain, x, y float32, now float
 func (s *Server) botCoverageTickLocked(b *botBrain, now float64) {
 	c, hs := b.c, b.c.huntState
 	if hs.attackTarget != 0 {
-		return
+		if target := hs.mobs[hs.attackTarget]; target != nil && !target.structure &&
+			target.enemyOf(c.playerTeam()) && !s.botFarmMayAttackCreepLocked(b, now) {
+			s.stopAttackLocked(c, false)
+		} else {
+			return
+		}
 	}
 	if botFirstFarmWavePendingLocked(b, now) {
 		// Keep the cover body staged on its assigned lane before the first
 		// wave exists. Returning to base here loses the race to the first
 		// creep after a safe walk or a cancelled teleport.
 		lane := botFarmLaneLocked(b)
-		if lane >= 0 && lane != b.lane {
-			lx, ly := s.botPushPointLocked(b, lane, now)
+		if lane >= 0 {
+			lx, ly, ok := s.botFarmPrestagePointLocked(b, lane, now)
+			if !ok {
+				lx, ly = s.botLanePoint(b, now)
+			}
 			s.botMoveTowardLocked(b, lx, ly, now)
 		} else {
 			lx, ly := s.botLanePoint(b, now)
@@ -3461,8 +3885,16 @@ func (s *Server) botCoverageTickLocked(b *botBrain, now float64) {
 	if s.botHoldFarmXPLocked(b, now) {
 		return
 	}
+	previousFarmTarget := b.farmTarget
 	target := s.botFarmTargetLocked(b, now, botLaneApproachRadius, false)
-	if px, py, ok := s.botFarmCoveragePointLocked(b, now); ok {
+	if previousFarmTarget != 0 {
+		if urgent := s.botUrgentFarmCoverageTargetLocked(b, now); urgent != nil {
+			if s.botMoveToFarmTargetLocked(b, urgent, now) {
+				return
+			}
+		}
+	}
+	if px, py, ok := s.botFarmTargetSafePointLocked(b, target, now); ok {
 		cx, cy := c.posAtLocked(float32(now))
 		if math.Hypot(float64(px-cx), float64(py-cy)) > dotaXPShareRadius*0.5 &&
 			!s.botEnemyStructureDangerLocked(c, px, py) && !s.botIncomingPressureLocked(b, now) {
@@ -3472,17 +3904,11 @@ func (s *Server) botCoverageTickLocked(b *botBrain, now float64) {
 	}
 	if target != nil &&
 		!s.botEnemyStructureDangerLocked(c, target.x, target.y) {
-		cx, cy := c.posAtLocked(float32(now))
-		distance := math.Hypot(float64(target.x-cx), float64(target.y-cy))
-		attackReach := hs.effAttackRangeLocked(now) + hs.av.Radius() + target.mob.Radius()
-		if distance <= attackReach {
-			s.startAttackLocked(c, target)
-		} else {
-			s.botMoveTowardLocked(b, target.x, target.y, now)
+		if s.botMoveToFarmTargetLocked(b, target, now) {
+			return
 		}
-		return
 	}
-	if px, py, ok := s.botFarmCoveragePointLocked(b, now); ok {
+	if px, py, ok := s.botFarmTargetSafePointLocked(b, target, now); ok {
 		cx, cy := c.posAtLocked(float32(now))
 		if math.Hypot(float64(px-cx), float64(py-cy)) > dotaXPShareRadius*0.5 &&
 			!s.botEnemyStructureDangerLocked(c, px, py) {
@@ -3491,15 +3917,17 @@ func (s *Server) botCoverageTickLocked(b *botBrain, now float64) {
 		}
 	}
 	if target := s.botFindLaneTargetLocked(b, now, botLaneEngageRadius, true); target != nil {
-		s.startAttackLocked(c, target)
-		return
+		if s.botMoveToFarmTargetLocked(b, target, now) {
+			return
+		}
 	}
 	// Cover is a lane-presence role, not a stationary waypoint role. Acquire the
 	// current safe wave before falling back to the push point; this closes the gap
 	// that left cover bots in lane_move for most of the match.
 	if target := s.botFarmApproachTargetLocked(b, now); target != nil {
-		s.botMoveTowardLocked(b, target.x, target.y, now)
-		return
+		if s.botMoveToFarmTargetLocked(b, target, now) {
+			return
+		}
 	}
 	if s.botMacroObjectiveTickLocked(b, now) {
 		return
@@ -3507,6 +3935,11 @@ func (s *Server) botCoverageTickLocked(b *botBrain, now float64) {
 	lane := b.macroAssignment.Lane
 	if b.farmLane >= 0 && b.farmLane != lane {
 		lane = b.farmLane
+	}
+	if prestageX, prestageY, prestageOK := s.botFarmPrestagePointLocked(b, lane, now); prestageOK &&
+		!s.botEnemyStructureDangerLocked(c, prestageX, prestageY) {
+		s.botMoveTowardLocked(b, prestageX, prestageY, now)
+		return
 	}
 	px, py := s.botPushPointLocked(b, lane, now)
 	s.botMoveTowardLocked(b, px, py, now)
@@ -3530,19 +3963,15 @@ func (s *Server) botRecoveryFarmTickLocked(b *botBrain, now float64) bool {
 		// wave when it is still above the hard retreat floor. This is limited
 		// to the local hand-off band and never overrides hero/structure danger.
 		if distance <= dotaXPShareRadius*1.75 && !s.botEnemyStructureDangerLocked(b.c, urgentTarget.x, urgentTarget.y) {
-			attackReach := b.c.huntState.effAttackRangeLocked(now) + b.c.huntState.av.Radius() + urgentTarget.mob.Radius()
-			if distance <= attackReach {
-				s.startAttackLocked(b.c, urgentTarget)
-			} else {
-				s.botMoveTowardLocked(b, urgentTarget.x, urgentTarget.y, now)
+			if s.botMoveToFarmTargetLocked(b, urgentTarget, now) {
+				return true
 			}
-			return true
 		}
 	}
 	if s.botIncomingPressureLocked(b, now) {
 		return false
 	}
-	px, py, ok := s.botFarmCoveragePointLocked(b, now)
+	px, py, ok := s.botFarmSafeAnchorLocked(b, now)
 	if !ok || s.botEnemyStructureDangerLocked(b.c, px, py) {
 		return false
 	}
@@ -3555,19 +3984,14 @@ func (s *Server) botRecoveryFarmTickLocked(b *botBrain, now float64) bool {
 		return false
 	}
 	if target := s.botUrgentFarmCoverageTargetLocked(b, now); target != nil {
-		attackReach := b.c.huntState.effAttackRangeLocked(now) + b.c.huntState.av.Radius() + target.mob.Radius()
-		cx, cy := b.c.posAtLocked(float32(now))
-		distanceToTarget := math.Hypot(float64(target.x-cx), float64(target.y-cy))
-		if distanceToTarget <= attackReach {
-			s.startAttackLocked(b.c, target)
-		} else {
-			s.botMoveTowardLocked(b, target.x, target.y, now)
+		if s.botMoveToFarmTargetLocked(b, target, now) {
+			return true
 		}
-		return true
 	}
 	if target := s.botFindLaneTargetLocked(b, now, botLaneEngageRadius, false); target != nil {
-		s.startAttackLocked(b.c, target)
-		return true
+		if s.botMoveToFarmTargetLocked(b, target, now) {
+			return true
+		}
 	}
 	if distance > dotaXPShareRadius*0.5 {
 		s.botMoveTowardLocked(b, px, py, now)
