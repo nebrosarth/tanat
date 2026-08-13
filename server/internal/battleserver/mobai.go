@@ -3,7 +3,7 @@ package battleserver
 import (
 	"log"
 	"math"
-	"math/rand"
+	"sort"
 	"time"
 
 	"tanatserver/internal/amf"
@@ -1113,7 +1113,7 @@ func (s *Server) randomMobInRangeLocked(c *conn, x, y float32, r float64, exclud
 	if len(cands) == 0 {
 		return nil
 	}
-	return cands[rand.Intn(len(cands))]
+	return cands[s.randIntn(len(cands))]
 }
 
 // tickBouncesLocked advances every in-flight chaining skull: when it reaches its
@@ -1483,7 +1483,7 @@ func (s *Server) tickSummonsLocked(c *conn, now float64) {
 			}
 			var tgt *mobState
 			if len(candidates) > 0 {
-				tgt = candidates[rand.Intn(len(candidates))]
+				tgt = candidates[s.randIntn(len(candidates))]
 			}
 			if tgt != nil && now >= sm.nextSwing {
 				sm.nextSwing = now + 1.0/summonAttackSpeedMulLocked(sm, now)
@@ -2327,7 +2327,7 @@ func (s *Server) tickMobsLocked(c *conn, now float64) {
 			// the next swing so a continuous attacker re-triggers cleanly.
 			animEnd := now + math.Min(0.9/atkSpeed, 1.2)
 			m.swingDoneAt = animEnd
-			dmg := m.rollDamage()
+			dmg := m.rollDamage(s)
 			m.hitDmg = dmg
 			m.hitTarget = target
 			if m.mob.AttackRange > 0 {
@@ -2405,7 +2405,13 @@ func (hs *huntState) bodySeparation(members map[int32]*conn, now float64, selfID
 		sx += dx / d * w
 		sy += dy / d * w
 	}
-	for _, o := range hs.mobs {
+	mobIDs := make([]int32, 0, len(hs.mobs))
+	for id := range hs.mobs {
+		mobIDs = append(mobIDs, id)
+	}
+	sort.Slice(mobIDs, func(i, j int) bool { return mobIDs[i] < mobIDs[j] })
+	for _, id := range mobIDs {
+		o := hs.mobs[id]
 		// Only an ACTIVE mob can be near enough to matter with a current position: an
 		// inactive one is >34m away (past mobHideRadius) and its coordinates are stale
 		// anyway, so skipping it is free and keeps this O(active^2) rather than
@@ -2419,14 +2425,26 @@ func (hs *huntState) bodySeparation(members map[int32]*conn, now float64, selfID
 		}
 		push(o.id, o.x, o.y, o.mob.Radius())
 	}
-	for _, mem := range members {
+	memberIDs := make([]int32, 0, len(members))
+	for id := range members {
+		memberIDs = append(memberIDs, id)
+	}
+	sort.Slice(memberIDs, func(i, j int) bool { return memberIDs[i] < memberIDs[j] })
+	for _, id := range memberIDs {
+		mem := members[id]
 		mhs := mem.huntState
 		if mhs == nil {
 			continue
 		}
 		// Liveness matches tickSummonsLocked's own test, not just the lazily-set flag:
 		// an expired summon still sits in the map until its tick removes it.
-		for _, sm := range mhs.summons {
+		summonIDs := make([]int32, 0, len(mhs.summons))
+		for summonID := range mhs.summons {
+			summonIDs = append(summonIDs, summonID)
+		}
+		sort.Slice(summonIDs, func(i, j int) bool { return summonIDs[i] < summonIDs[j] })
+		for _, summonID := range summonIDs {
+			sm := mhs.summons[summonID]
 			if !sm.alive(now) {
 				continue
 			}
@@ -3038,7 +3056,7 @@ func (s *Server) hitPlayerFromLocked(c *conn, damagerID int32, dmg float64, now 
 		return
 	}
 	// Dodge?
-	if rand.Float64() < hs.st.modSum(now, "dodge_pct") {
+	if s.randFloat64() < hs.st.modSum(now, "dodge_pct") {
 		s.broadcastAvatarObjLocked(c, battleproto.CmdReceiveHit, amf.NewArray().
 			Set("object", c.objID).
 			Set("damager", damagerID).

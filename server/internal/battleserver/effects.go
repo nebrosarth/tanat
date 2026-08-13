@@ -3,7 +3,6 @@ package battleserver
 import (
 	"log"
 	"math"
-	"math/rand"
 	"sort"
 	"strings"
 
@@ -1658,7 +1657,7 @@ func (s *Server) opTargetsLocked(c *conn, ctx opCtx, op gamedata.Op) []*mobState
 	// (fewer live enemies than MaxTargets) would decay in undefined map-iteration order.
 	if op.MaxTargets > 0 {
 		if op.Randomize {
-			rand.Shuffle(len(targets), func(i, j int) { targets[i], targets[j] = targets[j], targets[i] })
+			s.randShuffle(len(targets), func(i, j int) { targets[i], targets[j] = targets[j], targets[i] })
 		} else {
 			cx, cy := s.centerLocked(c, ctx)
 			sort.Slice(targets, func(i, j int) bool {
@@ -1740,7 +1739,7 @@ func (s *Server) applyOpsLocked(c *conn, ops []gamedata.Op, ctx opCtx, now float
 		// unconditional when nested in an active cast), so it is exempt here. The roll is
 		// server-side and its result is broadcast, so every client sees the same outcome.
 		if op.Kind != gamedata.OpProc {
-			if ch := op.Chance.At(ctx.level); ch > 0 && ch < 1 && rand.Float64() >= ch {
+			if ch := op.Chance.At(ctx.level); ch > 0 && ch < 1 && s.randFloat64() >= ch {
 				continue
 			}
 		}

@@ -11,9 +11,12 @@ func TestParseBotAIVersion(t *testing.T) {
 		{name: "empty defaults to latest", raw: "", want: botAIVersionDefault},
 		{name: "plain number", raw: "10", want: 10},
 		{name: "AI label", raw: "AI-20", want: 20},
+		{name: "scripted teacher", raw: "AI-30", want: 30},
+		{name: "neural profile", raw: "AI-40", want: 40},
 		{name: "lowercase label", raw: "ai18", want: 18},
 		{name: "invalid defaults to latest", raw: "experimental", want: botAIVersionDefault},
 		{name: "unsupported defaults to latest", raw: "9", want: botAIVersionDefault},
+		{name: "unassigned version", raw: "AI-21", want: botAIVersionDefault},
 		{name: "legacy profile", raw: "AI-0", want: 0},
 	}
 	for _, tt := range tests {
@@ -76,6 +79,13 @@ func TestBotAIProfilesAreCumulative(t *testing.T) {
 	}
 	if !botAIProfileForVersion(20).UsesTeamOrchestrator() {
 		t.Fatal("AI-20 unexpectedly disabled the team orchestrator")
+	}
+	if botAIProfileForVersion(40).UsesTeamOrchestrator() {
+		t.Fatal("AI-40 unexpectedly enabled scripted team orchestrator")
+	}
+	if profile := botAIProfileForVersion(30); profile.Version() != 30 || !profile.UsesTeamOrchestrator() ||
+		!profile.UsesFarmSafeWave() || !profile.UsesFarmDebt() {
+		t.Fatalf("AI-30 did not inherit the complete scripted policy: %+v", profile)
 	}
 	legacy := botAIProfileForVersion(10)
 	modern := botAIProfileForVersion(20)

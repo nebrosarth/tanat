@@ -11,11 +11,12 @@ package battleserver
 
 import (
 	"fmt"
+	"io"
 	"log"
-	"math/rand"
 	"net"
 	"os"
 	"strconv"
+	"time"
 
 	"tanatserver/internal/battleproto"
 	"tanatserver/internal/gamedata"
@@ -185,7 +186,7 @@ func (s *Server) balancedDotaSideLocked(inst *huntInstance) gamedata.DotaSide {
 		return gamedata.DotaSideHuman
 	case elfN < humanN:
 		return gamedata.DotaSideElf
-	case rand.Intn(2) == 0:
+	case s.randIntn(2) == 0:
 		return gamedata.DotaSideHuman
 	default:
 		return gamedata.DotaSideElf
@@ -202,16 +203,34 @@ func botName(slot int) string { return fmt.Sprintf("Bot_%d", slot+1) }
 // upgradeSkillLocked, buyItemLocked...) behaves identically for a bot and a live player.
 // Caller holds inst.mu.
 func (s *Server) newBotConnLocked(inst *huntInstance, slot int, side gamedata.DotaSide, av gamedata.Avatar) *conn {
+	return s.newBotConnWithModeLocked(inst, slot, side, av, false)
+}
+
+// newHeadlessBotConnLocked builds the same authoritative participant without a
+// fake net.Pipe. Rendering packets are irrelevant to AssaultEnv observations;
+// skipping their AMF encoding avoids hundreds of MiB/s of short-lived garbage.
+func (s *Server) newHeadlessBotConnLocked(inst *huntInstance, slot int, side gamedata.DotaSide, av gamedata.Avatar) *conn {
+	return s.newBotConnWithModeLocked(inst, slot, side, av, true)
+}
+
+func (s *Server) newBotConnWithModeLocked(inst *huntInstance, slot int, side gamedata.DotaSide, av gamedata.Avatar, headless bool) *conn {
 	id := botIDBase + int32(slot)
-	srv, cli := net.Pipe()
-	r := battleproto.NewReader(cli)
-	go func() {
-		for {
-			if _, err := r.Read(); err != nil {
-				return
+	var wire net.Conn
+	if headless {
+		wire = headlessBotConn{}
+	} else {
+		srv, cli := net.Pipe()
+		wire = srv
+		r := battleproto.NewReader(cli)
+		go func() {
+			defer cli.Close()
+			for {
+				if _, err := r.Read(); err != nil {
+					return
+				}
 			}
-		}
-	}()
+		}()
+	}
 	s.Store.CreateBotHero(id, botName(slot))
 	// Hero.Money is stored in bronze units. The requested bot allowance is 100
 	// gold, not 100 bronze (the latter is only one silver and cannot even buy
@@ -236,7 +255,7 @@ func (s *Server) newBotConnLocked(inst *huntInstance, slot int, side gamedata.Do
 	px, py := float32(sx)+off, float32(sy)-off
 
 	kit := gamedata.SkillsFor(av)
-	c := &conn{Conn: srv}
+	c := &conn{Conn: wire, headless: headless}
 	c.objID, c.selfPlayerID = id, id
 	c.x, c.y, c.snapT = px, py, s.battleTime()
 	c.nav = inst.nav
@@ -274,3 +293,21 @@ func (s *Server) newBotConnLocked(inst *huntInstance, slot int, side gamedata.Do
 		id, av.Prefab, botName(slot), inst.id, team, px, py)
 	return c
 }
+
+type headlessBotAddr string
+
+func (a headlessBotAddr) Network() string { return "headless" }
+func (a headlessBotAddr) String() string  { return string(a) }
+
+// headlessBotConn satisfies legacy combat code that logs RemoteAddr or closes
+// the participant, while c.send short-circuits before Write is reached.
+type headlessBotConn struct{}
+
+func (headlessBotConn) Read([]byte) (int, error)         { return 0, io.EOF }
+func (headlessBotConn) Write(p []byte) (int, error)      { return len(p), nil }
+func (headlessBotConn) Close() error                     { return nil }
+func (headlessBotConn) LocalAddr() net.Addr              { return headlessBotAddr("local") }
+func (headlessBotConn) RemoteAddr() net.Addr             { return headlessBotAddr("AI-40") }
+func (headlessBotConn) SetDeadline(time.Time) error      { return nil }
+func (headlessBotConn) SetReadDeadline(time.Time) error  { return nil }
+func (headlessBotConn) SetWriteDeadline(time.Time) error { return nil }

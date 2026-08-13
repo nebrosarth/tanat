@@ -161,6 +161,11 @@ type botBrain struct {
 	// farm opportunity is oldest without using match-time phases.
 	farmXPEvents  int
 	farmLastXPTAt float64
+
+	// AI-40 keeps observation-slot identity and policy cadence per hero. The
+	// recurrent tensors themselves live in the isolated ONNX sidecar.
+	ai40EntityIDs [AssaultMaxEntities]int32
+	ai40NextAt    float64
 }
 
 // hpSample is one botBrain.hpHistory entry.
@@ -435,6 +440,10 @@ func (s *Server) botTickLocked(b *botBrain, now float64) {
 	if hs == nil || hs.closed || c.inst == nil || c.inst.dota == nil {
 		return
 	}
+	if botAIVersionForBrain(b) == 40 {
+		s.botAI40TickLocked(b, now)
+		return
+	}
 	if b.pendingTeleport != nil {
 		if botAnyMobilizationReason(b.macroAssignment.Reason) && b.pendingTeleport.targetKind != "recovery_structure" {
 			// A pending ordinary lane teleport was selected before the team entered
@@ -505,7 +514,12 @@ func (s *Server) botTickLocked(b *botBrain, now float64) {
 			cx, cy := c.posAtLocked(float32(now))
 			distance := math.Hypot(float64(target.x-cx), float64(target.y-cy))
 			attackReach := hs.effAttackRangeLocked(now) + hs.av.Radius() + target.mob.Radius()
-			if distance > dotaXPShareRadius || distance > attackReach {
+			ai30Unsafe := false
+			if botUsesAI30(b) {
+				_, _, ai30Safe := s.botAI30FarmAttackPointLocked(b, target, now)
+				ai30Unsafe = !ai30Safe
+			}
+			if ai30Unsafe || distance > dotaXPShareRadius || distance > attackReach {
 				s.stopAttackLocked(c, false)
 			}
 		}
@@ -579,6 +593,24 @@ func (s *Server) botTickLocked(b *botBrain, now float64) {
 	// optional combat for a bot that actually carries a farm lane.
 	farmCoverageRequired := botAIProfileForBrain(b).UsesTeamOrchestrator() &&
 		s.botTeamFarmCoverageRequiredLocked(c.inst, c.playerTeam(), now)
+	// Farm coverage keeps AI-30 from chasing optional fights across the map, but
+	// it must not make a bot stand idle while a visible enemy avatar is already
+	// in its own attack range.  This is a hold-ground response only: the normal
+	// combat policy still owns target selection and every chase, while the usual
+	// structure and HP gates prevent a tower dive.
+	if botUsesAI30(b) && botHPFrac(hs, now) >= botAI30FarmMinHP {
+		if enemy := s.botAI30PreferredTargetLocked(b, botLivingEnemyHeroes(c, now), now); enemy != nil {
+			cx, cy := c.posAtLocked(float32(now))
+			ex, ey := enemy.posAtLocked(float32(now))
+			reach := hs.effAttackRangeLocked(now) + hs.av.Radius() + enemy.huntState.av.Radius()
+			if math.Hypot(float64(ex-cx), float64(ey-cy)) <= reach &&
+				!s.botEnemyStructureDangerLocked(c, ex, ey) {
+				b.engageTarget = enemy.objID
+				s.startPvpAttackLocked(c, enemy)
+				return
+			}
+		}
+	}
 	if (!farmCoverageRequired || !b.macroAssignment.FarmLaneSet) && s.botCombatTickLocked(b, now) {
 		return // an enemy hero is being fought/chased/kited -- that IS this tick's order
 	}

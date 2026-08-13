@@ -734,7 +734,7 @@ func (s *Server) botCombatTickLocked(b *botBrain, now float64) bool {
 			// into the wave just because it was selected as urgent.
 			if !s.botMoveToFarmTargetLocked(b, farmTarget, now) &&
 				distance <= attackReach && distance <= dotaXPShareRadius &&
-				s.botFarmMayAttackCreepLocked(b, now) {
+				s.botFarmMayAttackTargetLocked(b, farmTarget, now) {
 				s.startAttackLocked(c, farmTarget)
 			}
 			return true
@@ -865,9 +865,26 @@ func (s *Server) botCombatTickLocked(b *botBrain, now float64) bool {
 		return true
 	}
 	if len(enemies) == 0 {
+		wasEngaged := b.engageTarget != 0 || hs.pvpTarget != 0
 		b.engageTarget = 0
 		s.stopPvpAttackLocked(c, false)
+		if botUsesAI30(b) && wasEngaged {
+			x, y := s.botDisengagePointLocked(b, now)
+			s.botMoveTowardLocked(b, x, y, now)
+			return true
+		}
 		return false
+	}
+	if botUsesAI30(b) && hs.pvpTarget != 0 {
+		if chased := c.pvpMember(hs.pvpTarget); chased != nil && chased.huntState != nil &&
+			chased.huntState.pvpTarget != c.objID && chased.huntState.attackTarget != c.objID &&
+			!s.botAI30ChaseSafeLocked(b, chased, now) {
+			b.engageTarget = 0
+			s.stopPvpAttackLocked(c, false)
+			x, y := s.botDisengagePointLocked(b, now)
+			s.botMoveTowardLocked(b, x, y, now)
+			return true
+		}
 	}
 	// A shared focus is a coordination order, not just a tie-breaker between
 	// heroes that happen to be inside one bot's attack radius. When a teammate is
@@ -1234,11 +1251,15 @@ func (s *Server) botPickEngageTargetLocked(b *botBrain, enemies []*conn, now flo
 	c, hs := b.c, b.c.huntState
 	cx, cy := c.posAtLocked(float32(now))
 
-	var nearest *conn
+	nearest := s.botAI30PreferredTargetLocked(b, enemies, now)
 	nearestD := math.Inf(1)
+	if nearest != nil {
+		ex, ey := nearest.posAtLocked(float32(now))
+		nearestD = math.Hypot(float64(ex-cx), float64(ey-cy))
+	}
 	for _, e := range enemies {
 		ex, ey := e.posAtLocked(float32(now))
-		if d := math.Hypot(float64(ex-cx), float64(ey-cy)); d <= botEngageRadius &&
+		if d := math.Hypot(float64(ex-cx), float64(ey-cy)); nearest == nil && d <= botEngageRadius &&
 			(d < nearestD || (d == nearestD && (nearest == nil || e.objID < nearest.objID))) {
 			nearestD, nearest = d, e
 		}
@@ -1292,7 +1313,14 @@ func (s *Server) botPickEngageTargetLocked(b *botBrain, enemies []*conn, now flo
 		}
 		levelMul := 1 + math.Min(float64(mem.huntState.level), 19)*0.06
 		killMul := 1 + math.Min(float64(mem.huntState.frags), 20)*0.015
-		return hp * levelMul * killMul
+		power := hp * levelMul * killMul
+		// Cooldowns and mana of an enemy are not visible through the ordinary
+		// client contract. AI-30 may value its own ready kit, but must not inspect
+		// hidden opponent readiness through authoritative server state.
+		if botUsesAI30(b) && mem == c {
+			power += s.botAI30ReadyPowerLocked(mem, now)
+		}
+		return power
 	}
 	allyPower, enemyPower := heroPower(c), heroPower(nearest)
 	visionSources := dotaTeamVisionSourcesLocked(c.inst, c.playerTeam(), now)

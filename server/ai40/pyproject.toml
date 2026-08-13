@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=70"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "tanat-ai40"
+version = "0.1.0"
+description = "AI-40 rollout client and PPO learner for Tanat Assault"
+requires-python = ">=3.12,<3.14"
+dependencies = [
+  "numpy>=2.0,<3",
+  "torch>=2.8",
+]
+
+[project.optional-dependencies]
+onnx = ["onnx>=1.18", "onnxruntime>=1.22", "onnxscript>=0.5"]
+
+[project.scripts]
+tanat-ai40-smoke = "tanat_ai40.train:main"
+tanat-ai40-train = "tanat_ai40.train:main"
+tanat-ai40-train-matches = "tanat_ai40.train_matches:main"
+tanat-ai40-train-async = "tanat_ai40.train_async:main"
+tanat-ai40-eval = "tanat_ai40.evaluate:main"
+tanat-ai40-eval-ai30 = "tanat_ai40.evaluate_ai30:main"
+tanat-ai40-campaign = "tanat_ai40.train_campaign:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]

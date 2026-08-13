@@ -310,6 +310,26 @@ type telemetryMatchEnd struct {
 	Final    []telemetryFinalStats `json:"final"`
 }
 
+type telemetryAI40Action struct {
+	telemetryEvent
+	BotID     int32   `json:"bot_id"`
+	Team      int32   `json:"team"`
+	ModelID   string  `json:"model_id"`
+	Kind      uint8   `json:"kind"`
+	Target    uint16  `json:"target"`
+	Direction uint8   `json:"direction"`
+	Distance  uint8   `json:"distance"`
+	LatencyMS float64 `json:"latency_ms"`
+	Accepted  bool    `json:"accepted"`
+}
+
+type telemetryAI40Fallback struct {
+	telemetryEvent
+	Team    int32  `json:"team"`
+	ModelID string `json:"model_id,omitempty"`
+	Reason  string `json:"reason"`
+}
+
 // telemetryBotTeleport is the lifecycle record for a bot's battle-local
 // teleport channel. FX ids are retained on every transition so a JSONL reader
 // can correlate preparation/target visuals with the authoritative outcome.

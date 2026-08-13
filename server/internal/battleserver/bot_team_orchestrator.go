@@ -3657,7 +3657,7 @@ func (s *Server) botBaseDefenseTickLocked(b *botBrain, now float64) {
 	c, hs := b.c, b.c.huntState
 	if hs.attackTarget != 0 {
 		if target := hs.mobs[hs.attackTarget]; target != nil && !target.structure &&
-			target.enemyOf(c.playerTeam()) && !s.botFarmMayAttackCreepLocked(b, now) {
+			target.enemyOf(c.playerTeam()) && !s.botFarmMayAttackTargetLocked(b, target, now) {
 			s.stopAttackLocked(c, false)
 		} else {
 			return
@@ -3704,7 +3704,7 @@ func (s *Server) botBaseDefenseTickLocked(b *botBrain, now float64) {
 				distance := math.Hypot(float64(target.x-cx), float64(target.y-cy))
 				attackReach := hs.effAttackRangeLocked(now) + hs.av.Radius() + target.mob.Radius()
 				if distance <= attackReach && distance <= dotaXPShareRadius &&
-					s.botFarmMayAttackCreepLocked(b, now) {
+					s.botFarmMayAttackTargetLocked(b, target, now) {
 					s.startAttackLocked(c, target)
 				} else if distance <= dotaXPShareRadius*1.25 {
 					// A defender may clear a wave under its own structure, but
@@ -3736,7 +3736,7 @@ func (s *Server) botBaseDefenseTickLocked(b *botBrain, now float64) {
 			distance := math.Hypot(float64(target.x-cx), float64(target.y-cy))
 			attackReach := hs.effAttackRangeLocked(now) + hs.av.Radius() + target.mob.Radius()
 			if distance <= attackReach && distance <= dotaXPShareRadius {
-				if s.botFarmMayAttackCreepLocked(b, now) {
+				if s.botFarmMayAttackTargetLocked(b, target, now) {
 					s.startAttackLocked(c, target)
 				} else {
 					s.botMoveToFarmTargetLocked(b, target, now)
@@ -3841,7 +3841,7 @@ func (s *Server) botCoverageTickLocked(b *botBrain, now float64) {
 	c, hs := b.c, b.c.huntState
 	if hs.attackTarget != 0 {
 		if target := hs.mobs[hs.attackTarget]; target != nil && !target.structure &&
-			target.enemyOf(c.playerTeam()) && !s.botFarmMayAttackCreepLocked(b, now) {
+			target.enemyOf(c.playerTeam()) && !s.botFarmMayAttackTargetLocked(b, target, now) {
 			s.stopAttackLocked(c, false)
 		} else {
 			return

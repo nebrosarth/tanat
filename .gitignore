@@ -8,4 +8,10 @@
 /server/*.db-wal
 /server/accounts.json.imported
 /server/telemetry/
+/server/ai40/.venv/
+/server/ai40/.onnxverify/
+/server/ai40/checkpoints/
+/server/ai40/datasets/
+__pycache__/
+*.py[cod]
 /_decompiled/

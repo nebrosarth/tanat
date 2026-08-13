@@ -3,7 +3,6 @@ package battleserver
 import (
 	"log"
 	"math"
-	"math/rand"
 	"time"
 
 	"tanatserver/internal/amf"
@@ -209,7 +208,7 @@ func (s *Server) stopPvpAttackLocked(c *conn, silent bool) {
 // close twin of armAttackTimer; the differences are that the target is resolved from
 // inst.members (not hs.mobs) and its liveness is deadUntil, not a dead flag.
 func (s *Server) armPvpAttackTimer(c *conn, seq int, targetID int32, delay, interval time.Duration) {
-	dotaSimulationAfter(delay, func() {
+	s.simulationAfter(delay, func() {
 		c.lock()
 		defer c.unlock()
 		hs := c.huntState
@@ -262,7 +261,7 @@ func (s *Server) armPvpAttackTimer(c *conn, seq int, targetID int32, delay, inte
 // schedulePvpProjectileLocked flies a ranged avatar's basic-attack bolt at an enemy
 // avatar, landing the hit on arrival. Mirrors scheduleProjectileLocked's avatar path.
 func (s *Server) schedulePvpProjectileLocked(c *conn, seq int, targetID int32, release time.Duration) {
-	dotaSimulationAfter(release, func() {
+	s.simulationAfter(release, func() {
 		c.lock()
 		defer c.unlock()
 		hs := c.huntState
@@ -295,7 +294,7 @@ func (s *Server) schedulePvpHitLocked(c *conn, seq int, targetID int32, windup t
 // reusing the exact avatar damage math the PvE path uses (dmg roll, dmg_pct, power, crit,
 // lifesteal). committed=true skips the seq check for an in-flight projectile.
 func (s *Server) schedulePvpHitAfterLocked(c *conn, seq int, targetID int32, windup time.Duration, committed bool) {
-	dotaSimulationAfter(windup, func() {
+	s.simulationAfter(windup, func() {
 		c.lock()
 		defer c.unlock()
 		hs := c.huntState
@@ -312,9 +311,9 @@ func (s *Server) schedulePvpHitAfterLocked(c *conn, seq int, targetID int32, win
 		now := s.battleTime()
 		av := hs.av
 		flat := hs.st.modSum(float64(now), "dmg_flat") // +attack from avatar tree items
-		dmg := (float64(av.DmgMin) + flat + rand.Float64()*float64(av.DmgMax-av.DmgMin)) *
+		dmg := (float64(av.DmgMin) + flat + s.randFloat64()*float64(av.DmgMax-av.DmgMin)) *
 			hs.st.modMul(float64(now), "dmg_pct") * hs.powerMul()
-		if crit := hs.st.modSum(float64(now), "crit_pct"); crit > 0 && rand.Float64() < crit {
+		if crit := hs.st.modSum(float64(now), "crit_pct"); crit > 0 && s.randFloat64() < crit {
 			dmg *= 1.5 + hs.st.modSum(float64(now), "crit_dmg_pct")
 		}
 		s.hitPlayerFromLocked(victim, c.objID, dmg, float64(now), nil, c)

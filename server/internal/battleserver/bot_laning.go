@@ -466,7 +466,7 @@ func (s *Server) botLaneTickLocked(b *botBrain, now float64) {
 	}
 	if hs.attackTarget != 0 {
 		if target := hs.mobs[hs.attackTarget]; target != nil && !target.structure &&
-			target.enemyOf(c.playerTeam()) && !s.botFarmMayAttackCreepLocked(b, now) {
+			target.enemyOf(c.playerTeam()) && !s.botFarmMayAttackTargetLocked(b, target, now) {
 			s.stopAttackLocked(c, false)
 		} else {
 			return // hero/structure fight, or an isolated optional last hit
@@ -523,11 +523,11 @@ func (s *Server) botLaneTickLocked(b *botBrain, now float64) {
 		distance := math.Hypot(float64(target.x-cx), float64(target.y-cy))
 		if distance <= hs.effAttackRangeLocked(now)+hs.av.Radius()+target.mob.Radius() &&
 			distance <= dotaXPShareRadius &&
-			s.botFarmMayAttackCreepLocked(b, now) {
+			s.botFarmMayAttackTargetLocked(b, target, now) {
 			s.startAttackLocked(c, target)
 			return
 		}
-		if distance <= dotaXPShareRadius && !s.botFarmMayAttackCreepLocked(b, now) {
+		if distance <= dotaXPShareRadius && !s.botFarmMayAttackTargetLocked(b, target, now) {
 			// The owner is already under pressure; preserve the XP body instead
 			// of holding an attack order that would chase the wave.
 			if s.botMoveToFarmCoverageLocked(b, now) {

@@ -20,6 +20,7 @@ package battleserver
 import (
 	"log"
 	"math"
+	"sort"
 
 	"tanatserver/internal/amf"
 	"tanatserver/internal/battleproto"
@@ -126,8 +127,11 @@ type dotaState struct {
 	teamPlans            map[int32]botTeamPlan
 	teamPlanTelemetryKey map[int32]string
 	// botAIVersionByTeam is sampled at match creation. Team 1 is Собор and
-	// team 2 is Изгнанники; a missing entry means the default AI-20 profile.
+	// team 2 is Изгнанники; a missing entry means the default AI-30 profile.
 	botAIVersionByTeam map[int32]int
+	ai40Runtime        ai40PolicyRuntime
+	ai40StartAttempted bool
+	ai40FallbackByTeam map[int32]string
 
 	// telemetry is this match's optional recording session (see telemetry.go),
 	// non-nil only when TANAT_BOT_TELEMETRY is set. nil-safe on every method, so
@@ -224,7 +228,16 @@ func (s *Server) dotaSyncAltarImmunityLocked(rep *conn, now float64) {
 	if d == nil {
 		return
 	}
-	for _, m := range rep.inst.mobs {
+	mobIDs := make([]int32, 0, len(rep.inst.mobs))
+	for id := range rep.inst.mobs {
+		mobIDs = append(mobIDs, id)
+	}
+	sort.Slice(mobIDs, func(i, j int) bool { return mobIDs[i] < mobIDs[j] })
+	for _, id := range mobIDs {
+		m := rep.inst.mobs[id]
+		if m == nil {
+			continue
+		}
 		if !m.altar || m.dead {
 			continue
 		}
@@ -276,6 +289,7 @@ func newDotaInstance(s *Server, id, mapID int32) *huntInstance {
 			dotaTeamHuman: botAIVersionForTeam(dotaTeamHuman),
 			dotaTeamElf:   botAIVersionForTeam(dotaTeamElf),
 		},
+		ai40FallbackByTeam: map[int32]string{},
 	}
 	if dm.SiegeCreepWaves {
 		d.nextSiegeWaveAt = d.startedAt + gamedata.SiegeCreepFirstWave
@@ -559,7 +573,16 @@ func (s *Server) dotaTickLocked(rep *conn, now float64) {
 	// vision.go -- this never touches m.active, only the object list.
 	s.dotaVisionPassLocked(rep.inst, now)
 	// Drive every live combatant: creeps march + fight, cannons/towers shoot.
-	for _, m := range rep.inst.mobs {
+	mobIDs := make([]int32, 0, len(rep.inst.mobs))
+	for id := range rep.inst.mobs {
+		mobIDs = append(mobIDs, id)
+	}
+	sort.Slice(mobIDs, func(i, j int) bool { return mobIDs[i] < mobIDs[j] })
+	for _, id := range mobIDs {
+		m := rep.inst.mobs[id]
+		if m == nil {
+			continue
+		}
 		if m.dead {
 			continue
 		}
@@ -800,6 +823,11 @@ func (s *Server) dotaEndLocked(rep *conn, winner int32, now float64) {
 	}
 	d.ended = true
 	d.winner = winner
+	if d.ai40Runtime != nil {
+		runtime := d.ai40Runtime
+		d.ai40Runtime = nil
+		go runtime.Close()
+	}
 	s.dotaFreezeLocked(rep.inst, now)
 	log.Printf("battle: «Штурм» room=%d ended, winner team=%d", rep.inst.id, winner)
 	for _, mem := range rep.inst.members {
@@ -1253,7 +1281,8 @@ func (s *Server) dotaAcquireTargetLocked(rep *conn, m *mobState, radius, now flo
 		// A siege creep does not abandon an exposed structure for a hero that
 		// happens to be a little closer. Structures are its strategic target;
 		// ordinary units retain nearest-target behavior.
-		if priority < bestPriority || (priority == bestPriority && d < bestD) {
+		if priority < bestPriority || (priority == bestPriority &&
+			(d < bestD || (d == bestD && (best == nil || t.id() < best.id())))) {
 			bestPriority, bestD, best = priority, d, t
 		}
 	}
@@ -1361,7 +1390,7 @@ func (s *Server) dotaAttackLocked(rep *conn, m *mobState, target *dotaTarget, no
 	// down the lane mid-strike forever. Worse, InstanceData.DoAction REJECTS an action id
 	// the object is already doing, so the next swing would never animate at all.
 	m.swingDoneAt = now + math.Min(0.9/speed, 1.2)
-	m.hitDmg = m.rollDamage()
+	m.hitDmg = m.rollDamage(s)
 	m.hitTarget = target.id()
 	if m.hasProj {
 		// Ranged with a real shell: it must leave the muzzle at the END of the wind-up,
@@ -1454,7 +1483,7 @@ func teamForVictorOver(loserTeam int32) int32 {
 // dotaScheduleCorpseLocked removes a dead structure/creep from every client and the
 // mob set after the corpse-display window.
 func (s *Server) dotaScheduleCorpseLocked(inst *huntInstance, mobID int32) {
-	dotaSimulationAfter(corpseDeleteDelay, func() {
+	s.simulationAfter(corpseDeleteDelay, func() {
 		inst.mu.Lock()
 		defer inst.mu.Unlock()
 		if inst.closed {

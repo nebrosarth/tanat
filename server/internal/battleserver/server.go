@@ -20,6 +20,7 @@ import (
 	"io"
 	"log"
 	"math"
+	"math/rand"
 	"net"
 	"os"
 	"strings"
@@ -37,6 +38,9 @@ type Server struct {
 	Store *session.Store
 
 	start        time.Time
+	clock        battleClock
+	rng          *rand.Rand
+	rngMu        sync.Mutex
 	mu           sync.Mutex
 	nextBattleID int32
 
@@ -60,7 +64,8 @@ type Server struct {
 }
 
 func New(store *session.Store) *Server {
-	return &Server{Store: store, start: time.Now(), nextBattleID: 1,
+	now := time.Now()
+	return &Server{Store: store, start: now, clock: &liveBattleClock{start: now}, nextBattleID: 1,
 		insts:  map[int32]*huntInstance{},
 		linsts: map[int32]*lobbyInstance{}}
 }
@@ -91,6 +96,10 @@ func (s *Server) Serve(ln net.Listener) error {
 // (PLAYER_REG etc.) can share the socket with handshake replies safely.
 type conn struct {
 	net.Conn
+	// headless suppresses client-only packet encoding for synchronous training
+	// participants. Their authoritative state, trackers and combat paths remain
+	// identical, but no Battle client exists to consume rendering packets.
+	headless     bool
 	r            *battleproto.Reader
 	wm           sync.Mutex
 	selfPlayerID int32
@@ -149,7 +158,7 @@ type conn struct {
 	x, y    float32
 	vx, vy  float32
 	snapT   float32
-	arrival *time.Timer
+	arrival simulationTimer
 
 	// destX/destY is the whole move's final target; hasDest marks an in-flight
 	// move so a live speed change (slow/haste) can re-issue it. moveGen is bumped
@@ -170,6 +179,9 @@ type conn struct {
 }
 
 func (c *conn) send(p battleproto.Packet) error {
+	if c.headless {
+		return nil
+	}
 	c.wm.Lock()
 	defer c.wm.Unlock()
 	return battleproto.Write(c.Conn, p)
@@ -568,7 +580,45 @@ const (
 )
 
 func (s *Server) battleTime() float32 {
+	if _, manual := s.clock.(*manualBattleClock); manual {
+		return float32(s.clock.Now())
+	}
 	return float32(time.Since(s.start).Seconds() * dotaSimulationSpeed())
+}
+
+func (s *Server) simulationAfter(d time.Duration, fn func()) simulationTimer {
+	if s.clock != nil {
+		return s.clock.After(d, fn)
+	}
+	return time.AfterFunc(dotaSimulationWallDuration(d), fn)
+}
+
+func (s *Server) randFloat64() float64 {
+	s.rngMu.Lock()
+	defer s.rngMu.Unlock()
+	if s.rng == nil {
+		return rand.Float64()
+	}
+	return s.rng.Float64()
+}
+
+func (s *Server) randIntn(n int) int {
+	s.rngMu.Lock()
+	defer s.rngMu.Unlock()
+	if s.rng == nil {
+		return rand.Intn(n)
+	}
+	return s.rng.Intn(n)
+}
+
+func (s *Server) randShuffle(n int, swap func(i, j int)) {
+	s.rngMu.Lock()
+	defer s.rngMu.Unlock()
+	if s.rng == nil {
+		rand.Shuffle(n, swap)
+		return
+	}
+	s.rng.Shuffle(n, swap)
 }
 
 // speedSync builds a SYNC "data" blob carrying just the SPEED stat for objID
@@ -759,7 +809,7 @@ func (c *conn) startLegLocked(s *Server, now float32) {
 		// AfterFunc; stopArrivalLocked bumps moveGen on every re-issue/stop).
 		gen := c.moveGen
 		eta := time.Duration(float64(dist/speed) * float64(time.Second))
-		c.arrival = dotaSimulationAfter(eta, func() {
+		c.arrival = s.simulationAfter(eta, func() {
 			c.lock()
 			defer c.unlock()
 			if c.moveGen != gen {

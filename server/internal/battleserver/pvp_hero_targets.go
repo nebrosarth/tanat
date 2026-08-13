@@ -270,7 +270,7 @@ func (s *Server) dotaKnockbackHeroLocked(c *conn, mem *conn, dist float64, now f
 	mem.snapT = float32(now)
 	mem.sendPosLocked(s, fromX, fromY, float32(ux*knockbackSpeed), float32(uy*knockbackSpeed), float32(now))
 
-	dotaSimulationAfter(time.Duration(dur*float64(time.Second)), func() {
+	s.simulationAfter(time.Duration(dur*float64(time.Second)), func() {
 		mem.lock()
 		defer mem.unlock()
 		if mem.huntState == nil || mem.huntState.closed || mem.hasDest {

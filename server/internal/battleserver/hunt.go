@@ -4,7 +4,6 @@ import (
 	"fmt"
 	"log"
 	"math"
-	"math/rand"
 	"os"
 	"strconv"
 	"strings"
@@ -899,6 +898,9 @@ type huntState struct {
 	deaths     int32
 	assists    int32
 	lastKiller int32
+	// assaultCreepKills is an in-match training ledger. It has no persistent or
+	// client-visible effect and counts only hero-credited DOTA creep last hits.
+	assaultCreepKills int32
 	// pvpTarget is the enemy avatar's objID this player is auto-attacking in «Арена» (0 =
 	// none). It is the player-vs-player twin of attackTarget, which only ever holds a mob
 	// id; keeping them separate means the mob attack loop and the PvP loop never confuse a
@@ -1183,9 +1185,9 @@ func (m *mobState) dmgRange() (lo, hi float64) {
 	return float64(m.mob.DmgMin), float64(m.mob.DmgMax)
 }
 
-func (m *mobState) rollDamage() float64 {
+func (m *mobState) rollDamage(s *Server) float64 {
 	lo, hi := m.dmgRange()
-	return lo + rand.Float64()*(hi-lo)
+	return lo + s.randFloat64()*(hi-lo)
 }
 
 func (m *mobState) xpReward() float64 {
@@ -2172,7 +2174,7 @@ func (hs *huntState) baseAttackLocked(now float64) float64 {
 }
 
 func (s *Server) armAttackTimer(c *conn, seq int, delay, interval time.Duration) {
-	dotaSimulationAfter(delay, func() {
+	s.simulationAfter(delay, func() {
 		c.lock()
 		defer c.unlock()
 		hs := c.huntState
@@ -2298,7 +2300,7 @@ func (s *Server) scheduleProjectileLocked(c *conn, seq int, targetID int32, rele
 		launch() // inline: caller holds the lock (snap shot, byte-identical to before)
 		return
 	}
-	dotaSimulationAfter(release, func() {
+	s.simulationAfter(release, func() {
 		c.lock()
 		defer c.unlock()
 		launch()
@@ -2315,7 +2317,7 @@ func (s *Server) scheduleProjectileLocked(c *conn, seq int, targetID int32, rele
 // OTHERS only: the owner's self animation is AvatarAI-driven and must not change.
 func (s *Server) scheduleSwingDone(c *conn, seq int, interval time.Duration) {
 	// Fire at 85% of the swing interval: after this swing's ACTION, before the next.
-	dotaSimulationAfter(interval*85/100, func() {
+	s.simulationAfter(interval*85/100, func() {
 		c.lock()
 		defer c.unlock()
 		hs := c.huntState
@@ -2349,7 +2351,7 @@ func (s *Server) scheduleProjectileHitLocked(c *conn, targetID int32, windup tim
 }
 
 func (s *Server) scheduleHitAfterLocked(c *conn, seq int, targetID int32, windup time.Duration, committed, rangeCommitted bool) {
-	dotaSimulationAfter(windup, func() {
+	s.simulationAfter(windup, func() {
 		c.lock()
 		defer c.unlock()
 		hs := c.huntState
@@ -2373,7 +2375,7 @@ func (s *Server) scheduleHitAfterLocked(c *conn, seq int, targetID int32, windup
 		// Hekata's kill-window), which grow the base attack floor exactly like gear does.
 		flat := hs.st.modSum(float64(now), "dmg_flat") + s.killAttackBonusLocked(hs, float64(now))
 		dmgPctMul := hs.st.modMul(float64(now), "dmg_pct")
-		dmg := (float64(av.DmgMin) + flat + rand.Float64()*float64(av.DmgMax-av.DmgMin)) * dmgPctMul * hs.powerMul()
+		dmg := (float64(av.DmgMin) + flat + s.randFloat64()*float64(av.DmgMax-av.DmgMin)) * dmgPctMul * hs.powerMul()
 		// Sigilion's «Мощь берсерка»: while armed, every swing costs recoilFrac × the
 		// portion of this hit attributable to the LIVE dmg_pct bonus ("ранит себя на 50%
 		// от увеличенного урона"). dmg/dmgPctMul backs out the pre-bonus damage.
@@ -2409,7 +2411,7 @@ func (s *Server) scheduleHitAfterLocked(c *conn, seq int, targetID int32, windup
 		// flagged 2 on the RECEIVE_HIT so the client plays its CritStrikeEffect. (Skill
 		// damage does not crit -- only the basic attack.)
 		var hitFlags int32
-		if crit := hs.st.modSum(float64(now), "crit_pct"); crit > 0 && rand.Float64() < crit {
+		if crit := hs.st.modSum(float64(now), "crit_pct"); crit > 0 && s.randFloat64() < crit {
 			dmg *= 1.5 + hs.st.modSum(float64(now), "crit_dmg_pct")
 			hitFlags = 2
 		}
@@ -2586,7 +2588,7 @@ func (s *Server) runProcsLocked(c *conn, ms *mobState, now float64) {
 		if pr.cd.At(level) > 0 && now < pr.readyAt {
 			continue // on its internal cooldown (client button is greyed)
 		}
-		if rand.Float64() >= pr.chance.At(level) {
+		if s.randFloat64() >= pr.chance.At(level) {
 			continue
 		}
 		ctx := opCtx{slot: pr.slot, level: level, target: ms, px: ms.x, py: ms.y, hasPos: true}
@@ -2622,7 +2624,7 @@ func (s *Server) runKillProcsLocked(c *conn, ms *mobState, now float64) {
 		if pr.cd.At(level) > 0 && now < pr.readyAt {
 			continue // on its internal cooldown (client button is greyed)
 		}
-		if rand.Float64() >= pr.chance.At(level) {
+		if s.randFloat64() >= pr.chance.At(level) {
 			continue
 		}
 		ctx := opCtx{slot: pr.slot, level: level, px: ms.x, py: ms.y, hasPos: true}
@@ -2649,7 +2651,7 @@ func (s *Server) runAnyDamageProcsLocked(c *conn, now float64) {
 		if pr.cd.At(level) > 0 && now < pr.readyAt {
 			continue
 		}
-		if rand.Float64() >= pr.chance.At(level) {
+		if s.randFloat64() >= pr.chance.At(level) {
 			continue
 		}
 		s.applyOpsLocked(c, pr.ops, opCtx{slot: pr.slot, level: level}, now)
@@ -2704,7 +2706,7 @@ func (s *Server) runDefenseProcsLocked(c *conn, attacker *mobState, dmg float64,
 		if pr.skillOnly && !wasSkill {
 			continue // Neirofim's «Обращение энергии»: a basic attack doesn't trigger it
 		}
-		if rand.Float64() >= pr.chance.At(level) {
+		if s.randFloat64() >= pr.chance.At(level) {
 			continue
 		}
 		// dmgIn carries the size of the blow that triggered the proc, so an op can heal
@@ -2868,6 +2870,9 @@ func (s *Server) hitMobFlagsLocked(c *conn, ms *mobState, dmg float64, damager i
 	}
 	// Death. Credit goes to the damager's owner.
 	killer := s.creditConnLocked(c, damager)
+	if c.inst != nil && c.inst.dota != nil && !ms.structure && killer != nil && killer.huntState != nil {
+		killer.huntState.assaultCreepKills++
+	}
 	ms.hp = 0
 	ms.dead = true
 	if c.inst != nil && c.inst.dota != nil && !ms.structure {
@@ -3006,7 +3011,7 @@ func (s *Server) hitMobFlagsLocked(c *conn, ms *mobState, dmg float64, damager i
 	if extra := time.Duration((anchorUntil - float64(s.battleTime()) + 0.5) * float64(time.Second)); extra > corpseDelay {
 		corpseDelay = extra
 	}
-	dotaSimulationAfter(corpseDelay, func() {
+	s.simulationAfter(corpseDelay, func() {
 		c.lock()
 		defer c.unlock()
 		hs := c.huntState

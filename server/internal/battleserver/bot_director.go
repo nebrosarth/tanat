@@ -658,6 +658,27 @@ func (s *Server) botFarmMayAttackCreepLocked(b *botBrain, now float64) bool {
 	return botHPFrac(b.c.huntState, now) >= botPredictiveRetreatHPFrac
 }
 
+func (s *Server) botFarmMayAttackTargetLocked(b *botBrain, target *mobState, now float64) bool {
+	if botUsesAI30(b) {
+		// Friendly creep cover is a requirement for walking INTO a wave, not for
+		// firing at a creep that is already safely in reach.  Treating it as an
+		// attack veto made an AI-30 laner become a spectator the instant its own
+		// front creep died: it held its XP position beside hostile creeps but would
+		// neither thin them nor defend itself.  The caller still checks real attack
+		// reach; retain the hero/structure safety gates here so this exception never
+		// turns into an uncovered approach or a tower dive.
+		if b != nil && b.c != nil && b.c.huntState != nil && target != nil && !target.dead &&
+			botHPFrac(b.c.huntState, now) >= botAI30FarmMinHP &&
+			!s.botEnemyStructureDangerLocked(b.c, target.x, target.y) &&
+			botNearbyEnemyHeroPressureLocked(b, now) == 0 {
+			return true
+		}
+		_, _, safe := s.botAI30FarmAttackPointLocked(b, target, now)
+		return safe
+	}
+	return s.botFarmMayAttackCreepLocked(b, now)
+}
+
 // botMoveToFarmTargetLocked keeps every ordinary farm route behind the same
 // safety invariant as botHoldFarmXPLocked. Several macro branches need to
 // approach a live wave; allowing one of them to move directly to the target
@@ -672,9 +693,21 @@ func (s *Server) botMoveToFarmTargetLocked(b *botBrain, target *mobState, now fl
 	attackReach := c.huntState.effAttackRangeLocked(now) + c.huntState.av.Radius() + target.mob.Radius()
 	b.farmTarget = target.id
 	if distance <= attackReach && distance <= dotaXPShareRadius &&
-		s.botFarmMayAttackCreepLocked(b, now) {
+		s.botFarmMayAttackTargetLocked(b, target, now) {
 		b.farmDecision = "wave_clear"
 		s.startAttackLocked(c, target)
+		return true
+	}
+	// AI-30 converts safe allied creep cover into active wave damage. It walks
+	// only to a home-side attack point that still covers proximity XP; without
+	// cover or under pressure it falls through to AI-20's rear anchor.
+	if x, y, ok := s.botAI30FarmAttackPointLocked(b, target, now); ok {
+		b.farmDecision = "active_wave_clear"
+		if math.Hypot(float64(x-cx), float64(y-cy)) > 1.0 {
+			s.botMoveTowardLocked(b, x, y, now)
+		} else {
+			s.startAttackLocked(c, target)
+		}
 		return true
 	}
 	if ax, ay, ok := s.botFarmTargetSafePointLocked(b, target, now); ok &&
@@ -778,7 +811,7 @@ func (s *Server) botHoldFarmXPLocked(b *botBrain, now float64) bool {
 	// into the creep pack and make the following wave lose its only recipient;
 	// the abundant bot economy does not justify that risk. Keep the narrow
 	// attack behavior for isolated/unit tests and ordinary non-coverage play.
-	if nearestDistance <= attackReach && s.botFarmMayAttackCreepLocked(b, now) {
+	if nearestDistance <= attackReach && s.botFarmMayAttackTargetLocked(b, nearest, now) {
 		b.farmDecision = "wave_clear"
 		s.startAttackLocked(c, nearest)
 		return true

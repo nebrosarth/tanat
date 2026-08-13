@@ -7,13 +7,13 @@ import (
 )
 
 // Bot AI versions are cumulative profiles. AI-10 is the original combat,
-// economy, and macro baseline; AI-20 is the current profile. Version-specific
-// policy lives in bot_ai10.go and bot_ai20.go; this file only owns selection
+// economy, and macro baseline; AI-30 is the current scripted profile. Version-specific
+// policy lives in bot_ai10.go, bot_ai20.go, and bot_ai30.go; this file only owns selection
 // and match-scoped lookup.
 const (
 	botAIVersionMin     = 0
-	botAIVersionMax     = 20
-	botAIVersionDefault = botAIVersionMax
+	botAIVersionMax     = 40
+	botAIVersionDefault = 30
 )
 
 type botAIPolicy interface {
@@ -45,7 +45,7 @@ func parseBotAIVersion(raw string) int {
 	upper = strings.TrimPrefix(upper, "AI-")
 	upper = strings.TrimPrefix(upper, "AI")
 	v, err := strconv.Atoi(upper)
-	if err != nil || (v != 0 && (v < 10 || v > botAIVersionMax)) {
+	if err != nil || (v != 0 && (v < 10 || (v > 20 && v != 30 && v != 40))) {
 		return botAIVersionDefault
 	}
 	return v
@@ -67,7 +67,7 @@ func botAIVersionForTeam(team int32) int {
 }
 
 func normalizeBotAIVersion(v int) int {
-	if v != 0 && (v < 10 || v > botAIVersionMax) {
+	if v != 0 && (v < 10 || (v > 20 && v != 30 && v != 40)) {
 		return botAIVersionDefault
 	}
 	return v
@@ -81,8 +81,28 @@ func botAIProfileForVersion(version int) botAIPolicy {
 	if version == 10 {
 		return botAI10Profile{}
 	}
+	if version == 30 {
+		return botAI30Profile{}
+	}
+	if version == 40 {
+		// The neural policy owns actions, not the scripted team orchestrator. Its
+		// fail-closed path rewrites the match profile to AI-20.
+		return botAI40Profile{}
+	}
 	return botAI20Profile{version: version}
 }
+
+type botAI40Profile struct{}
+
+func (botAI40Profile) Version() int               { return 40 }
+func (botAI40Profile) UsesTeamOrchestrator() bool { return false }
+func (botAI40Profile) UsesFarmSafeWave() bool     { return false }
+func (botAI40Profile) UsesFarmLanePlan() bool     { return false }
+func (botAI40Profile) UsesPlanHysteresis() bool   { return false }
+func (botAI40Profile) UsesFarmRescue() bool       { return false }
+func (botAI40Profile) UsesFarmRotation() bool     { return false }
+func (botAI40Profile) UsesFarmStability() bool    { return false }
+func (botAI40Profile) UsesFarmDebt() bool         { return false }
 
 func botAIVersionForBrain(b *botBrain) int {
 	if b == nil || !b.aiVersionSet {

@@ -278,7 +278,15 @@ func (s *Server) runInstanceTicker(inst *huntInstance) {
 		}
 		if len(inst.members) == 0 {
 			inst.closed = true
+			var ai40Runtime ai40PolicyRuntime
+			if inst.dota != nil {
+				ai40Runtime = inst.dota.ai40Runtime
+				inst.dota.ai40Runtime = nil
+			}
 			inst.mu.Unlock()
+			if ai40Runtime != nil {
+				_ = ai40Runtime.Close()
+			}
 			s.mu.Lock()
 			if s.insts[inst.id] == inst {
 				delete(s.insts, inst.id)
@@ -306,7 +314,7 @@ func (s *Server) runInstanceTicker(inst *huntInstance) {
 				// Bot decision-making rides the same shared tick: a bot is an ordinary
 				// member for every OTHER purpose (regen, status expiry, channels...),
 				// this is the one extra step that gives it a "mind".
-				if brain := inst.bots[c.objID]; brain != nil {
+				if brain := inst.bots[c.objID]; brain != nil && botAIVersionForBrain(brain) != 40 {
 					s.botTickLocked(brain, now)
 				}
 				// Telemetry (see telemetry.go): a no-op unless TANAT_BOT_TELEMETRY is
@@ -316,6 +324,9 @@ func (s *Server) runInstanceTicker(inst *huntInstance) {
 					s.telemetrySnapshotLocked(inst.dota.telemetry, c, inst.dota.telemetryMatchTimeLocked(now), now)
 				}
 			}
+		}
+		if inst.dota != nil {
+			s.botAI40BatchTickLocked(inst, now)
 		}
 		// One shared object pass for the whole world, driven through any live member.
 		// «Штурм» (DOTA) swaps the Hunt mob simulation for its lane-pusher pass
