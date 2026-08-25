@@ -3,10 +3,23 @@ from __future__ import annotations
 import ast
 import json
 from pathlib import Path
+import shutil
+import subprocess
 import unittest
 
 
 ROOT = Path(__file__).resolve().parents[1]
+
+
+def _bash_executable():
+    candidates = (
+        Path("C:/Program Files/Git/bin/bash.exe"),
+        Path("C:/Program Files/Git/usr/bin/bash.exe"),
+    )
+    for candidate in candidates:
+        if candidate.is_file():
+            return str(candidate)
+    return shutil.which("bash")
 
 
 class AI42BCV2StaticTests(unittest.TestCase):
@@ -63,6 +76,81 @@ class AI42BCV2StaticTests(unittest.TestCase):
             ROOT / "tests" / "test_ai42_bc_v2.py",
         ):
             ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+
+    def test_bc_preflight_wrappers_harden_control_flag_boundary(self) -> None:
+        for name in ("run-ai42-bc-preflight.ps1", "run-ai42-bc-preflight.sh"):
+            wrapper = (ROOT.parent / name).read_text(encoding="utf-8")
+            self.assertIn("./cmd/ai42preflight", wrapper)
+            self.assertIn("torch_probe_worker_ai42", wrapper)
+            self.assertNotIn("preflight_torch_ai42", wrapper)
+            for flag in ("--torch-python", "--worker-command", "--worker-arg", "--worker-timeout"):
+                self.assertIn(flag, wrapper)
+            self.assertIn("Duplicate", wrapper)
+            self.assertIn("5m", wrapper)
+            self.assertNotIn("TANAT_AI42_PREFLIGHT_TIMEOUT", wrapper)
+            self.assertNotIn("--worker-command=", wrapper)
+            self.assertNotIn("--worker-arg=", wrapper)
+            self.assertIn("--worker-timeout", wrapper)
+            self.assertNotIn("train_ai42_bc", wrapper)
+
+    def test_bc_preflight_wrappers_use_fixed_worker_flags_only(self) -> None:
+        powershell = (ROOT.parent / "run-ai42-bc-preflight.ps1").read_text(encoding="utf-8")
+        powershell_invocation = powershell[powershell.index("$nativeArgs =") :]
+        self.assertIn('"--torch-python", $python', powershell_invocation)
+        self.assertIn('"--worker-timeout", $workerTimeout', powershell_invocation)
+        self.assertNotIn("--worker-command", powershell_invocation)
+        self.assertNotIn("--worker-arg", powershell_invocation)
+
+        bash = (ROOT.parent / "run-ai42-bc-preflight.sh").read_text(encoding="utf-8")
+        bash_invocation = bash[bash.index("native_args+=(") :]
+        self.assertIn('--torch-python "$PYTHON_BIN"', bash_invocation)
+        self.assertIn('--worker-timeout "$WORKER_TIMEOUT"', bash_invocation)
+        self.assertNotIn("--worker-command", bash_invocation)
+        self.assertNotIn("--worker-arg", bash_invocation)
+
+    @unittest.skipUnless(_bash_executable(), "bash is required for shell syntax validation")
+    def test_bash_wrapper_syntax(self) -> None:
+        bash = _bash_executable()
+        subprocess.run(
+            [bash, "-n", str(ROOT.parent / "run-ai42-bc-preflight.sh")],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+
+    @unittest.skipUnless(
+        shutil.which("pwsh") or shutil.which("powershell"),
+        "PowerShell is required for wrapper syntax validation",
+    )
+    def test_powershell_wrapper_syntax(self) -> None:
+        powershell = shutil.which("pwsh") or shutil.which("powershell")
+        path = str(ROOT.parent / "run-ai42-bc-preflight.ps1").replace("'", "''")
+        command = (
+            "$tokens = $null; $errors = $null; "
+            f"[System.Management.Automation.Language.Parser]::ParseFile('{path}', "
+            "[ref]$tokens, [ref]$errors) | Out-Null; "
+            "if ($errors.Count -gt 0) { $errors | ForEach-Object { $_.Message }; exit 1 }"
+        )
+        subprocess.run(
+            [powershell, "-NoProfile", "-NonInteractive", "-Command", command],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+
+    def test_preflight_docs_pin_profile_hash_and_report_scope(self) -> None:
+        readme = (ROOT / "README.md").read_text(encoding="utf-8")
+        self.assertIn("--profile-hash <lower-case-profile-sha256>", readme)
+        self.assertIn("`--report` must\nbe located under `--output`", readme)
+        self.assertIn("exact selected\ninterpreter as `--torch-python`", readme)
+        self.assertIn("full durable-data verification and report publication", readme)
+
+    def test_python_entrypoints_keep_smoke_separate_from_native_preflight(self) -> None:
+        pyproject = (ROOT / "pyproject.toml").read_text(encoding="utf-8")
+        self.assertIn("tanat-ai42-actor-smoke", pyproject)
+        self.assertNotIn("tanat-ai42-preflight", pyproject)
+        self.assertNotIn("tanat-ai42-bc-preflight", pyproject)
+        self.assertIn("tanat_ai40.smoke_ai42_actor:main", pyproject)
 
 
 if __name__ == "__main__":

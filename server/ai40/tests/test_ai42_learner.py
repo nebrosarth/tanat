@@ -6,7 +6,7 @@ import io
 import random
 import tempfile
 import unittest
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 
 try:
@@ -32,6 +32,7 @@ from tanat_ai40.learner_ai42 import (
 )
 from tanat_ai40.env import ACTION_DTYPE
 from tanat_ai40.model_ai42_actor import AI42Actor
+import tanat_ai40.train_ai42_bc as train_ai42_bc
 from tanat_ai40.train_ai42_bc import main
 
 
@@ -244,11 +245,16 @@ class AI42LearnerTest(unittest.TestCase):
             with self.assertRaisesRegex(CheckpointError, "artifact digest"):
                 load_ai42_checkpoint(path, self.actor, optimizer, manifest)
 
-    def test_cli_is_preflight_by_default_and_execute_is_explicitly_refused(self) -> None:
+    def test_cli_requires_execute_and_directs_to_native_preflight(self) -> None:
         output = io.StringIO()
-        with redirect_stdout(output):
-            self.assertEqual(main([]), 0)
-        self.assertIn('"mode":"preflight"', output.getvalue())
+        error = io.StringIO()
+        with redirect_stdout(output), redirect_stderr(error):
+            self.assertEqual(main([]), 2)
+        self.assertEqual(output.getvalue(), "")
+        self.assertIn("requires --execute", error.getvalue())
+        self.assertIn("run-ai42-bc-preflight", error.getvalue())
+        self.assertNotIn("preflight", train_ai42_bc.__all__)
+        self.assertFalse(hasattr(train_ai42_bc, "preflight"))
         self.assertEqual(main(["--execute"]), 2)
 
 

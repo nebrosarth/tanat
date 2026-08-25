@@ -1,7 +1,8 @@
 """Deterministic, explicitly enabled AI-42 behavior-cloning training.
 
-The default command remains a no-update preflight. A run that performs an
-optimizer update must pass ``--execute`` and a run directory. Tensor
+A run that performs an optimizer update must pass ``--execute`` and a run
+directory. Production preflight is supervised by the native Go command
+``./cmd/ai42preflight`` and its explicit Torch worker. Tensor
 validation, loss calculation, and exact checkpoint serialization remain in
 ``learner_ai42``; this module owns the execution evidence and promotion gate.
 """
@@ -299,10 +300,10 @@ def _training_config_defaults(path: Path) -> dict[str, Any]:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="AI-42 actor-only behavior-cloning preflight/training")
+    parser = argparse.ArgumentParser(description="AI-42 actor-only behavior-cloning training")
     parser.add_argument("--config", type=Path, help="strict AI-42 BC JSON config")
     parser.add_argument("--dataset", type=Path, help="validated AI-42 dataset directory")
-    parser.add_argument("--checkpoint", type=Path, help="preflight checkpoint, or resume checkpoint with --execute")
+    parser.add_argument("--checkpoint", type=Path, help="checkpoint, or resume checkpoint with --execute")
     parser.add_argument("--resume", type=Path, help="exact AI-42 training checkpoint to resume")
     parser.add_argument("--output", "--run-dir", dest="output", type=Path, help="atomic BC run directory")
     parser.add_argument("--report", type=Path, help="run report path (default: <output>/run_report.json)")
@@ -995,6 +996,11 @@ _promotion_gate = promotion_gate
 def train(args: argparse.Namespace, *, clock: Callable[[], float] = time.monotonic) -> dict[str, Any]:
     """Run one deterministic BC proposal and publish its evidence report."""
 
+    if not getattr(args, "execute", False):
+        raise AI42TrainingError(
+            "--execute is required for training; run the native AI-42 preflight "
+            "wrapper before authorizing optimizer updates",
+        )
     _validate_training_args(args)
     if args.dataset is None:
         raise AI42TrainingError("--dataset is required with --execute")
@@ -1474,104 +1480,26 @@ def train(args: argparse.Namespace, *, clock: Callable[[], float] = time.monoton
     return report
 
 
-def preflight(args: argparse.Namespace) -> dict[str, Any]:
-    """Run the existing no-update validation path."""
-
-    _validate_model_args(args)
-    device = _device_from_arg(args.device)
-    config = AI42LearnerConfig(
-        class_balance_power=args.class_balance_power,
-        max_gradient_norm=args.max_gradient_norm,
-        model_kwargs={
-            "hidden_size": args.hidden_size,
-            "model_width": args.model_width,
-            "entity_layers": args.entity_layers,
-            "num_heads": args.num_heads,
-            "ff_multiplier": args.ff_multiplier,
-            "timing_bins": args.timing_bins,
-        },
-    )
-    actor = AI42Actor(**config.model_kwargs).to(device)
-    dataset_summary: dict[str, Any] = {"provided": False}
-    dataset_hash = "0" * 64
-    first_batch: AI42Batch | None = None
-    if args.dataset is not None:
-        dataset = load_dataset(args.dataset)
-        dataset_hash = dataset.manifest_hash
-        if args.dataset_hash is not None and args.dataset_hash != dataset_hash:
-            raise AI42LearnerError("--dataset-hash does not match the validated dataset manifest")
-        split_ids = dataset.split_match_ids()
-        if not split_ids["train"]:
-            raise AI42LearnerError("validated dataset has no train matches")
-        batches = iter_ai42_dataset_batches(
-            dataset, split="train", sequence_length=args.sequence_length, batch_size=args.batch_size,
-        )
-        first_batch = next(iter(batches), None)
-        if first_batch is None:
-            raise AI42LearnerError("validated dataset produced no recurrent train batch")
-        dataset_summary = {
-            "provided": True,
-            "path": str(args.dataset),
-            "manifest_hash": dataset_hash,
-            "matches": len(dataset),
-            "train_matches": len(split_ids["train"]),
-            "validation_matches": len(split_ids["validation"]),
-            "batch_size": first_batch.batch_size,
-            "sequence_length": first_batch.sequence_length,
-        }
-    elif args.dataset_hash is not None:
-        raise AI42LearnerError("--dataset-hash requires --dataset")
-    manifest = build_learner_manifest(actor, config, dataset_hash)
-    learner = AI42Learner(actor, config)
-    loss_summary: dict[str, Any] = {"checked": False}
-    parameters_unchanged = True
-    if first_batch is not None:
-        before = {name: value.detach().clone() for name, value in actor.state_dict().items()}
-        result = learner.backward(first_batch.to(device))
-        gradient_norm = learner.clip_gradients()
-        learner.optimizer.zero_grad(set_to_none=True)
-        parameters_unchanged = all(torch.equal(value, before[name]) for name, value in actor.state_dict().items())
-        if not parameters_unchanged:
-            raise AI42LearnerError("BC preflight changed model parameters without an optimizer step")
-        loss_summary = {"checked": True, "gradient_norm": gradient_norm, **result.to_dict()}
-    checkpoint_summary: dict[str, Any] = {"provided": False}
-    if args.checkpoint is not None:
-        if not args.checkpoint.is_file():
-            raise AI42LearnerError(f"checkpoint path does not exist: {args.checkpoint}")
-        resumed = learner.load_checkpoint(args.checkpoint, manifest)
-        checkpoint_summary = {
-            "provided": True, "path": str(args.checkpoint), "bytes": args.checkpoint.stat().st_size,
-            "step": resumed.step, "epoch": resumed.epoch,
-        }
-    else:
-        with tempfile.TemporaryDirectory(prefix="ai42-bc-preflight-") as directory:
-            checkpoint = Path(directory) / "roundtrip.pt"
-            learner.save_checkpoint(checkpoint, manifest)
-            resumed = learner.load_checkpoint(checkpoint, manifest)
-            checkpoint_summary = {
-                "provided": False, "roundtrip_checked": True,
-                "step": resumed.step, "epoch": resumed.epoch,
-            }
-    return {
-        "mode": "preflight",
-        "execute_required_for_training": True,
-        "training_implemented": True,
-        "device": str(device),
-        "parameter_count": sum(parameter.numel() for parameter in actor.parameters()),
-        "parameters_unchanged": parameters_unchanged,
-        "manifest": manifest,
-        "dataset": dataset_summary,
-        "loss": loss_summary,
-        "checkpoint": checkpoint_summary,
-    }
-
-
 def main(argv: Sequence[str] | None = None) -> int:
     raw = list(sys.argv[1:] if argv is None else argv)
     bootstrap = argparse.ArgumentParser(add_help=False)
     bootstrap.add_argument("--config", type=Path)
     known, _ = bootstrap.parse_known_args(raw)
     parser = build_parser()
+    # Parse the explicit authorization first. A no-``--execute`` invocation
+    # must fail closed without loading or running the retired Python preflight,
+    # including when a legacy preflight config is supplied.
+    args = parser.parse_args(raw)
+    if not args.execute:
+        print(
+            "AI-42 BC training requires --execute. Run the native AI-42 preflight "
+            "wrapper: server/run-ai42-bc-preflight.ps1 (Windows) or "
+            "server/run-ai42-bc-preflight.sh (Linux), or invoke "
+            "go run ./cmd/ai42preflight directly, with --dataset, --warm-start, "
+            "and --output.",
+            file=sys.stderr,
+        )
+        return 2
     if known.config is not None:
         try:
             payload = _read_json(known.config, "BC config")
@@ -1583,14 +1511,6 @@ def main(argv: Sequence[str] | None = None) -> int:
             print(f"AI-42 BC config failed: {exc}", file=sys.stderr)
             return 2
     args = parser.parse_args(raw)
-    if not args.execute:
-        try:
-            result = preflight(args)
-        except (AI42DatasetError, AI42LearnerError, OSError, RuntimeError) as exc:
-            print(f"AI-42 preflight failed: {exc}", file=sys.stderr)
-            return 2
-        print(json.dumps(result, sort_keys=True, separators=(",", ":")))
-        return 0
     try:
         result = train(args)
     except (AI42DatasetError, AI42LearnerError, OSError, RuntimeError) as exc:
@@ -1610,5 +1530,5 @@ sha256_file = _sha256_file
 
 __all__ = [
     "AI42TrainingError", "DEFAULT_SEED", "GATE_HEAD_ACCURACY_FLOOR", "GATE_LOSS_IMPROVEMENT", "GATE_CONTROL_RECALL_FLOOR", "MAX_OPTIMIZER_SECONDS", "ProbeSummary", "ValidationSummary",
-    "atomic_write_json", "build_parser", "class_weight_overrides_hash", "evaluate_probe", "main", "preflight", "promotion_gate", "run_training", "sha256_file", "train", "validate_class_weight_overrides",
+    "atomic_write_json", "build_parser", "class_weight_overrides_hash", "evaluate_probe", "main", "promotion_gate", "run_training", "sha256_file", "train", "validate_class_weight_overrides",
 ]

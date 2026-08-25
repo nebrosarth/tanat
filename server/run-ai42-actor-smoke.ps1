@@ -15,7 +15,7 @@ $python = $candidates | Where-Object { Test-Path -LiteralPath $_ } | Select-Obje
 if (-not $python) {
     $command = Get-Command python -ErrorAction SilentlyContinue
     if (-not $command) {
-        throw "No Python interpreter found for AI-42 preflight."
+        throw "No Python interpreter found for AI-42 actor smoke."
     }
     $python = $command.Source
 }
@@ -27,7 +27,7 @@ try {
     } else {
         $sourceRoot
     }
-    & $python -m tanat_ai40.preflight_ai42 @args
+    & $python -m tanat_ai40.smoke_ai42_actor @args
     exit $LASTEXITCODE
 } finally {
     $env:PYTHONPATH = $previousPythonPath

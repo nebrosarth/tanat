@@ -57,22 +57,61 @@ recurrent-lineage matrices are explicitly needed.
 
 AI-42 behavior cloning is intentionally validation-only until training is
 explicitly authorized. Build the environment from the same source revision,
-capture and strictly reload a short ten-hero AI-30 episode, then run the CUDA
-preflight against that dataset:
+capture and strictly reload a short ten-hero AI-30 episode, then run the
+native Go preflight against that dataset. The wrapper requires both the Go
+toolchain and a Python interpreter that can import Torch; it has no Python
+preflight fallback:
 
 ```powershell
 $env:PYTHONPATH = "$PWD\ai40\src"
 python -m tanat_ai40.smoke_ai42_dataset .\assaultenv.exe <new-dataset-dir> `
   --seed 4242 --max-steps 8
-python -m tanat_ai40.train_ai42_bc `
-  --config .\ai40\config\ai42_bc_preflight.json `
-  --device cuda --dataset <new-dataset-dir>
+$warmStart = '<accepted-checkpoint.pt>'
+$run = '<preflight-run-dir>'
+$profile = Join-Path $run 'class_profile_ai42.json'
+$report = Join-Path $run 'preflight_report.json'
+.\run-ai42-bc-preflight.ps1 `
+  --dataset <new-dataset-dir> `
+  --dataset-hash <lower-case-dataset-manifest-sha256> `
+  --profile $profile `
+  --profile-hash <lower-case-profile-sha256> `
+  --warm-start $warmStart `
+  --output $run `
+  --report $report `
+  --device cuda
 ```
 
-Dataset destinations are immutable and must be absent or empty. The second
-command validates the dataset, recurrent batching, control/action losses,
-finite gradients, clipping and checkpoint roundtrip without calling
-`optimizer.step`; without `--execute` it remains preflight-only. ONNX is not
+On Linux, use the same native flags with `./run-ai42-bc-preflight.sh`:
+
+```bash
+export PYTHONPATH="$PWD/ai40/src"
+./run-ai42-bc-preflight.sh \
+  --dataset <new-dataset-dir> \
+  --dataset-hash <lower-case-dataset-manifest-sha256> \
+  --profile <preflight-run-dir>/class_profile_ai42.json \
+  --profile-hash <lower-case-profile-sha256> \
+  --warm-start <accepted-checkpoint.pt> \
+  --output <preflight-run-dir> \
+  --report <preflight-run-dir>/preflight_report.json \
+  --device cuda
+```
+
+The wrappers add the default preflight config, pass the exact selected
+interpreter as `--torch-python`, and own a fixed positive `--worker-timeout`
+of `5m`. They reject caller-supplied `--torch-python`, legacy
+`--worker-command`/`--worker-arg`, `--worker-timeout`, wrapper-owned
+`--config`, and duplicate control flags before invoking Go. The Go command
+owns full durable-data verification and report publication. Python is only
+the fixed bounded `-m tanat_ai40.torch_probe_worker_ai42` probe launched by
+Go; it never owns the report or a production hot path. An external
+`--profile` always requires its explicit `--profile-hash`, and `--report` must
+be located under `--output`. Paths and flags are passed as separate process
+arguments, including paths containing spaces. The native command validates
+the durable dataset, recurrent batching, control/action losses, finite
+gradients, clipping and checkpoint roundtrip without calling
+`optimizer.step`; it atomically publishes the profile, batch bundle and
+report. `train_ai42_bc` no longer runs a Python preflight: invoking it without
+`--execute` fails closed with the native-wrapper instruction. ONNX is not
 required for PyTorch/CUDA training and remains a later production-inference
 gate.
 

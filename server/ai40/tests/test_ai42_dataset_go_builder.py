@@ -4,7 +4,7 @@ import io
 from pathlib import Path
 from unittest import mock
 from collections import Counter
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr
 import hashlib
 import json
 import tempfile
@@ -115,7 +115,7 @@ class AI42GoBuilderTests(unittest.TestCase):
                 self.assertEqual(int(arrays["done"][-1]), 1)
                 self.assertLessEqual(len(dataset._shards), 1)
 
-    def test_v2_recurrent_batches_and_validation_only_bc_preserve_parameters(self) -> None:
+    def test_v2_recurrent_batches_and_bc_cli_requires_native_preflight(self) -> None:
         try:
             import torch
             from tanat_ai40.learner_ai42 import iter_ai42_dataset_batches
@@ -133,8 +133,8 @@ class AI42GoBuilderTests(unittest.TestCase):
                 self.assertEqual((batch.batch_size, batch.sequence_length), (1, 1))
                 self.assertLessEqual(len(dataset._shards), 1)
 
-            # This is the existing validation-only CLI path.  It may build a
-            # graph and inspect gradients, but an optimizer update is forbidden.
+            # The Python CLI no longer owns preflight. It must fail closed and
+            # direct callers to the native Go supervisor.
             arguments = [
                 "--dataset", str(destination), "--device", "cpu",
                 "--hidden-size", "8", "--model-width", "8",
@@ -142,15 +142,12 @@ class AI42GoBuilderTests(unittest.TestCase):
                 "--ff-multiplier", "1", "--timing-bins", "2",
                 "--sequence-length", "1", "--batch-size", "1",
             ]
-            output = io.StringIO()
-            with mock.patch.object(torch.optim.AdamW, "step", side_effect=AssertionError("optimizer step")):
-                with redirect_stdout(output):
-                    self.assertEqual(train_ai42_bc(arguments), 0)
-            report = json.loads(output.getvalue())
-            self.assertTrue(report["dataset"]["provided"])
-            self.assertEqual(report["dataset"]["train_matches"], 1)
-            self.assertEqual(report["dataset"]["validation_matches"], 1)
-            self.assertTrue(report["parameters_unchanged"])
+            error = io.StringIO()
+            with redirect_stderr(error):
+                self.assertEqual(train_ai42_bc(arguments), 2)
+            self.assertIn("requires --execute", error.getvalue())
+            self.assertIn("run-ai42-bc-preflight", error.getvalue())
+            self.assertFalse(hasattr(train_ai42_bc, "preflight"))
 
     def test_scenario_mix_exact_counts_determinism_and_worker_independence(self) -> None:
         mix = {

@@ -9,4 +9,4 @@ if [[ ! -x "$PYTHON_BIN" ]]; then
 fi
 
 export PYTHONPATH="$PACKAGE_ROOT/src${PYTHONPATH:+:$PYTHONPATH}"
-exec "$PYTHON_BIN" -m tanat_ai40.preflight_ai42 "$@"
+exec "$PYTHON_BIN" -m tanat_ai40.smoke_ai42_actor "$@"
