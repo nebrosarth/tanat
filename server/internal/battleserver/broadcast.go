@@ -19,6 +19,9 @@ import (
 // the world lock.
 func (c *conn) mobViewersLocked(objID int32, fn func(mem *conn, idx, count int)) {
 	for _, mem := range c.members() {
+		if mem.headless {
+			continue
+		}
 		tr := mem.renderTr()
 		if tr == nil {
 			continue

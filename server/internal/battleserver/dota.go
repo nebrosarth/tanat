@@ -18,8 +18,10 @@ package battleserver
 // ENEMY). No GAME_DATA team table is needed.
 
 import (
+	"cmp"
 	"log"
 	"math"
+	"slices"
 	"sort"
 
 	"tanatserver/internal/amf"
@@ -65,9 +67,96 @@ const (
 	dotaEnemyTeam = int32(-1)
 )
 
+// dotaSpatialCell is deliberately wider than one creep's move in a 200ms tick.
+// The index is a start-of-tick snapshot; querySpatialMobs expands every query by
+// the exact maximum possible creep displacement recorded for that snapshot and
+// retains the old distance predicate afterwards.  It therefore only removes
+// impossible candidates and cannot change target or collision results.
+const dotaSpatialCell float32 = 16
+
+type dotaMobSpatialIndex struct {
+	buckets         map[uint64][]*mobState
+	used            []uint64
+	maxRadius       float32
+	maxDisplacement float32
+}
+
+func dotaSpatialKey(x, y float32) uint64 {
+	cx := int32(math.Floor(float64(x / dotaSpatialCell)))
+	cy := int32(math.Floor(float64(y / dotaSpatialCell)))
+	return uint64(uint32(cx))<<32 | uint64(uint32(cy))
+}
+
+func dotaSpatialRange(value, radius float32) (int32, int32) {
+	return int32(math.Floor(float64((value - radius) / dotaSpatialCell))),
+		int32(math.Floor(float64((value + radius) / dotaSpatialCell)))
+}
+
+func (idx *dotaMobSpatialIndex) rebuild(mobs []*mobState, now float64) {
+	if idx.buckets == nil {
+		idx.buckets = make(map[uint64][]*mobState)
+	}
+	for _, key := range idx.used {
+		idx.buckets[key] = idx.buckets[key][:0]
+	}
+	idx.used = idx.used[:0]
+	idx.maxRadius = 0
+	idx.maxDisplacement = 0
+	for _, mob := range mobs {
+		if mob == nil || mob.dead {
+			continue
+		}
+		key := dotaSpatialKey(mob.x, mob.y)
+		bucket := idx.buckets[key]
+		if len(bucket) == 0 {
+			idx.used = append(idx.used, key)
+		}
+		idx.buckets[key] = append(bucket, mob)
+		if radius := float32(mob.mob.Radius()); radius > idx.maxRadius {
+			idx.maxRadius = radius
+		}
+		// DOTA units only move through dotaMoveTowardLocked.  Capture the
+		// largest legal distance a candidate can travel before the next rebuild;
+		// this makes a snapshot lookup exact even late in the sequential tick.
+		speed := mobSpeed(mob, now)
+		if speed <= 0 {
+			speed = 4.0 // same defensive fallback as dotaMoveTowardLocked
+		}
+		if step := float32(speed * tickInterval.Seconds()); step > idx.maxDisplacement {
+			idx.maxDisplacement = step
+		}
+	}
+}
+
+func (idx *dotaMobSpatialIndex) forEachNearby(x, y, radius float32, visit func(*mobState)) {
+	if idx == nil || len(idx.buckets) == 0 {
+		return
+	}
+	radius += idx.maxDisplacement
+	minX, maxX := dotaSpatialRange(x, radius)
+	minY, maxY := dotaSpatialRange(y, radius)
+	for cellX := minX; cellX <= maxX; cellX++ {
+		for cellY := minY; cellY <= maxY; cellY++ {
+			key := uint64(uint32(cellX))<<32 | uint64(uint32(cellY))
+			for _, mob := range idx.buckets[key] {
+				visit(mob)
+			}
+		}
+	}
+}
+
 // dotaState is the per-instance «Штурм» simulation, hung on huntInstance.dota.
 type dotaState struct {
 	m gamedata.DotaMap
+
+	// Stable, allocation-free view of this tick's mob set. Waves are spawned
+	// before it is rebuilt. Target selection and body separation then share the
+	// same sorted pointers instead of repeatedly ranging and sorting the map for
+	// every creep.
+	tickMobs   []*mobState
+	tickMobsAt float64
+	tickMobsOK bool
+	spatial    dotaMobSpatialIndex
 
 	// nextSide alternates as players join so the two bases fill evenly (Human, Elf,
 	// Human, ...). Read/advanced under the instance lock in the world-state build, the
@@ -571,15 +660,21 @@ func (s *Server) dotaTickLocked(rep *conn, now float64) {
 	s.sweepPvpTaskTimersLocked(rep, now)
 	// Fog of war: decide what each side's clients are actually SHOWN this tick. See
 	// vision.go -- this never touches m.active, only the object list.
-	s.dotaVisionPassLocked(rep.inst, now)
-	// Drive every live combatant: creeps march + fight, cannons/towers shoot.
-	mobIDs := make([]int32, 0, len(rep.inst.mobs))
-	for id := range rep.inst.mobs {
-		mobIDs = append(mobIDs, id)
+	if dotaHasRenderableMemberLocked(rep.inst) {
+		s.dotaVisionPassLocked(rep.inst, now)
 	}
-	sort.Slice(mobIDs, func(i, j int) bool { return mobIDs[i] < mobIDs[j] })
-	for _, id := range mobIDs {
-		m := rep.inst.mobs[id]
+	// Drive every live combatant: creeps march + fight, cannons/towers shoot.
+	d.tickMobs = d.tickMobs[:0]
+	for _, mob := range rep.inst.mobs {
+		d.tickMobs = append(d.tickMobs, mob)
+	}
+	slices.SortFunc(d.tickMobs, func(a, b *mobState) int {
+		return cmp.Compare(a.id, b.id)
+	})
+	d.tickMobsAt = now
+	d.tickMobsOK = true
+	d.spatial.rebuild(d.tickMobs, now)
+	for _, m := range d.tickMobs {
 		if m == nil {
 			continue
 		}
@@ -610,6 +705,18 @@ func (s *Server) dotaTickLocked(rep *conn, now float64) {
 		}
 		s.dotaCreepTickLocked(rep, m, now)
 	}
+}
+
+// Headless training policies consume authoritative observations directly and
+// never decode client object-list packets. Fog remains part of those observations
+// through dotaVisibleEnemy*; only the expensive render tracker/SYNC pass is skipped.
+func dotaHasRenderableMemberLocked(inst *huntInstance) bool {
+	for _, member := range inst.members {
+		if member != nil && !member.headless {
+			return true
+		}
+	}
+	return false
 }
 
 // dotaResolveSwingLocked advances a «Штурм» unit's in-flight swing: it releases a
@@ -1270,10 +1377,11 @@ func (t dotaTarget) id() int32 {
 func (s *Server) dotaAcquireTargetLocked(rep *conn, m *mobState, radius, now float64) *dotaTarget {
 	dota := rep.inst.dota
 	r2 := radius * radius
-	var best *dotaTarget
+	var best dotaTarget
+	hasBest := false
 	bestD := math.Inf(1)
 	bestPriority := 99
-	consider := func(t *dotaTarget, priority int) {
+	consider := func(t dotaTarget, priority int) {
 		d := float64(dist2(m.x, m.y, t.x, t.y))
 		if d > r2 {
 			return
@@ -1282,14 +1390,23 @@ func (s *Server) dotaAcquireTargetLocked(rep *conn, m *mobState, radius, now flo
 		// happens to be a little closer. Structures are its strategic target;
 		// ordinary units retain nearest-target behavior.
 		if priority < bestPriority || (priority == bestPriority &&
-			(d < bestD || (d == bestD && (best == nil || t.id() < best.id())))) {
+			(d < bestD || (d == bestD && (!hasBest || t.id() < best.id())))) {
 			bestPriority, bestD, best = priority, d, t
+			hasBest = true
 		}
 	}
-	// enemy mobs (creeps + structures)
-	for _, o := range rep.inst.mobs {
+	// enemy mobs (creeps + structures). During the DOTA world pass this slice is
+	// already sorted and hot in cache; the fallback preserves direct-call tests.
+	mobs := dota.tickMobs
+	if !dota.tickMobsOK || dota.tickMobsAt != now {
+		mobs = mobs[:0]
+		for _, o := range rep.inst.mobs {
+			mobs = append(mobs, o)
+		}
+	}
+	considerMob := func(o *mobState) {
 		if o.dead || o.id == m.id || o.teamVal() == m.teamVal() {
-			continue
+			return
 		}
 		// An enemy altar still shielded by its base cannons is not a valid target: creeps
 		// (and cannons/towers, which share this picker) would otherwise plant on it and swing
@@ -1298,13 +1415,20 @@ func (s *Server) dotaAcquireTargetLocked(rep *conn, m *mobState, radius, now flo
 		// altarVulnerableLocked flips and the altar re-enters the candidate set. This mirrors
 		// the player's altarShieldedLocked gate and the client PHYS_IMM the altar advertises.
 		if o.altar && dota != nil && !dota.altarVulnerableLocked(o) {
-			continue
+			return
 		}
 		priority := 0
 		if m.siege && !o.structure {
 			priority = 1
 		}
-		consider(&dotaTarget{mob: o, x: o.x, y: o.y, radius: float32(o.mob.Radius())}, priority)
+		consider(dotaTarget{mob: o, x: o.x, y: o.y, radius: float32(o.mob.Radius())}, priority)
+	}
+	if dota != nil && dota.tickMobsOK && dota.tickMobsAt == now {
+		dota.spatial.forEachNearby(m.x, m.y, float32(radius), considerMob)
+	} else {
+		for _, o := range mobs {
+			considerMob(o)
+		}
 	}
 	// enemy players AND their summons: a creep/cannon strikes any player whose side
 	// differs from its own -- Human units hunt Elf heroes and vice versa (true PvP), and
@@ -1322,7 +1446,7 @@ func (s *Server) dotaAcquireTargetLocked(rep *conn, m *mobState, radius, now flo
 			if m.siege {
 				priority = 1
 			}
-			consider(&dotaTarget{player: mem, x: px, y: py, radius: float32(hs.av.Radius())}, priority)
+			consider(dotaTarget{player: mem, x: px, y: py, radius: float32(hs.av.Radius())}, priority)
 		}
 		// Summons live in their owner's map, never in inst.mobs, so the mob scan above
 		// cannot see them. Only the Hunt driver was ever taught that, which made a pet
@@ -1337,10 +1461,14 @@ func (s *Server) dotaAcquireTargetLocked(rep *conn, m *mobState, radius, now flo
 			if m.siege {
 				priority = 1
 			}
-			consider(&dotaTarget{summon: sm, x: sm.x, y: sm.y, radius: summonRadius}, priority)
+			consider(dotaTarget{summon: sm, x: sm.x, y: sm.y, radius: summonRadius}, priority)
 		}
 	}
-	return best
+	if !hasBest {
+		return nil
+	}
+	m.dotaTargetScratch = best
+	return &m.dotaTargetScratch
 }
 
 // dotaReach is m's attack reach against a target of body radius tr (melee default, or

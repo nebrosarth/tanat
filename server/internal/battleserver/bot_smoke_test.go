@@ -11,14 +11,9 @@ import (
 	"tanatserver/internal/session"
 )
 
-// TestBotFilledMatchRunsForReal is a real-clock integration smoke test: a real TCP
-// CONNECT/READY launch into a fresh «Штурм» room with TANAT_DOTA_BOTS set, then the actual
-// runInstanceTicker (real 200ms ticks, real time.AfterFunc swing/arrival timers -- nothing
-// stubbed) is left to run for a few seconds. It only asserts loose, timing-tolerant
-// conditions (bots exist, the world is still alive, at least one bot has left its exact
-// spawn point) -- the precise decision logic itself is covered by bot_test.go's
-// synchronous, deterministic unit tests; this exists to catch what those can't: a deadlock,
-// panic, or two goroutines fighting over inst.mu under real concurrent timers.
+// TestBotFilledMatchRunsForReal uses the real TCP CONNECT/READY path, but
+// advances the authoritative Assault clock explicitly. It checks that bots
+// join, move, and remain in a live world without relying on wall-clock ticks.
 func TestBotFilledMatchRunsForReal(t *testing.T) {
 	if testing.Short() {
 		t.Skip("real-clock smoke test skipped in -short")
@@ -27,6 +22,11 @@ func TestBotFilledMatchRunsForReal(t *testing.T) {
 
 	store := session.NewStore()
 	s := New(store)
+	clock := newManualBattleClock()
+	s.clock = clock
+	instanceStarted := make(chan *huntInstance, 1)
+	s.instanceTickerStarter = func(*huntInstance) {}
+	s.instanceReadyHook = func(inst *huntInstance) { instanceStarted <- inst }
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("listen: %v", err)
@@ -77,30 +77,19 @@ func TestBotFilledMatchRunsForReal(t *testing.T) {
 		}
 	}()
 
-	// Find the room this launch actually landed in (self PLAYER_REG doesn't carry it,
-	// but the server logged it and we can just poll the registry instead of parsing logs).
+	// The hook fires only after the player's world state and bot backfill finish.
 	var inst *huntInstance
-	deadline := time.Now().Add(3 * time.Second)
-	for time.Now().Before(deadline) {
-		s.mu.Lock()
-		for _, i := range s.insts {
-			if i.dota != nil {
-				inst = i
-			}
-		}
-		s.mu.Unlock()
-		if inst != nil {
-			break
-		}
-		time.Sleep(50 * time.Millisecond)
+	select {
+	case inst = <-instanceStarted:
+	case <-time.After(3 * time.Second):
+		t.Fatal("no Assault instance appeared after CONNECT/READY")
+		return
 	}
-	if inst == nil {
-		t.Fatal("no «Штурм» instance appeared after CONNECT/READY")
+	driver := &manualDotaBots{server: s, inst: inst, clock: clock}
+	defer driver.close()
+	for tick := 0; tick < int((4*time.Second)/AssaultTick); tick++ {
+		driver.step()
 	}
-
-	// Let the real ticker run: real 200ms ticks, real swing/arrival timers, nothing
-	// simulated. Long enough for several think cycles (0.3s) to fire.
-	time.Sleep(4 * time.Second)
 
 	inst.mu.Lock()
 	nBots := len(inst.bots)
@@ -125,7 +114,7 @@ func TestBotFilledMatchRunsForReal(t *testing.T) {
 		t.Fatal("the match ended within the smoke window -- unexpected this early")
 	}
 	if !moved {
-		t.Error("no bot moved from its exact spawn point in 4 real seconds of ticking")
+		t.Error("no bot moved from its exact spawn point in 4 simulated seconds of ticking")
 	}
 
 	cl.Close()

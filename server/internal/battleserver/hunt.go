@@ -46,6 +46,15 @@ func huntStartLevel() int32 {
 // separate path. A pure testing aid for exercising skills without resource limits.
 var debugWTFMode bool
 
+// Environment variables are process-start configuration, unlike the live
+// gamedata toggle below. Parsing the legacy value once removes an OS call from
+// every skill-mask and combat calculation while keeping the live admin switch
+// authoritative.
+var legacyWTFMode = func() bool {
+	v := os.Getenv("TANAT_WTF_MODE")
+	return v != "" && v != "0" && !strings.EqualFold(v, "false")
+}()
+
 // wtfMode reports whether WTF MODE is on: the test override, else the admin-panel
 // setting (gamedata), else the legacy TANAT_WTF_MODE env var set to a truthy value
 // (any non-empty value except "0"/"false" counts as on).
@@ -56,8 +65,7 @@ func wtfMode() bool {
 	if gamedata.WTFMode() {
 		return true
 	}
-	v := os.Getenv("TANAT_WTF_MODE")
-	return v != "" && v != "0" && !strings.EqualFold(v, "false")
+	return legacyWTFMode
 }
 
 // skillManaCost / skillCooldown gate an avatar skill's mana cost and cooldown
@@ -542,6 +550,24 @@ type huntState struct {
 	inst *huntInstance // the shared world this player is a member of
 	tr   tracker
 	mobs map[int32]*mobState // aliases inst.mobs (shared authoritative set)
+
+	// Reused deterministic-order scratch for body separation. The simulation is
+	// serialized by the instance lock, so a hunt state never uses these slices
+	// concurrently. Keeping capacity here removes several allocations per moving
+	// unit and tick without changing summation order or movement results.
+	separationMobIDs     []int32
+	separationMobs       []*mobState
+	separationCandidates []*mobState
+	separationMemberIDs  []int32
+	separationSummonIDs  []int32
+	separationMembersAt  float64
+
+	// AI training requests an ability description for every hero on every
+	// 200 ms tick.  Most of that description is authored, rank-specific data
+	// and cannot change during a match; retain it per hero rather than
+	// reparsing the effect tree ten times per environment tick.
+	assaultAbilityStatic      [4][5][AssaultAbilityFeatures]float32
+	assaultAbilityStaticReady [4][5]bool
 
 	// pvp holds this player's live «Штурм» battle-tasks (nil outside «Штурм» / before the world
 	// state is built); assigned at world-ready and driven over QUEST_TASK (see pvptasks.go).
@@ -1052,6 +1078,9 @@ type mobState struct {
 	skillTargetObj int32 // objID a single-target boss skill was aimed at
 
 	pf pathState // cached route waypoints; «Штурм» creeps use it for every movement leg
+	// Reused nearest-target result. Target selection is synchronous under the
+	// instance lock and consumers finish before this mob is queried again.
+	dotaTargetScratch dotaTarget
 
 	// «Штурм» (DOTA) fields. team is the object's in-battle team: 1 = the player's
 	// side (allies), -1 = enemies (Hunt's convention; teamVal falls back to -1 so a
@@ -1801,6 +1830,9 @@ func (s *Server) syncMobHealthLocked(c *conn, ms *mobState) {
 
 // syncSelfLocked pushes fraction/absolute stats of the self avatar.
 func (s *Server) syncSelfLocked(c *conn, types ...uint64) {
+	if c.headless {
+		return
+	}
 	hs := c.huntState
 	idx := hs.tr.index(c.objID)
 	if idx < 0 {
@@ -1849,6 +1881,9 @@ func (s *Server) syncSelfLocked(c *conn, types ...uint64) {
 
 // syncSelfIntLocked pushes one int32-encoded self sync (SILENCE etc.).
 func (s *Server) syncSelfIntLocked(c *conn, typ uint64, v int32) {
+	if c.headless {
+		return
+	}
 	hs := c.huntState
 	idx := hs.tr.index(c.objID)
 	if idx < 0 {
@@ -1937,6 +1972,12 @@ func (s *Server) doActionLocked(c *conn, itemID, action, target int32, px, py fl
 func (s *Server) startAttackLocked(c *conn, ms *mobState) {
 	hs := c.huntState
 	if hs.deadUntil > 0 {
+		return
+	}
+	// Policies may repeat the same discrete Attack action every simulation tick.
+	// The existing timer chain already keeps chasing and swinging; restarting it
+	// would reset the chase cache and run a fresh A* query every 200ms.
+	if hs.attackTarget == ms.id && hs.pvpTarget == 0 {
 		return
 	}
 	// Switching from a PvP target to a creep must close the old visible swing too;
@@ -2200,7 +2241,7 @@ func (s *Server) armAttackTimer(c *conn, seq int, delay, interval time.Duration)
 		// AvatarAI reach math), so a big-bodied boss is hit from farther than a
 		// small mob instead of a flat pad.
 		if dist > hs.effAttackRangeLocked(float64(now))+hs.av.Radius()+ms.mob.Radius() {
-			c.chaseMoveLocked(s, ms.x, ms.y) // throttled: re-paths on >1m drift or 1/s when idle
+			c.chaseMoveLocked(s, ms.x, ms.y) // throttled moving-target route refresh
 			s.armAttackTimer(c, seq, 250*time.Millisecond, interval)
 			return
 		}

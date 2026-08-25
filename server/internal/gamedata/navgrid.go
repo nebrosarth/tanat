@@ -1,6 +1,9 @@
 package gamedata
 
-import "math"
+import (
+	"math"
+	"sync"
+)
 
 // NavGrid is a rasterised walkability map: a bit per Cell-sized square of the
 // scene ground plane, true where the avatar may stand. It is built offline from
@@ -12,6 +15,15 @@ type NavGrid struct {
 	W, H             int
 	bits             []uint64 // bit index = i*H + j, LSB-first
 	spawn            Vec2
+
+	// A* needs several grid-sized working arrays.  A sync.Pool is deliberately
+	// allowed to forget its contents at every GC, which made a busy headless
+	// Assault simulation repeatedly allocate those multi-megabyte arrays. Keep a
+	// bounded pool on the immutable navigation grid instead. Vectorized Assault
+	// runs up to 16 environment steps concurrently, so retaining just one scratch
+	// discarded 15 large buffers after every parallel path wave.
+	pathScratchMu   sync.Mutex
+	pathScratchFree []*pathScratch
 }
 
 func (g *NavGrid) cellWalkable(i, j int) bool {

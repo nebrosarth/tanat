@@ -2,6 +2,7 @@ package battleserver
 
 import (
 	"math"
+	"slices"
 	"sort"
 
 	"tanatserver/internal/gamedata"
@@ -22,14 +23,37 @@ func botSortedMobs(inst *huntInstance) []*mobState {
 	if inst == nil {
 		return nil
 	}
+	if inst.botSortedMobs != nil && inst.botSortedMobsCount == len(inst.mobs) {
+		return inst.botSortedMobs
+	}
 	out := make([]*mobState, 0, len(inst.mobs))
 	for _, m := range inst.mobs {
 		if m != nil {
 			out = append(out, m)
 		}
 	}
-	sort.Slice(out, func(i, j int) bool { return out[i].id < out[j].id })
-	return out
+	slices.SortFunc(out, func(left, right *mobState) int {
+		if left.id < right.id {
+			return -1
+		}
+		if left.id > right.id {
+			return 1
+		}
+		return 0
+	})
+	inst.botSortedMobs, inst.botSortedMobsCount = out, len(inst.mobs)
+	return inst.botSortedMobs
+}
+
+// botInvalidateSortedMobsLocked starts a new authoritative world snapshot.
+// Callers hold inst.mu.  The explicit tick boundary also covers a same-sized
+// despawn/spawn pair, which a map-length check alone cannot observe.
+func botInvalidateSortedMobsLocked(inst *huntInstance) {
+	if inst == nil {
+		return
+	}
+	inst.botSortedMobs = nil
+	inst.botSortedMobsCount = 0
 }
 
 // botSameDotaLane compares the authored polyline rather than only its first
@@ -660,17 +684,13 @@ func (s *Server) botFarmMayAttackCreepLocked(b *botBrain, now float64) bool {
 
 func (s *Server) botFarmMayAttackTargetLocked(b *botBrain, target *mobState, now float64) bool {
 	if botUsesAI30(b) {
-		// Friendly creep cover is a requirement for walking INTO a wave, not for
-		// firing at a creep that is already safely in reach.  Treating it as an
-		// attack veto made an AI-30 laner become a spectator the instant its own
-		// front creep died: it held its XP position beside hostile creeps but would
-		// neither thin them nor defend itself.  The caller still checks real attack
-		// reach; retain the hero/structure safety gates here so this exception never
-		// turns into an uncovered approach or a tower dive.
+		// Friendly creep cover only controls the approach into a wave. Once a
+		// target is already in reach, AI-30 contests it even when enemy heroes are
+		// visible: treating their mere presence as a farm veto made both lane teams
+		// stand beside the same creeps without taking an action.
 		if b != nil && b.c != nil && b.c.huntState != nil && target != nil && !target.dead &&
 			botHPFrac(b.c.huntState, now) >= botAI30FarmMinHP &&
-			!s.botEnemyStructureDangerLocked(b.c, target.x, target.y) &&
-			botNearbyEnemyHeroPressureLocked(b, now) == 0 {
+			!s.botEnemyStructureDangerLocked(b.c, target.x, target.y) {
 			return true
 		}
 		_, _, safe := s.botAI30FarmAttackPointLocked(b, target, now)

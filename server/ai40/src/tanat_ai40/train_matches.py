@@ -41,19 +41,27 @@ class MatchAssignment:
     opponent: str
     controllers: tuple[int, ...]
     ai40_side: int
+    historical_id: str | None = None
 
 
 def build_schedule(
     ai40_matches: int, ai30_matches: int, teacher_start_index: int = 0,
+    historical_matches: int = 0, historical_ids: tuple[str, ...] = (),
 ) -> list[MatchAssignment]:
-    """Alternate mirror and teacher matches and swap the AI-40 faction."""
-    if ai40_matches < 0 or ai30_matches < 0 or ai40_matches + ai30_matches == 0:
+    """Interleave mirror, scripted-teacher and frozen historical matches."""
+    if min(ai40_matches, ai30_matches, historical_matches) < 0:
+        raise ValueError("match counts must be non-negative")
+    if ai40_matches + ai30_matches + historical_matches == 0:
         raise ValueError("match counts must be non-negative and have a positive sum")
+    if historical_matches and not historical_ids:
+        raise ValueError("historical matches require at least one historical policy")
     if teacher_start_index < 0:
         raise ValueError("teacher_start_index must be non-negative")
     schedule: list[MatchAssignment] = []
-    mirror_left, teacher_left, teacher_index = ai40_matches, ai30_matches, teacher_start_index
-    while mirror_left or teacher_left:
+    mirror_left, teacher_left = ai40_matches, ai30_matches
+    history_left, teacher_index = historical_matches, teacher_start_index
+    history_index = 0
+    while mirror_left or teacher_left or history_left:
         if mirror_left:
             schedule.append(MatchAssignment("ai40", AI40_SELF_PLAY_CONTROLLERS, 0))
             mirror_left -= 1
@@ -67,15 +75,45 @@ def build_schedule(
             ))
             teacher_left -= 1
             teacher_index += 1
+        if history_left:
+            ai40_side = 1 + history_index % 2
+            schedule.append(MatchAssignment(
+                "historical", AI40_SELF_PLAY_CONTROLLERS, ai40_side,
+                historical_ids[history_index % len(historical_ids)],
+            ))
+            history_left -= 1
+            history_index += 1
     return schedule
 
 
 def policy_actor_mask(assignments: list[MatchAssignment | None]) -> np.ndarray:
     return np.concatenate([
-        np.asarray([controller == CONTROLLER_AI40 for controller in assignment.controllers], dtype=np.uint8)
+        (np.ones(HERO_COUNT, dtype=np.uint8)
+         if assignment.ai40_side == 0 else np.asarray(
+             ([1] * (HERO_COUNT // 2) + [0] * (HERO_COUNT // 2))
+             if assignment.ai40_side == 1 else
+             ([0] * (HERO_COUNT // 2) + [1] * (HERO_COUNT // 2)),
+             dtype=np.uint8,
+         ))
         if assignment is not None else np.zeros(HERO_COUNT, dtype=np.uint8)
         for assignment in assignments
     ])
+
+
+def historical_actor_indices(
+    assignments: list[MatchAssignment | None],
+) -> dict[str, np.ndarray]:
+    """Return flattened actor indices controlled by each frozen policy."""
+    grouped: dict[str, list[int]] = {}
+    for match_index, assignment in enumerate(assignments):
+        if assignment is None or assignment.historical_id is None:
+            continue
+        opponent_side = 2 if assignment.ai40_side == 1 else 1
+        start = match_index * HERO_COUNT + (0 if opponent_side == 1 else HERO_COUNT // 2)
+        grouped.setdefault(assignment.historical_id, []).extend(
+            range(start, start + HERO_COUNT // 2)
+        )
+    return {key: np.asarray(value, dtype=np.int64) for key, value in grouped.items()}
 
 
 def train_matches(

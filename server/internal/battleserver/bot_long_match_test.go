@@ -6,9 +6,6 @@ import (
 	"sort"
 	"testing"
 	"time"
-
-	"tanatserver/internal/gamedata"
-	"tanatserver/internal/session"
 )
 
 const (
@@ -31,14 +28,9 @@ type assaultBotActivity struct {
 	sawProgress     bool
 }
 
-// TestTenBotAssaultRunsFiveMinutesWithoutAFK runs Assault without a TCP client.
-// It is opt-in because the default duration is intentionally five real minutes:
-//
-//	$env:TANAT_RUN_5M_BOT_TEST = "1"
-//	go test ./internal/battleserver -run TestTenBotAssaultRunsFiveMinutesWithoutAFK -count=1 -timeout=6m
-//
-// TANAT_BOT_MATCH_TEST_DURATION may be set to a shorter duration for a local
-// smoke run; the production/default test window remains five minutes.
+// TestTenBotAssaultRunsFiveMinutesWithoutAFK drives five simulated minutes by
+// advancing the authoritative battle clock. It never waits for wall-clock
+// timers, so it is safe to run as part of the ordinary integration suite.
 func TestTenBotAssaultRunsFiveMinutesWithoutAFK(t *testing.T) {
 	if testing.Short() {
 		t.Skip("long bot match test is disabled in -short mode")
@@ -48,19 +40,8 @@ func TestTenBotAssaultRunsFiveMinutesWithoutAFK(t *testing.T) {
 	}
 
 	duration := 5 * time.Minute
-	if raw := os.Getenv("TANAT_BOT_MATCH_TEST_DURATION"); raw != "" {
-		parsed, err := time.ParseDuration(raw)
-		if err != nil || parsed <= 0 {
-			t.Fatalf("invalid TANAT_BOT_MATCH_TEST_DURATION %q: %v", raw, err)
-		}
-		duration = parsed
-	}
-
-	t.Setenv("TANAT_DOTA_BOTS", "10")
-
-	server := New(session.NewStore())
-	mapData := gamedata.DotaMaps()[0]
-	instance := newDotaInstance(server, 190010, mapData.ID)
+	driver := newManualDotaBots(t, 190010, assaultLongMatchBots)
+	server, instance := driver.server, driver.inst
 
 	instance.mu.Lock()
 	server.spawnDotaBotsLocked(instance, assaultLongMatchBots)
@@ -83,45 +64,10 @@ func TestTenBotAssaultRunsFiveMinutesWithoutAFK(t *testing.T) {
 	}
 	instance.mu.Unlock()
 
-	defer func() {
-		instance.mu.Lock()
-		instance.closed = true
-		connections := make([]*conn, 0, len(instance.members))
-		for _, member := range instance.members {
-			if member == nil {
-				continue
-			}
-			if member.huntState != nil {
-				member.huntState.closed = true
-				member.huntState.attackSeq++
-				member.stopArrivalLocked()
-			}
-			connections = append(connections, member)
-		}
-		if instance.dota != nil && instance.dota.telemetry != nil {
-			instance.dota.telemetry.close()
-			instance.dota.telemetry = nil
-		}
-		instance.mu.Unlock()
-		for _, member := range connections {
-			if member.Conn != nil {
-				_ = member.Conn.Close()
-			}
-		}
-	}()
-
-	go server.runInstanceTicker(instance)
-
-	const sampleEvery = 200 * time.Millisecond
-	samples := time.NewTicker(dotaSimulationWallDuration(sampleEvery))
-	defer samples.Stop()
-	deadline := time.Now().Add(dotaSimulationWallDuration(duration))
-
-	for time.Now().Before(deadline) {
-		<-samples.C
+	for tick := 0; tick < int(duration/AssaultTick); tick++ {
+		ended := driver.step()
 
 		instance.mu.Lock()
-		ended := instance.dota != nil && instance.dota.ended
 		matchTime := float64(server.battleTime()) - instance.dota.startedAt
 		if !ended {
 			for id, activity := range activities {
@@ -231,23 +177,14 @@ func TestTenBotAssaultRunsFiveMinutesWithoutAFK(t *testing.T) {
 	}
 }
 
-// TestTenBotAssaultRunsFiveMinutesAtX20 is the opt-in accelerated headless
-// scenario. It reuses the same activity and final-score assertions as the
-// real-time test, but five simulated minutes take about fifteen wall seconds.
-//
-//	$env:TANAT_RUN_X20_BOT_TEST = "1"
-//	go test ./internal/battleserver -run TestTenBotAssaultRunsFiveMinutesAtX20 -count=1
+// TestTenBotAssaultRunsFiveMinutesAtX20 is retained as a compatibility alias
+// for developer scripts. The simulation is now manual, therefore X20 does not
+// alter correctness or execution time.
 func TestTenBotAssaultRunsFiveMinutesAtX20(t *testing.T) {
-	if testing.Short() {
-		t.Skip("accelerated bot match test is disabled in -short mode")
-	}
 	if os.Getenv("TANAT_RUN_X20_BOT_TEST") != "1" {
-		t.Skip("set TANAT_RUN_X20_BOT_TEST=1 to run the accelerated Assault test")
+		t.Skip("set TANAT_RUN_X20_BOT_TEST=1 to run the compatibility alias")
 	}
 	t.Setenv("TANAT_RUN_5M_BOT_TEST", "1")
-	t.Setenv("TANAT_DOTA_SIM_SPEED", "20")
-	t.Setenv("TANAT_BOT_MATCH_TEST_DURATION", "5m")
-	t.Setenv("TANAT_BOT_TELEMETRY", t.TempDir())
 	TestTenBotAssaultRunsFiveMinutesWithoutAFK(t)
 }
 

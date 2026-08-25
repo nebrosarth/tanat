@@ -20,21 +20,71 @@ func (botAI30Profile) UsesFarmDebt() bool         { return true }
 
 const (
 	botAI30FarmMinHP       = 0.72
-	botAI30ChaseMinHP      = 0.58
+	botAI30ChaseMinHP      = 0.05
 	botAI30WaveCoverRadius = 9.0
+	// AI-30 is the aggressive scripted opponent.  It still needs a live wave
+	// before touching a fresh structure, but it converts that wave with a small
+	// strike group instead of waiting for every teammate's ultimate and a large
+	// numerical advantage.  The ordinary AI-20 thresholds remain unchanged.
+	botAI30ObjectiveMinPower         = 1.40
+	botAI30ObjectiveEnemyPowerMargin = 0.90
+	botAI30MobilizationMinGroup      = 2
 )
 
 func botUsesAI30(b *botBrain) bool { return botAIVersionForBrain(b) == 30 }
 
+// botAI30AssaultCreepTickLocked gives a committed assault one local priority:
+// remove the hostile wave currently blocking the group. The generic farm picker
+// intentionally filters by the bot's old baseline lane and conservative cover
+// rules, which meant a full push could walk past (or stand beside) enemy creeps
+// without attacking them. This is not a farm detour: only visible, nearby creeps
+// are selected, and the named structure resumes immediately after they are gone.
+func (s *Server) botAI30AssaultCreepTickLocked(b *botBrain, now float64) bool {
+	if b == nil || b.c == nil || b.c.inst == nil || b.c.huntState == nil ||
+		!botUsesAI30(b) || b.macroAssignment.Reason != botMacroReasonFullMobilization {
+		return false
+	}
+	c := b.c
+	cx, cy := c.posAtLocked(float32(now))
+	visionSources := dotaTeamVisionSourcesLocked(c.inst, c.playerTeam(), now)
+	var target *mobState
+	bestDistance := math.Inf(1)
+	for _, mob := range botSortedMobs(c.inst) {
+		if mob == nil || mob.dead || mob.structure || !mob.enemyOf(c.playerTeam()) ||
+			!botVisibleEnemyMobLocked(c.playerTeam(), mob, visionSources) {
+			continue
+		}
+		distance := math.Hypot(float64(mob.x-cx), float64(mob.y-cy))
+		if distance > botGroupEngageRadius*1.5 {
+			continue
+		}
+		if distance < bestDistance || (distance == bestDistance && (target == nil || mob.id < target.id)) {
+			target, bestDistance = mob, distance
+		}
+	}
+	if target == nil {
+		return false
+	}
+	reach := c.huntState.effAttackRangeLocked(now) + c.huntState.av.Radius() + target.mob.Radius()
+	if bestDistance <= reach {
+		b.farmTarget = target.id
+		b.farmDecision = "assault_wave_clear"
+		s.startAttackLocked(c, target)
+		return true
+	}
+	s.botMoveTowardLocked(b, target.x, target.y, now)
+	return true
+}
+
 // botAI30FarmAttackPointLocked returns a home-side point from which the hero
-// can attack target. A friendly creep must already be tanking the wave, and
-// hero/structure pressure vetoes the step. The point remains inside XP range;
-// AI-30 helps kill the wave but never sacrifices proximity coverage for gold.
+// can attack target. A friendly creep must already be tanking the wave. The
+// point remains inside XP range; AI-30 is deliberately willing to contest a
+// lane against visible enemy avatars, but never walks into an enemy structure
+// or commits while its own health is already low.
 func (s *Server) botAI30FarmAttackPointLocked(b *botBrain, target *mobState, now float64) (float32, float32, bool) {
 	if b == nil || b.c == nil || b.c.huntState == nil || target == nil || target.dead || target.structure ||
 		!target.enemyOf(b.c.playerTeam()) || !botUsesAI30(b) ||
-		botHPFrac(b.c.huntState, now) < botAI30FarmMinHP || s.botIncomingPressureLocked(b, now) ||
-		botNearbyEnemyHeroPressureLocked(b, now) > 0 {
+		botHPFrac(b.c.huntState, now) < botAI30FarmMinHP {
 		return 0, 0, false
 	}
 	covered := false

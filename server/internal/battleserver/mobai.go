@@ -1,9 +1,10 @@
 package battleserver
 
 import (
+	"cmp"
 	"log"
 	"math"
-	"sort"
+	"slices"
 	"time"
 
 	"tanatserver/internal/amf"
@@ -2393,6 +2394,13 @@ func (hs *huntState) bodySeparation(members map[int32]*conn, now float64, selfID
 		}
 		rng := float32(math.Max(mobSepRange, r+or+sepMargin))
 		dx, dy := x-ox, y-oy
+		// The circular range is contained in this axis-aligned square. Most
+		// creeps are on different parts of a lane, so reject them before the
+		// comparatively expensive square root without changing the exact force
+		// for any body that can contribute.
+		if math.Abs(float64(dx)) >= float64(rng) || math.Abs(float64(dy)) >= float64(rng) {
+			return
+		}
 		d := float32(math.Hypot(float64(dx), float64(dy)))
 		if d >= rng {
 			return
@@ -2405,13 +2413,35 @@ func (hs *huntState) bodySeparation(members map[int32]*conn, now float64, selfID
 		sx += dx / d * w
 		sy += dy / d * w
 	}
-	mobIDs := make([]int32, 0, len(hs.mobs))
-	for id := range hs.mobs {
-		mobIDs = append(mobIDs, id)
+	var orderedMobs []*mobState
+	if hs.inst != nil && hs.inst.dota != nil && hs.inst.dota.tickMobsOK && hs.inst.dota.tickMobsAt == now {
+		// The spatial snapshot is built from the same id-sorted list.  Restore
+		// that order for the small local candidate set before accumulating forces:
+		// floating-point addition then remains bit-for-bit identical to the old
+		// full scan, while distant bodies are never even considered.
+		index := &hs.inst.dota.spatial
+		queryRadius := float32(math.Max(mobSepRange, r+float64(index.maxRadius)+sepMargin))
+		candidates := hs.separationCandidates[:0]
+		index.forEachNearby(x, y, queryRadius, func(o *mobState) {
+			candidates = append(candidates, o)
+		})
+		slices.SortFunc(candidates, func(a, b *mobState) int { return cmp.Compare(a.id, b.id) })
+		hs.separationCandidates = candidates
+		orderedMobs = candidates
+	} else {
+		mobIDs := hs.separationMobIDs[:0]
+		for id := range hs.mobs {
+			mobIDs = append(mobIDs, id)
+		}
+		slices.Sort(mobIDs)
+		hs.separationMobIDs = mobIDs
+		orderedMobs = hs.separationMobs[:0]
+		for _, id := range mobIDs {
+			orderedMobs = append(orderedMobs, hs.mobs[id])
+		}
+		hs.separationMobs = orderedMobs
 	}
-	sort.Slice(mobIDs, func(i, j int) bool { return mobIDs[i] < mobIDs[j] })
-	for _, id := range mobIDs {
-		o := hs.mobs[id]
+	for _, o := range orderedMobs {
 		// Only an ACTIVE mob can be near enough to matter with a current position: an
 		// inactive one is >34m away (past mobHideRadius) and its coordinates are stale
 		// anyway, so skipping it is free and keeps this O(active^2) rather than
@@ -2425,11 +2455,16 @@ func (hs *huntState) bodySeparation(members map[int32]*conn, now float64, selfID
 		}
 		push(o.id, o.x, o.y, o.mob.Radius())
 	}
-	memberIDs := make([]int32, 0, len(members))
-	for id := range members {
-		memberIDs = append(memberIDs, id)
+	memberIDs := hs.separationMemberIDs
+	if hs.separationMembersAt != now {
+		memberIDs = memberIDs[:0]
+		for id := range members {
+			memberIDs = append(memberIDs, id)
+		}
+		slices.Sort(memberIDs)
+		hs.separationMemberIDs = memberIDs
+		hs.separationMembersAt = now
 	}
-	sort.Slice(memberIDs, func(i, j int) bool { return memberIDs[i] < memberIDs[j] })
 	for _, id := range memberIDs {
 		mem := members[id]
 		mhs := mem.huntState
@@ -2438,11 +2473,12 @@ func (hs *huntState) bodySeparation(members map[int32]*conn, now float64, selfID
 		}
 		// Liveness matches tickSummonsLocked's own test, not just the lazily-set flag:
 		// an expired summon still sits in the map until its tick removes it.
-		summonIDs := make([]int32, 0, len(mhs.summons))
+		summonIDs := hs.separationSummonIDs[:0]
 		for summonID := range mhs.summons {
 			summonIDs = append(summonIDs, summonID)
 		}
-		sort.Slice(summonIDs, func(i, j int) bool { return summonIDs[i] < summonIDs[j] })
+		slices.Sort(summonIDs)
+		hs.separationSummonIDs = summonIDs
 		for _, summonID := range summonIDs {
 			sm := mhs.summons[summonID]
 			if !sm.alive(now) {
@@ -3410,6 +3446,7 @@ func (s *Server) playerDieLocked(c *conn, killer int32, now float64) {
 		}
 	}
 	s.stopAttackLocked(c, true)
+	s.stopPvpAttackLocked(c, true)
 	c.stopArrivalLocked()
 	c.hasDest = false
 	cx, cy := c.posAtLocked(float32(now))

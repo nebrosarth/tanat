@@ -159,7 +159,15 @@ func (s *Server) orderDoneLocked(c *conn, action int32) {
 // startSkillOrderLocked validates a DO_ACTION for a skill and either casts
 // now, or starts the approach chase. It reports whether the order was accepted.
 // Caller holds mvMu.
-func (s *Server) startSkillOrderLocked(c *conn, slot int, target int32, px, py float32, hasPos bool) bool {
+func (s *Server) startSkillOrderLocked(c *conn, slot int, target int32, px, py float32, hasPos bool) (accepted bool) {
+	defer func() {
+		if accepted && c != nil {
+			c.assaultTeacherSkill = assaultTeacherSkillIntent{
+				slot: slot, target: target, x: px, y: py, hasPos: hasPos,
+				sequence: c.assaultTeacherSkill.sequence + 1,
+			}
+		}
+	}()
 	hs := c.huntState
 	def := hs.skillDef(slot)
 	now := float64(s.battleTime())
@@ -1557,10 +1565,22 @@ func (c *conn) mobsAlongLineLocked(cx, cy, tx, ty float32, halfWidth, maxLen flo
 // Tokens are matched WHOLE: a naive substring test would see FRIEND inside NOT_FRIEND
 // and invert the rule.
 func skillHasTargetFlag(sk gamedata.Skill, flag string) bool {
-	for _, f := range strings.Split(sk.Target, "+") {
-		if strings.TrimSpace(f) == flag {
+	// This function is on the 5 Hz action-mask path for every training hero.
+	// strings.Split allocates a slice on each call; scan the small authored
+	// '+'-separated mask directly while retaining the whole-token semantics.
+	for rest := sk.Target; ; {
+		end := strings.IndexByte(rest, '+')
+		token := rest
+		if end >= 0 {
+			token = rest[:end]
+		}
+		if strings.TrimSpace(token) == flag {
 			return true
 		}
+		if end < 0 {
+			break
+		}
+		rest = rest[end+1:]
 	}
 	return false
 }

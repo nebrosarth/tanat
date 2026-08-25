@@ -113,7 +113,12 @@ func (s *Server) botCanCommitStructureFocusLocked(b *botBrain, threat *mobState,
 	// full mobilization or an objective conversion; otherwise the safety layer
 	// correctly detects the cannon shot but the macro layer turns it back into
 	// a forced death.
-	if b.c.huntState == nil || botHPFrac(b.c.huntState, now) <= botRetreatHPFrac {
+	minimumHP := botRetreatHPFrac
+	fullAI30Assault := botUsesAI30(b) && b.macroAssignment.Reason == botMacroReasonFullMobilization
+	if fullAI30Assault {
+		minimumHP = botAI30ChaseMinHP
+	}
+	if b.c.huntState == nil || botHPFrac(b.c.huntState, now) <= minimumHP {
 		return false
 	}
 	// A conversion lease is not permission to stand under a full-health gun
@@ -123,7 +128,7 @@ func (s *Server) botCanCommitStructureFocusLocked(b *botBrain, threat *mobState,
 	// One committed shot may be traded; sustained local damage must still force
 	// an escape unless the named structure is already in the finish window.
 	loss, rate := botRecentHPLossLocked(b, now)
-	if !botMacroObjectiveFinishWindowLocked(objective) &&
+	if !fullAI30Assault && !botMacroObjectiveFinishWindowLocked(objective) &&
 		(loss >= botPredictiveRetreatLossFrac || rate >= botPredictiveRetreatLossRate) {
 		return false
 	}
@@ -718,7 +723,7 @@ func (s *Server) botCombatTickLocked(b *botBrain, now float64) bool {
 	// optional hero focus and even a rescue of a nearby ally; only a hero that
 	// is directly hitting this bot may pre-empt it. Otherwise the cover body
 	// walks to the exact creep and preserves the next proximity-XP event.
-	if !directHeroThreat {
+	if !directHeroThreat && !botUsesAI30(b) {
 		if farmTarget := s.botUrgentFarmCoverageTargetLocked(b, now); farmTarget != nil {
 			b.engageTarget = 0
 			s.stopPvpAttackLocked(c, false)
@@ -743,7 +748,7 @@ func (s *Server) botCombatTickLocked(b *botBrain, now float64) bool {
 	// Before the first visible wave, a zero-XP farm owner must stage on its
 	// assigned lane instead of taking an optional hero duel. This is a live
 	// obligation (no XP yet + lane wave pending), not a match-clock phase.
-	if immediateThreat == nil && botFirstFarmWavePendingLocked(b, now) {
+	if immediateThreat == nil && !botUsesAI30(b) && botFirstFarmWavePendingLocked(b, now) {
 		b.engageTarget = 0
 		s.stopPvpAttackLocked(c, false)
 		return false
@@ -754,7 +759,7 @@ func (s *Server) botCombatTickLocked(b *botBrain, now float64) bool {
 		farmOwnerUnderPressure := assignment.FarmLaneSet && assignment.FarmLane >= 0 &&
 			(assignment.Mode == botMacroLane || assignment.Mode == botMacroCover || assignment.Mode == botMacroBase) &&
 			!assignment.Aggressive && s.botFarmApproachTargetLocked(b, now) != nil
-		if farmOwnerUnderPressure && !botLastStandObjectiveLocked(b, now) {
+		if farmOwnerUnderPressure && !botUsesAI30(b) && !botLastStandObjectiveLocked(b, now) {
 			// A farm owner is not a duelist. Once an enemy hero has committed
 			// contact on a lane with a live wave, preserve the avatar and let the
 			// orchestrator hand the XP obligation to a healthy cover body. Walking
@@ -770,13 +775,13 @@ func (s *Server) botCombatTickLocked(b *botBrain, now float64) bool {
 		// every ordinary assignment, including push responders; a farm bot that
 		// loses 30% more HP before its next thought is already too late to cover
 		// the following wave.
-		if !botLastStandObjectiveLocked(b, now) && botHPFrac(hs, now) <= botPredictiveRetreatHPFrac {
+		if !botUsesAI30(b) && !botLastStandObjectiveLocked(b, now) && botHPFrac(hs, now) <= botPredictiveRetreatHPFrac {
 			botSetRetreatModeLocked(b, botRetreatModeDisengage, now)
 			hx, hy := s.botRetreatPointLocked(b, now)
 			s.botMoveTowardLocked(b, hx, hy, now)
 			return true
 		}
-		if farmOwnerUnderPressure && botHPFrac(hs, now) <= botSafeHPFrac {
+		if farmOwnerUnderPressure && !botUsesAI30(b) && botHPFrac(hs, now) <= botSafeHPFrac {
 			// A farm owner is strategically replaceable; a death creates an
 			// unrecoverable XP gap. Leave an active hero contact once HP has
 			// crossed the normal safe band instead of accepting a fair duel on
@@ -792,7 +797,11 @@ func (s *Server) botCombatTickLocked(b *botBrain, now float64) bool {
 		tx, ty := immediateThreat.posAtLocked(float32(now))
 		cx, cy := c.posAtLocked(float32(now))
 		distance := math.Hypot(float64(tx-cx), float64(ty-cy))
-		if botHPFrac(hs, now) > botPressureRetreatHPFrac &&
+		chaseFloor := botPressureRetreatHPFrac
+		if botUsesAI30(b) {
+			chaseFloor = botAI30ChaseMinHP
+		}
+		if botHPFrac(hs, now) > chaseFloor &&
 			distance > botEngageRadius && distance <= botFocusRallyRadius+botFightRadius &&
 			!s.botEnemyStructureDangerLocked(c, tx, ty) {
 			b.engageTarget = immediateThreat.objID
@@ -1212,6 +1221,13 @@ func (s *Server) botShouldProtectFarmFromOptionalFightLocked(b *botBrain, target
 	if b == nil || b.c == nil || b.c.inst == nil || target == nil || target.huntState == nil {
 		return false
 	}
+	// AI-30 is the aggressive scripted opponent. A visible local enemy hero is
+	// a legitimate lane target, not a reason to keep both sides staring across a
+	// creep wave. Its combat path still refuses a tower dive and breaks below the
+	// AI-30 chase-health floor.
+	if botUsesAI30(b) {
+		return false
+	}
 	assignment := b.macroAssignment
 	if assignment.Aggressive || assignment.Mode == botMacroPush || assignment.Mode == botMacroAltar {
 		return false
@@ -1295,6 +1311,16 @@ func (s *Server) botPickEngageTargetLocked(b *botBrain, enemies []*conn, now flo
 	tx, ty := nearest.posAtLocked(float32(now))
 	if s.botEnemyStructureDangerLocked(c, tx, ty) {
 		return nil // the fight (or the chase toward it) is inside the enemy's own tower/cannon range -- not worth pressing
+	}
+	// AI-30 must initiate ordinary visible lane duels instead of waiting for an
+	// enemy to attack first or for a favorable power estimate. Its only opening
+	// gates are meaningful: do not fight inside enemy structure range and do not
+	// start a new chase while already below its retreat floor.
+	if botUsesAI30(b) {
+		if botHPFrac(hs, now) >= botAI30ChaseMinHP {
+			return nearest
+		}
+		return nil
 	}
 
 	// Favourability: count living allies vs enemies near the FIGHT LOCATION. A lone

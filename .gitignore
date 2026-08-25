@@ -12,6 +12,9 @@
 /server/ai40/.onnxverify/
 /server/ai40/checkpoints/
 /server/ai40/datasets/
+/server/.tools/
+/server/assaultenv
+/server/ai40/.venv.windows.*/
 __pycache__/
 *.py[cod]
 /_decompiled/

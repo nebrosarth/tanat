@@ -17,6 +17,11 @@ import (
 // what it's doing.
 const botThinkInterval = 0.3
 
+// Teleport planning ranks landing points and may run A*. It is strategic work,
+// not per-tick combat/movement work. Assignment and recovery transitions clear
+// its gate so a newly useful scroll is still considered immediately.
+const botTeleportThinkInterval = 15.0
+
 // botPhase is where a bot's overall game plan currently sits. Transitions are decided
 // fresh every think tick (botUpdatePhaseLocked), not stored as a one-way ratchet, so a
 // grouped team that loses its fight and scatters correctly falls back to laning instead of
@@ -62,6 +67,9 @@ type botBrain struct {
 
 	phase       botPhase
 	nextThinkAt float64
+	// Kept independent from the normal think cadence: throttling scroll planning
+	// must never delay attack, retreat, channel or movement processing.
+	nextTeleportThinkAt float64
 
 	// engageTarget is the enemy hero this bot has committed to fighting this
 	// engagement (0 = none). Kept sticky for a few think-ticks (see botCombatTickLocked)
@@ -514,12 +522,8 @@ func (s *Server) botTickLocked(b *botBrain, now float64) {
 			cx, cy := c.posAtLocked(float32(now))
 			distance := math.Hypot(float64(target.x-cx), float64(target.y-cy))
 			attackReach := hs.effAttackRangeLocked(now) + hs.av.Radius() + target.mob.Radius()
-			ai30Unsafe := false
-			if botUsesAI30(b) {
-				_, _, ai30Safe := s.botAI30FarmAttackPointLocked(b, target, now)
-				ai30Unsafe = !ai30Safe
-			}
-			if ai30Unsafe || distance > dotaXPShareRadius || distance > attackReach {
+			if !s.botFarmMayAttackTargetLocked(b, target, now) ||
+				distance > dotaXPShareRadius || distance > attackReach {
 				s.stopAttackLocked(c, false)
 			}
 		}
@@ -538,8 +542,11 @@ func (s *Server) botTickLocked(b *botBrain, now float64) {
 	if botHasBlockingChannelLocked(hs, now) || botHasPendingBlockingChannelLocked(hs, now) {
 		return
 	}
-	if s.botMaybeStartTeleportLocked(b, now) {
-		return
+	if now >= b.nextTeleportThinkAt {
+		b.nextTeleportThinkAt = now + botTeleportThinkInterval
+		if s.botTeleportPlanRelevantLocked(b, now) && s.botMaybeStartTeleportLocked(b, now) {
+			return
+		}
 	}
 
 	// A burst of damage (a tower+wave combo, or a hero gank) can blow straight through
@@ -611,7 +618,11 @@ func (s *Server) botTickLocked(b *botBrain, now float64) {
 			}
 		}
 	}
-	if (!farmCoverageRequired || !b.macroAssignment.FarmLaneSet) && s.botCombatTickLocked(b, now) {
+	// AI-30 keeps a lane's XP owner near the wave, but it is not a pacifist:
+	// local combat is allowed while that coverage exists. botCombatTickLocked
+	// still gives an urgent uncovered creep first refusal and retains the HP and
+	// enemy-structure escape checks.
+	if (!farmCoverageRequired || !b.macroAssignment.FarmLaneSet || botUsesAI30(b)) && s.botCombatTickLocked(b, now) {
 		return // an enemy hero is being fought/chased/kited -- that IS this tick's order
 	}
 	if b.macroAssignment.Mode == botMacroBase {
@@ -825,8 +836,14 @@ func botClearRetreatLocked(b *botBrain) {
 }
 
 func botSetRetreatModeLocked(b *botBrain, mode botRetreatMode, now float64) {
+	wasRetreating := b.retreating
 	b.retreating = true
 	b.retreatMode = mode
+	if !wasRetreating {
+		// A new recovery/disengage state is a real decision event; do not wait
+		// for the steady-state scroll-planning cadence.
+		b.nextTeleportThinkAt = 0
+	}
 	if mode == botRetreatModeDisengage {
 		b.retreatHoldUntil = now + botDisengageMinHold
 	} else {
@@ -838,6 +855,18 @@ func botSetRetreatModeLocked(b *botBrain, mode botRetreatMode, now float64) {
 func (s *Server) botShouldRetreatLocked(b *botBrain, now float64) bool {
 	hs := b.c.huntState
 	if hs.deadUntil > 0 {
+		botClearRetreatLocked(b)
+		return false
+	}
+	// AI-30 is intentionally a high-commitment sparring opponent. It does not
+	// inherit the conservative farm/predictive disengage bands used by the
+	// macro-oriented AI versions: once it starts a visible lane duel it holds
+	// contact down to 20% HP. Structure-danger checks remain in the combat path.
+	if botUsesAI30(b) {
+		if botHPFrac(hs, now) <= botAI30ChaseMinHP {
+			botSetRetreatModeLocked(b, botRetreatModeRecovery, now)
+			return true
+		}
 		botClearRetreatLocked(b)
 		return false
 	}
@@ -1211,6 +1240,9 @@ const (
 // once HP recovers past botSafeHPFrac -- the two share one latch, not two competing ones.
 func (s *Server) botCheckHPCrashLocked(b *botBrain, now float64) bool {
 	cur := botHPFrac(b.c.huntState, now)
+	if botUsesAI30(b) && cur > botAI30ChaseMinHP {
+		return false
+	}
 	crash := false
 	for _, sample := range b.hpHistory {
 		if sample.t == 0 || now-sample.t > hpCrashWindow {
@@ -1363,5 +1395,5 @@ func (s *Server) botMoveTowardLocked(b *botBrain, tx, ty float32, now float64) {
 	if dist2(cx, cy, tx, ty) <= 2*2 {
 		return // already there
 	}
-	c.moveToLocked(s, tx, ty)
+	c.moveToFastLocked(s, tx, ty)
 }

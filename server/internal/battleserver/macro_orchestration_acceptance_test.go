@@ -111,6 +111,8 @@ func TestDotaAltarKillFinalizesSynchronouslyAndIdempotently(t *testing.T) {
 
 func TestDotaFinalizationFreezesActionsAndEndedTicker(t *testing.T) {
 	s, c, inst, _, _ := newDotaCaptureConn(t)
+	clock := newManualBattleClock()
+	s.clock = clock
 	bot := macroAddBot(t, s, inst, botIDBase+1, dotaTeamHuman, c.x+2, c.y, 0)
 	enemy := dotaPlayerConn(t, s, inst, botIDBase+2, dotaTeamElf, c.x+3, c.y)
 	target := structOfSide(inst, gamedata.DotaGun, dotaTeamElf)
@@ -161,10 +163,10 @@ func TestDotaFinalizationFreezesActionsAndEndedTicker(t *testing.T) {
 	}
 
 	phase, nextThink, x, y := bot.phase, bot.nextThinkAt, target.x, target.y
-	inst.mu.Lock()
-	go s.runInstanceTicker(inst)
-	inst.mu.Unlock()
-	time.Sleep(350 * time.Millisecond)
+	driver := &manualDotaBots{server: s, inst: inst, clock: clock}
+	for tick := 0; tick < 2; tick++ {
+		driver.step()
+	}
 	inst.mu.Lock()
 	if bot.phase != phase || bot.nextThinkAt != nextThink || target.x != x || target.y != y {
 		inst.mu.Unlock()

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import warnings
 import torch
 from torch import nn
 
@@ -41,6 +42,42 @@ class AI40Policy(nn.Module):
             "direction": self.direction_head(h), "distance": self.distance_head(h),
             "value": self.value_head(h).squeeze(-1), "h": h, "c": c,
         }
+
+
+class PolicyRunner:
+    """Optional torch.compile wrapper that falls back to eager execution."""
+
+    def __init__(
+        self,
+        policy: AI40Policy,
+        compile_model: bool = False,
+        *,
+        mode: str = "default",
+        dynamic: bool = True,
+        fullgraph: bool = False,
+    ):
+        self.policy = policy
+        self.compiled = None
+        if compile_model and hasattr(torch, "compile"):
+            try:
+                self.compiled = torch.compile(
+                    policy, mode=mode, dynamic=dynamic, fullgraph=fullgraph,
+                )
+            except Exception as exc:  # pragma: no cover - backend/platform specific
+                warnings.warn(f"torch.compile setup failed; using eager policy: {exc}")
+
+    def __call__(self, *args, **kwargs):
+        if self.compiled is not None:
+            try:
+                return self.compiled(*args, **kwargs)
+            except Exception as exc:  # pragma: no cover - backend/platform specific
+                warnings.warn(f"torch.compile execution failed; using eager policy: {exc}")
+                self.compiled = None
+        return self.policy(*args, **kwargs)
+
+    @property
+    def active(self) -> bool:
+        return self.compiled is not None
 
 
 def masked_categorical(logits: torch.Tensor, mask: torch.Tensor) -> torch.distributions.Categorical:

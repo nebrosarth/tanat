@@ -10,6 +10,7 @@ requires-python = ">=3.12,<3.14"
 dependencies = [
   "numpy>=2.0,<3",
   "torch>=2.8",
+  "triton-windows==3.7.1.post27; sys_platform == 'win32'",
 ]
 
 [project.optional-dependencies]
@@ -23,6 +24,15 @@ tanat-ai40-train-async = "tanat_ai40.train_async:main"
 tanat-ai40-eval = "tanat_ai40.evaluate:main"
 tanat-ai40-eval-ai30 = "tanat_ai40.evaluate_ai30:main"
 tanat-ai40-campaign = "tanat_ai40.train_campaign:main"
+tanat-ai41-campaign = "tanat_ai40.ai41:main"
+tanat-ai41-migrate = "tanat_ai40.migrate_ai41:main"
+tanat-ai41-migrate-navigation = "tanat_ai40.migrate_ai41_navigation:main"
+tanat-ai41-migrate-strategic = "tanat_ai40.migrate_ai41_strategic:main"
+tanat-ai42-preflight = "tanat_ai40.preflight_ai42:main"
+tanat-ai42-bc-preflight = "tanat_ai40.train_ai42_bc:main"
+tanat-ai42-build-dataset = "tanat_ai40.build_ai42_dataset_go:main"
+tanat-ai42-audit-dataset = "tanat_ai40.audit_ai42_dataset:main"
+tanat-ai42-compact-dataset = "tanat_ai40.compact_ai42_dataset:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

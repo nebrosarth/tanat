@@ -498,14 +498,9 @@ func TestDotaEndLockedWritesMatchEndAndCloses(t *testing.T) {
 	_ = loser
 }
 
-// TestBotTelemetryRecordsRealMatch is a real-clock integration smoke test, mirroring
-// bot_smoke_test.go's TestBotFilledMatchRunsForReal: a real TCP CONNECT/READY launch
-// into a fresh «Штурм» room with TANAT_DOTA_BOTS set AND TANAT_BOT_TELEMETRY pointed at
-// a temp dir, then the actual runInstanceTicker (real 200ms ticks, nothing stubbed) is
-// left to run for a few seconds. Confirms the async, goroutine-driven recording path --
-// not just the direct function calls the other tests in this file exercise -- actually
-// produces a growing, well-formed JSONL file with multiple bots' positions moving over
-// real time.
+// TestBotTelemetryRecordsRealMatch uses a real TCP CONNECT/READY launch and
+// asynchronous JSONL writer, but advances the Assault clock explicitly. It
+// verifies the live telemetry path without waiting for real server ticks.
 func TestBotTelemetryRecordsRealMatch(t *testing.T) {
 	if testing.Short() {
 		t.Skip("real-clock smoke test skipped in -short")
@@ -516,6 +511,11 @@ func TestBotTelemetryRecordsRealMatch(t *testing.T) {
 
 	store := session.NewStore()
 	s := New(store)
+	clock := newManualBattleClock()
+	s.clock = clock
+	instanceStarted := make(chan *huntInstance, 1)
+	s.instanceTickerStarter = func(*huntInstance) {}
+	s.instanceReadyHook = func(inst *huntInstance) { instanceStarted <- inst }
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("listen: %v", err)
@@ -562,7 +562,17 @@ func TestBotTelemetryRecordsRealMatch(t *testing.T) {
 		}
 	}()
 
-	time.Sleep(3 * time.Second) // several real ticks + a couple of bot think cycles
+	var inst *huntInstance
+	select {
+	case inst = <-instanceStarted:
+	case <-time.After(3 * time.Second):
+		t.Fatal("no Assault instance appeared after CONNECT/READY")
+	}
+	driver := &manualDotaBots{server: s, inst: inst, clock: clock}
+	defer driver.close()
+	for tick := 0; tick < int((3*time.Second)/AssaultTick); tick++ {
+		driver.step()
+	}
 
 	cl.Close()
 	<-drainDone
@@ -584,7 +594,7 @@ func TestBotTelemetryRecordsRealMatch(t *testing.T) {
 
 	got := readTelemetryLines(t, dir)
 	if len(got) == 0 {
-		t.Fatal("no telemetry lines recorded during a real 3s match window")
+		t.Fatal("no telemetry lines recorded during a 3s simulated match window")
 	}
 	var starts, snaps int
 	positions := map[int32]bool{}
@@ -603,7 +613,7 @@ func TestBotTelemetryRecordsRealMatch(t *testing.T) {
 		t.Errorf("got %d match_start lines, want exactly 1", starts)
 	}
 	if snaps < 10 {
-		t.Errorf("got only %d snapshot lines in 3 real seconds of a live match, want a healthy stream", snaps)
+		t.Errorf("got only %d snapshots in 3 simulated seconds, want a healthy stream", snaps)
 	}
 	if len(positions) < 2 {
 		t.Errorf("snapshots only ever covered %d distinct hero ids, want the player + several bots", len(positions))

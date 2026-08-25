@@ -89,6 +89,9 @@ func TestStickyMacroPlanKeepsOneKeyAndEligibleRespondersAcrossJitter(t *testing.
 func TestFullMobilizationPreparesBeforeAttack(t *testing.T) {
 	s, inst, bots, now, cleanup := stickyLaneFixture(t, 3)
 	defer cleanup()
+	// This is the conservative baseline contract. AI-30 deliberately has a
+	// different, wave-gated launch rule covered by its own test.
+	inst.dota.botAIVersionByTeam[dotaTeamHuman] = 20
 	objective, _ := s.botMacroLaneObjectiveLocked(inst, dotaTeamHuman, 0)
 	if objective == nil {
 		t.Fatal("setup: missing enemy lane objective")
@@ -169,6 +172,9 @@ func TestFullMobilizationDoesNotStartBeforeEveryUltimateIsLearned(t *testing.T) 
 func TestFullMobilizationPlanWaitsForEveryUltimateCooldown(t *testing.T) {
 	s, inst, bots, now, cleanup := stickyLaneFixture(t, 3)
 	defer cleanup()
+	// This is the conservative baseline contract. AI-30 deliberately has a
+	// different, wave-gated launch rule covered by its own test.
+	inst.dota.botAIVersionByTeam[dotaTeamHuman] = 20
 	objective, _ := s.botMacroLaneObjectiveLocked(inst, dotaTeamHuman, 0)
 	if objective == nil {
 		t.Fatal("setup: missing enemy lane objective")

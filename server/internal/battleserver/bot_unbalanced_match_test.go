@@ -7,9 +7,6 @@ import (
 	"strings"
 	"testing"
 	"time"
-
-	"tanatserver/internal/gamedata"
-	"tanatserver/internal/session"
 )
 
 const (
@@ -17,11 +14,7 @@ const (
 )
 
 // TestFiveBotAssaultFourVsFiveFirstFourMinutesFarm is the short farm probe for
-// the numerical-advantage macro. It intentionally stops after the opening
-// window: the current fast metric is zero missed creep XP.
-//
-//	$env:TANAT_RUN_4V5_BOT_TEST = "1"
-//	go test ./internal/battleserver -run TestFiveBotAssaultFourVsFiveFirstFourMinutesFarm -count=1 -timeout=2m
+// the numerical-advantage macro. It runs against a manually advanced clock.
 func TestFiveBotAssaultFourVsFiveFirstFourMinutesFarm(t *testing.T) {
 	if testing.Short() {
 		t.Skip("4v5 accelerated Assault test is disabled in -short mode")
@@ -34,10 +27,7 @@ func TestFiveBotAssaultFourVsFiveFirstFourMinutesFarm(t *testing.T) {
 
 // TestFiveBotAssaultFourVsFiveWithinThirtyMinutes is the end-to-end goal gate:
 // the side with five bots must destroy the opposing altar within 30 simulated
-// minutes. It is opt-in because it runs a full accelerated match.
-//
-//	$env:TANAT_RUN_5V4_BOT_TEST = "1"
-//	go test ./internal/battleserver -run TestFiveBotAssaultFourVsFiveWithinThirtyMinutes -count=1 -timeout=3m
+// minutes. It runs against a manually advanced clock.
 func TestFiveBotAssaultFourVsFiveWithinThirtyMinutes(t *testing.T) {
 	if testing.Short() {
 		t.Skip("5v4 accelerated Assault test is disabled in -short mode")
@@ -49,18 +39,16 @@ func TestFiveBotAssaultFourVsFiveWithinThirtyMinutes(t *testing.T) {
 }
 
 func runUnbalancedAssault(t *testing.T, minutes int, requireFiveBotWin bool, telemetryEnv string) {
-	t.Setenv("TANAT_DOTA_SIM_SPEED", "20")
 	telemetryDir := os.Getenv(telemetryEnv)
 	if telemetryDir == "" {
 		telemetryDir = t.TempDir()
 	}
 	t.Setenv("TANAT_BOT_TELEMETRY", telemetryDir)
 
-	s := New(session.NewStore())
-	inst := newDotaInstance(s, 190012, gamedata.DotaMaps()[0].ID)
+	driver := newManualDotaBots(t, 190012, unbalancedAssaultBots)
+	s, inst := driver.server, driver.inst
 
 	inst.mu.Lock()
-	s.spawnDotaBotsLocked(inst, unbalancedAssaultBots)
 	if len(inst.bots) != unbalancedAssaultBots {
 		inst.mu.Unlock()
 		t.Fatalf("spawned %d bots, want %d", len(inst.bots), unbalancedAssaultBots)
@@ -84,16 +72,10 @@ func runUnbalancedAssault(t *testing.T, minutes int, requireFiveBotWin bool, tel
 	start := inst.dota.startedAt
 	inst.mu.Unlock()
 
-	defer closeUnbalancedAssaultTestInstance(inst)
-	go s.runInstanceTicker(inst)
-
-	deadline := time.Now().Add(dotaSimulationWallDuration(time.Duration(minutes) * time.Minute))
-	tick := time.NewTicker(dotaSimulationWallDuration(time.Second))
-	defer tick.Stop()
-	for time.Now().Before(deadline) {
-		<-tick.C
+	for tick := 0; tick < int((time.Duration(minutes)*time.Minute)/AssaultTick); tick++ {
+		ended := driver.step()
 		inst.mu.Lock()
-		if inst.dota != nil && inst.dota.ended {
+		if ended {
 			elapsed := float64(s.battleTime()) - start
 			winner := inst.dota.winner
 			logUnbalancedAssaultScore(t, inst, elapsed, winner)

@@ -31,6 +31,14 @@ type huntInstance struct {
 	members map[int32]*conn // keyed by avatar objID
 	closed  bool
 
+	// botSortedMobs is the deterministic map projection shared by all scripted
+	// bot decisions in one server tick.  AI-30 asks many strategic questions per
+	// tick; rebuilding and reflection-sorting the same mob map for each one was
+	// the largest allocation and GC source in headless Assault rollouts.  The
+	// instance lock protects this cache together with mobs.
+	botSortedMobs      []*mobState
+	botSortedMobsCount int
+
 	// nextFxUID allocates world-scoped effect ids (mob debuffs, boss telegraphs,
 	// fog-ring shade) that are broadcast to every member with the SAME id, so a
 	// mob's stun/slow/shade looks identical on all clients and can be ended
@@ -187,7 +195,7 @@ func (s *Server) joinInstance(roomID, mapID int32, c *conn) *huntInstance {
 			c.inst = inst
 			c.lk = &inst.mu
 			inst.mu.Unlock()
-			go s.runInstanceTicker(inst)
+			s.startInstanceTicker(inst)
 			log.Printf("battle: created hunt instance room=%d map=%d (member %d)", roomID, mapID, c.objID)
 			return inst
 		}
@@ -207,6 +215,14 @@ func (s *Server) joinInstance(roomID, mapID int32, c *conn) *huntInstance {
 			roomID, mapID, c.objID, n)
 		return inst
 	}
+}
+
+func (s *Server) startInstanceTicker(inst *huntInstance) {
+	if s.instanceTickerStarter != nil {
+		s.instanceTickerStarter(inst)
+		return
+	}
+	go s.runInstanceTicker(inst)
 }
 
 // memberList snapshots the instance's READY members -- those whose world state is

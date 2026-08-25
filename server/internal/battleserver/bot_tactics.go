@@ -304,8 +304,14 @@ func (s *Server) botGroupTickLocked(b *botBrain, now float64) {
 		// frozen on the old target and never reaches the shared rally point or the
 		// named structure. The exact objective order is preserved if it is already
 		// the active target.
-		if b.macroAssignment.Reason == botMacroReasonMobilizationPreparation ||
-			hs.attackTarget == 0 || hs.attackTarget != b.macroAssignment.ObjectiveID {
+		keepAI30WaveAttack := false
+		if botUsesAI30(b) && b.macroAssignment.Reason == botMacroReasonFullMobilization && hs.attackTarget != 0 {
+			if target := c.inst.mobs[hs.attackTarget]; target != nil && !target.dead && !target.structure && target.enemyOf(c.playerTeam()) {
+				keepAI30WaveAttack = true
+			}
+		}
+		if !keepAI30WaveAttack && (b.macroAssignment.Reason == botMacroReasonMobilizationPreparation ||
+			hs.attackTarget == 0 || hs.attackTarget != b.macroAssignment.ObjectiveID) {
 			s.stopAttackLocked(c, false)
 		}
 	}
@@ -314,6 +320,9 @@ func (s *Server) botGroupTickLocked(b *botBrain, now float64) {
 	}
 	if b.macroAssignment.Reason == botMacroReasonMobilizationPreparation {
 		s.botMobilizationGatherTickLocked(b, now)
+		return
+	}
+	if objectiveFormation && s.botAI30AssaultCreepTickLocked(b, now) {
 		return
 	}
 	// Once an aggressive responder is within the objective commit radius, issue

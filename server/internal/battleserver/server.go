@@ -50,6 +50,13 @@ type Server struct {
 	// member sees the others. Guarded by mu.
 	insts map[int32]*huntInstance
 
+	// instanceTickerStarter is a test seam for transport integration tests.
+	// Production leaves it nil and starts the ordinary ticker goroutine.
+	instanceTickerStarter func(*huntInstance)
+	// instanceReadyHook runs after a real client has received its world state and
+	// any configured Assault bot backfill has completed. It is test-only.
+	instanceReadyHook func(*huntInstance)
+
 	// linsts holds the shared central-square hubs keyed by lobby area (367 cs_human,
 	// 368 cs_elf). Every occupant of one square joins its hub and sees the others
 	// walk around (lobby_render.go). Bounded to one per area, so unlike insts these
@@ -176,7 +183,31 @@ type conn struct {
 	// staleness/drift throttle does for mobs (see chaseMoveLocked).
 	chaseGoalX, chaseGoalY float32
 	chaseRepathAt          float64
+	policyAttackRetargetAt float64
+
+	// assaultTeacherSkill is a transient trace of a server-side bot ability
+	// order. It is consumed by the offline AI-30 imitation protocol after the
+	// tick; live clients and ordinary simulations never read it.
+	assaultTeacherSkill assaultTeacherSkillIntent
 }
+
+type assaultTeacherSkillIntent struct {
+	slot     int
+	target   int32
+	x, y     float32
+	hasPos   bool
+	sequence uint64
+}
+
+const (
+	// Combat targets move every simulation tick. Re-running A* for every metre of
+	// target movement dominates headless self-play, while a one-second-old chase
+	// route is still accurate enough for attack-range acquisition.
+	chaseRepathInterval = 1.0
+	chaseRepathDrift    = 4.0
+	// Teleports and large dashes must invalidate the old route immediately.
+	chaseRepathUrgentDrift = 12.0
+)
 
 func (c *conn) send(p battleproto.Packet) error {
 	if c.headless {
@@ -477,6 +508,9 @@ func (s *Server) sendWorldState(c *conn) {
 		// Dev/test convenience (TANAT_DOTA_BOTS): backfill a fresh «Штурм» match with
 		// bot-controlled heroes now that this player's own side is assigned. See bot.go.
 		s.maybeFillDotaBotsLocked(c)
+		if s.instanceReadyHook != nil && c.inst != nil {
+			s.instanceReadyHook(c.inst)
+		}
 		return
 	}
 
@@ -744,7 +778,19 @@ func (s *Server) handleStop(c *conn, p battleproto.Packet) {
 // arrival timer each). A clear straight shot yields a single leg — identical to the
 // old straight-line behaviour — so unobstructed moves and the lobby (nav==nil) are
 // unchanged.
+type chasePathNav interface {
+	FastPath(fx, fy, tx, ty float64) []gamedata.Vec2
+}
+
 func (c *conn) moveToLocked(s *Server, tx, ty float32) {
+	c.moveToRoutedLocked(s, tx, ty, false)
+}
+
+func (c *conn) moveToFastLocked(s *Server, tx, ty float32) {
+	c.moveToRoutedLocked(s, tx, ty, true)
+}
+
+func (c *conn) moveToRoutedLocked(s *Server, tx, ty float32, chase bool) {
 	now := s.battleTime()
 	if c.movementBlockedLocked(float64(now)) {
 		c.stopMovementLocked(s, float64(now))
@@ -758,7 +804,11 @@ func (c *conn) moveToLocked(s *Server, tx, ty float32) {
 	// straight (clipped) leg — the historical behaviour.
 	var route []gamedata.Vec2
 	if c.nav != nil && !calibrateNav {
-		route = c.nav.Path(float64(cx), float64(cy), float64(tx), float64(ty))
+		if fast, ok := c.nav.(chasePathNav); chase && ok {
+			route = fast.FastPath(float64(cx), float64(cy), float64(tx), float64(ty))
+		} else {
+			route = c.nav.Path(float64(cx), float64(cy), float64(tx), float64(ty))
+		}
 	}
 	if len(route) == 0 {
 		etx, ety := tx, ty
@@ -846,11 +896,44 @@ func (c *conn) resetChaseLocked() {
 	c.chaseRepathAt = 0
 }
 
+// refreshChaseRouteEndpointLocked retargets an existing route without A*. The
+// expensive part of a chase route is getting around static walls; a moving unit
+// usually remains directly reachable from the route's final corner. For a
+// multi-leg route only its not-yet-active tail is changed. Once the final leg is
+// active, a cheap Clip check permits restarting that straight leg toward the new
+// position without searching the complete nav grid again.
+func (c *conn) refreshChaseRouteEndpointLocked(s *Server, tx, ty float32) bool {
+	if !c.hasDest || len(c.path) == 0 || c.nav == nil || calibrateNav {
+		return false
+	}
+	var ax, ay float64
+	if len(c.path) >= 2 {
+		anchor := c.path[len(c.path)-2]
+		ax, ay = anchor.X, anchor.Y
+	} else {
+		cx, cy := c.posAtLocked(s.battleTime())
+		ax, ay = float64(cx), float64(cy)
+	}
+	clippedX, clippedY := c.nav.Clip(ax, ay, float64(tx), float64(ty))
+	if math.Hypot(clippedX-float64(tx), clippedY-float64(ty)) > 0.25 {
+		return false
+	}
+	if len(c.path) >= 2 {
+		c.path[len(c.path)-1] = gamedata.Vec2{X: float64(tx), Y: float64(ty)}
+		c.destX, c.destY = tx, ty
+		return true
+	}
+	// The only remaining waypoint is already captured by the active arrival
+	// callback, so replace that leg rather than mutating the slice underneath it.
+	c.moveStraightExLocked(s, tx, ty, false)
+	return true
+}
+
 // chaseMoveLocked re-paths a combat chase (auto-attack pursuit / approach-cast)
-// toward (tx,ty) only when it is worth it: immediately when the goal has
-// drifted >1m since the last chase re-path, and at most once per second when
-// the walker went idle short of the goal (a clipped/failed route, or the target
-// nudged less than the tolerance). Without the gate every 200-250ms combat
+// toward (tx,ty) only when it is worth it: after at least one second and four
+// metres of accumulated target drift, immediately after a >12m teleport/dash,
+// or once per second when the walker went idle short of the goal. Without the
+// gate every 200-250ms combat
 // re-arm would re-run A*, cancel and recreate the arrival timer and push a
 // redundant POSITION sync even for a target that has not moved — and a
 // nil-route target would re-run a worst-case search every tick (the failure
@@ -865,12 +948,21 @@ func (c *conn) chaseMoveLocked(s *Server, tx, ty float32) {
 		return
 	}
 	drift := math.Hypot(float64(tx-c.chaseGoalX), float64(ty-c.chaseGoalY))
-	if drift <= 1.0 && (c.hasDest || now-c.chaseRepathAt < 1.0) {
-		return // same goal and the walker is busy (or retried recently): keep walking
+	elapsed := now - c.chaseRepathAt
+	if drift < chaseRepathUrgentDrift {
+		if c.hasDest && (elapsed < chaseRepathInterval || drift < chaseRepathDrift) {
+			return // keep following the usable route while target drift accumulates
+		}
+		if !c.hasDest && elapsed < chaseRepathInterval {
+			return // clipped/failed route: cap retries at once per second
+		}
 	}
 	c.chaseGoalX, c.chaseGoalY = tx, ty
 	c.chaseRepathAt = now
-	c.moveToLocked(s, tx, ty)
+	if c.refreshChaseRouteEndpointLocked(s, tx, ty) {
+		return
+	}
+	c.moveToRoutedLocked(s, tx, ty, true)
 }
 
 // movementBlockedLocked is the single authoritative gate for ordinary avatar

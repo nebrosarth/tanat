@@ -1,0 +1,21 @@
+{
+  "protocol_version": 13,
+  "model": {
+    "hidden_size": 384,
+    "model_width": 384,
+    "entity_layers": 4,
+    "num_heads": 8,
+    "ff_multiplier": 4,
+    "timing_bins": 4
+  },
+  "recurrent_batch": {
+    "sequence_length": 64,
+    "batch_size": 32
+  },
+  "learner": {
+    "class_balance_power": 1.0,
+    "max_gradient_norm": 1.0,
+    "timing_loss_enabled": false,
+    "optimizer_step_allowed_in_preflight": false
+  }
+}

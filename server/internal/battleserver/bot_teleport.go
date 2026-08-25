@@ -61,6 +61,33 @@ func botTeleportScroll() (gamedata.Item, bool) {
 	return items[0], true
 }
 
+// botTeleportPlanRelevantLocked is deliberately cheap.  It rejects the common
+// lane-farming case before the expensive planner scans every allied destination
+// and invokes A*.  The detailed planner still owns every actual eligibility,
+// safety and ETA decision once a state can plausibly justify a scroll.
+func (s *Server) botTeleportPlanRelevantLocked(b *botBrain, now float64) bool {
+	if b == nil || b.c == nil || b.c.huntState == nil {
+		return false
+	}
+	if b.retreating {
+		return b.retreatMode == botRetreatModeRecovery
+	}
+	if b.farmLaneArrivalPending || botBaseDefenseResponderAssignment(b.macroAssignment) {
+		return true
+	}
+	if b.macroAssignment.Mode == botMacroBase && b.macroAssignment.Role == "cover" &&
+		b.macroAssignment.FarmLaneSet {
+		return true
+	}
+	// The standing-barracks fallback is relevant only after a genuine lane
+	// reassignment.  This mirrors its own guard without running its spatial
+	// target-selection work on ordinary lane farmers.
+	if b.macroAssignment.FarmLaneSet && b.macroAssignment.FarmLane != b.lane {
+		return true
+	}
+	return s.atRespawnFountainLocked(b.c, now)
+}
+
 // seedBotTeleportScrollLocked gives a new bot a battle-only stack. It deliberately
 // bypasses grantItemLocked: bot scrolls must never touch session.Store.
 func (s *Server) seedBotTeleportScrollLocked(c *conn) {
@@ -1169,7 +1196,34 @@ func (s *Server) botTeleportTargetValidLocked(b *botBrain, m *mobState) bool {
 	return len(m.lane) > 1 && m.laneIdx >= 0 && m.laneIdx < len(m.lane)
 }
 
+// botTeleportSafetySnapshot is immutable for the duration of one teleport
+// planning decision. Landing-point selection used to rebuild the same fog and
+// enemy lists for every one of its 16 candidate points (and twice per point),
+// turning one scroll decision into dozens of full-world scans.
+type botTeleportSafetySnapshot struct {
+	now           float64
+	visionSources []dotaVisionSource
+	enemyHeroes   []*conn
+}
+
+func (s *Server) botTeleportSafetySnapshotLocked(c *conn, now float64) botTeleportSafetySnapshot {
+	return botTeleportSafetySnapshot{
+		now:           now,
+		visionSources: dotaTeamVisionSourcesLocked(c.inst, c.playerTeam(), now),
+		enemyHeroes:   botLivingEnemyHeroes(c, now),
+	}
+}
+
 func (s *Server) botTeleportDestinationLocked(c *conn, target *mobState) (float32, float32, bool) {
+	now := float64(s.battleTime())
+	return s.botTeleportDestinationWithSafetyLocked(
+		c, target, s.botTeleportSafetySnapshotLocked(c, now),
+	)
+}
+
+func (s *Server) botTeleportDestinationWithSafetyLocked(
+	c *conn, target *mobState, safety botTeleportSafetySnapshot,
+) (float32, float32, bool) {
 	if target == nil || target.dead || target.team != c.playerTeam() {
 		return 0, 0, false
 	}
@@ -1186,10 +1240,10 @@ func (s *Server) botTeleportDestinationLocked(c *conn, target *mobState) (float3
 		angle := base + float64(i)*math.Pi/8
 		x := target.x + need*float32(math.Cos(angle))
 		y := target.y + need*float32(math.Sin(angle))
-		if s.botTeleportUnsafeLocked(c, x, y, target) {
+		if s.botTeleportUnsafeWithSafetyLocked(c, x, y, target, safety) {
 			continue
 		}
-		clearance := s.botTeleportEnemyClearanceLocked(c, x, y, float64(s.battleTime()))
+		clearance := s.botTeleportEnemyClearanceWithSafetyLocked(c, x, y, safety)
 		if !found || clearance > bestClearance {
 			bestX, bestY, bestClearance, found = x, y, clearance, true
 		}
@@ -1198,22 +1252,38 @@ func (s *Server) botTeleportDestinationLocked(c *conn, target *mobState) (float3
 }
 
 func (s *Server) botTeleportEnemyClearanceLocked(c *conn, x, y float32, now float64) float64 {
+	return s.botTeleportEnemyClearanceWithSafetyLocked(
+		c, x, y, s.botTeleportSafetySnapshotLocked(c, now),
+	)
+}
+
+func (s *Server) botTeleportEnemyClearanceWithSafetyLocked(
+	c *conn, x, y float32, safety botTeleportSafetySnapshot,
+) float64 {
 	clearance := math.Inf(1)
-	visionSources := dotaTeamVisionSourcesLocked(c.inst, c.playerTeam(), now)
 	for _, m := range c.inst.mobs {
-		if m == nil || m.dead || !m.enemyOf(c.playerTeam()) || !botVisibleEnemyMobLocked(c.playerTeam(), m, visionSources) {
+		if m == nil || m.dead || !m.enemyOf(c.playerTeam()) || !botVisibleEnemyMobLocked(c.playerTeam(), m, safety.visionSources) {
 			continue
 		}
 		clearance = math.Min(clearance, math.Sqrt(float64(dist2(x, y, m.x, m.y))))
 	}
-	for _, mem := range botLivingEnemyHeroes(c, now) {
-		mx, my := mem.posAtLocked(float32(now))
+	for _, mem := range safety.enemyHeroes {
+		mx, my := mem.posAtLocked(float32(safety.now))
 		clearance = math.Min(clearance, math.Sqrt(float64(dist2(x, y, mx, my))))
 	}
 	return clearance
 }
 
 func (s *Server) botTeleportUnsafeLocked(c *conn, x, y float32, target *mobState) bool {
+	now := float64(s.battleTime())
+	return s.botTeleportUnsafeWithSafetyLocked(
+		c, x, y, target, s.botTeleportSafetySnapshotLocked(c, now),
+	)
+}
+
+func (s *Server) botTeleportUnsafeWithSafetyLocked(
+	c *conn, x, y float32, target *mobState, safety botTeleportSafetySnapshot,
+) bool {
 	if c.nav != nil && !c.nav.Walkable(float64(x), float64(y)) {
 		return true
 	}
@@ -1221,17 +1291,16 @@ func (s *Server) botTeleportUnsafeLocked(c *conn, x, y float32, target *mobState
 		return true
 	}
 	enemyCount := 0
-	visionSources := dotaTeamVisionSourcesLocked(c.inst, c.playerTeam(), float64(s.battleTime()))
 	for _, m := range c.inst.mobs {
-		if m.dead || !m.enemyOf(c.playerTeam()) || !botVisibleEnemyMobLocked(c.playerTeam(), m, visionSources) {
+		if m.dead || !m.enemyOf(c.playerTeam()) || !botVisibleEnemyMobLocked(c.playerTeam(), m, safety.visionSources) {
 			continue
 		}
 		if dist2(x, y, m.x, m.y) <= botTeleportEnemyRadius*botTeleportEnemyRadius {
 			enemyCount++
 		}
 	}
-	for _, mem := range botLivingEnemyHeroes(c, float64(s.battleTime())) {
-		mx, my := mem.posAtLocked(s.battleTime())
+	for _, mem := range safety.enemyHeroes {
+		mx, my := mem.posAtLocked(float32(safety.now))
 		if dist2(x, y, mx, my) <= botTeleportEnemyRadius*botTeleportEnemyRadius {
 			return true
 		}
@@ -1249,7 +1318,7 @@ func (s *Server) botTeleportUnsafeLocked(c *conn, x, y float32, target *mobState
 		// that the bot's team does not currently see. Enemy structures remain
 		// visible through fog via botVisibleEnemyMobLocked, as they do for the
 		// client-side map representation.
-		if m.enemyOf(c.playerTeam()) && !botVisibleEnemyMobLocked(c.playerTeam(), m, visionSources) {
+		if m.enemyOf(c.playerTeam()) && !botVisibleEnemyMobLocked(c.playerTeam(), m, safety.visionSources) {
 			continue
 		}
 		gap := float32(m.mob.Radius() + c.huntState.av.Radius() + 0.5)

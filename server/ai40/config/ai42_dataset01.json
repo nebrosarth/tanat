@@ -1,0 +1,25 @@
+{
+  "match_count": 320,
+  "seed": 420000,
+  "workers": 8,
+  "in_flight": 8,
+  "max_steps": 4500,
+  "timeout_minutes": 15.0,
+  "scenario_mix": {
+    "ai30_mirror": {
+      "train": 210,
+      "validation": 30
+    },
+    "ai30_vs_ai20": {
+      "train": 35,
+      "validation": 5
+    },
+    "ai20_vs_ai30": {
+      "train": 35,
+      "validation": 5
+    }
+  },
+  "validation_fraction": 0.125,
+  "split_seed": 42,
+  "go_command": "go run ./cmd/assaultdataset"
+}

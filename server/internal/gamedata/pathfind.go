@@ -2,7 +2,6 @@ package gamedata
 
 import (
 	"math"
-	"sync"
 )
 
 // Pathfinding turns the flat walkability grid into routes that go AROUND walls
@@ -25,6 +24,12 @@ const sqrt2 = 1.4142135623730951
 // real map expand far fewer cells than this thanks to the octile heuristic.
 const maxExpansions = 200000
 
+// retainedPathScratches matches the rollout server's maximum GOMAXPROCS. It
+// bounds live-server memory while retaining every scratch needed by one
+// vectorized headless path wave, avoiding repeated multi-megabyte allocation
+// and GC clearing.
+const retainedPathScratches = 16
+
 type step struct {
 	di, dj int
 	diag   bool
@@ -44,6 +49,18 @@ var dirs8 = [8]step{
 // (the goal), so an unobstructed move stays a single leg. Returns nil when no
 // route exists (caller should fall back to Clip or stay put).
 func (g *NavGrid) Path(fx, fy, tx, ty float64) []Vec2 {
+	return g.path(fx, fy, tx, ty, 1)
+}
+
+// FastPath is the chase-oriented variant of Path. A weighted heuristic greatly
+// reduces grid expansion around long static obstacles; the resulting route may
+// be somewhat longer than optimal, which is acceptable for a moving combat
+// target whose endpoint will change before the route is completed.
+func (g *NavGrid) FastPath(fx, fy, tx, ty float64) []Vec2 {
+	return g.path(fx, fy, tx, ty, 5)
+}
+
+func (g *NavGrid) path(fx, fy, tx, ty, heuristicWeight float64) []Vec2 {
 	si := int(math.Floor((fx - g.MinX) / g.Cell))
 	sj := int(math.Floor((fy - g.MinY) / g.Cell))
 	si, sj, ok := g.nearestWalkable(si, sj, 4)
@@ -72,7 +89,7 @@ func (g *NavGrid) Path(fx, fy, tx, ty float64) []Vec2 {
 		return []Vec2{{goalX, goalY}}
 	}
 
-	cells := g.astar(si, sj, gi, gj)
+	cells := g.astarWeighted(si, sj, gi, gj, heuristicWeight)
 	if cells == nil {
 		return nil
 	}
@@ -136,7 +153,29 @@ type pathScratch struct {
 	heap   []hNode
 }
 
-var scratchPool = sync.Pool{New: func() any { return &pathScratch{} }}
+func (g *NavGrid) borrowPathScratch() *pathScratch {
+	g.pathScratchMu.Lock()
+	n := len(g.pathScratchFree)
+	if n == 0 {
+		g.pathScratchMu.Unlock()
+		return &pathScratch{}
+	}
+	sc := g.pathScratchFree[n-1]
+	g.pathScratchFree = g.pathScratchFree[:n-1]
+	g.pathScratchMu.Unlock()
+	return sc
+}
+
+func (g *NavGrid) releasePathScratch(sc *pathScratch) {
+	if sc == nil {
+		return
+	}
+	g.pathScratchMu.Lock()
+	if len(g.pathScratchFree) < retainedPathScratches {
+		g.pathScratchFree = append(g.pathScratchFree, sc)
+	}
+	g.pathScratchMu.Unlock()
+}
 
 func (s *pathScratch) prepare(n int) uint32 {
 	if cap(s.g) < n {
@@ -210,13 +249,17 @@ func (s *pathScratch) pop() int32 {
 // an octile heuristic, refusing to cut wall corners on diagonal steps. Returns
 // the cell indices start..goal inclusive, or nil if unreachable / capped.
 func (g *NavGrid) astar(si, sj, gi, gj int) []int {
+	return g.astarWeighted(si, sj, gi, gj, 1)
+}
+
+func (g *NavGrid) astarWeighted(si, sj, gi, gj int, heuristicWeight float64) []int {
 	start := int32(si*g.H + sj)
 	goal := int32(gi*g.H + gj)
 	if start == goal {
 		return []int{int(start)}
 	}
-	sc := scratchPool.Get().(*pathScratch)
-	defer scratchPool.Put(sc)
+	sc := g.borrowPathScratch()
+	defer g.releasePathScratch(sc)
 	gen := sc.prepare(g.W * g.H)
 
 	sc.g[start] = 0
@@ -260,7 +303,7 @@ func (g *NavGrid) astar(si, sj, gi, gj int) []int {
 			sc.g[nc] = ng
 			sc.came[nc] = c
 			sc.seen[nc] = gen
-			sc.push(nc, ng+octile(ni, nj, gi, gj))
+			sc.push(nc, ng+heuristicWeight*octile(ni, nj, gi, gj))
 		}
 	}
 	return nil

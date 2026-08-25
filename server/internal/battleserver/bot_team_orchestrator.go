@@ -2,6 +2,7 @@ package battleserver
 
 import (
 	"math"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -86,6 +87,10 @@ func (s *Server) botPlanTeamsLocked(inst *huntInstance, now float64) {
 	if inst == nil || inst.dota == nil || len(inst.bots) == 0 {
 		return
 	}
+	// All scripted decisions below and in the following member tick observe one
+	// deterministic mob ordering.  Rebuild it once after the clock callbacks
+	// have settled instead of sorting the shared map in every helper.
+	botInvalidateSortedMobsLocked(inst)
 	d := inst.dota
 	if d.teamPlans == nil {
 		d.teamPlans = map[int32]botTeamPlan{}
@@ -146,6 +151,12 @@ func (s *Server) botPlanTeamsLocked(inst *huntInstance, now float64) {
 				(baselineCoverage || baseDefense || assignment.Mode == botMacroLane || assignment.Mode == botMacroCover || assignment.Role == "defender") {
 				brain.farmLaneArrivalPending = true
 			}
+			if assignment != previousAssignment {
+				// A fresh lane/objective hand-off can make a scroll useful at once.
+				// Leave the normal expensive planner throttled, but invalidate its
+				// negative result when the orchestrator changes the premise.
+				brain.nextTeleportThinkAt = 0
+			}
 			brain.macroAssignment = assignment
 		}
 	}
@@ -183,7 +194,15 @@ func (s *Server) botPlanTeamLocked(inst *huntInstance, team int32, now float64) 
 			active++
 		}
 	}
-	sort.Slice(bots, func(i, j int) bool { return bots[i].c.objID < bots[j].c.objID })
+	slices.SortFunc(bots, func(left, right *botBrain) int {
+		if left.c.objID < right.c.objID {
+			return -1
+		}
+		if left.c.objID > right.c.objID {
+			return 1
+		}
+		return 0
+	})
 	for _, brain := range bots {
 		// Baseline lane ownership is immutable. Coordinated work is an overlay;
 		// when a bot is not selected as a responder it explicitly covers this lane.
@@ -202,6 +221,13 @@ func (s *Server) botPlanTeamLocked(inst *huntInstance, team int32, now float64) 
 	conversionReady := s.botObjectiveConversionReadyLocked(inst, team, offensiveObjective, now)
 	ignoreGunDefense := defenseStructure != nil && defenseStructure.dotaRole == gamedata.DotaGun &&
 		defenseSeverity > 0 && conversionReady
+	// The aggressive AI-30 teacher must not turn an AFK side's creep contact
+	// into a full retreat from its offensive route. It commits to the base race,
+	// including its own altar: a non-playing team cannot convert a defensive
+	// detour into an active counterattack.
+	if botTeamAIVersionLocked(inst, team) == 30 && defenseStructure != nil {
+		ignoreGunDefense = true
+	}
 	if ignoreGunDefense && hasPrevious && previous.Mode == botMacroBase {
 		// Keep a stable base plan while the own gun is under direct fire. The
 		// base responder overlay can still reserve a counter-pusher for a low
@@ -273,6 +299,18 @@ func (s *Server) botPlanTeamLocked(inst *huntInstance, team int32, now float64) 
 				s.botTeamFarmRescueRequiredLocked(inst, team)
 			farmCoverageRequired := botAIProfileForVersion(plan.AIVersion).UsesFarmSafeWave() &&
 				s.botTeamFarmCoverageRequiredLocked(inst, team, now)
+			// Once AI-30 has committed to a wave push, do not dissolve the assembly
+			// because the sacrificial wave dies while the group is walking to its
+			// rally point. Keep that commitment through the next front object on the
+			// same route as well; otherwise one destroyed gun turns the whole team
+			// back into farmers before it can reach the barracks behind it.
+			ai30AssaultCommitted := plan.AIVersion == 30 && hasPrevious && objective != nil &&
+				((previous.ObjectiveID == objective.id && botAnyMobilizationReason(previous.Reason)) ||
+					(continuedPush && botAnyMobilizationReason(previous.Reason)))
+			if ai30AssaultCommitted {
+				farmRescue = false
+				farmCoverageRequired = false
+			}
 			if farmRescue && hasPrevious && (previous.Mode == botMacroPush || previous.Mode == botMacroRally) &&
 				previous.ObjectiveID != 0 && objective != nil && previous.ObjectiveID == objective.id &&
 				botMacroObjectiveDamaged(objective) {
@@ -299,6 +337,16 @@ func (s *Server) botPlanTeamLocked(inst *huntInstance, team int32, now float64) 
 				if !farmCoverageRequired {
 					farmRescue = false
 				}
+			}
+			// AI-30 is the explicit aggressive teacher. A live enemy front objective
+			// is sufficient to launch it; the normal bot profile may wait for lane
+			// progress and a wave, but that wait made an AFK opponent consume every
+			// opportunity before the team ever left farm. Local survival checks still
+			// protect each hero while the group advances.
+			ai30WavePush := plan.AIVersion == 30 && objective != nil
+			if ai30WavePush {
+				farmRescue = false
+				farmCoverageRequired = false
 			}
 			conversionReady := s.botObjectiveConversionReadyLocked(inst, team, objective, now)
 			objectiveStaging := !conversionReady && s.botObjectiveStagingRequiredLocked(inst, team, objective, previous, hasPrevious, now)
@@ -336,13 +384,13 @@ func (s *Server) botPlanTeamLocked(inst *huntInstance, team int32, now float64) 
 			allUltimatesLearned := botMobilizationUltimatesLearnedLocked(bots)
 			allUltimatesReady := allUltimatesLearned && botMobilizationUltimatesReadyLocked(bots, now)
 			finishWindow := botMacroObjectiveFinishWindowLocked(objective)
-			mobilizationContinuation := continuedPush && hasPrevious && botMobilizationReason(previous.Reason)
+			mobilizationContinuation := ai30AssaultCommitted || (continuedPush && hasPrevious && botMobilizationReason(previous.Reason))
 			// A structure already inside the execution window is a direct finish
 			// debt. Do not hold its damage at 1-2% while waiting for a full-roster
 			// rally; healthy assigned responders can close it immediately, and the
 			// ordinary retreat gate still protects a critically injured bot.
 			mobilizationOpportunity := progress && coverage >= 2 && conversionReady && !farmRescue
-			mobilizationRequested := mobilizationContinuation || (allUltimatesReady &&
+			mobilizationRequested := mobilizationContinuation || ai30WavePush || (allUltimatesReady &&
 				((criticalFinish && !finishWindow) || (finishWindow && conversionReady) || mobilizationOpportunity))
 			// Do not downgrade an already active objective conversion into a
 			// non-aggressive muster on the same tick that the front object becomes
@@ -367,7 +415,7 @@ func (s *Server) botPlanTeamLocked(inst *huntInstance, team int32, now float64) 
 					}
 				}
 			}
-			if activeObjectiveCommit {
+			if activeObjectiveCommit && !ai30WavePush && !ai30AssaultCommitted {
 				mobilizationRequested = false
 			}
 			mobilizationAlreadyCommitted := mobilizationContinuation && previous.Reason == botMacroReasonFullMobilization
@@ -392,6 +440,13 @@ func (s *Server) botPlanTeamLocked(inst *huntInstance, team int32, now float64) 
 				previous.ObjectiveID != 0 && objective != nil && previous.ObjectiveID == objective.id && healthyResponders >= 2 &&
 				!farmRescue && partialWindow {
 				partialMobilizationRequested = true
+			}
+			// AI-30's wave trigger is an all-team attack order. The generic partial
+			// fallback keeps three bodies on farm and is useful for conservative
+			// profiles, but it was exactly what left the aggressive teacher unable
+			// to convert a passive opponent's base.
+			if ai30WavePush || ai30AssaultCommitted {
+				partialMobilizationRequested = false
 			}
 			// Coverage is a hard tactical prerequisite. If a visible wave has no
 			// living teammate inside the authoritative XP radius, suspend every
@@ -508,7 +563,7 @@ func (s *Server) botPlanTeamLocked(inst *huntInstance, team int32, now float64) 
 				plan.Reason = botMacroReasonFullMobilization
 			} else if s.botMobilizationReadyLocked(inst, team, objective, bots, now) {
 				plan.Reason = botMacroReasonFullMobilization
-			} else if previous.Reason == botMacroReasonMobilizationPreparation &&
+			} else if plan.AIVersion != 30 && previous.Reason == botMacroReasonMobilizationPreparation &&
 				botMacroObjectiveFinishWindowLocked(objective) {
 				// The named object entered its execution window while the roster
 				// was preparing. Launch the full group when it has actually assembled.
@@ -528,7 +583,7 @@ func (s *Server) botPlanTeamLocked(inst *huntInstance, team int32, now float64) 
 				} else {
 					plan.Reason = "objective_conversion_ready"
 				}
-			} else if previous.Reason == botMacroReasonMobilizationPreparation &&
+			} else if plan.AIVersion != 30 && previous.Reason == botMacroReasonMobilizationPreparation &&
 				!botMobilizationUltimatesReadyLocked(bots, now) {
 				// Preparation is a launch gate, not a permanent lock. If the roster
 				// cannot launch a full mobilization anymore (for example because a
@@ -1616,36 +1671,60 @@ func botMobilizationRallyPointLocked(inst *huntInstance, team int32, objective *
 }
 
 // botMobilizationReadyLocked is the only gate that turns a preparation group
-// into an attack group. Every living teammate must be above the normal safe HP
-// hysteresis, have a learned ultimate whose cooldown has elapsed, and be inside
-// the shared staging radius. A dead member blocks launch until it respawns and
-// rejoins; this is a full-roster mobilization, not a partial attack.
+// into an attack group. Ordinary bots require every living teammate, a ready
+// ultimate, and the shared staging radius. AI-30 is intentionally more
+// aggressive: two healthy, gathered bots may launch with their covered wave
+// even if a teammate is dead, recovering, or waiting for an ultimate.
 func (s *Server) botMobilizationReadyLocked(inst *huntInstance, team int32, objective *mobState, bots []*botBrain, now float64) bool {
 	rx, ry, ok := botMobilizationRallyPointLocked(inst, team, objective)
 	if !ok {
 		return false
 	}
-	if !botMobilizationUltimatesReadyLocked(bots, now) {
+	aggressiveAI30 := botTeamAIVersionLocked(inst, team) == 30
+	if !aggressiveAI30 && !botMobilizationUltimatesReadyLocked(bots, now) {
 		return false
 	}
 	live := 0
+	gathered := 0
 	for _, brain := range bots {
 		if brain == nil || brain.c == nil || brain.c.huntState == nil || brain.c.playerTeam() != team {
 			continue
 		}
 		if brain.c.huntState.deadUntil > 0 {
+			if aggressiveAI30 {
+				continue
+			}
 			return false
 		}
 		live++
 		if botHPFrac(brain.c.huntState, now) < botSafeHPFrac {
+			if aggressiveAI30 {
+				continue
+			}
 			return false
+		}
+		if aggressiveAI30 {
+			// The AI-30 wave trigger is already the safe launch premise. Waiting
+			// for the same two heroes to walk to an extra rally point consumed the
+			// complete lifetime of that wave and repeatedly reset the attack. Give
+			// the whole roster the direct structure order as soon as a healthy pair
+			// exists; normal local retreat logic remains active under the structure.
+			gathered++
+			continue
 		}
 		x, y := brain.c.posAtLocked(float32(now))
 		if math.Hypot(float64(x-rx), float64(y-ry)) > botMobilizationGatherRadius {
+			if aggressiveAI30 {
+				continue
+			}
 			return false
 		}
+		gathered++
 	}
-	return live > 0
+	if aggressiveAI30 {
+		return gathered >= botAI30MobilizationMinGroup
+	}
+	return live > 0 && gathered == live
 }
 
 // botMobilizationUltimatesReadyLocked keeps the launch decision tied to the
@@ -2728,7 +2807,15 @@ func (s *Server) botAssignMacroRespondersLocked(plan *botTeamPlan, previous botT
 	if altarAssault {
 		responderHPFrac = botAltarAssaultRejoinHPFrac
 	}
-	if plan.Reason == botMacroReasonFullMobilization || plan.Reason == botMacroReasonPartialMobilization || plan.Reason == "objective_conversion_ready" {
+	fullAI30Assault := plan.AIVersion == 30 && plan.Reason == botMacroReasonFullMobilization
+	if fullAI30Assault {
+		// AI-30's local combat policy only retreats below its critical 5% floor.
+		// Use that same floor when assigning the group.  Previously the planner
+		// selected only bodies above 30%; the remaining, still-combat-capable
+		// bots retained their baseline lane assignment and therefore neither
+		// followed the push nor attacked the named creep/structure objective.
+		responderHPFrac = botAI30ChaseMinHP
+	} else if plan.Reason == botMacroReasonFullMobilization || plan.Reason == botMacroReasonPartialMobilization || plan.Reason == "objective_conversion_ready" {
 		// Full mobilization includes every living, non-critical body. Keeping
 		// the normal 55% threshold here silently turns "all bots" into "all
 		// healthy bots" exactly when a conversion needs reinforcement. The same
@@ -2744,6 +2831,15 @@ func (s *Server) botAssignMacroRespondersLocked(plan *botTeamPlan, previous botT
 	}
 	for _, brain := range bots {
 		eligible := s.botMacroResponderEligibleLocked(brain, now)
+		if fullAI30Assault && brain != nil && brain.c != nil && brain.c.huntState != nil &&
+			brain.c.huntState.deadUntil <= 0 && botHPFrac(brain.c.huntState, now) > botAI30ChaseMinHP &&
+			s.botCommittedStructureFocusLocked(brain.c, now) == nil {
+			// The orchestrator runs before the local combat tick has a chance to
+			// clear a stale retreat flag.  A recoverable AI-30 attacker must keep
+			// its objective assignment instead of being silently dropped for one
+			// planning cycle.
+			eligible = true
+		}
 		if altarAssault {
 			eligible = s.botAltarAssaultResponderEligibleLocked(brain, objective, now)
 		}
@@ -3498,7 +3594,11 @@ func (s *Server) botObjectiveConversionReadyExcludingLocked(inst *huntInstance, 
 	if maxHP := objective.maxHealth(); maxHP > 0 {
 		objectiveFrac = objective.hp / maxHP
 	}
+	ai30 := botTeamAIVersionLocked(inst, team) == 30
 	required := botObjectiveMinPower
+	if ai30 {
+		required = botAI30ObjectiveMinPower
+	}
 	// A full structure is a wave-first objective. A healthy grouped hero push can
 	// look powerful enough on paper, but without allied creeps the structure
 	// itself supplies all the aggro and repeatedly forces the group to retreat;
@@ -3514,7 +3614,11 @@ func (s *Server) botObjectiveConversionReadyExcludingLocked(inst *huntInstance, 
 		required -= 0.45
 	}
 	if wavePower > 0 {
-		required -= math.Min(0.25, wavePower)
+		waveDiscount := 0.25
+		if ai30 {
+			waveDiscount = 0.35
+		}
+		required -= math.Min(waveDiscount, wavePower)
 	}
 	if alliedPower+wavePower < required {
 		return false
@@ -3524,7 +3628,11 @@ func (s *Server) botObjectiveConversionReadyExcludingLocked(inst *huntInstance, 
 	// movement, structure damage, and the ability to reinforce. The margin is
 	// still small enough to allow a real advantage to convert, but prevents a
 	// nominally even group from repeatedly feeding under tower pressure.
-	if enemyPower > 0 && alliedPower+wavePower < enemyPower*1.08 {
+	enemyPowerMargin := 1.08
+	if ai30 {
+		enemyPowerMargin = botAI30ObjectiveEnemyPowerMargin
+	}
+	if enemyPower > 0 && alliedPower+wavePower < enemyPower*enemyPowerMargin {
 		return false
 	}
 	return true

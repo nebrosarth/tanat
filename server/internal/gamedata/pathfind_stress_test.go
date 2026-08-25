@@ -107,3 +107,53 @@ func TestPathFuzzRealMap(t *testing.T) {
 		t.Fatalf("fuzz batch too slow (%v) — possible non-termination", elapsed)
 	}
 }
+
+func TestFastPathRealMapReachabilityAndStretch(t *testing.T) {
+	g := navGrid40
+	var pts []Vec2
+	for i := 0; i < g.W; i++ {
+		for j := 0; j < g.H; j++ {
+			if g.cellWalkable(i, j) {
+				pts = append(pts, Vec2{g.cellCenterX(i), g.cellCenterY(j)})
+			}
+		}
+	}
+	rng := rand.New(rand.NewSource(41))
+	const queries = 500
+	var exactTotal, fastTotal, maxStretch float64
+	for n := 0; n < queries; n++ {
+		a := pts[rng.Intn(len(pts))]
+		b := pts[rng.Intn(len(pts))]
+		exact := g.Path(a.X, a.Y, b.X, b.Y)
+		fast := g.FastPath(a.X, a.Y, b.X, b.Y)
+		if len(exact) == 0 {
+			continue
+		}
+		if len(fast) == 0 {
+			t.Fatalf("fast path lost reachable query %d", n)
+		}
+		ax, ay := a.X, a.Y
+		for _, waypoint := range fast {
+			if !g.lineWalkable(ax, ay, waypoint.X, waypoint.Y) {
+				t.Fatalf("fast query %d crosses blocked geometry", n)
+			}
+			ax, ay = waypoint.X, waypoint.Y
+		}
+		if distance := math.Hypot(ax-b.X, ay-b.Y); distance > 2 {
+			t.Fatalf("fast query %d ended %.2fm from goal", n, distance)
+		}
+		exactLength := polyLen(exact, a.X, a.Y)
+		fastLength := polyLen(fast, a.X, a.Y)
+		exactTotal += exactLength
+		fastTotal += fastLength
+		if exactLength > 0 {
+			maxStretch = math.Max(maxStretch, fastLength/exactLength)
+		}
+	}
+	meanStretch := fastTotal / exactTotal
+	t.Logf("weighted chase path stretch: mean=%.3f max=%.3f", meanStretch, maxStretch)
+	if meanStretch > 1.35 || maxStretch > 3.05 {
+		t.Fatalf("weighted chase paths too indirect: mean=%.3f max=%.3f",
+			meanStretch, maxStretch)
+	}
+}

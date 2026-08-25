@@ -162,6 +162,11 @@ func (s *Server) startPvpAttackLocked(c *conn, victim *conn) {
 	if hs.deadUntil > 0 {
 		return
 	}
+	// Repeating the same policy action means "continue attacking", not "cancel
+	// and rebuild the entire attack/chase timer chain".
+	if hs.pvpTarget == victim.objID && hs.attackTarget == 0 {
+		return
+	}
 	// Switching from a creep to an enemy avatar must close any visible PvE swing;
 	// clearing attackTarget alone would leave the old ACTION on remote clients.
 	if hs.attackTarget != 0 || hs.attackActionActive {

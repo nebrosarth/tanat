@@ -1,0 +1,12 @@
+{
+  "match_count": 100,
+  "seed": 420001,
+  "workers": 8,
+  "max_steps": 4500,
+  "timeout_minutes": 15.0,
+  "scenario": "ai30_mirror",
+  "in_flight": 2,
+  "go_command": "go run ./cmd/assaultdataset",
+  "validation_fraction": 0.2,
+  "split_seed": 42
+}

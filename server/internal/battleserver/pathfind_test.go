@@ -10,6 +10,18 @@ import (
 	"tanatserver/internal/session"
 )
 
+type reusableChaseNav struct{ pathCalls int }
+
+func (*reusableChaseNav) Walkable(_, _ float64) bool { return true }
+func (*reusableChaseNav) Spawn() (float64, float64)  { return 0, 0 }
+func (*reusableChaseNav) Clip(_, _, tx, ty float64) (float64, float64) {
+	return tx, ty
+}
+func (n *reusableChaseNav) Path(_, _, tx, ty float64) []gamedata.Vec2 {
+	n.pathCalls++
+	return []gamedata.Vec2{{X: tx / 2, Y: ty / 2}, {X: tx, Y: ty}}
+}
+
 // newNavConn builds a minimal hunt conn positioned at the map_4_0 spawn with the
 // scene's real walkability grid installed, plus a drain goroutine on the socket
 // so pushed syncs never block. Caller gets the conn, the server and the nav.
@@ -311,8 +323,9 @@ func TestAimAlongThrottlesRecompute(t *testing.T) {
 
 // TestChaseMoveThrottles: chaseMoveLocked must not re-run A* (and churn the
 // arrival timer + POSITION syncs) on every 200-250ms combat re-arm while the
-// chase goal is unchanged — but must re-path at once on >1m goal drift, and at
-// most once per second when the walker went idle short of the goal.
+// chase goal is moving — it accumulates four metres of drift and waits one
+// second, except that a >12m teleport/dash re-paths immediately. An idle walker
+// retries at most once per second.
 func TestChaseMoveThrottles(t *testing.T) {
 	s, c, nav, sx, sy := newNavConn(t)
 
@@ -347,15 +360,28 @@ func TestChaseMoveThrottles(t *testing.T) {
 	if c.moveGen != gen {
 		t.Fatal("chaseMoveLocked re-pathed an unchanged goal while the walker was busy")
 	}
-	// Sub-tolerance nudge (<1m): still throttled.
+	// An ordinary moving-target nudge is throttled within the one-second window.
 	c.chaseMoveLocked(s, gx+0.4, gy)
 	if c.moveGen != gen {
-		t.Fatal("chaseMoveLocked re-pathed a sub-tolerance (<1m) goal nudge")
+		t.Fatal("chaseMoveLocked re-pathed an ordinary target nudge")
 	}
-	// Real drift (>1m): re-paths at once.
+	// Even after one second, less than four metres of accumulated drift keeps the
+	// existing usable route.
+	c.chaseRepathAt = float64(s.battleTime()) - 2
 	c.chaseMoveLocked(s, gx+2, gy)
+	if c.moveGen != gen {
+		t.Fatal("chaseMoveLocked re-pathed before four metres of drift accumulated")
+	}
+	// Four metres plus one second is enough to refresh the route.
+	c.chaseMoveLocked(s, gx+5, gy)
 	if c.moveGen == gen {
-		t.Fatal("chaseMoveLocked ignored a >1m goal drift")
+		t.Fatal("chaseMoveLocked ignored a stale, materially drifted goal")
+	}
+	gen = c.moveGen
+	// A teleport-sized displacement bypasses the one-second interval.
+	c.chaseMoveLocked(s, gx+18, gy)
+	if c.moveGen == gen {
+		t.Fatal("chaseMoveLocked delayed an urgent teleport-sized drift")
 	}
 	gen = c.moveGen
 
@@ -363,15 +389,38 @@ func TestChaseMoveThrottles(t *testing.T) {
 	// gated to once per second, then allowed.
 	c.stopArrivalLocked()
 	c.hasDest = false
-	c.chaseMoveLocked(s, gx+2, gy)
+	c.chaseMoveLocked(s, gx+18, gy)
 	if c.moveGen != gen+1 { // stopArrivalLocked above bumped gen once itself
 		t.Fatal("idle chase retried within the 1s gate")
 	}
 	c.chaseRepathAt = float64(s.battleTime()) - 2.0
 	c.hasDest = false
-	c.chaseMoveLocked(s, gx+2, gy)
+	c.chaseMoveLocked(s, gx+18, gy)
 	if c.moveGen == gen+1 {
 		t.Fatal("idle chase did not retry after the 1s gate elapsed")
+	}
+}
+
+func TestChaseMoveReusesRouteForMovingEndpoint(t *testing.T) {
+	s, c, _, sx, sy := newNavConn(t)
+	nav := &reusableChaseNav{}
+	c.nav = nav
+	c.mvMu.Lock()
+	defer c.mvMu.Unlock()
+
+	c.resetChaseLocked()
+	c.chaseMoveLocked(s, sx+20, sy)
+	if nav.pathCalls != 1 || len(c.path) != 2 {
+		t.Fatalf("initial chase route: calls=%d path=%v", nav.pathCalls, c.path)
+	}
+	c.chaseRepathAt = float64(s.battleTime()) - 2
+	c.chaseMoveLocked(s, sx+25, sy)
+	if nav.pathCalls != 1 {
+		t.Fatalf("moving endpoint triggered a new path search: calls=%d", nav.pathCalls)
+	}
+	if math.Hypot(float64(c.destX-(sx+25)), float64(c.destY-sy)) > 0.01 {
+		t.Fatalf("route endpoint=(%.2f,%.2f), want (%.2f,%.2f)",
+			c.destX, c.destY, sx+25, sy)
 	}
 }
 

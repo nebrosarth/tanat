@@ -20,6 +20,61 @@ The transport test needs NumPy only. One `assaultenv.exe` process represents
 one rollout worker; launch several processes rather than sharing one process
 between threads.
 
+## AI-42 pre-training gates
+
+### Production AI-42 dataset
+
+The production collector is Go-backed, training-free, resumable, and uses the
+frozen stratified schedule in `config/ai42_dataset01.json`: 320 matches, 40
+validation matches, 4,500 ticks (15 simulated minutes), and eight bounded
+workers/in-flight matches. From `server`, run:
+
+```powershell
+$env:PYTHONPATH = "$PWD\ai40\src"
+python -m tanat_ai40.build_ai42_dataset_go `
+  .\ai40\data\ai42_dataset01 `
+  --config .\ai40\config\ai42_dataset01.json
+```
+
+The destination is immutable; an interrupted run resumes only from the exact
+staging contract. Use `--python-fallback` only for an explicit reference-path
+diagnostic, never for the production dataset.
+
+To compact an existing immutable Go v1 generation without decompressing its
+payloads, publish to a new destination:
+
+```powershell
+$env:PYTHONPATH = "$PWD\ai40\src"
+python -m tanat_ai40.compact_ai42_dataset `
+  .\ai40\data\ai42_dataset-v1 `
+  .\ai40\data\ai42_dataset-v2
+```
+
+AI42 Go v2 keeps `trajectory_hashes` and compressed payload bytes unchanged but
+stores only `first_step` and the versioned implicit lineage schema per match.
+Call `dataset.match_metadata(match_id, derive=True)` when legacy tick or
+recurrent-lineage matrices are explicitly needed.
+
+AI-42 behavior cloning is intentionally validation-only until training is
+explicitly authorized. Build the environment from the same source revision,
+capture and strictly reload a short ten-hero AI-30 episode, then run the CUDA
+preflight against that dataset:
+
+```powershell
+$env:PYTHONPATH = "$PWD\ai40\src"
+python -m tanat_ai40.smoke_ai42_dataset .\assaultenv.exe <new-dataset-dir> `
+  --seed 4242 --max-steps 8
+python -m tanat_ai40.train_ai42_bc `
+  --config .\ai40\config\ai42_bc_preflight.json `
+  --device cuda --dataset <new-dataset-dir>
+```
+
+Dataset destinations are immutable and must be absent or empty. The second
+command validates the dataset, recurrent batching, control/action losses,
+finite gradients, clipping and checkpoint roundtrip without calling
+`optimizer.step`; `--execute` is deliberately refused. ONNX is not required
+for PyTorch/CUDA training and remains a later production-inference gate.
+
 Headless controller values are `0` for a generic external policy, `1` for
 AI-20, `2` for the scripted AI-30 teacher/opponent and `3` for AI-40. Mixed
 controller teams remain supported, but `tanat-ai40-train` and
@@ -93,17 +148,26 @@ simulation:
 
 ```powershell
 tanat-ai40-train-async --env .\assaultenv.exe --ai40-matches 50 `
-  --ai30-matches 50 --workers 64 --group-size 32 --steps 256 `
-  --max-steps 4500 --device cuda --minibatch-size 2048 `
-  --env-gomaxprocs 1 --output ai40\checkpoints\async-100
+  --ai30-matches 50 --workers 64 --group-size 64 --steps 256 `
+  --max-steps 4500 --device cuda --minibatch-size 8192 `
+  --env-gomaxprocs 16 --output ai40\checkpoints\async-100
 ```
+
+Protocol v4 keeps all environments in one batched Go process per rollout
+group. The default 64-worker group therefore uses one `assaultenv.exe`, one
+STEP request and one structure-of-arrays result frame per tick. Splitting the
+workers with `--group-size 32` uses two vector processes when lower rollout
+latency matters more than the one-process constraint.
 
 All groups use the same frozen actor during one 256-step horizon. By default,
 the next rollout overlaps the current PPO update using a separate actor copy.
 This introduces at most one PPO update of policy lag; the behavior log
 probabilities are retained for PPO importance ratios and the observed lag is
 written to every metrics row. Use `--no-pipeline` for strictly sequential
-collection and learning.
+collection and learning. CUDA training uses BF16 and 8,192-sample minibatches
+by default. PPO forward graphs use `torch.compile`; pass `--no-bf16` or
+`--no-compile` for diagnostics. Windows compile support is supplied by the
+`triton-windows` project dependency.
 
 ## Long training campaign and AI-30 win rate
 
@@ -117,15 +181,15 @@ matches against AI-30, and maintains `best.pt`:
 
 With no arguments, the wrapper uses `mixed-100/latest.pt` as its initial model,
 writes the campaign to `ai40/checkpoints/long-001`, and selects the measured
-64-worker/32-group settings, 256-step rollouts, 4,500-tick (15-minute) matches,
-2,048-sample PPO minibatches and adaptive evaluations. Evaluation starts with
+64 workers in one vector process, 256-step rollouts, 4,500-tick (15-minute)
+matches, 8,192-sample BF16 PPO minibatches and adaptive evaluations. Evaluation starts with
 50 matches, expands to 200 at 40% win rate, and uses 500 confirmation matches
 at 55%. Repeating the same bare command resumes `long-001`. Use
 `-FromScratch -RunName <new-name>` only when a
 new randomly initialized policy is intentional. Add `-DryRun -SkipBuild` to
 print the resolved defaults without starting training.
 
-The default campaign contains ten stages. Each stage adds 100 mirror matches
+The default campaign contains 100 stages. Each stage adds 100 mirror matches
 and 100 matches against AI-30, then runs the adaptive evaluation with AI-40
 alternating between factions. With 4,500 simulation ticks per match this is at
 most approximately 67.5 million new trainable hero-steps before matches that
@@ -166,19 +230,134 @@ moves one minibatch at a time to CUDA; `--minibatch-size` is the primary
 RAM/VRAM control. To continue an interrupted curriculum without repeating
 completed matches, add `--resume ai40\checkpoints\mixed-100\latest.pt`.
 
-On a Ryzen 9 9950X3D with an RTX 5090, the measured mixed-training default is
-64 workers in groups of 32, `--minibatch-size 2048` and `--env-gomaxprocs 1`.
-Actions are packed
-as one NumPy batch, observations are decoded as structured zero-copy NumPy
-views, target masks stay vectorized on CUDA, and the Go runner reuses one
-fixed-size result encoder. The same 32-worker short benchmark improved from
-about 845 to 1,995 environment steps/second after the transport changes. The
-asynchronous 64-worker short rollout reaches about 3,107 environment
-steps/second. A mixed 128-match, 3,000-tick benchmark completed 2.88 million
-trainable hero-steps in 227.3 seconds (12,670 hero-steps/second), about 41% more
-throughput than the comparable synchronous 32-worker run. Tests at 80 and 96
-workers did not improve full-training throughput because PPO time and CPU
-contention offset the larger rollout batch.
+## AI-41 strategic historical self-play
+
+AI-41-v5 uses protocol v10 for training and protocol v11 for evaluation alongside
+the unchanged AI-40 protocol v4 and legacy AI-41 protocols v5-v7. Each hero
+receives a `[4, 40]` ability tensor containing rank/readiness, cooldown and
+mana, targeting/range/AoE, authored effect categories (damage, heal, control,
+mobility, summon, channel, buffs/debuffs and vision), magnitude/duration and
+toggle state. The policy also has a hero-ID embedding and separate
+target/offset/anchor contexts for every action kind; skill actions receive
+the encoded record for their own slot.
+
+Position actions use an OpenAI-Five-style row-major 9x9 grid. The 81 cells are
+spaced three world units apart and cover `[-12,+12]` on both axes; cell 40 is
+the caster's current position. For `Move`, the former distance factor is now a
+15-way navigation selector:
+
+- `0`: use the local 9x9 offset;
+- `1`, `2`: own base and enemy base;
+- `3..6`: north lane at 20/40/60/80% progress from the hero's own side;
+- `7..10`: the same four centre-lane anchors;
+- `11..14`: the same four south-lane anchors.
+
+The server resolves anchors relative to the hero's team and runs A* to the
+resulting map point. Repeating an anchor continues the existing route instead
+of rebuilding it every tick. Point-target abilities use the same local grid;
+unit-target abilities still use the 96-slot entity head. Training metrics add
+`global_anchor_move_rate`, `global_anchor_steps`, and `move_steps`.
+
+Training resets independently randomize a `2-1-2` north/centre/south assignment
+for each team. `global[8]` marks the curriculum active, `global[9:12]` is the
+hero's one-hot lane, `global[12]` marks the hero outside its 30-unit lane
+corridor. The random 6-to-10-minute cutoff is intentionally hidden from the
+policy; it only sees `global[8]` switch to zero when the assignment expires. An
+alive policy hero outside its lane loses `0.15` reward per simulated second
+until that cutoff. Scripted AI-20/AI-30 opponents are exempt. Evaluation
+protocol v9 zeros these fields and disables the penalty, so win rate measures
+play without a forced lane assignment. Per-update metrics record
+`wrong_lane_rate`, its numerator and the active sample count.
+
+On Windows, prepare and start the default campaign with:
+
+```powershell
+.\run-ai41-training.ps1
+```
+
+On Ubuntu, prepare and start the default campaign with:
+
+```bash
+./run-ai41-training.sh
+```
+
+The bare launcher starts `ai40/checkpoints/ai41-tanat-reward-stable-002` from
+the promoted stage-002 checkpoint of `ai41-tanat-reward-stable-001`. Its Adam
+state and cumulative counters are reset, so the smaller candidate updates are
+measured as a separate campaign. The original stage-005 file remains immutable
+and is the first historical opponent.
+
+Each default stage runs 50 current-policy mirror matches, 25 matches against
+AI-30 and 50 matches against the historical pool. PPO samples are retained only
+for the current-policy side; a frozen policy owns the other side and has an
+independent recurrent state in the same vectorized environment process. Accepted
+former `latest` checkpoints enter the bounded eight-model pool.
+
+The default conservative proposal profile uses Adam `5e-5`, one PPO epoch per rollout and an
+approximate-KL guard of `0.01`. It keeps each candidate close to the promoted
+checkpoint, avoiding the observed policy-collapse regime
+(KL near `0.2` and clipping near `60%`). `training_metrics.jsonl` records
+`ppo_epochs_completed` and `ppo_early_stopped`; pass `-LearningRate`,
+`-PpoEpochs` or `-TargetKl` to deliberately use another profile. A campaign
+locks these values after its first update, so use a new run name for a different
+schedule.
+
+Credit assignment uses a 1,200-second discount horizon and a 180-second GAE
+horizon. The default rollout is 1,024 ticks (204.8 simulated seconds), long
+enough to observe that trace rather than truncating it after the former 51.2
+seconds. Non-terminal shaping is multiplied by `0.6^(elapsed/600 seconds)`.
+A timeout/draw applies `-2` after zero-sum and team-spirit correction, so the
+same penalty on both teams cannot cancel out.
+
+Every stage reports deterministic win rate and score against AI-30, the frozen
+stage-005 anchor, and the remaining historical pool. The candidate is compared
+with the currently promoted checkpoint on identical seeds. `latest.pt` is
+promoted only when the composite score does not regress and no category loses
+more than five percentage points; otherwise `latest.pt` is restored from
+`promoted.pt`. Full candidate/reference suites and the decision are stored in
+the stage evaluation JSON and summarized in `metrics.csv`.
+
+The Ubuntu AI-41 runner defaults to two independent rollout groups of 32
+matches with 16 Go execution threads each. Chase routes use a validated
+weighted A* path, reuse their final segment for moving targets, and hold a live
+attack target for at least five simulation ticks.
+
+To select a different navigation source explicitly:
+
+```bash
+ai40/.venv/bin/python -m tanat_ai40.migrate_ai41_navigation \
+  ai40/checkpoints/ai41-lanes-001/latest.pt \
+  --output ai40/checkpoints/ai41-nav-custom-bootstrap/latest.pt
+./run-ai41-training.sh --run-name ai41-nav-custom \
+  --resume ai40/checkpoints/ai41-nav-custom-bootstrap/latest.pt
+```
+
+AI-41 strategic checkpoints use `AI-41-v5-tanat-reward-selfplay`, the V4 observation
+hash and RewardV5. RewardV5 preserves OpenAI Five's `-0.16` last-hit correction
+and adds a separate Tanat calibration of `+0.24`. A standard 3-melee + 1-ranged
+wave therefore averages `+0.4` raw reward per hero last hit. These checkpoints
+fail closed if passed to an AI-40 evaluator. Live ONNX activation remains on
+the AI-40 contract until an AI-41 sidecar/export contract is installed.
+
+On a Ryzen 9 9950X3D with an RTX 5090, two 32-worker vector groups complete a
+warm 64-worker, 256-tick AI-41-v3 navigation rollout in about 1.65 seconds, or
+roughly 9,900 environment steps/second. Actor inference and the packed pinned
+transfer take about 0.56 seconds; batched Go simulation and result transfer
+take about 1.05 seconds at the initial 0.47% anchor exploration rate. Strategic
+historical inference and the default 1,024-tick horizon add work beyond that
+legacy benchmark. GAE is computed per rollout group so the
+large entity tensor is not copied into an intermediate time-major batch. Actor
+forward and action sampling use fixed-shape CUDA graphs; sampling receives
+freshly generated exponential noise on every tick so graph capture cannot
+freeze its random choices. The first rollout additionally pays about 1.2
+seconds of graph compilation. BF16 with 8,192-sample minibatches keeps a short
+eager PPO update near 1.9 seconds for the larger navigation heads. Per-update
+metrics include
+`actor_inference_seconds` and `environment_step_seconds` for checking this
+balance on other machines. Campaigns compile the fixed-shape actor and sampler
+by default but keep PPO eager: compiling the learner has a large cold-start cost
+on every campaign stage. `--compile-learner` remains available for long stages;
+`--no-compile` disables actor compilation as well.
 
 Headless participants suppress Battle-client packet encoding and use a
 zero-buffer discard connection. Their authoritative combat state and object
