@@ -1060,6 +1060,7 @@ class AI42Learner:
         self.optimizer.step()
         for parameter in self.actor.parameters():
             _finite_tensor(parameter, "updated model parameter")
+        _tree_finite(self.optimizer.state_dict(), "updated optimizer state")
 
     def save_checkpoint(self, path: str | os.PathLike[str], manifest: Mapping[str, Any], *, step: int = 0, epoch: int = 0, extra: Mapping[str, Any] | None = None) -> Path:
         return save_ai42_checkpoint(path, self.actor, self.optimizer, manifest, step=step, epoch=epoch, extra=extra)
@@ -1156,7 +1157,10 @@ def _artifact_digest(value: Any) -> str:
             digest.update(b"t")
             update(str(tensor.dtype))
             update(tuple(tensor.shape))
-            raw = tensor.view(torch.uint8).numpy().tobytes(order="C")
+            # Optimizer state includes scalar step tensors.  Reshaping first
+            # makes the byte view valid for both scalar and non-scalar tensors
+            # without changing the shape/type material included in the hash.
+            raw = tensor.reshape(-1).view(torch.uint8).numpy().tobytes(order="C")
             digest.update(len(raw).to_bytes(8, "little") + raw)
         elif isinstance(item, Mapping):
             digest.update(b"m" + len(item).to_bytes(8, "little"))
@@ -1331,6 +1335,106 @@ class ResumeState:
     extra: Mapping[str, Any]
 
 
+@dataclass(frozen=True, slots=True)
+class CheckpointArtifact:
+    """Validated immutable checkpoint metadata without mutating a learner."""
+
+    step: int
+    epoch: int
+    manifest: Mapping[str, Any]
+    extra: Mapping[str, Any]
+    artifact_hashes: Mapping[str, str]
+    payload_digest: str
+
+
+def inspect_ai42_checkpoint(
+    path: str | os.PathLike[str],
+    expected_manifest: Mapping[str, Any],
+    *,
+    model: nn.Module | None = None,
+    map_location: str | torch.device = "cpu",
+) -> CheckpointArtifact:
+    """Validate every serialized checkpoint payload without loading state.
+
+    This is intentionally separate from :func:`load_ai42_checkpoint`: promotion
+    code needs to inspect a prior artifact while leaving the active learner and
+    its optimizer/RNG untouched.  All payload and per-artifact digests are
+    recomputed, including the model tensor tree.
+    """
+
+    expected = validate_learner_manifest(expected_manifest)
+    try:
+        payload = torch.load(path, map_location=map_location, weights_only=True)
+    except Exception as exc:
+        raise CheckpointError(f"cannot read checkpoint: {exc}") from exc
+    if not isinstance(payload, Mapping) or payload.get("format") != "AI42-bc-checkpoint-v1":
+        raise CheckpointError("checkpoint format is missing or incompatible")
+    expected_fields = {
+        "format", "manifest", "manifest_digest", "model_state_dict", "optimizer_state_dict",
+        "step", "epoch", "rng_state", "extra", "artifact_hashes", "payload_digest",
+    }
+    if set(payload) != expected_fields:
+        raise CheckpointError("checkpoint field set is incomplete or contains unknown data")
+    actual_manifest = validate_learner_manifest(payload.get("manifest"))
+    if actual_manifest != expected:
+        raise CheckpointError("checkpoint manifest is not an exact match")
+    if payload.get("manifest_digest") != manifest_digest(actual_manifest):
+        raise CheckpointError("checkpoint manifest digest does not match its contents")
+
+    model_state = payload.get("model_state_dict")
+    if model is not None:
+        _state_dict_compatible(model, model_state)
+    elif not isinstance(model_state, Mapping):
+        raise CheckpointError("checkpoint model state is missing")
+    else:
+        for name, value in model_state.items():
+            if not isinstance(name, str) or not isinstance(value, Tensor):
+                raise CheckpointError("checkpoint model state contains an invalid entry")
+            _finite_tensor(value, f"checkpoint model state {name}")
+
+    optimizer_state = payload.get("optimizer_state_dict")
+    if not isinstance(optimizer_state, Mapping):
+        raise CheckpointError("checkpoint optimizer state is missing")
+    _tree_finite(optimizer_state, "checkpoint optimizer state")
+    rng = payload.get("rng_state")
+    if not isinstance(rng, Mapping):
+        raise CheckpointError("checkpoint RNG state is missing")
+    _tree_finite(rng, "checkpoint RNG state")
+    step = payload.get("step")
+    epoch = payload.get("epoch")
+    if (
+        isinstance(step, bool) or not isinstance(step, int) or step < 0
+        or isinstance(epoch, bool) or not isinstance(epoch, int) or epoch < 0
+    ):
+        raise CheckpointError("checkpoint step and epoch are invalid")
+    extra = payload.get("extra", {})
+    if not isinstance(extra, Mapping):
+        raise CheckpointError("checkpoint extra payload is not a mapping")
+    _canonical_json(dict(extra))
+    expected_artifacts = {
+        "model": _artifact_digest(model_state),
+        "optimizer": _artifact_digest(optimizer_state),
+        "rng": _artifact_digest(rng),
+        "extra": _artifact_digest(dict(extra)),
+    }
+    if payload.get("artifact_hashes") != expected_artifacts:
+        raise CheckpointError("checkpoint artifact digest mismatch")
+    expected_payload_digest = _artifact_digest({
+        "format": payload["format"], "manifest_digest": payload["manifest_digest"],
+        "step": step, "epoch": epoch, "artifact_hashes": expected_artifacts,
+    })
+    if payload.get("payload_digest") != expected_payload_digest:
+        raise CheckpointError("checkpoint payload digest mismatch")
+    return CheckpointArtifact(
+        step=step,
+        epoch=epoch,
+        manifest=actual_manifest,
+        extra=dict(extra),
+        artifact_hashes=dict(expected_artifacts),
+        payload_digest=str(expected_payload_digest),
+    )
+
+
 def load_ai42_checkpoint(
     path: str | os.PathLike[str],
     model: nn.Module,
@@ -1421,8 +1525,8 @@ load_checkpoint = load_ai42_checkpoint
 __all__ = [
     "ACTION_STATUS", "AI42Batch", "AI42Learner", "AI42LearnerConfig", "AI42LearnerError", "AI42SequenceBatch",
     "ATTACK_KIND", "CheckpointError", "CONTROL_STATUSES", "EXCLUDED_STATUSES", "LossResult", "MOVE_KIND",
-    "NonFiniteError", "ResumeState", "SKILL_KINDS", "SPATIAL_KINDS", "TARGET_KINDS", "TeacherStatus", "TELEPORT_KIND",
+    "CheckpointArtifact", "NonFiniteError", "ResumeState", "SKILL_KINDS", "SPATIAL_KINDS", "TARGET_KINDS", "TeacherStatus", "TELEPORT_KIND",
     "WAIT_KIND", "build_learner_manifest", "class_balance_weights", "clip_grad_norm_finite", "compute_behavior_cloning_loss",
-    "forward_batch", "iter_ai42_dataset_batches", "load_ai42_checkpoint", "load_checkpoint", "manifest_digest", "save_ai42_checkpoint", "save_checkpoint",
+    "forward_batch", "inspect_ai42_checkpoint", "iter_ai42_dataset_batches", "load_ai42_checkpoint", "load_checkpoint", "manifest_digest", "save_ai42_checkpoint", "save_checkpoint",
     "validate_learner_manifest",
 ]

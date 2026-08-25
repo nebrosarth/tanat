@@ -1,0 +1,30 @@
+{
+  "protocol_version": 13,
+  "model": {
+    "hidden_size": 384,
+    "model_width": 384,
+    "entity_layers": 4,
+    "num_heads": 8,
+    "ff_multiplier": 4,
+    "timing_bins": 4
+  },
+  "recurrent_batch": {
+    "sequence_length": 64,
+    "batch_size": 8
+  },
+  "learner": {
+    "learning_rate": 0.0003,
+    "weight_decay": 0.0001,
+    "class_balance_power": 1.0,
+    "max_gradient_norm": 1.0
+  },
+  "training": {
+    "seed": 4242,
+    "max_optimizer_seconds": 300.0,
+    "max_steps": 1000,
+    "epochs": 1,
+    "validation_batches": 16,
+    "validation_epsilon": 0.0001,
+    "checkpoint_interval": 100
+  }
+}
