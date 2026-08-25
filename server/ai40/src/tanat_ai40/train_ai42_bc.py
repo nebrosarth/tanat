@@ -65,10 +65,44 @@ PROFILE_FILENAME = "class_profile_ai42.json"
 GATE_LOSS_IMPROVEMENT = 0.005
 GATE_CONTROL_RECALL_FLOOR = 0.02
 GATE_HEAD_ACCURACY_FLOOR = 0.01
+DEFAULT_HEAD_WEIGHTS = {
+    "control": 1.0, "kind": 1.0, "target": 1.0, "offset": 1.0, "anchor": 1.0,
+}
 
 
 class AI42TrainingError(AI42LearnerError):
     """Raised for an invalid or unsuccessful executable BC run."""
+
+
+def validate_head_weights(value: Any) -> dict[str, float]:
+    """Return a complete, finite AI-42 loss-head weight mapping."""
+
+    if value is None:
+        value = DEFAULT_HEAD_WEIGHTS
+    if not isinstance(value, Mapping) or set(value) != set(DEFAULT_HEAD_WEIGHTS):
+        raise AI42TrainingError(
+            "learner.head_weights must contain exactly " + ", ".join(sorted(DEFAULT_HEAD_WEIGHTS)),
+        )
+    normalized: dict[str, float] = {}
+    for head in sorted(DEFAULT_HEAD_WEIGHTS):
+        raw = value[head]
+        if isinstance(raw, bool) or not isinstance(raw, (int, float)):
+            raise AI42TrainingError(f"learner.head_weights[{head!r}] must be numeric")
+        number = float(raw)
+        if not math.isfinite(number) or number < 0.0:
+            raise AI42TrainingError(f"learner.head_weights[{head!r}] must be finite and non-negative")
+        normalized[head] = 0.0 if number == 0.0 else number
+    if not any(normalized.values()):
+        raise AI42TrainingError("learner.head_weights must enable at least one loss head")
+    return normalized
+
+
+def head_weights_hash(value: Mapping[str, float] | None) -> str:
+    normalized = validate_head_weights(value)
+    encoded = json.dumps(
+        normalized, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
 
 
 def validate_class_weight_overrides(
@@ -268,7 +302,7 @@ def _training_config_defaults(path: Path) -> dict[str, Any]:
     required_learner = {
         "class_balance_power", "max_gradient_norm", "learning_rate", "weight_decay",
     }
-    optional_learner = {"class_weight_overrides"}
+    optional_learner = {"class_weight_overrides", "head_weights"}
     if (
         not isinstance(learner, dict)
         or not required_learner.issubset(learner)
@@ -285,6 +319,7 @@ def _training_config_defaults(path: Path) -> dict[str, Any]:
     if raw_overrides is None:
         raise AI42LearnerError("training config learner.class_weight_overrides must be a mapping")
     normalized_overrides = validate_class_weight_overrides(raw_overrides)
+    normalized_head_weights = validate_head_weights(learner.get("head_weights"))
     return {
         **model,
         **recurrent,
@@ -295,6 +330,7 @@ def _training_config_defaults(path: Path) -> dict[str, Any]:
         "class_weight_overrides": {
             head: list(values) for head, values in normalized_overrides.items()
         },
+        "head_weights": normalized_head_weights,
         **training,
     }
 
@@ -321,6 +357,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--learning-rate", type=float, default=3e-4)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
     parser.add_argument("--class-weight-overrides", dest="class_weight_overrides", default=None, help=argparse.SUPPRESS)
+    parser.add_argument("--head-weights", dest="head_weights", default=dict(DEFAULT_HEAD_WEIGHTS), help=argparse.SUPPRESS)
     parser.add_argument("--seed", type=int, default=DEFAULT_SEED)
     parser.add_argument("--max-optimizer-seconds", type=float, default=MAX_OPTIMIZER_SECONDS)
     parser.add_argument("--max-steps", type=int, default=1, help="total optimizer step target, including resumed steps")
@@ -400,6 +437,7 @@ def _validate_training_args(args: argparse.Namespace) -> None:
         raise AI42TrainingError("seed must be a non-negative integer")
     if not math.isclose(float(args.class_balance_power), CLASS_BALANCE_POWER, rel_tol=0.0, abs_tol=0.0):
         raise AI42TrainingError("AI-42 BC-v2 freezes class-balance-power at 0.5")
+    validate_head_weights(args.head_weights)
     if args.resume is not None and (args.warm_start is not None or args.warm_start_accepted):
         raise AI42TrainingError("--warm-start and --resume are mutually exclusive")
     if args.checkpoint is not None and (args.warm_start is not None or args.warm_start_accepted):
@@ -1052,12 +1090,15 @@ def train(args: argparse.Namespace, *, clock: Callable[[], float] = time.monoton
         raise
     except (KeyError, TypeError, ValueError) as exc:
         raise AI42TrainingError(f"class-weight overrides are invalid: {exc}") from exc
+    normalized_head_weights = validate_head_weights(getattr(args, "head_weights", None))
+    normalized_head_weights_hash = head_weights_hash(normalized_head_weights)
 
     learner_config = AI42LearnerConfig(
         learning_rate=args.learning_rate,
         weight_decay=args.weight_decay,
         class_balance_power=profile.class_balance_power,
         max_gradient_norm=args.max_gradient_norm,
+        head_weights=normalized_head_weights,
         class_weights=final_class_weights,
         model_kwargs={
             "hidden_size": args.hidden_size,
@@ -1088,6 +1129,8 @@ def train(args: argparse.Namespace, *, clock: Callable[[], float] = time.monoton
         class_weight_overrides={head: list(values) for head, values in normalized_overrides.items()},
         class_weight_overrides_hash=overrides_hash,
         class_weights={head: list(final_class_weights[head]) for head in HEAD_NAMES},
+        head_weights=normalized_head_weights,
+        head_weights_hash=normalized_head_weights_hash,
     )
 
     resume_path = args.resume or args.checkpoint
@@ -1219,6 +1262,8 @@ def train(args: argparse.Namespace, *, clock: Callable[[], float] = time.monoton
                     "class_weight_overrides_hash": overrides_hash,
                     "class_weights": class_weight_provenance["final"],
                     "class_weight_provenance": class_weight_provenance,
+                    "head_weights": normalized_head_weights,
+                    "head_weights_hash": normalized_head_weights_hash,
                 }
                 checkpoint_started = float(clock())
                 learner.save_checkpoint(latest_path, manifest, step=global_step, epoch=epoch, extra=periodic_extra)
@@ -1303,6 +1348,8 @@ def train(args: argparse.Namespace, *, clock: Callable[[], float] = time.monoton
         "class_weight_overrides_hash": overrides_hash,
         "class_weights": class_weight_provenance["final"],
         "class_weight_provenance": class_weight_provenance,
+        "head_weights": normalized_head_weights,
+        "head_weights_hash": normalized_head_weights_hash,
         "warm_start": None if warm_start_state is None else {
             "source_path": warm_start_state.source_path,
             "source_file_sha256": warm_start_state.source_file_sha256,
@@ -1400,6 +1447,8 @@ def train(args: argparse.Namespace, *, clock: Callable[[], float] = time.monoton
         "class_weight_overrides_hash": extra["class_weight_overrides_hash"],
         "class_weights": extra["class_weights"],
         "class_weight_provenance": extra["class_weight_provenance"],
+        "head_weights": extra["head_weights"],
+        "head_weights_hash": extra["head_weights_hash"],
         "warm_start": extra["warm_start"],
         "improvement": {
             "epsilon": epsilon,
@@ -1530,5 +1579,5 @@ sha256_file = _sha256_file
 
 __all__ = [
     "AI42TrainingError", "DEFAULT_SEED", "GATE_HEAD_ACCURACY_FLOOR", "GATE_LOSS_IMPROVEMENT", "GATE_CONTROL_RECALL_FLOOR", "MAX_OPTIMIZER_SECONDS", "ProbeSummary", "ValidationSummary",
-    "atomic_write_json", "build_parser", "class_weight_overrides_hash", "evaluate_probe", "main", "promotion_gate", "run_training", "sha256_file", "train", "validate_class_weight_overrides",
+    "atomic_write_json", "build_parser", "class_weight_overrides_hash", "evaluate_probe", "head_weights_hash", "main", "promotion_gate", "run_training", "sha256_file", "train", "validate_class_weight_overrides", "validate_head_weights",
 ]

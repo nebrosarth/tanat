@@ -120,6 +120,15 @@ func TestLoadConfigRejectsUnknownAndAcceptsQ3Overrides(t *testing.T) {
 	if config.Learner.LearningRate != 1e-4 || len(config.Learner.ClassWeightOverrides["control"]) != 4 {
 		t.Fatalf("unexpected Q3 config: %+v", config.Learner)
 	}
+	q4 := filepath.Join("..", "..", "ai40", "config", "ai42_bc_training_q4.json")
+	q4Config, err := LoadConfig(q4)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantHeadWeights := map[string]float64{"control": 1, "kind": 1.5, "target": 1, "offset": 2, "anchor": 1}
+	if !reflect.DeepEqual(q4Config.Learner.HeadWeights, wantHeadWeights) {
+		t.Fatalf("unexpected Q4 head weights: %#v", q4Config.Learner.HeadWeights)
+	}
 	path := filepath.Join(t.TempDir(), "unknown.json")
 	if err := os.WriteFile(path, []byte(`{"protocol_version":13,"model":{"hidden_size":1,"model_width":1,"entity_layers":1,"num_heads":1,"ff_multiplier":1,"timing_bins":1},"recurrent_batch":{"sequence_length":1,"batch_size":1},"learner":{"class_balance_power":0.5,"max_gradient_norm":1,"timing_loss_enabled":false,"optimizer_step_allowed_in_preflight":false,"unknown":true}}`), 0o600); err != nil {
 		t.Fatal(err)
@@ -158,6 +167,32 @@ func TestRunPublishesProfileBundleAndReportWithInjectedRunner(t *testing.T) {
 	}
 	if runner.calls != 1 {
 		t.Fatalf("worker calls=%d", runner.calls)
+	}
+	requestValue, err := decodeCanonical(runner.lastRequest, "request", MaxWorkerRequest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	requestRoot, err := object(requestValue, "request")
+	if err != nil {
+		t.Fatal(err)
+	}
+	requestLearner, err := object(requestRoot["learner"], "request.learner")
+	if err != nil {
+		t.Fatal(err)
+	}
+	requestHeadWeights, err := canonicalJSON(requestLearner["head_weights"])
+	if err != nil {
+		t.Fatal(err)
+	}
+	reportHeadWeights, err := canonicalJSON(report["head_weights"])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(requestHeadWeights, reportHeadWeights) {
+		t.Fatalf("request head weights=%s, report=%s", requestHeadWeights, reportHeadWeights)
+	}
+	if report["head_weights_hash"] != sha256Hex(reportHeadWeights) {
+		t.Fatalf("head weights hash=%v", report["head_weights_hash"])
 	}
 	native := report["native_evidence"].(map[string]any)
 	counters := native["io_counters"].(map[string]any)

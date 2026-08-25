@@ -199,6 +199,9 @@ class AI42BCTrainingTests(unittest.TestCase):
             output = Path(directory)
             args = _args(output, "--max-steps", "1")
             args.class_weight_overrides = {"control": [0.0, 1.0, 0.0, 0.0]}
+            args.head_weights = {
+                "control": 1.0, "kind": 1.5, "target": 1.0, "offset": 2.0, "anchor": 1.0,
+            }
             summaries = iter((
                 _mock_probe_summary(1.0), _mock_probe_summary(1.0),
                 _mock_probe_summary(0.5), _mock_probe_summary(0.5),
@@ -216,6 +219,11 @@ class AI42BCTrainingTests(unittest.TestCase):
             self.assertEqual(extra["class_weight_overrides_hash"], report["class_weight_overrides_hash"])
             self.assertEqual(extra["class_weights"], report["class_weights"])
             self.assertEqual(extra["class_weight_provenance"]["final"], report["class_weights"])
+            self.assertEqual(manifest["head_weights"], args.head_weights)
+            self.assertEqual(manifest["head_weights_hash"], report["head_weights_hash"])
+            self.assertEqual(extra["head_weights"], args.head_weights)
+            self.assertEqual(extra["head_weights_hash"], report["head_weights_hash"])
+            self.assertEqual(report["head_weights_hash"], train_ai42_bc.head_weights_hash(args.head_weights))
             self.assertEqual(report["manifest_digest"], train_ai42_bc.manifest_digest(manifest))
 
     def test_resume_restores_step_and_atomic_report_failure_preserves_old_file(self) -> None:

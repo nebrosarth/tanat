@@ -98,6 +98,15 @@ class AI42BCV2Tests(unittest.TestCase):
             defaults["class_weight_overrides"]["control"],
             [0.76592687, 0.68894406, 0.07211628, 2.47301279],
         )
+        q4_path = Path(__file__).resolve().parents[1] / "config" / "ai42_bc_training_q4.json"
+        q4_defaults = train_ai42_bc._training_config_defaults(q4_path)
+        self.assertEqual(q4_defaults["head_weights"], {
+            "anchor": 1.0, "control": 1.0, "kind": 1.5, "offset": 2.0, "target": 1.0,
+        })
+        self.assertEqual(
+            q4_defaults["head_weights"],
+            train_ai42_bc.validate_head_weights(q4_defaults["head_weights"]),
+        )
 
         base = json.loads(q3_path.read_text(encoding="utf-8"))
         malformed = {
@@ -114,6 +123,23 @@ class AI42BCV2Tests(unittest.TestCase):
                 path = Path(directory) / f"{label}.json"
                 path.write_text(json.dumps(payload), encoding="utf-8")
                 with self.subTest(label=label), self.assertRaises(train_ai42_bc.AI42LearnerError):
+                    train_ai42_bc._training_config_defaults(path)
+
+        malformed_head_weights = {
+            "missing head": {"control": 1.0},
+            "unknown head": {**train_ai42_bc.DEFAULT_HEAD_WEIGHTS, "bogus": 1.0},
+            "boolean": {**train_ai42_bc.DEFAULT_HEAD_WEIGHTS, "kind": True},
+            "negative": {**train_ai42_bc.DEFAULT_HEAD_WEIGHTS, "offset": -1.0},
+            "all zero": {head: 0.0 for head in train_ai42_bc.DEFAULT_HEAD_WEIGHTS},
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            base_q4 = json.loads(q4_path.read_text(encoding="utf-8"))
+            for label, weights in malformed_head_weights.items():
+                payload = copy.deepcopy(base_q4)
+                payload["learner"]["head_weights"] = weights
+                path = Path(directory) / f"head-{label}.json"
+                path.write_text(json.dumps(payload), encoding="utf-8")
+                with self.subTest(head_weights=label), self.assertRaises(train_ai42_bc.AI42LearnerError):
                     train_ai42_bc._training_config_defaults(path)
 
         profile = AI42ClassBalanceProfile.from_batches(

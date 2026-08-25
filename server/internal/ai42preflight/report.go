@@ -45,15 +45,18 @@ func makeReport(config Config, options Options, generation *ai42dataset.Generati
 	trainIDs := append([]string(nil), profile.TrainMatchIDs...)
 	validationIDs := append([]string(nil), plan.ValidationMatchIDs...)
 	datasetContentFingerprint := datasetContentFingerprint(verification, evidence.DatasetManifestFile)
+	headWeights := scalarWeightsAsAny(config.Learner.HeadWeights)
+	headWeightsBytes, _ := canonicalJSON(headWeights)
+	headWeightsHash := sha256Hex(headWeightsBytes)
 	profilePayload := map[string]any{"path": options.ProfilePath, "hash": profile.ProfileHash, "file_sha256": profileFileHash, "expected_file_sha256": options.ProfileHash, "dataset_manifest_hash": profile.DatasetManifestHash, "train_match_ids_hash": profile.TrainMatchIDsHash, "train_match_ids": stringsAny(trainIDs), "counts": countsAsAny(profile.Counts), "weights": weightsAsAny(profile.Weights), "existing_validated": profileExisting}
-	manifest := map[string]any{"protocol_version": ProtocolVersion, "dataset_schema_version": "AI42-dataset-v1", "shard_schema_version": "AI42-go-shard-v2", "dataset_manifest_hash": generation.ManifestHash(), "profile_hash": profile.ProfileHash, "train_match_ids_hash": profile.TrainMatchIDsHash}
+	manifest := map[string]any{"protocol_version": ProtocolVersion, "dataset_schema_version": "AI42-dataset-v1", "shard_schema_version": "AI42-go-shard-v2", "dataset_manifest_hash": generation.ManifestHash(), "profile_hash": profile.ProfileHash, "train_match_ids_hash": profile.TrainMatchIDsHash, "head_weights": headWeights, "head_weights_hash": headWeightsHash}
 	fileEvidence := make([]any, len(verification.Files))
 	for index, file := range verification.Files {
 		fileEvidence[index] = map[string]any{"shard": file.Shard, "stored_bytes": file.StoredBytes, "sha256": file.SHA256, "compressed_bytes": file.CompressedBytes, "payload_sha256": file.PayloadSHA256, "raw_bytes": file.RawBytes, "raw_sha256": file.RawSHA256}
 	}
 	dataset := map[string]any{"provided": true, "path": options.DatasetPath, "manifest_hash": generation.ManifestHash(), "dataset_schema_version": "AI42-dataset-v1", "shard_schema_version": "AI42-go-shard-v2", "matches": verification.Matches, "train_matches": len(trainIDs), "validation_matches": len(accumulator.Matches) - len(trainIDs), "shards": verification.Shards, "rows": verification.Rows, "fingerprint": datasetContentFingerprint, "identity_mode": "content-hash-plus-stat", "identity_hash": datasetIdentityHash, "post_worker_content_hash_verified": evidence.PostWorkerContentHashPasses == 1}
 	batchPlan := map[string]any{"version": plan.Version, "hash": plan.Hash, "split_hash": plan.SplitHash, "validation_probe_hash": plan.ValidationHash, "batch_cursor": 0, "train_match_ids": stringsAny(plan.TrainMatchIDs), "validation_match_ids": stringsAny(validationIDs), "sequence_length": plan.SequenceLength, "batch_size": plan.BatchSize, "selected_batch_size": len(plan.Sequences), "physical_batches_scanned": plan.PhysicalBatches, "empty_batches_skipped": plan.EmptyBatches, "sequences_scanned": plan.SequencesScanned}
-	hashes := map[string]any{"dataset_manifest": generation.ManifestHash(), "dataset_manifest_file_sha256": evidence.DatasetManifestFile.SHA256, "dataset_fingerprint": datasetContentFingerprint, "dataset_identity": datasetIdentityHash, "split": plan.SplitHash, "profile": profile.ProfileHash, "profile_file_sha256": profileFileHash, "train_match_ids": profile.TrainMatchIDsHash, "batch_bundle": bundleHash, "request_sha256": requestHash, "warm_start_sha256": warmHash}
+	hashes := map[string]any{"dataset_manifest": generation.ManifestHash(), "dataset_manifest_file_sha256": evidence.DatasetManifestFile.SHA256, "dataset_fingerprint": datasetContentFingerprint, "dataset_identity": datasetIdentityHash, "split": plan.SplitHash, "profile": profile.ProfileHash, "profile_file_sha256": profileFileHash, "train_match_ids": profile.TrainMatchIDsHash, "head_weights": headWeightsHash, "batch_bundle": bundleHash, "request_sha256": requestHash, "warm_start_sha256": warmHash}
 	invariants := map[string]any{"durable_v2_full_verify": evidence.FullVerifyPasses == 1, "single_full_verify_pass": evidence.FullVerifyPasses == 1, "no_redundant_full_generation_pass": evidence.FullVerifyPasses == 1, "train_only_profile": true, "ordered_train_ids_hash_checked": true, "deterministic_split_checked": evidence.SplitRecomputed, "deterministic_batch_plan_checked": true, "profile_immutable_or_atomically_published": true, "bounded_bundle": true, "targeted_bundle_read": evidence.TargetedReadCalls == 1, "targeted_verified_shard_reread": evidence.TargetedShardRereadPasses == 1, "request_hash_checked": true, "worker_response_canonical": true, "worker_exit_zero": workerOutput.ExitCode == 0, "worker_ok": true, "dataset_unchanged": evidence.PostWorkerContentHashPasses == 1, "warm_start_unchanged": true, "bundle_unchanged": true, "no_python_fallback": true, "optimizer_step_authorized": false, "report_atomically_published": true}
 	postWorkerFiles := postWorkerContentEvidence(verification, evidence.DatasetManifestFile, evidence.PostWorkerContent)
 	ioCounters := map[string]any{"open_generation_calls": evidence.OpenGenerationCalls, "full_verify_passes": evidence.FullVerifyPasses, "full_verify_workers": evidence.VerifyWorkers, "targeted_shard_reread_passes": evidence.TargetedShardRereadPasses, "targeted_shard_reread_shards": evidence.TargetedShardRereadShards, "targeted_read_calls": evidence.TargetedReadCalls, "targeted_rows": evidence.TargetedRows, "identity_checks": evidence.IdentityChecks, "post_worker_content_hash_passes": evidence.PostWorkerContentHashPasses, "post_worker_content_hash_files": evidence.PostWorkerContentHashFiles}
@@ -63,7 +66,7 @@ func makeReport(config Config, options Options, generation *ai42dataset.Generati
 		"format": "AI42-bc-run-report-v1", "mode": "preflight", "status": "ok", "ok": true, "accepted": false, "execute_required_for_training": true, "training_implemented": true, "python_fallback": false,
 		"device": device, "seed": int(config.Seed), "deterministic_order": true, "parameter_count": parameterCount, "parameters_unchanged": workerInvariant(workerResult, "parameters_unchanged"),
 		"manifest": manifest, "dataset": dataset, "loss": workerResult["loss"], "checkpoint": workerResult["warm_start"], "warm_start": workerResult["warm_start"], "profile": profilePayload,
-		"class_weight_overrides": overridesAsAny(config.Learner.ClassWeightOverrides), "class_weights": weightsAsAny(weights), "batch_plan": batchPlan, "hashes": hashes,
+		"class_weight_overrides": overridesAsAny(config.Learner.ClassWeightOverrides), "class_weights": weightsAsAny(weights), "head_weights": headWeights, "head_weights_hash": headWeightsHash, "batch_plan": batchPlan, "hashes": hashes,
 		"torch": workerResult, "native_evidence": nativeEvidence, "replay_scope": ReplayScope, "timings": timings, "invariants": invariants,
 	}
 }
@@ -95,6 +98,14 @@ func overridesAsAny(value map[string][]float64) map[string]any {
 			items[index] = item
 		}
 		result[head] = items
+	}
+	return result
+}
+
+func scalarWeightsAsAny(value map[string]float64) map[string]any {
+	result := make(map[string]any, len(value))
+	for head, weight := range value {
+		result[head] = weight
 	}
 	return result
 }

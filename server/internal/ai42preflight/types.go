@@ -80,6 +80,7 @@ type LearnerConfig struct {
 	WeightDecay          float64
 	ClassBalancePower    float64
 	MaxGradientNorm      float64
+	HeadWeights          map[string]float64
 	ClassWeights         map[string][]float64
 	ClassWeightOverrides map[string][]float64
 }

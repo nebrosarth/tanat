@@ -13,6 +13,7 @@ var defaultConfig = Config{
 	BatchSize:       8,
 	Learner: LearnerConfig{
 		LearningRate: 3e-4, WeightDecay: 1e-4, ClassBalancePower: 0.5, MaxGradientNorm: 1.0,
+		HeadWeights: map[string]float64{"control": 1, "kind": 1, "target": 1, "offset": 1, "anchor": 1},
 	},
 	Seed: 4242, ValidationProbeLimit: 0,
 }
@@ -22,7 +23,7 @@ var modelFields = map[string]struct{}{
 }
 var recurrentFields = map[string]struct{}{"sequence_length": {}, "batch_size": {}}
 var preflightLearnerFields = map[string]struct{}{"class_balance_power": {}, "max_gradient_norm": {}, "timing_loss_enabled": {}, "optimizer_step_allowed_in_preflight": {}}
-var trainingLearnerFields = map[string]struct{}{"class_balance_power": {}, "max_gradient_norm": {}, "learning_rate": {}, "weight_decay": {}, "class_weight_overrides": {}}
+var trainingLearnerFields = map[string]struct{}{"class_balance_power": {}, "max_gradient_norm": {}, "learning_rate": {}, "weight_decay": {}, "class_weight_overrides": {}, "head_weights": {}}
 var trainingFields = map[string]struct{}{
 	"seed": {}, "max_optimizer_seconds": {}, "max_steps": {}, "epochs": {}, "validation_batches": {}, "validation_epsilon": {},
 	"checkpoint_interval": {}, "validation_matches": {},
@@ -138,7 +139,7 @@ func parseTrainingConfig(root map[string]any, config *Config) error {
 		return err
 	}
 	requiredLearner := map[string]struct{}{"class_balance_power": {}, "max_gradient_norm": {}, "learning_rate": {}, "weight_decay": {}}
-	if err := exactFields(learner, requiredLearner, map[string]struct{}{"class_weight_overrides": {}}, "training config.learner"); err != nil {
+	if err := exactFields(learner, requiredLearner, map[string]struct{}{"class_weight_overrides": {}, "head_weights": {}}, "training config.learner"); err != nil {
 		return err
 	}
 	config.Learner.ClassBalancePower, err = asNumber(learner["class_balance_power"], "training config.learner.class_balance_power")
@@ -159,6 +160,11 @@ func parseTrainingConfig(root map[string]any, config *Config) error {
 	}
 	if raw, ok := learner["class_weight_overrides"]; ok {
 		if err := parseOverrides(raw, &config.Learner.ClassWeightOverrides); err != nil {
+			return err
+		}
+	}
+	if raw, ok := learner["head_weights"]; ok {
+		if err := parseHeadWeights(raw, &config.Learner.HeadWeights); err != nil {
 			return err
 		}
 	}
@@ -296,6 +302,30 @@ func parseOverrides(value any, destination *map[string][]float64) error {
 	return nil
 }
 
+func parseHeadWeights(value any, destination *map[string]float64) error {
+	objectValue, err := object(value, "config.learner.head_weights")
+	if err != nil {
+		return err
+	}
+	expected := map[string]struct{}{"control": {}, "kind": {}, "target": {}, "offset": {}, "anchor": {}}
+	if err := exactFields(objectValue, expected, nil, "config.learner.head_weights"); err != nil {
+		return err
+	}
+	result := make(map[string]float64, len(expected))
+	for head := range expected {
+		number, err := asNumber(objectValue[head], "config.learner.head_weights."+head)
+		if err != nil {
+			return err
+		}
+		if number < 0 {
+			return fmt.Errorf("head_weights[%q] must be non-negative", head)
+		}
+		result[head] = number
+	}
+	*destination = result
+	return nil
+}
+
 func (config Config) Validate() error {
 	if config.ProtocolVersion != ProtocolVersion {
 		return fmt.Errorf("protocol_version must be %d", ProtocolVersion)
@@ -319,6 +349,20 @@ func (config Config) Validate() error {
 	}
 	if config.Learner.LearningRate <= 0 || config.Learner.WeightDecay < 0 || config.Learner.MaxGradientNorm <= 0 {
 		return fmt.Errorf("learner rates and gradient norm are outside their valid ranges")
+	}
+	if len(config.Learner.HeadWeights) != 5 {
+		return fmt.Errorf("head_weights must contain exactly the five AI-42 loss heads")
+	}
+	positive := false
+	for _, head := range []string{"control", "kind", "target", "offset", "anchor"} {
+		value, ok := config.Learner.HeadWeights[head]
+		if !ok || value != value || value > 1e308 || value < 0 {
+			return fmt.Errorf("head_weights[%q] is outside its valid range", head)
+		}
+		positive = positive || value > 0
+	}
+	if !positive {
+		return fmt.Errorf("head_weights must enable at least one loss head")
 	}
 	return nil
 }
