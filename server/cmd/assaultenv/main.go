@@ -18,9 +18,10 @@ import (
 )
 
 type vectorJob struct {
-	index   int
-	reset   *battleserver.AssaultResetV1
-	actions *[battleserver.AssaultHeroCount]battleserver.HeroActionV1
+	index    int
+	reset    *battleserver.AssaultResetV1
+	actions  *[battleserver.AssaultHeroCount]battleserver.HeroActionV1
+	controls *[battleserver.AssaultHeroCount]battleserver.AssaultControlV1
 }
 
 type vectorWorker struct {
@@ -44,22 +45,26 @@ func protocolModes(version uint16) (contract, wrongLane, navigation, strategic, 
 		version == assaultproto.VersionAI41Strategic ||
 		version == assaultproto.VersionAI41StrategicEvaluation ||
 		version == assaultproto.VersionAI41Teacher ||
-		version == assaultproto.VersionAI42
+		version == assaultproto.VersionAI42 ||
+		version == assaultproto.VersionAI42Evaluation
 	wrongLane = version == assaultproto.VersionAI41WrongLane ||
 		version == assaultproto.VersionAI41Navigation ||
 		version == assaultproto.VersionAI41Strategic ||
 		version == assaultproto.VersionAI41Teacher ||
-		version == assaultproto.VersionAI42
+		version == assaultproto.VersionAI42 ||
+		version == assaultproto.VersionAI42Evaluation
 	navigation = version == assaultproto.VersionAI41Navigation ||
 		version == assaultproto.VersionAI41NavigationEvaluation ||
 		version == assaultproto.VersionAI41Strategic ||
 		version == assaultproto.VersionAI41StrategicEvaluation ||
 		version == assaultproto.VersionAI41Teacher ||
-		version == assaultproto.VersionAI42
+		version == assaultproto.VersionAI42 ||
+		version == assaultproto.VersionAI42Evaluation
 	strategic = version == assaultproto.VersionAI41Strategic ||
 		version == assaultproto.VersionAI41StrategicEvaluation ||
 		version == assaultproto.VersionAI41Teacher ||
-		version == assaultproto.VersionAI42
+		version == assaultproto.VersionAI42 ||
+		version == assaultproto.VersionAI42Evaluation
 	teacher = version == assaultproto.VersionAI41Teacher || version == assaultproto.VersionAI42
 	return
 }
@@ -81,6 +86,8 @@ func newVectorRunner(count int) *vectorRunner {
 				w := r.workers[job.index]
 				if job.reset != nil {
 					w.result, w.err = w.env.Reset(*job.reset)
+				} else if job.controls != nil {
+					w.result, w.err = w.env.StepControlled(*job.actions, *job.controls)
 				} else {
 					w.result, w.err = w.env.Step(*job.actions)
 				}
@@ -164,12 +171,23 @@ func (r *vectorRunner) resetIndices(
 }
 
 func (r *vectorRunner) step(actions [][battleserver.AssaultHeroCount]battleserver.HeroActionV1) error {
+	return r.stepControlled(actions, nil)
+}
+
+func (r *vectorRunner) stepControlled(
+	actions [][battleserver.AssaultHeroCount]battleserver.HeroActionV1,
+	controls [][battleserver.AssaultHeroCount]battleserver.AssaultControlV1,
+) error {
 	if len(actions) != len(r.workers) {
 		return fmt.Errorf("vector action count %d, want %d", len(actions), len(r.workers))
 	}
 	r.pending.Add(len(actions))
 	for i := range actions {
-		r.jobs <- vectorJob{index: i, actions: &actions[i]}
+		job := vectorJob{index: i, actions: &actions[i]}
+		if controls != nil {
+			job.controls = &controls[i]
+		}
+		r.jobs <- job
 	}
 	r.pending.Wait()
 	for i := range actions {
@@ -260,7 +278,12 @@ func run(input io.Reader, output io.Writer) error {
 				return err
 			}
 		case assaultproto.CommandStep:
-			result, err := env.Step(request.Actions)
+			var result battleserver.StepResultV1
+			if request.Version == assaultproto.VersionAI42Evaluation {
+				result, err = env.StepControlled(request.Actions, request.Controls)
+			} else {
+				result, err = env.Step(request.Actions)
+			}
 			if err != nil {
 				if writeErr := writeError(err.Error()); writeErr != nil {
 					return writeErr
@@ -293,8 +316,14 @@ func run(input io.Reader, output io.Writer) error {
 				}
 				continue
 			}
-			if err := vector.step(request.VectorActions); err != nil {
-				if writeErr := writeError(err.Error()); writeErr != nil {
+			var stepErr error
+			if request.Version == assaultproto.VersionAI42Evaluation {
+				stepErr = vector.stepControlled(request.VectorActions, request.VectorControls)
+			} else {
+				stepErr = vector.step(request.VectorActions)
+			}
+			if stepErr != nil {
+				if writeErr := writeError(stepErr.Error()); writeErr != nil {
 					return writeErr
 				}
 				continue

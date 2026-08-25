@@ -14,8 +14,10 @@ from tanat_ai40.env import (
     ACTION_DTYPE, AI40_ROSTER, AI40_SELF_PLAY_CONTROLLERS, AI41_EVALUATION_PROTOCOL_VERSION,
     AI41_NAVIGATION_PROTOCOL_VERSION, AI41_PROTOCOL_VERSION,
     AI41_STRATEGIC_PROTOCOL_VERSION, AI41_TEACHER_PROTOCOL_VERSION,
-    AI41_STRATEGIC_REWARD_HASH, AI42_PROTOCOL_VERSION, AI42_REWARD_HASH,
-    AI42_SCHEMA, AI42_SCHEMA_HASH,
+    AI41_STRATEGIC_REWARD_HASH, AI42_EVALUATION_PROTOCOL_VERSION,
+    AI42_EVALUATION_SCHEMA, AI42_EVALUATION_SCHEMA_HASH,
+    AI42_PROTOCOL_VERSION, AI42_REWARD_HASH, AI42_SCHEMA, AI42_SCHEMA_HASH,
+    CONTROLLED_ACTION_DTYPE, COMMAND_VECTOR_STEP,
     AssaultEnvProcess, AssaultProtocolError, AssaultVectorEnv, AssaultVectorProcess,
     HeroAction, HERO_COUNT,
     MAGIC, RESPONSE_RESULT, SCHEMA_HASH, STDERR_TAIL_BYTES, _result_layout,
@@ -249,6 +251,37 @@ class ProtocolContractTest(unittest.TestCase):
         self.assertEqual(AI42_SCHEMA_HASH, hashlib.sha256(AI42_SCHEMA.encode()).digest())
         self.assertEqual(AI42_REWARD_HASH, AI41_STRATEGIC_REWARD_HASH)
         self.assertEqual(_result_layout(AI42_PROTOCOL_VERSION).size, 76508)
+
+    def test_ai42_evaluation_hash_and_controlled_action_wire_are_exact(self):
+        self.assertEqual(
+            AI42_EVALUATION_SCHEMA_HASH,
+            hashlib.sha256(AI42_EVALUATION_SCHEMA.encode()).digest(),
+        )
+        self.assertEqual(
+            AI42_EVALUATION_SCHEMA_HASH.hex(),
+            "f55ea7220d095f52fbd218e4e8665977b30824de13b59da139252eabc5bc212c",
+        )
+        self.assertEqual(
+            _result_layout(AI42_EVALUATION_PROTOCOL_VERSION).size, 76378,
+        )
+        process = object.__new__(AssaultVectorProcess)
+        process.protocol_version = AI42_EVALUATION_PROTOCOL_VERSION
+        process.workers = 1
+        captured = {}
+        process._write = lambda command, payload: captured.update(
+            command=command, payload=bytes(payload),
+        )
+        process._read_vector_results = lambda count: []
+        values = np.zeros((1, HERO_COUNT, 5), dtype=np.int16)
+        values[0, 0] = [2, 1, 0x1234, 80, 14]
+        process.step(values)
+        self.assertEqual(captured["command"], COMMAND_VECTOR_STEP)
+        self.assertEqual(struct.unpack_from("<I", captured["payload"])[0], 1)
+        packed = np.frombuffer(
+            captured["payload"], dtype=CONTROLLED_ACTION_DTYPE,
+            count=HERO_COUNT, offset=4,
+        )
+        self.assertEqual(tuple(packed[0]), (2, 1, 0x1234, 80, 14))
 
     def test_ai42_scalar_parser_reads_append_fields_exactly(self):
         layout = _result_layout(AI42_PROTOCOL_VERSION)

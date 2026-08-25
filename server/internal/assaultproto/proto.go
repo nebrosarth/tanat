@@ -45,8 +45,12 @@ const (
 	// resolved AI-30 teacher actions for offline behavior cloning only.
 	VersionAI41Teacher uint16 = 12
 	// VersionAI42 is the opt-in AI-42 append-only v12 observation contract.
-	VersionAI42               uint16 = 13
-	VersionAI42Reserved              = VersionAI42 // compatibility alias
+	VersionAI42         uint16 = 13
+	VersionAI42Reserved        = VersionAI42 // compatibility alias
+	// VersionAI42Evaluation keeps v13 actor observations/rewards but removes
+	// teacher-only response fields and adds one explicit control byte to every
+	// submitted action. It is evaluation-only; v13 dataset lineage is unchanged.
+	VersionAI42Evaluation     uint16 = 14
 	CommandReset              uint16 = 1
 	CommandStep               uint16 = 2
 	CommandClose              uint16 = 3
@@ -64,13 +68,14 @@ func versionHasAbilities(version uint16) bool {
 		version == VersionAI41Evaluation || version == VersionAI41Navigation ||
 		version == VersionAI41NavigationEvaluation || version == VersionAI41Strategic ||
 		version == VersionAI41StrategicEvaluation || version == VersionAI41Teacher ||
-		version == VersionAI42
+		version == VersionAI42 || version == VersionAI42Evaluation
 }
 
 func versionHasNavigation(version uint16) bool {
 	return version == VersionAI41Navigation || version == VersionAI41NavigationEvaluation ||
 		version == VersionAI41Strategic || version == VersionAI41StrategicEvaluation ||
-		version == VersionAI41Teacher || version == VersionAI42
+		version == VersionAI41Teacher || version == VersionAI42 ||
+		version == VersionAI42Evaluation
 }
 
 func versionHasTeacher(version uint16) bool {
@@ -95,22 +100,26 @@ func supportedVersion(version uint16) bool {
 // it is not a separately maintained/precomputed contract value. The reward
 // hash intentionally remains the existing strategic V5 hash.
 var AI42SchemaHash = sha256.Sum256([]byte(ai42SchemaText()))
+var AI42EvaluationSchemaHash = sha256.Sum256([]byte(ai42EvaluationSchemaText()))
 var AI42RewardHash = battleserver.AssaultRewardHashV5
 
 var magic = [4]byte{'T', 'A', 'N', 'T'}
 
 type Request struct {
-	Version       uint16
-	Command       uint16
-	Reset         battleserver.AssaultResetV1
-	Actions       [battleserver.AssaultHeroCount]battleserver.HeroActionV1
-	VectorResets  []battleserver.AssaultResetV1
-	VectorIndices []uint32
-	VectorActions [][battleserver.AssaultHeroCount]battleserver.HeroActionV1
+	Version        uint16
+	Command        uint16
+	Reset          battleserver.AssaultResetV1
+	Actions        [battleserver.AssaultHeroCount]battleserver.HeroActionV1
+	Controls       [battleserver.AssaultHeroCount]battleserver.AssaultControlV1
+	VectorResets   []battleserver.AssaultResetV1
+	VectorIndices  []uint32
+	VectorActions  [][battleserver.AssaultHeroCount]battleserver.HeroActionV1
+	VectorControls [][battleserver.AssaultHeroCount]battleserver.AssaultControlV1
 }
 
 const resetPayloadSize = 8 + 4 + battleserver.AssaultHeroCount*4 + battleserver.AssaultHeroCount
 const actionPayloadSize = battleserver.AssaultHeroCount * 5
+const controlledActionPayloadSize = battleserver.AssaultHeroCount * 6
 
 func decodeReset(p []byte) (battleserver.AssaultResetV1, error) {
 	var reset battleserver.AssaultResetV1
@@ -158,6 +167,31 @@ func decodeActions(p []byte) ([battleserver.AssaultHeroCount]battleserver.HeroAc
 	return actions, nil
 }
 
+func decodeControlledActions(p []byte) (
+	[battleserver.AssaultHeroCount]battleserver.HeroActionV1,
+	[battleserver.AssaultHeroCount]battleserver.AssaultControlV1,
+	error,
+) {
+	var actions [battleserver.AssaultHeroCount]battleserver.HeroActionV1
+	var controls [battleserver.AssaultHeroCount]battleserver.AssaultControlV1
+	if len(p) != controlledActionPayloadSize {
+		return actions, controls, fmt.Errorf(
+			"assault protocol: field=STEP.controlled_actions offset=%d: got %d bytes, want %d",
+			8+len(p), len(p), controlledActionPayloadSize,
+		)
+	}
+	for i := range actions {
+		off := i * 6
+		controls[i] = battleserver.AssaultControlV1(p[off])
+		actions[i] = battleserver.HeroActionV1{
+			Kind:      battleserver.AssaultActionKindV1(p[off+1]),
+			Target:    binary.LittleEndian.Uint16(p[off+2 : off+4]),
+			Direction: p[off+4], Distance: p[off+5],
+		}
+	}
+	return actions, controls, nil
+}
+
 func ReadRequest(r io.Reader) (Request, error) {
 	body, err := readFrame(r)
 	if err != nil {
@@ -184,7 +218,11 @@ func ReadRequest(r io.Reader) (Request, error) {
 			return Request{}, err
 		}
 	case CommandStep:
-		request.Actions, err = decodeActions(p)
+		if version == VersionAI42Evaluation {
+			request.Actions, request.Controls, err = decodeControlledActions(p)
+		} else {
+			request.Actions, err = decodeActions(p)
+		}
 		if err != nil {
 			return Request{}, err
 		}
@@ -221,21 +259,34 @@ func ReadRequest(r io.Reader) (Request, error) {
 		}
 		count := int(binary.LittleEndian.Uint32(p[:4]))
 		p = p[4:]
-		want := count * actionPayloadSize
+		itemSize := actionPayloadSize
+		if version == VersionAI42Evaluation {
+			itemSize = controlledActionPayloadSize
+		}
+		want := count * itemSize
 		if count < 1 {
 			return Request{}, fmt.Errorf("assault protocol: field=VECTOR_STEP.count offset=8: invalid count %d", count)
 		}
 		if len(p) < want {
 			return Request{}, fmt.Errorf("assault protocol: field=VECTOR_STEP[%d] offset=%d: truncated, got %d bytes, want %d",
-				len(p)/actionPayloadSize, 12+len(p), len(p), want)
+				len(p)/itemSize, 12+len(p), len(p), want)
 		}
 		if len(p) > want {
 			return Request{}, fmt.Errorf("assault protocol: field=VECTOR_STEP.trailing offset=%d: got %d extra bytes",
 				12+want, len(p)-want)
 		}
 		request.VectorActions = make([][battleserver.AssaultHeroCount]battleserver.HeroActionV1, count)
+		if version == VersionAI42Evaluation {
+			request.VectorControls = make([][battleserver.AssaultHeroCount]battleserver.AssaultControlV1, count)
+		}
 		for i := range request.VectorActions {
-			request.VectorActions[i], err = decodeActions(p[i*actionPayloadSize : (i+1)*actionPayloadSize])
+			if version == VersionAI42Evaluation {
+				request.VectorActions[i], request.VectorControls[i], err = decodeControlledActions(
+					p[i*itemSize : (i+1)*itemSize],
+				)
+			} else {
+				request.VectorActions[i], err = decodeActions(p[i*itemSize : (i+1)*itemSize])
+			}
 			if err != nil {
 				return Request{}, err
 			}
@@ -439,6 +490,8 @@ func resultHeaderHashes(version uint16, result *battleserver.StepResultV1) ([32]
 		schema, reward = battleserver.AssaultSchemaHashV4, battleserver.AssaultRewardHashV5
 	case VersionAI42:
 		return AI42SchemaHash, AI42RewardHash, nil
+	case VersionAI42Evaluation:
+		return AI42EvaluationSchemaHash, AI42RewardHash, nil
 	default:
 		return [32]byte{}, [32]byte{}, fmt.Errorf("assault protocol: field=frame.version offset=4: unsupported version %d", version)
 	}
@@ -532,6 +585,16 @@ func ai42SchemaText() string {
 		"skill_navigation=offset81_only|" +
 		"teacher_status=none,action,wait,hold,cancel,unavailable|" +
 		"executed_reason=none,masked,invalid,server_rejected,safety,timeout,policy_error,unknown255|" +
+		"scalar.body=" + strconv.Itoa(scalar.bodySize) + "|scalar.fields=" + layoutFieldsText(scalar.fields) +
+		"|vector.body=" + strconv.Itoa(vector.size) + "|vector.fields=" + layoutFieldsText(vector.fields)
+}
+
+func ai42EvaluationSchemaText() string {
+	scalar := newResultFrameLayout(VersionAI42Evaluation)
+	vector := newVectorResultLayoutVersion(1, VersionAI42Evaluation)
+	return "tanat.assault.ai42.evaluation.v14|frame=little-endian|" +
+		"input=control,kind,target,offset81,anchor15|control=issue,hold,idle|" +
+		"skill_navigation=offset81_only|" +
 		"scalar.body=" + strconv.Itoa(scalar.bodySize) + "|scalar.fields=" + layoutFieldsText(scalar.fields) +
 		"|vector.body=" + strconv.Itoa(vector.size) + "|vector.fields=" + layoutFieldsText(vector.fields)
 }

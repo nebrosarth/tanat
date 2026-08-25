@@ -42,6 +42,19 @@ const (
 	AssaultTeacherStatusUnavailable uint8 = 5
 )
 
+// AI-42 evaluation controls are transported separately from the factorized
+// action. ISSUE applies the action payload, HOLD preserves the authoritative
+// order, and IDLE guarantees that no order remains active. Keeping this outside
+// HeroActionV1 preserves all established v4-v13 action layouts.
+type AssaultControlV1 uint8
+
+const (
+	AssaultControlIssue AssaultControlV1 = iota
+	AssaultControlHold
+	AssaultControlIdle
+	AssaultControlCount
+)
+
 // Rejection reasons are stable v13 wire values.  Unknown is the fail-closed
 // value for an action that was not submitted to this controller slot.
 const (
@@ -439,6 +452,22 @@ func (e *AssaultEnv) Reset(cfg AssaultResetV1) (StepResultV1, error) {
 }
 
 func (e *AssaultEnv) Step(actions [AssaultHeroCount]HeroActionV1) (StepResultV1, error) {
+	return e.executeStep(actions, nil)
+}
+
+// StepControlled executes the explicit AI-42 recurrent control contract.
+// Legacy callers remain on Step and therefore retain byte-for-byte behavior.
+func (e *AssaultEnv) StepControlled(
+	actions [AssaultHeroCount]HeroActionV1,
+	controls [AssaultHeroCount]AssaultControlV1,
+) (StepResultV1, error) {
+	return e.executeStep(actions, &controls)
+}
+
+func (e *AssaultEnv) executeStep(
+	actions [AssaultHeroCount]HeroActionV1,
+	controls *[AssaultHeroCount]AssaultControlV1,
+) (StepResultV1, error) {
 	if e.closed || e.server == nil || e.inst == nil || e.clock == nil {
 		return StepResultV1{}, errors.New("assault: Step called before Reset or after Close")
 	}
@@ -457,6 +486,21 @@ func (e *AssaultEnv) Step(actions [AssaultHeroCount]HeroActionV1) (StepResultV1,
 	for i := 0; i < AssaultHeroCount; i++ {
 		if !assaultControllerUsesActions(e.controllers[i]) {
 			rejectionReason[i] = AssaultRejectionReasonUnknown
+			continue
+		}
+		if controls != nil && controls[i] != AssaultControlIssue {
+			control := controls[i]
+			switch control {
+			case AssaultControlHold:
+				// HOLD submits no new world action and preserves the order.
+				rejectionReason[i] = AssaultRejectionReasonUnknown
+			case AssaultControlIdle:
+				e.cancelExternalActionLocked(i)
+				rejectionReason[i] = AssaultRejectionReasonUnknown
+			default:
+				invalid[i] = 1
+				rejectionReason[i] = AssaultRejectionReasonInvalid
+			}
 			continue
 		}
 		classification := e.classifyActionLocked(i, actions[i])
@@ -540,6 +584,30 @@ func (e *AssaultEnv) Step(actions [AssaultHeroCount]HeroActionV1) (StepResultV1,
 	result.RejectionReason = rejectionReason
 	e.inst.mu.Unlock()
 	return result, nil
+}
+
+// cancelExternalActionLocked is the authoritative counterpart of AI-42 IDLE.
+// It stops every command family an external policy can start and is harmless
+// when the hero already has no active command.
+// Caller holds the instance lock.
+func (e *AssaultEnv) cancelExternalActionLocked(slot int) {
+	if slot < 0 || slot >= AssaultHeroCount {
+		return
+	}
+	c := e.heroes[slot]
+	if c == nil || c.huntState == nil {
+		return
+	}
+	hs := c.huntState
+	e.server.breakInterruptibleChannelsLocked(c)
+	if hs.attackTarget != 0 || (hs.attackActionActive && hs.pvpTarget == 0) {
+		e.server.stopAttackLocked(c, true)
+	}
+	if hs.pvpTarget != 0 || (hs.attackActionActive && hs.attackTarget == 0) {
+		e.server.stopPvpAttackLocked(c, true)
+	}
+	e.server.cancelOrderLocked(c)
+	c.stopMovementLocked(e.server, float64(e.server.battleTime()))
 }
 
 func assaultControllerUsesActions(controller AssaultControllerV1) bool {

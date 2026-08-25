@@ -24,6 +24,33 @@ func TestAI42SchemaHashMatchesCrossLanguageGolden(t *testing.T) {
 	}
 }
 
+func TestAI42EvaluationControlledActionIsByteExact(t *testing.T) {
+	const schemaWant = "f55ea7220d095f52fbd218e4e8665977b30824de13b59da139252eabc5bc212c"
+	if got := hex.EncodeToString(AI42EvaluationSchemaHash[:]); got != schemaWant {
+		t.Fatalf("AI-42 evaluation schema hash drift: got %s, want %s", got, schemaWant)
+	}
+	payload := make([]byte, controlledActionPayloadSize)
+	payload[0] = byte(battleserver.AssaultControlIdle)
+	payload[1] = byte(battleserver.AssaultActionMove)
+	binary.LittleEndian.PutUint16(payload[2:4], 0x1234)
+	payload[4], payload[5] = 80, 14
+	request, err := ReadRequest(bytes.NewReader(requestFrameVersion(
+		VersionAI42Evaluation, CommandStep, payload,
+	)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if request.Controls[0] != battleserver.AssaultControlIdle ||
+		request.Actions[0] != (battleserver.HeroActionV1{
+			Kind: battleserver.AssaultActionMove, Target: 0x1234, Direction: 80, Distance: 14,
+		}) {
+		t.Fatalf("decoded controlled action=%+v/%d", request.Actions[0], request.Controls[0])
+	}
+	if newResultFrameLayout(VersionAI42Evaluation).bodySize != resultBodySizeV2 {
+		t.Fatal("AI-42 evaluation response unexpectedly contains teacher-only fields")
+	}
+}
+
 func requestFrameVersion(version, command uint16, payload []byte) []byte {
 	body := new(bytes.Buffer)
 	body.Write(magic[:])

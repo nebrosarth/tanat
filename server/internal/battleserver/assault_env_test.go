@@ -135,6 +135,41 @@ func TestAssaultExecutedActionTelemetryIsDeterministicAndFailClosed(t *testing.T
 	}
 }
 
+func TestAssaultAI42HoldPreservesAndIdleCancelsMovement(t *testing.T) {
+	env := NewAssaultEnv()
+	defer env.Close()
+	if _, err := env.Reset(externalAssaultReset(701, 10)); err != nil {
+		t.Fatal(err)
+	}
+	hero := env.heroes[0]
+	env.inst.mu.Lock()
+	hero.hasDest = true
+	hero.destX, hero.destY = hero.x+100, hero.y+100
+	env.inst.mu.Unlock()
+	var actions [AssaultHeroCount]HeroActionV1
+	var controls [AssaultHeroCount]AssaultControlV1
+	controls[0] = AssaultControlHold
+	if _, err := env.StepControlled(actions, controls); err != nil {
+		t.Fatal(err)
+	}
+	env.inst.mu.Lock()
+	preserved := hero.hasDest
+	env.inst.mu.Unlock()
+	if !preserved {
+		t.Fatal("HOLD cancelled the active movement order")
+	}
+	controls[0] = AssaultControlIdle
+	if _, err := env.StepControlled(actions, controls); err != nil {
+		t.Fatal(err)
+	}
+	env.inst.mu.Lock()
+	cancelled := !hero.hasDest && hero.arrival == nil && len(hero.path) == 0
+	env.inst.mu.Unlock()
+	if !cancelled {
+		t.Fatal("IDLE did not cancel the active movement order")
+	}
+}
+
 func TestAssaultStrategicRewardTimeWeightAndPostZeroSumDraw(t *testing.T) {
 	if got := assaultShapingTimeWeight(600); math.Abs(got-0.6) > 1e-12 {
 		t.Fatalf("shaping weight at 10 minutes = %g, want 0.6", got)
