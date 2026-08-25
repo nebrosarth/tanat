@@ -145,6 +145,11 @@ class AI42EvaluationActor:
     def act(
         self, observations: Any, indices: np.ndarray,
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        if all(getattr(result, "active_order", None) is not None for result in observations):
+            active = np.concatenate([result.active_order for result in observations])[indices]
+            self.active_order.copy_(
+                torch.as_tensor(active, dtype=torch.bool, device=self.device),
+            )
         batch = stack_observations(observations)
 
         def tensor(name: str, dtype: torch.dtype | None = None) -> torch.Tensor:

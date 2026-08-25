@@ -55,7 +55,7 @@ class _FixedActor(torch.nn.Module):
 class _Observations:
     batched_observations = None
 
-    def __init__(self, dead: bool = False):
+    def __init__(self, dead: bool = False, active_order=None):
         self.teacher_actions = None
         self.teacher_valid = None
         self.hero = np.zeros((HERO_COUNT, 32), dtype=np.float32)
@@ -67,6 +67,7 @@ class _Observations:
         self.kind_mask = np.ones((HERO_COUNT, ACTION_KINDS), dtype=np.uint8)
         self.target_mask = np.ones((HERO_COUNT, MAX_ENTITIES), dtype=np.uint8)
         self.skill_target_mask = np.ones((HERO_COUNT, 4, MAX_ENTITIES), dtype=np.uint8)
+        self.active_order = active_order
 
 
 class AI42EvaluationTests(unittest.TestCase):
@@ -98,6 +99,12 @@ class AI42EvaluationTests(unittest.TestCase):
         self.assertTrue(np.all(model == CONTROL_HOLD))
         self.assertTrue(np.all(runtime[:4] == RUNTIME_CONTROL_HOLD))
         self.assertEqual(int(runtime[4]), RUNTIME_CONTROL_ISSUE)
+
+        _, runtime, _ = evaluator.act(
+            [_Observations(active_order=np.zeros(HERO_COUNT, dtype=np.uint8))],
+            np.arange(5, dtype=np.intp),
+        )
+        self.assertTrue(np.all(runtime == RUNTIME_CONTROL_ISSUE))
 
     def test_death_and_first_respawn_tick_reset_recurrent_state(self) -> None:
         actor = _FixedActor()

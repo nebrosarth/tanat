@@ -25,7 +25,7 @@ func TestAI42SchemaHashMatchesCrossLanguageGolden(t *testing.T) {
 }
 
 func TestAI42EvaluationControlledActionIsByteExact(t *testing.T) {
-	const schemaWant = "f55ea7220d095f52fbd218e4e8665977b30824de13b59da139252eabc5bc212c"
+	const schemaWant = "a54f64514781db87ed2624720916c454d21a41ee2aabca6f094b0924e58e8bef"
 	if got := hex.EncodeToString(AI42EvaluationSchemaHash[:]); got != schemaWant {
 		t.Fatalf("AI-42 evaluation schema hash drift: got %s, want %s", got, schemaWant)
 	}
@@ -46,8 +46,26 @@ func TestAI42EvaluationControlledActionIsByteExact(t *testing.T) {
 		}) {
 		t.Fatalf("decoded controlled action=%+v/%d", request.Actions[0], request.Controls[0])
 	}
-	if newResultFrameLayout(VersionAI42Evaluation).bodySize != resultBodySizeV2 {
-		t.Fatal("AI-42 evaluation response unexpectedly contains teacher-only fields")
+	if newResultFrameLayout(VersionAI42Evaluation).bodySize != resultBodySizeV14 {
+		t.Fatal("AI-42 evaluation response has an unexpected layout")
+	}
+}
+
+func TestAI42EvaluationActiveOrderResponseIsByteExact(t *testing.T) {
+	var result battleserver.StepResultV1
+	result.RewardHash = battleserver.AssaultRewardHashV5
+	result.ActiveOrder[3] = 1
+	var out bytes.Buffer
+	if err := NewResultEncoder().WriteVersion(&out, &result, VersionAI42Evaluation); err != nil {
+		t.Fatal(err)
+	}
+	body, err := readFrame(&out)
+	if err != nil {
+		t.Fatal(err)
+	}
+	layout := newResultFrameLayout(VersionAI42Evaluation)
+	if len(body) != resultBodySizeV14 || body[layout.activeOrderOffset+3] != 1 {
+		t.Fatalf("v14 active-order bytes drifted: size=%d value=%d", len(body), body[layout.activeOrderOffset+3])
 	}
 }
 

@@ -202,6 +202,9 @@ type StepResultV1 struct {
 	ExecutedActions [AssaultHeroCount]HeroActionV1
 	ExecutedValid   [AssaultHeroCount]uint8
 	RejectionReason [AssaultHeroCount]uint8
+	// ActiveOrder is evaluation-only authoritative control state. It lets a
+	// recurrent policy distinguish legal HOLD from a completed command.
+	ActiveOrder [AssaultHeroCount]uint8
 }
 
 type AssaultResetV1 struct {
@@ -1620,8 +1623,32 @@ func (e *AssaultEnv) resultLockedWithTeacher(
 	if r.Done {
 		e.terminalRewarded = true
 	}
+	for i, hero := range e.heroes {
+		if assaultExternalOrderActiveLocked(hero, now) {
+			r.ActiveOrder[i] = 1
+		}
+	}
 	e.laneRewardStep = e.step
 	return r
+}
+
+func assaultExternalOrderActiveLocked(c *conn, now float64) bool {
+	if c == nil || c.huntState == nil {
+		return false
+	}
+	hs := c.huntState
+	if hs.closed || hs.deadUntil > now {
+		return false
+	}
+	if c.hasDest || hs.order != nil || hs.attackTarget != 0 || hs.pvpTarget != 0 || hs.attackActionActive {
+		return true
+	}
+	for _, channel := range hs.channels {
+		if channel.interruptible && now <= channel.until {
+			return true
+		}
+	}
+	return false
 }
 
 // assaultTeacherTransitionLocked emits one deterministic v13 teacher status for

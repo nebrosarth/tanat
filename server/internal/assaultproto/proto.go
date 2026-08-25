@@ -350,6 +350,7 @@ const resultRecordSizeV2 = resultBodySizeV2 - resultHeaderSize
 const resultRecordSizeV3 = resultBodySizeV3 - resultHeaderSize
 const resultBodySizeV13 = resultBodySizeV3 + battleserver.AssaultHeroCount*(5+1+1)
 const resultRecordSizeV13 = resultBodySizeV13 - resultHeaderSize
+const resultBodySizeV14 = resultBodySizeV2 + battleserver.AssaultHeroCount
 const vectorResultHeaderSize = resultHeaderSize + 4
 
 // The scalar result body is the authoritative frame layout. Every offset is
@@ -383,6 +384,7 @@ type resultFrameLayout struct {
 	teacherActionsOffset, teacherValidOffset                          int
 	teacherIntentOffset, teacherStatusOffset                          int
 	executedActionsOffset, executedValidOffset, rejectionReasonOffset int
+	activeOrderOffset                                                 int
 	fields                                                            []resultLayoutField
 }
 
@@ -431,6 +433,7 @@ func newResultFrameLayout(version uint16) resultFrameLayout {
 	teacherActionsOffset, teacherValidOffset := -1, -1
 	teacherIntentOffset, teacherStatusOffset := -1, -1
 	executedActionsOffset, executedValidOffset, rejectionReasonOffset := -1, -1, -1
+	activeOrderOffset := -1
 	if version == VersionAI41Teacher {
 		teacherActionsOffset = add("result.teacher_actions", battleserver.AssaultHeroCount*5)
 		teacherValidOffset = add("result.teacher_valid", battleserver.AssaultHeroCount)
@@ -440,6 +443,8 @@ func newResultFrameLayout(version uint16) resultFrameLayout {
 		executedActionsOffset = add("result.executed_actions", battleserver.AssaultHeroCount*5)
 		executedValidOffset = add("result.executed_valid", battleserver.AssaultHeroCount)
 		rejectionReasonOffset = add("result.rejection_reason", battleserver.AssaultHeroCount)
+	} else if version == VersionAI42Evaluation {
+		activeOrderOffset = add("result.active_order", battleserver.AssaultHeroCount)
 	}
 	return resultFrameLayout{
 		bodySize: off, recordSize: off - resultHeaderSize,
@@ -447,8 +452,8 @@ func newResultFrameLayout(version uint16) resultFrameLayout {
 		teacherActionsOffset: teacherActionsOffset, teacherValidOffset: teacherValidOffset,
 		teacherIntentOffset: teacherIntentOffset, teacherStatusOffset: teacherStatusOffset,
 		executedActionsOffset: executedActionsOffset, executedValidOffset: executedValidOffset,
-		rejectionReasonOffset: rejectionReasonOffset,
-		fields:                fields,
+		rejectionReasonOffset: rejectionReasonOffset, activeOrderOffset: activeOrderOffset,
+		fields: fields,
 	}
 }
 
@@ -508,7 +513,7 @@ type vectorResultLayout struct {
 	hero, abilities, entities, global, entityMask, kindMask      int
 	targetMask, skillTargetMask, teacherActions, teacherValid    int
 	teacherIntent, teacherStatus, executedActions, executedValid int
-	rejectionReason, size                                        int
+	rejectionReason, activeOrder, size                           int
 	fields                                                       []resultLayoutField
 }
 
@@ -561,6 +566,8 @@ func newVectorResultLayoutVersion(count int, version uint16) vectorResultLayout 
 		layout.executedActions = take("result.executed_actions", actors*5)
 		layout.executedValid = take("result.executed_valid", actors)
 		layout.rejectionReason = take("result.rejection_reason", actors)
+	} else if version == VersionAI42Evaluation {
+		layout.activeOrder = take("result.active_order", actors)
 	}
 	layout.size = off
 	layout.fields = fields
@@ -698,6 +705,8 @@ func encodeResultRecord(body []byte, result *battleserver.StepResultV1, version 
 		}
 		putBytes(result.ExecutedValid[:])
 		putBytes(result.RejectionReason[:])
+	} else if version == VersionAI42Evaluation {
+		putBytes(result.ActiveOrder[:])
 	}
 	want := layout.recordSize
 	if off != want {
@@ -854,6 +863,8 @@ func (e *VectorResultEncoder) WriteVersion(w io.Writer, results []*battleserver.
 					body[start+4] = action.Distance
 					body[layout.executedValid+actor] = value.ExecutedValid[heroIndex]
 					body[layout.rejectionReason+actor] = value.RejectionReason[heroIndex]
+				} else if version == VersionAI42Evaluation {
+					body[layout.activeOrder+actor] = value.ActiveOrder[heroIndex]
 				}
 			}
 		}(i, result)

@@ -251,6 +251,8 @@ def _result_layout(protocol_version: int, count: int = 1, vector: bool = False) 
             add("result.executed_actions", actors * ACTION_DTYPE.itemsize)
             add("result.executed_valid", actors)
             add("result.rejection_reason", actors)
+        elif protocol_version == AI42_EVALUATION_PROTOCOL_VERSION:
+            add("result.active_order", actors)
     else:
         add("result.step", 4)
         add("result.elapsed", 4)
@@ -278,6 +280,8 @@ def _result_layout(protocol_version: int, count: int = 1, vector: bool = False) 
             add("result.executed_actions", HERO_COUNT * ACTION_DTYPE.itemsize)
             add("result.executed_valid", HERO_COUNT)
             add("result.rejection_reason", HERO_COUNT)
+        elif protocol_version == AI42_EVALUATION_PROTOCOL_VERSION:
+            add("result.active_order", HERO_COUNT)
     return _FrameLayout(offset, tuple(fields))
 
 
@@ -386,6 +390,7 @@ class StepResult:
     rejection_reason: np.ndarray | None = None
     schema_hash: bytes | None = None
     reward_hash: bytes | None = None
+    active_order: np.ndarray | None = None
 
 
 class VectorStepResults(list[StepResult]):
@@ -590,6 +595,7 @@ class AssaultEnvProcess:
         teacher_actions = teacher_valid = None
         teacher_intent = teacher_status = None
         executed_actions = executed_valid = rejection_reason = None
+        active_order = None
         if self.protocol_version == AI41_TEACHER_PROTOCOL_VERSION:
             teacher_actions = np.frombuffer(body, dtype=ACTION_DTYPE, count=HERO_COUNT, offset=offset)
             offset += HERO_COUNT * ACTION_DTYPE.itemsize
@@ -606,13 +612,18 @@ class AssaultEnvProcess:
             offset += HERO_COUNT
             rejection_reason = np.frombuffer(body, dtype=np.uint8, count=HERO_COUNT, offset=offset)
             offset += HERO_COUNT
+        elif self.protocol_version == AI42_EVALUATION_PROTOCOL_VERSION:
+            active_order = np.frombuffer(
+                body, dtype=np.uint8, count=HERO_COUNT, offset=offset,
+            )
+            offset += HERO_COUNT
         if offset != len(body):
             raise AssaultProtocolError(f"field=result.trailing offset={offset}: got {len(body)-offset} bytes")
         return StepResult(step, elapsed, bool(done), winner, invalid, rewards, hero, entities,
                           global_state, entity_mask, kind_mask, target_mask, skill_target_mask,
                           abilities, teacher_actions, teacher_valid, teacher_intent,
                           teacher_status, executed_actions, executed_valid, rejection_reason,
-                          bytes(body[8:40]), bytes(body[40:72]))
+                          bytes(body[8:40]), bytes(body[40:72]), active_order)
 
 
 def _reset_values(
@@ -800,6 +811,8 @@ class AssaultVectorProcess:
             batched["executed_actions"] = take(ACTION_DTYPE, (actors,), "result.executed_actions")
             batched["executed_valid"] = take("u1", (actors,), "result.executed_valid")
             batched["rejection_reason"] = take("u1", (actors,), "result.rejection_reason")
+        elif self.protocol_version == AI42_EVALUATION_PROTOCOL_VERSION:
+            batched["active_order"] = take("u1", (actors,), "result.active_order")
         if offset != size:
             raise AssaultProtocolError(f"field=result.trailing offset={offset}: got {size-offset} bytes")
         results: list[StepResult] = []
@@ -821,6 +834,7 @@ class AssaultVectorProcess:
                 batched["executed_valid"][start:end] if "executed_valid" in batched else None,
                 batched["rejection_reason"][start:end] if "rejection_reason" in batched else None,
                 bytes(view[8:40]), bytes(view[40:72]),
+                batched["active_order"][start:end] if "active_order" in batched else None,
             ))
         return VectorStepResults(results, batched)
 

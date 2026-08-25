@@ -259,10 +259,10 @@ class ProtocolContractTest(unittest.TestCase):
         )
         self.assertEqual(
             AI42_EVALUATION_SCHEMA_HASH.hex(),
-            "f55ea7220d095f52fbd218e4e8665977b30824de13b59da139252eabc5bc212c",
+            "a54f64514781db87ed2624720916c454d21a41ee2aabca6f094b0924e58e8bef",
         )
         self.assertEqual(
-            _result_layout(AI42_EVALUATION_PROTOCOL_VERSION).size, 76378,
+            _result_layout(AI42_EVALUATION_PROTOCOL_VERSION).size, 76388,
         )
         process = object.__new__(AssaultVectorProcess)
         process.protocol_version = AI42_EVALUATION_PROTOCOL_VERSION
@@ -282,6 +282,20 @@ class ProtocolContractTest(unittest.TestCase):
             count=HERO_COUNT, offset=4,
         )
         self.assertEqual(tuple(packed[0]), (2, 1, 0x1234, 80, 14))
+
+        layout = _result_layout(AI42_EVALUATION_PROTOCOL_VERSION)
+        body = bytearray(layout.size)
+        self._header(body, AI42_EVALUATION_PROTOCOL_VERSION, RESPONSE_RESULT)
+        active_offset = next(
+            offset for name, offset, _ in layout.fields if name == "result.active_order"
+        )
+        body[active_offset + 3] = 1
+        frame = struct.pack("<I", len(body)) + body
+        result = self._scalar_env(
+            frame, AI42_EVALUATION_PROTOCOL_VERSION,
+        )._read_result()
+        self.assertEqual(int(result.active_order[3]), 1)
+        self.assertEqual(int(result.active_order.sum()), 1)
 
     def test_ai42_scalar_parser_reads_append_fields_exactly(self):
         layout = _result_layout(AI42_PROTOCOL_VERSION)

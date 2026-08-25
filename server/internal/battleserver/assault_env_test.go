@@ -149,7 +149,8 @@ func TestAssaultAI42HoldPreservesAndIdleCancelsMovement(t *testing.T) {
 	var actions [AssaultHeroCount]HeroActionV1
 	var controls [AssaultHeroCount]AssaultControlV1
 	controls[0] = AssaultControlHold
-	if _, err := env.StepControlled(actions, controls); err != nil {
+	holdResult, err := env.StepControlled(actions, controls)
+	if err != nil {
 		t.Fatal(err)
 	}
 	env.inst.mu.Lock()
@@ -158,8 +159,12 @@ func TestAssaultAI42HoldPreservesAndIdleCancelsMovement(t *testing.T) {
 	if !preserved {
 		t.Fatal("HOLD cancelled the active movement order")
 	}
+	if holdResult.ActiveOrder[0] != 1 {
+		t.Fatal("HOLD response did not expose the active movement order")
+	}
 	controls[0] = AssaultControlIdle
-	if _, err := env.StepControlled(actions, controls); err != nil {
+	idleResult, err := env.StepControlled(actions, controls)
+	if err != nil {
 		t.Fatal(err)
 	}
 	env.inst.mu.Lock()
@@ -167,6 +172,9 @@ func TestAssaultAI42HoldPreservesAndIdleCancelsMovement(t *testing.T) {
 	env.inst.mu.Unlock()
 	if !cancelled {
 		t.Fatal("IDLE did not cancel the active movement order")
+	}
+	if idleResult.ActiveOrder[0] != 0 {
+		t.Fatal("IDLE response retained a cancelled movement order")
 	}
 }
 
