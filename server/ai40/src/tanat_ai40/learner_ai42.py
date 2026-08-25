@@ -89,6 +89,17 @@ EXCLUDED_STATUSES = frozenset({
     int(TeacherStatus.UNAVAILABLE),
 })
 ACTION_STATUS = int(TeacherStatus.ACTION)
+# These are the single source of truth for the actor-v13 supervision
+# vocabulary.  The class-profile and metrics modules import them instead of
+# repeating head sizes or relying on model implementation details.
+HEAD_NAMES = ("control", "kind", "target", "offset", "anchor")
+HEAD_CLASS_COUNTS = {
+    "control": CONTROL_CLASSES,
+    "kind": ACTION_KINDS,
+    "target": MAX_ENTITIES,
+    "offset": NAVIGATION_OFFSETS,
+    "anchor": NAVIGATION_ANCHORS,
+}
 # Kept as a public compatibility constant for callers that use the v13
 # action vocabulary.  Control WAIT is not mapped to this action kind.
 WAIT_KIND = 0
@@ -594,7 +605,7 @@ class AI42LearnerConfig:
 
     learning_rate: float = 3e-4
     weight_decay: float = 1e-4
-    class_balance_power: float = 1.0
+    class_balance_power: float = 0.5
     max_gradient_norm: float = 1.0
     head_weights: Mapping[str, float] = field(default_factory=lambda: {
         "control": 1.0, "kind": 1.0, "target": 1.0, "offset": 1.0, "anchor": 1.0,
@@ -640,6 +651,8 @@ class LossResult:
     metrics: Mapping[str, Any]
     class_counts: Mapping[str, tuple[int, ...]]
     skill_metrics: Mapping[str, Mapping[str, Any]]
+    head_weighted_numerators: Mapping[str, float] = field(default_factory=dict)
+    head_weighted_denominators: Mapping[str, float] = field(default_factory=dict)
 
     @property
     def control_counts(self) -> Mapping[str, int]:
@@ -669,8 +682,41 @@ class LossResult:
             "class_counts": {name: list(value) for name, value in self.class_counts.items()},
             "control_counts": dict(self.control_counts),
             "skill_metrics": {name: dict(value) for name, value in self.skill_metrics.items()},
+            "head_weighted_numerators": dict(self.head_weighted_numerators),
+            "head_weighted_denominators": dict(self.head_weighted_denominators),
         }
 
+
+@dataclass(frozen=True, slots=True)
+class AI42Supervision:
+    """Prepared labels, applicability masks, and action masks for one batch.
+
+    Every consumer of teacher supervision (loss, class profiles, and metrics)
+    uses this object.  Tensors retain the batch device and are flattened only
+    across the recurrent ``[B,T]`` prefix.
+    """
+
+    labels: Mapping[str, Tensor]
+    active: Mapping[str, Tensor]
+    masks: Mapping[str, Tensor]
+    action_rows: Tensor
+    control_rows: Tensor
+    supervised_rows: Tensor
+    target_applicable: Tensor
+    move_rows: Tensor
+    skill_rows: Tensor
+
+    @property
+    def control_active(self) -> Tensor:
+        return self.active["control"]
+
+    @property
+    def action_active(self) -> Tensor:
+        return self.active["kind"]
+
+    @property
+    def action_parameter_active(self) -> Tensor:
+        return self.supervised_rows
 
 def class_balance_weights(class_counts: Sequence[int], power: float = 1.0) -> Tensor:
     """Return mean-one inverse-frequency weights; absent classes have weight 0."""
@@ -834,8 +880,10 @@ def _head_loss(
         counts = _counts(labels, active, classes)
         weights = _weights_for(config, head, counts, logits.device)
         sample_weights = weights[selected_labels]
-        denominator = sample_weights.sum().clamp_min(torch.finfo(per_item.dtype).eps)
-        value = (per_item * sample_weights).sum() / denominator
+        weighted_numerator = (per_item * sample_weights).sum()
+        weighted_denominator = sample_weights.sum()
+        denominator = weighted_denominator.clamp_min(torch.finfo(per_item.dtype).eps)
+        value = weighted_numerator / denominator
         predicted = masked_logits.argmax(dim=-1)
         accuracy = float((predicted == selected_labels).float().mean().detach().cpu().item())
         mean_weight = float(sample_weights.mean().detach().cpu().item())
@@ -844,9 +892,23 @@ def _head_loss(
         value = logits.sum() * 0.0
         accuracy = 0.0
         mean_weight = 0.0
+    if bool(active.any()):
+        weighted_numerator_value = float(
+            (per_item.to(dtype=torch.float64) * sample_weights.to(dtype=torch.float64)).sum().detach().cpu().item()
+        )
+        weighted_denominator_value = float(sample_weights.to(dtype=torch.float64).sum().detach().cpu().item())
+    else:
+        weighted_numerator_value = 0.0
+        weighted_denominator_value = 0.0
     if not bool(torch.isfinite(value).all()):
         raise NonFiniteError(f"{head} loss is non-finite")
-    metrics = {"loss": float(value.detach().cpu().item()), "accuracy": accuracy, "count": int(sum(counts)), "mean_class_weight": mean_weight, "class_counts": counts}
+    metrics = {
+        "loss": float(value.detach().cpu().item()), "accuracy": accuracy,
+        "count": int(sum(counts)), "mean_class_weight": mean_weight,
+        "class_counts": counts,
+        "weighted_numerator": weighted_numerator_value,
+        "weighted_denominator": weighted_denominator_value,
+    }
     return value, metrics, counts
 
 
@@ -865,6 +927,78 @@ def _conditioned_target_mask(batch: AI42Batch, kinds: Tensor) -> Tensor:
         rows, (kinds - SKILL_KINDS[0]).clamp(0, 3),
     ]
     return torch.where(skill.unsqueeze(-1), skill_mask & entity, target)
+
+
+def prepare_ai42_supervision(batch: AI42Batch) -> AI42Supervision:
+    """Prepare the canonical AI-42 v13 supervision masks exactly once.
+
+    Control rows include ISSUE/WAIT/HOLD/CANCEL.  Parameter heads are active
+    only for ISSUE and use the teacher kind to determine target/offset/anchor
+    applicability.  The function performs no model work and is therefore
+    safe to use for a streaming train-split profile pass.
+    """
+
+    if not isinstance(batch, AI42Batch):
+        batch = AI42Batch.from_mapping(batch)  # type: ignore[arg-type]
+    flat_status = batch.teacher_status.reshape(-1)
+    flat_base = batch.loss_mask.reshape(-1)
+    flat_actions = batch.teacher_actions.reshape(-1, 4)
+    action_rows = flat_status == ACTION_STATUS
+    control_rows = torch.zeros_like(flat_base)
+    control_labels = torch.zeros_like(flat_status)
+    for status, control_class in CONTROL_STATUS_TO_CLASS.items():
+        rows_for_status = flat_status == status
+        control_rows |= rows_for_status
+        control_labels = torch.where(
+            rows_for_status,
+            torch.full_like(control_labels, control_class),
+            control_labels,
+        )
+
+    supervised = flat_base & action_rows
+    kinds = flat_actions[:, 0]
+    targets = flat_actions[:, 1]
+    offsets = flat_actions[:, 2]
+    anchors = flat_actions[:, 3]
+    if bool((kinds < 0).any()) or bool((kinds >= ACTION_KINDS).any()):
+        raise AI42LearnerError("kind label is outside the model vocabulary")
+    target_mask = _conditioned_target_mask(batch, kinds)
+    move_rows = kinds == MOVE_KIND
+    skill_rows = (kinds >= SKILL_KINDS[0]) & (kinds <= SKILL_KINDS[-1])
+    target_applicable = (kinds == ATTACK_KIND) | (skill_rows & target_mask.any(dim=-1))
+
+    active = {
+        "control": flat_base & control_rows,
+        "kind": supervised,
+        "target": supervised & target_applicable,
+        "offset": supervised & (skill_rows | (move_rows & (anchors == 0))),
+        "anchor": supervised & move_rows & (anchors > 0),
+    }
+    masks = {
+        "control": torch.ones((*control_labels.shape, CONTROL_CLASSES), dtype=torch.bool, device=control_labels.device),
+        "kind": batch.kind_mask.reshape(-1, ACTION_KINDS),
+        "target": target_mask,
+        "offset": torch.ones((*offsets.shape, NAVIGATION_OFFSETS), dtype=torch.bool, device=offsets.device),
+        "anchor": torch.ones((*anchors.shape, NAVIGATION_ANCHORS), dtype=torch.bool, device=anchors.device),
+    }
+    labels = {
+        "control": control_labels,
+        "kind": kinds,
+        "target": targets,
+        "offset": offsets,
+        "anchor": anchors,
+    }
+    return AI42Supervision(
+        labels=labels,
+        active=active,
+        masks=masks,
+        action_rows=action_rows,
+        control_rows=control_rows,
+        supervised_rows=supervised,
+        target_applicable=target_applicable,
+        move_rows=move_rows,
+        skill_rows=skill_rows,
+    )
 
 
 def compute_behavior_cloning_loss(
@@ -889,30 +1023,18 @@ def compute_behavior_cloning_loss(
             raise AI42LearnerError(f"actor output is missing {name}")
         _validate_logits(output[name], name)
 
-    flat_status = batch.teacher_status.reshape(-1)
-    flat_base = batch.loss_mask.reshape(-1)
-    flat_actions = batch.teacher_actions.reshape(-1, 4)
-    action_rows = flat_status == ACTION_STATUS
-    control_rows = torch.zeros_like(flat_base)
-    control_labels = torch.zeros_like(flat_status)
-    for status, control_class in CONTROL_STATUS_TO_CLASS.items():
-        rows_for_status = flat_status == status
-        control_rows |= rows_for_status
-        control_labels = torch.where(
-            rows_for_status,
-            torch.full_like(control_labels, control_class),
-            control_labels,
-        )
-    control_active = flat_base & control_rows
+    prepared = prepare_ai42_supervision(batch)
+    labels = prepared.labels
+    active = prepared.active
+    masks = prepared.masks
+    control_labels = labels["control"]
+    control_active = active["control"]
     control_logits = output["control"].reshape(-1, CONTROL_CLASSES)
-    control_mask = torch.ones(
-        (*control_labels.shape, CONTROL_CLASSES), dtype=torch.bool, device=control_labels.device,
-    )
     control_value, control_metrics, control_counts = _head_loss(
         control_logits,
         control_labels,
         control_active,
-        control_mask,
+        masks["control"],
         head="control",
         classes=CONTROL_CLASSES,
         config=config,
@@ -920,38 +1042,32 @@ def compute_behavior_cloning_loss(
 
     # Action parameters are meaningful only when the recurrent control
     # decision is ISSUE. WAIT/HOLD/CANCEL must not fabricate a v13 action.
-    supervised = flat_base & action_rows
-    kinds = flat_actions[:, 0]
-    targets = flat_actions[:, 1]
-    offsets = flat_actions[:, 2]
-    anchors = flat_actions[:, 3]
+    supervised = prepared.supervised_rows
+    kinds = labels["kind"]
+    targets = labels["target"]
+    offsets = labels["offset"]
+    anchors = labels["anchor"]
     kind_logits = output["kind"].reshape(-1, ACTION_KINDS)
-    kind_mask = batch.kind_mask.reshape(-1, ACTION_KINDS)
     kind_value, kind_metrics, kind_counts = _head_loss(
-        kind_logits, kinds, supervised, kind_mask, head="kind", classes=ACTION_KINDS, config=config,
+        kind_logits, kinds, active["kind"], masks["kind"], head="kind", classes=ACTION_KINDS, config=config,
     )
 
     rows = torch.arange(kinds.shape[0], device=kinds.device)
     target_logits = output["target"].reshape(-1, ACTION_KINDS, MAX_ENTITIES)[rows, kinds]
     offset_logits = output["offset"].reshape(-1, ACTION_KINDS, NAVIGATION_OFFSETS)[rows, kinds]
     anchor_logits = output["anchor"].reshape(-1, ACTION_KINDS, NAVIGATION_ANCHORS)[rows, kinds]
-    target_mask = _conditioned_target_mask(batch, kinds)
-    move_rows = kinds == MOVE_KIND
-    skill_rows_all = (kinds >= SKILL_KINDS[0]) & (kinds <= SKILL_KINDS[-1])
-    target_applicable = (kinds == ATTACK_KIND) | (skill_rows_all & target_mask.any(dim=-1))
-    target_active = supervised & action_rows & target_applicable
-    offset_active = supervised & action_rows & (skill_rows_all | (move_rows & (anchors == 0)))
-    anchor_active = supervised & action_rows & move_rows & (anchors > 0)
+    target_mask = masks["target"]
+    target_active = active["target"]
+    offset_active = active["offset"]
+    anchor_active = active["anchor"]
     target_value, target_metrics, target_counts = _head_loss(
         target_logits, targets, target_active, target_mask, head="target", classes=MAX_ENTITIES, config=config,
     )
-    offset_mask = torch.ones((*offsets.shape, NAVIGATION_OFFSETS), dtype=torch.bool, device=offsets.device)
-    anchor_mask = torch.ones((*anchors.shape, NAVIGATION_ANCHORS), dtype=torch.bool, device=anchors.device)
     offset_value, offset_metrics, offset_counts = _head_loss(
-        offset_logits, offsets, offset_active, offset_mask, head="offset", classes=NAVIGATION_OFFSETS, config=config,
+        offset_logits, offsets, offset_active, masks["offset"], head="offset", classes=NAVIGATION_OFFSETS, config=config,
     )
     anchor_value, anchor_metrics, anchor_counts = _head_loss(
-        anchor_logits, anchors, anchor_active, anchor_mask, head="anchor", classes=NAVIGATION_ANCHORS, config=config,
+        anchor_logits, anchors, anchor_active, masks["anchor"], head="anchor", classes=NAVIGATION_ANCHORS, config=config,
     )
 
     head_losses = {
@@ -979,10 +1095,10 @@ def compute_behavior_cloning_loss(
         skill_entry: dict[str, Any] = {"count": int(skill_rows.sum().detach().cpu().item()), "target_count": int(skill_target_rows.sum().detach().cpu().item())}
         for head_name, logits, labels, active, classes, mask in (
             ("target", target_logits, targets, skill_target_rows, MAX_ENTITIES, target_mask),
-            ("offset", offset_logits, offsets, skill_rows, NAVIGATION_OFFSETS, offset_mask),
+            ("offset", offset_logits, offsets, skill_rows, NAVIGATION_OFFSETS, masks["offset"]),
             # Skill navigation is offset-only in protocol v13.  A skill anchor
             # is rejected by the bridge/dataset and is never a supervised row.
-            ("anchor", anchor_logits, anchors, torch.zeros_like(skill_rows), NAVIGATION_ANCHORS, anchor_mask),
+            ("anchor", anchor_logits, anchors, torch.zeros_like(skill_rows), NAVIGATION_ANCHORS, masks["anchor"]),
         ):
             if bool(active.any()):
                 selected = logits[active].masked_fill(~mask[active], -torch.inf)
@@ -998,9 +1114,9 @@ def compute_behavior_cloning_loss(
         "skills": skill_metrics,
         "supervised_count": int(control_active.sum().detach().cpu().item()),
         "action_parameter_count": int(supervised.sum().detach().cpu().item()),
-        "action_count": int((flat_base & action_rows).sum().detach().cpu().item()),
+        "action_count": int(prepared.action_rows.logical_and(batch.loss_mask.reshape(-1)).sum().detach().cpu().item()),
         "control_count": int(control_active.sum().detach().cpu().item()),
-        "excluded_count": int((flat_base & ~control_rows).sum().detach().cpu().item()),
+        "excluded_count": int((batch.loss_mask.reshape(-1) & ~prepared.control_rows).sum().detach().cpu().item()),
         "timing": {"excluded": True, "reason": "timing heads are reserved by the initial AI-42 BC contract"},
     }
     return LossResult(
@@ -1015,6 +1131,12 @@ def compute_behavior_cloning_loss(
             "anchor": anchor_counts,
         },
         skill_metrics=skill_metrics,
+        head_weighted_numerators={
+            name: float(metrics_by_head[name]["weighted_numerator"]) for name in HEAD_NAMES
+        },
+        head_weighted_denominators={
+            name: float(metrics_by_head[name]["weighted_denominator"]) for name in HEAD_NAMES
+        },
     )
 
 
@@ -1347,9 +1469,24 @@ class CheckpointArtifact:
     payload_digest: str
 
 
+@dataclass(frozen=True, slots=True)
+class WarmStartState:
+    """Provenance for a validated model-only warm start."""
+
+    source_path: str
+    source_file_sha256: str
+    source_manifest_digest: str
+    source_payload_digest: str
+    source_model_hash: str
+    source_model_artifact_hash: str
+    source_dataset_hash: str
+    source_step: int
+    source_epoch: int
+
+
 def inspect_ai42_checkpoint(
     path: str | os.PathLike[str],
-    expected_manifest: Mapping[str, Any],
+    expected_manifest: Mapping[str, Any] | None = None,
     *,
     model: nn.Module | None = None,
     map_location: str | torch.device = "cpu",
@@ -1362,7 +1499,7 @@ def inspect_ai42_checkpoint(
     recomputed, including the model tensor tree.
     """
 
-    expected = validate_learner_manifest(expected_manifest)
+    expected = validate_learner_manifest(expected_manifest) if expected_manifest is not None else None
     try:
         payload = torch.load(path, map_location=map_location, weights_only=True)
     except Exception as exc:
@@ -1376,7 +1513,7 @@ def inspect_ai42_checkpoint(
     if set(payload) != expected_fields:
         raise CheckpointError("checkpoint field set is incomplete or contains unknown data")
     actual_manifest = validate_learner_manifest(payload.get("manifest"))
-    if actual_manifest != expected:
+    if expected is not None and actual_manifest != expected:
         raise CheckpointError("checkpoint manifest is not an exact match")
     if payload.get("manifest_digest") != manifest_digest(actual_manifest):
         raise CheckpointError("checkpoint manifest digest does not match its contents")
@@ -1432,6 +1569,72 @@ def inspect_ai42_checkpoint(
         extra=dict(extra),
         artifact_hashes=dict(expected_artifacts),
         payload_digest=str(expected_payload_digest),
+    )
+
+
+def load_ai42_model_warm_start(
+    path: str | os.PathLike[str],
+    model: nn.Module,
+    expected_manifest: Mapping[str, Any],
+    *,
+    map_location: str | torch.device = "cpu",
+) -> WarmStartState:
+    """Restore model weights from a fully validated prior generation only.
+
+    The source may have a different learner config (the first BC generation
+    used batch-local balancing), but its protocol, dataset lineage, and model
+    architecture must match.  Optimizer state, RNG state, step, epoch, and
+    cursor are intentionally never read into the active learner.
+    """
+
+    source = Path(path)
+    if not source.is_file():
+        raise CheckpointError(f"warm-start checkpoint does not exist: {source}")
+    target = validate_learner_manifest(expected_manifest)
+    try:
+        source_sha_before = hashlib.sha256(source.read_bytes()).hexdigest()
+    except OSError as exc:
+        raise CheckpointError(f"cannot hash warm-start checkpoint: {exc}") from exc
+    artifact = inspect_ai42_checkpoint(source, None, model=model, map_location=map_location)
+    source_manifest = dict(artifact.manifest)
+    for field in ("protocol_version", "dataset_hash", "dataset_schema_version", "shard_schema_version"):
+        if field in target or field in source_manifest:
+            if source_manifest.get(field) != target.get(field):
+                raise CheckpointError(f"warm-start {field} is incompatible")
+    if source_manifest.get("model_hash") != target.get("model_hash"):
+        raise CheckpointError("warm-start model architecture hash is incompatible")
+    try:
+        payload = torch.load(source, map_location=map_location, weights_only=True)
+    except Exception as exc:
+        raise CheckpointError(f"cannot read warm-start checkpoint: {exc}") from exc
+    if not isinstance(payload, Mapping):
+        raise CheckpointError("warm-start payload is not a mapping")
+    model_state = payload.get("model_state_dict")
+    _state_dict_compatible(model, model_state)
+    try:
+        source_sha_after = hashlib.sha256(source.read_bytes()).hexdigest()
+    except OSError as exc:
+        raise CheckpointError(f"cannot re-hash warm-start checkpoint: {exc}") from exc
+    if source_sha_before != source_sha_after:
+        raise CheckpointError("warm-start checkpoint changed during validation")
+    before = {name: value.detach().clone() for name, value in model.state_dict().items()}
+    try:
+        model.load_state_dict(model_state, strict=True)
+        for name, value in model.state_dict().items():
+            _finite_tensor(value, f"warm-start model state {name}")
+    except Exception as exc:
+        model.load_state_dict(before, strict=True)
+        raise CheckpointError(f"warm-start model restore rolled back: {exc}") from exc
+    return WarmStartState(
+        source_path=str(source),
+        source_file_sha256=source_sha_before,
+        source_manifest_digest=manifest_digest(source_manifest),
+        source_payload_digest=artifact.payload_digest,
+        source_model_hash=str(source_manifest["model_hash"]),
+        source_model_artifact_hash=artifact.artifact_hashes["model"],
+        source_dataset_hash=str(source_manifest["dataset_hash"]),
+        source_step=artifact.step,
+        source_epoch=artifact.epoch,
     )
 
 
@@ -1520,13 +1723,15 @@ def load_ai42_checkpoint(
 
 save_checkpoint = save_ai42_checkpoint
 load_checkpoint = load_ai42_checkpoint
+load_ai42_warm_start = load_ai42_model_warm_start
+warm_start_ai42_checkpoint = load_ai42_model_warm_start
 
 
 __all__ = [
-    "ACTION_STATUS", "AI42Batch", "AI42Learner", "AI42LearnerConfig", "AI42LearnerError", "AI42SequenceBatch",
+    "ACTION_STATUS", "AI42Batch", "AI42Learner", "AI42LearnerConfig", "AI42LearnerError", "AI42SequenceBatch", "AI42Supervision", "HEAD_CLASS_COUNTS", "HEAD_NAMES",
     "ATTACK_KIND", "CheckpointError", "CONTROL_STATUSES", "EXCLUDED_STATUSES", "LossResult", "MOVE_KIND",
-    "CheckpointArtifact", "NonFiniteError", "ResumeState", "SKILL_KINDS", "SPATIAL_KINDS", "TARGET_KINDS", "TeacherStatus", "TELEPORT_KIND",
+    "CheckpointArtifact", "NonFiniteError", "ResumeState", "WarmStartState", "SKILL_KINDS", "SPATIAL_KINDS", "TARGET_KINDS", "TeacherStatus", "TELEPORT_KIND",
     "WAIT_KIND", "build_learner_manifest", "class_balance_weights", "clip_grad_norm_finite", "compute_behavior_cloning_loss",
-    "forward_batch", "inspect_ai42_checkpoint", "iter_ai42_dataset_batches", "load_ai42_checkpoint", "load_checkpoint", "manifest_digest", "save_ai42_checkpoint", "save_checkpoint",
+    "forward_batch", "inspect_ai42_checkpoint", "iter_ai42_dataset_batches", "load_ai42_checkpoint", "load_ai42_model_warm_start", "load_ai42_warm_start", "load_checkpoint", "manifest_digest", "prepare_ai42_supervision", "save_ai42_checkpoint", "save_checkpoint", "warm_start_ai42_checkpoint",
     "validate_learner_manifest",
 ]

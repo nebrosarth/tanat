@@ -13,7 +13,7 @@
     "batch_size": 32
   },
   "learner": {
-    "class_balance_power": 1.0,
+    "class_balance_power": 0.5,
     "max_gradient_norm": 1.0,
     "timing_loss_enabled": false,
     "optimizer_step_allowed_in_preflight": false

@@ -26,6 +26,15 @@ import numpy as np
 import torch
 
 from .dataset_ai42 import AI42DatasetError, load_dataset
+from .bc_metrics_ai42 import AI42MetricAccumulator
+from .bc_profile_ai42 import (
+    AI42ClassBalanceProfile,
+    AI42ProfileError,
+    CLASS_BALANCE_POWER,
+    PROFILE_FORMAT,
+    load_ai42_profile,
+    save_ai42_profile,
+)
 from .learner_ai42 import (
     AI42Batch,
     AI42Learner,
@@ -35,6 +44,7 @@ from .learner_ai42 import (
     build_learner_manifest,
     inspect_ai42_checkpoint,
     iter_ai42_dataset_batches,
+    load_ai42_model_warm_start,
     manifest_digest,
 )
 from .model_ai42_actor import AI42Actor
@@ -48,6 +58,10 @@ BATCH_PLAN_VERSION = "AI42-bc-batch-plan-v1"
 ACCEPTED_POINTER_FORMAT = "AI42-bc-accepted-pointer-v1"
 ACCEPTED_POINTER_FILENAME = "accepted_pointer.json"
 CHECKPOINT_GENERATION_DIRNAME = "checkpoint_generations"
+PROFILE_FILENAME = "class_profile_ai42.json"
+GATE_LOSS_IMPROVEMENT = 0.005
+GATE_CONTROL_RECALL_FLOOR = 0.02
+GATE_HEAD_ACCURACY_FLOOR = 0.01
 
 
 class AI42TrainingError(AI42LearnerError):
@@ -66,6 +80,9 @@ class ProbeSummary:
     head_losses: Mapping[str, float]
     head_accuracies: Mapping[str, float] = field(default_factory=dict)
     head_denominators: Mapping[str, int] = field(default_factory=dict)
+    metrics: Mapping[str, Any] = field(default_factory=dict)
+    head_weighted_numerators: Mapping[str, float] = field(default_factory=dict)
+    head_weighted_denominators: Mapping[str, float] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -77,6 +94,9 @@ class ProbeSummary:
             "head_losses": dict(self.head_losses),
             "head_accuracies": dict(self.head_accuracies),
             "head_denominators": dict(self.head_denominators),
+            "metrics": dict(self.metrics),
+            "head_weighted_numerators": dict(self.head_weighted_numerators),
+            "head_weighted_denominators": dict(self.head_weighted_denominators),
         }
 
 
@@ -178,7 +198,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--timing-bins", type=int, default=4)
     parser.add_argument("--sequence-length", type=int, default=64)
     parser.add_argument("--batch-size", type=int, default=8)
-    parser.add_argument("--class-balance-power", type=float, default=1.0)
+    parser.add_argument("--class-balance-power", type=float, default=CLASS_BALANCE_POWER)
     parser.add_argument("--max-gradient-norm", type=float, default=1.0)
     parser.add_argument("--learning-rate", type=float, default=3e-4)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
@@ -191,6 +211,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--validation-epsilon", type=float, default=1e-4)
     parser.add_argument("--checkpoint-interval", type=int, default=DEFAULT_CHECKPOINT_INTERVAL)
     parser.add_argument("--dataset-hash", help="optional expected manifest hash")
+    parser.add_argument("--profile", type=Path, help="frozen AI-42 class-balance profile JSON")
+    parser.add_argument("--warm-start", "--warm-start-from", dest="warm_start", type=Path, help="validated accepted generation; restore model weights only")
+    parser.add_argument("--warm-start-accepted", action="store_true", help="use the accepted generation in the output run directory")
     parser.add_argument("--execute", action="store_true", help="explicitly authorize optimizer updates")
     return parser
 
@@ -256,6 +279,14 @@ def _validate_training_args(args: argparse.Namespace) -> None:
         raise AI42TrainingError("validation-epsilon must be non-negative")
     if isinstance(args.seed, bool) or not isinstance(args.seed, int) or args.seed < 0:
         raise AI42TrainingError("seed must be a non-negative integer")
+    if not math.isclose(float(args.class_balance_power), CLASS_BALANCE_POWER, rel_tol=0.0, abs_tol=0.0):
+        raise AI42TrainingError("AI-42 BC-v2 freezes class-balance-power at 0.5")
+    if args.resume is not None and (args.warm_start is not None or args.warm_start_accepted):
+        raise AI42TrainingError("--warm-start and --resume are mutually exclusive")
+    if args.checkpoint is not None and (args.warm_start is not None or args.warm_start_accepted):
+        raise AI42TrainingError("--warm-start and --checkpoint are mutually exclusive")
+    if args.warm_start_accepted and args.output is None:
+        raise AI42TrainingError("--warm-start-accepted requires --output/--run-dir")
 
 
 def _sha256_file(path: Path) -> str:
@@ -439,18 +470,30 @@ def evaluate_probe(learner: AI42Learner, batches: Iterable[AI42Batch]) -> ProbeS
 
     was_training = learner.actor.training
     learner.actor.eval()
-    # LossResult head losses are means over active rows. Weighting each head by
-    # its active count gives a stable micro/count-weighted report over tails.
+    # LossResult head losses are means. Aggregate each head's raw weighted
+    # numerator and sample-weight denominator so probe composition cannot
+    # change the reported loss.
     head_numerators: dict[str, float] = {}
+    head_loss_denominators: dict[str, float] = {}
+    head_weighted_numerators: dict[str, float] = {}
+    head_weighted_denominators: dict[str, float] = {}
+    head_weighted_numerator_parts: dict[str, list[float]] = {}
+    head_weighted_denominator_parts: dict[str, list[float]] = {}
     head_denominators: dict[str, int] = {}
     accuracy_numerators: dict[str, float] = {}
     accuracy_denominators: dict[str, int] = {}
+    metrics_accumulator = AI42MetricAccumulator(
+        class_weights=getattr(getattr(learner, "config", None), "class_weights", None),
+    ) if hasattr(learner, "forward") else None
     batches_seen = 0
     supervised = action = control = 0
     try:
         with torch.no_grad():
             for batch in batches:
-                result: LossResult = learner.loss(batch)
+                outputs = learner.forward(batch) if metrics_accumulator is not None else None
+                result: LossResult = learner.loss(batch, outputs=outputs) if outputs is not None else learner.loss(batch)
+                if metrics_accumulator is not None:
+                    metrics_accumulator.update(batch, outputs)
                 total_count = int(result.metrics.get("supervised_count", 0))
                 if total_count <= 0:
                     # Direct callers may provide an unfiltered stream. Empty
@@ -462,9 +505,22 @@ def evaluate_probe(learner: AI42Learner, batches: Iterable[AI42Batch]) -> ProbeS
                     head_metrics = result.metrics.get("heads", {}).get(name, {})
                     head_count = int(head_metrics.get("count", total_count)) if isinstance(head_metrics, Mapping) else total_count
                     if head_count > 0:
-                        head_numerators[name] = head_numerators.get(name, 0.0) + _finite_number(
-                            value.detach().cpu().item(), f"probe {name} loss",
-                        ) * head_count
+                        weighted_numerator = head_metrics.get("weighted_numerator") if isinstance(head_metrics, Mapping) else None
+                        weighted_denominator = head_metrics.get("weighted_denominator") if isinstance(head_metrics, Mapping) else None
+                        if weighted_numerator is None or weighted_denominator is None:
+                            weighted_numerator = _finite_number(value.detach().cpu().item(), f"probe {name} loss") * head_count
+                            weighted_denominator = float(head_count)
+                        else:
+                            weighted_numerator = _finite_number(weighted_numerator, f"probe {name} weighted numerator")
+                            weighted_denominator = _finite_number(weighted_denominator, f"probe {name} weighted denominator")
+                            if weighted_denominator <= 0.0:
+                                raise AI42TrainingError(f"probe {name} has a non-positive weighted denominator")
+                        head_numerators[name] = head_numerators.get(name, 0.0) + weighted_numerator
+                        head_loss_denominators[name] = head_loss_denominators.get(name, 0.0) + weighted_denominator
+                        head_weighted_numerators[name] = head_weighted_numerators.get(name, 0.0) + weighted_numerator
+                        head_weighted_denominators[name] = head_weighted_denominators.get(name, 0.0) + weighted_denominator
+                        head_weighted_numerator_parts.setdefault(name, []).append(weighted_numerator)
+                        head_weighted_denominator_parts.setdefault(name, []).append(weighted_denominator)
                         head_denominators[name] = head_denominators.get(name, 0) + head_count
                         head_accuracy = head_metrics.get("accuracy") if isinstance(head_metrics, Mapping) else None
                         if head_accuracy is not None:
@@ -480,15 +536,25 @@ def evaluate_probe(learner: AI42Learner, batches: Iterable[AI42Batch]) -> ProbeS
         learner.actor.train(was_training)
     if not head_denominators:
         raise AI42TrainingError("probe is empty")
+    head_weighted_numerators = {
+        name: math.fsum(head_weighted_numerator_parts[name])
+        for name in head_weighted_numerator_parts
+    }
+    head_weighted_denominators = {
+        name: math.fsum(head_weighted_denominator_parts[name])
+        for name in head_weighted_denominator_parts
+    }
+    head_numerators = dict(head_weighted_numerators)
+    head_loss_denominators = dict(head_weighted_denominators)
     head_losses = {
-        name: head_numerators[name] / head_denominators[name]
+        name: head_numerators[name] / head_loss_denominators[name]
         for name in sorted(head_numerators)
     }
     # The learner's scalar loss is a weighted sum of head means.  Preserve
     # that contract at probe level: first form each head's micro loss using
     # its own denominator, then apply the configured head weight.  Weighting
     # batch-level totals by supervised_count would mix unlike head metrics.
-    total_loss = sum(
+    total_loss = math.fsum(
         float(learner.config.head_weights.get(name, 1.0)) * value
         for name, value in head_losses.items()
     )
@@ -504,6 +570,9 @@ def evaluate_probe(learner: AI42Learner, batches: Iterable[AI42Batch]) -> ProbeS
             for name in sorted(accuracy_numerators)
         },
         head_denominators={name: head_denominators[name] for name in sorted(head_denominators)},
+        metrics=metrics_accumulator.to_dict() if metrics_accumulator is not None else {},
+        head_weighted_numerators={name: head_weighted_numerators[name] for name in sorted(head_weighted_numerators)},
+        head_weighted_denominators={name: head_weighted_denominators[name] for name in sorted(head_weighted_denominators)},
     )
 
 
@@ -663,6 +732,148 @@ def _next_generation(run_root: Path, prior_pointer: Mapping[str, Any] | None) ->
     return max(values, default=0) + 1
 
 
+def _gate_float(value: Any, name: str, *, minimum: float = 0.0, maximum: float | None = None) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"{name} must be a finite number")
+    result = float(value)
+    if not math.isfinite(result) or result < minimum or (maximum is not None and result > maximum):
+        raise ValueError(f"{name} is outside its valid range")
+    return result
+
+
+def _gate_count(value: Any, name: str, *, positive: bool = False) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < (1 if positive else 0):
+        qualifier = "positive " if positive else "nonnegative "
+        raise ValueError(f"{name} must be a {qualifier}integer")
+    return value
+
+
+def _validate_gate_metric_schema(summary: ProbeSummary, name: str) -> dict[str, Any]:
+    """Validate and normalize the exact composite-gate evidence schema."""
+
+    loss = _gate_float(summary.loss, f"{name}.loss")
+    if not isinstance(summary.head_losses, Mapping) or "control" not in summary.head_losses:
+        raise ValueError(f"{name}.head_losses.control is required")
+    control_loss = _gate_float(summary.head_losses["control"], f"{name}.head_losses.control")
+    metrics = summary.metrics
+    if not isinstance(metrics, Mapping):
+        raise ValueError(f"{name}.metrics must be a mapping")
+    heads = metrics.get("heads")
+    action = metrics.get("action")
+    offset = metrics.get("offset")
+    if not isinstance(heads, Mapping) or not isinstance(action, Mapping) or not isinstance(offset, Mapping):
+        raise ValueError(f"{name}.metrics heads/action/offset mappings are required")
+    required_heads = ("control", "kind", "target", "anchor")
+    if any(not isinstance(heads.get(head), Mapping) for head in required_heads):
+        raise ValueError(f"{name}.metrics.heads is missing a required head mapping")
+    if not isinstance(summary.head_denominators, Mapping):
+        raise ValueError(f"{name}.head_denominators must be a mapping")
+    head_counts: dict[str, int] = {}
+    for head in required_heads:
+        metric_count = _gate_count(
+            heads[head].get("count"), f"{name}.metrics.heads.{head}.count", positive=True,
+        )
+        probe_count = _gate_count(
+            summary.head_denominators.get(head), f"{name}.head_denominators.{head}", positive=True,
+        )
+        if metric_count != probe_count:
+            raise ValueError(f"{name} {head} metric count does not match its probe denominator")
+        head_counts[head] = metric_count
+
+    control = heads["control"]
+    per_class = control.get("per_class")
+    class_keys = {str(index) for index in range(4)}
+    if not isinstance(per_class, Mapping) or set(per_class) != class_keys:
+        raise ValueError(f"{name}.metrics.heads.control.per_class must contain exactly classes 0..3")
+    supports: list[int] = []
+    recalls: list[float] = []
+    for class_name in sorted(class_keys, key=int):
+        item = per_class[class_name]
+        if not isinstance(item, Mapping) or "support" not in item or "recall" not in item:
+            raise ValueError(f"{name}.metrics.heads.control.per_class.{class_name} is incomplete")
+        supports.append(_gate_count(item["support"], f"{name}.metrics.heads.control.per_class.{class_name}.support"))
+        recalls.append(_gate_float(
+            item["recall"], f"{name}.metrics.heads.control.per_class.{class_name}.recall", maximum=1.0,
+        ))
+    if sum(supports) <= 0:
+        raise ValueError(f"{name}.metrics.heads.control has no supported classes")
+    if sum(supports) != head_counts["control"]:
+        raise ValueError(f"{name}.metrics.heads.control supports do not sum to its count")
+    control_count = _gate_count(summary.control_count, f"{name}.control_count", positive=True)
+    if control_count != head_counts["control"]:
+        raise ValueError(f"{name}.control_count does not match the control metric count")
+    action_count = _gate_count(action.get("count"), f"{name}.metrics.action.count", positive=True)
+    probe_action_count = _gate_count(summary.action_count, f"{name}.action_count", positive=True)
+    if action_count != probe_action_count or action_count != head_counts["kind"]:
+        raise ValueError(f"{name} action count does not match the probe/kind count")
+
+    return {
+        "loss": loss,
+        "control_loss": control_loss,
+        "control_micro_accuracy": _gate_float(control.get("micro_accuracy"), f"{name}.metrics.heads.control.micro_accuracy", maximum=1.0),
+        "control_macro_f1": _gate_float(control.get("supported_macro_f1"), f"{name}.metrics.heads.control.supported_macro_f1", maximum=1.0),
+        "control_balanced_accuracy": _gate_float(control.get("balanced_accuracy"), f"{name}.metrics.heads.control.balanced_accuracy", maximum=1.0),
+        "control_supports": tuple(supports),
+        "control_recalls": tuple(recalls),
+        "head_counts": tuple(head_counts[head] for head in required_heads),
+        "action_count": action_count,
+        "kind_accuracy": _gate_float(heads["kind"].get("micro_accuracy"), f"{name}.metrics.heads.kind.micro_accuracy", maximum=1.0),
+        "target_accuracy": _gate_float(heads["target"].get("micro_accuracy"), f"{name}.metrics.heads.target.micro_accuracy", maximum=1.0),
+        "anchor_accuracy": _gate_float(heads["anchor"].get("micro_accuracy"), f"{name}.metrics.heads.anchor.micro_accuracy", maximum=1.0),
+        "action_accuracy": _gate_float(action.get("end_to_end_accuracy"), f"{name}.metrics.action.end_to_end_accuracy", maximum=1.0),
+        "offset_count": _gate_count(offset.get("count"), f"{name}.metrics.offset.count", positive=True),
+        "offset_distance": _gate_float(offset.get("mean_manhattan_grid_distance"), f"{name}.metrics.offset.mean_manhattan_grid_distance"),
+    }
+
+
+def promotion_gate(baseline: ProbeSummary, candidate: ProbeSummary) -> dict[str, Any]:
+    """Apply the conjunctive AI-42-v2 held-out promotion gate.
+
+    Missing or incomplete v2 metrics fail closed.  A loss-only comparison is
+    never sufficient to promote a generation.
+    """
+
+    try:
+        before = _validate_gate_metric_schema(baseline, "baseline")
+        after = _validate_gate_metric_schema(candidate, "candidate")
+        if before["control_supports"] != after["control_supports"]:
+            raise ValueError("baseline/candidate control supports do not match")
+        if before["head_counts"] != after["head_counts"]:
+            raise ValueError("baseline/candidate head counts do not match")
+        if before["action_count"] != after["action_count"]:
+            raise ValueError("baseline/candidate action counts do not match")
+        if before["offset_count"] != after["offset_count"]:
+            raise ValueError("baseline/candidate offset counts do not match")
+    except ValueError as exc:
+        return {
+            "accepted": False,
+            "legacy_fallback": False,
+            "checks": {"metrics_complete": False},
+            "failed": ["metrics_complete"],
+            "metrics_error": str(exc),
+        }
+    checks: dict[str, bool] = {"metrics_complete": True}
+    checks["total_validation_loss_improvement"] = after["loss"] <= before["loss"] * (1.0 - GATE_LOSS_IMPROVEMENT)
+    checks["control_loss_no_worse"] = after["control_loss"] <= before["control_loss"]
+    checks["control_macro_f1_improves"] = after["control_macro_f1"] > before["control_macro_f1"]
+    checks["control_balanced_accuracy_improves"] = after["control_balanced_accuracy"] > before["control_balanced_accuracy"]
+    checks["micro_accuracy_floor"] = after["control_micro_accuracy"] >= before["control_micro_accuracy"]
+    for index, support in enumerate(before["control_supports"]):
+        checks[f"control_recall_{index}_floor"] = (
+            support == 0
+            or after["control_recalls"][index] >= before["control_recalls"][index] - GATE_CONTROL_RECALL_FLOOR
+        )
+    for head in ("kind", "target", "anchor"):
+        checks[f"{head}_accuracy_floor"] = after[f"{head}_accuracy"] >= before[f"{head}_accuracy"] - GATE_HEAD_ACCURACY_FLOOR
+    checks["end_to_end_action_improves"] = after["action_accuracy"] > before["action_accuracy"]
+    checks["offset_distance_no_worse"] = after["offset_distance"] <= before["offset_distance"]
+    failed = sorted(name for name, passed in checks.items() if not passed)
+    return {"accepted": not failed, "legacy_fallback": False, "checks": checks, "failed": failed}
+
+
+_promotion_gate = promotion_gate
+
+
 def train(args: argparse.Namespace, *, clock: Callable[[], float] = time.monotonic) -> dict[str, Any]:
     """Run one deterministic BC proposal and publish its evidence report."""
 
@@ -685,11 +896,37 @@ def train(args: argparse.Namespace, *, clock: Callable[[], float] = time.monoton
         raise AI42TrainingError("validated dataset must contain both train and validation matches")
     plan = _batch_plan(dataset, args)
 
+    run_root = args.output
+    run_root.mkdir(parents=True, exist_ok=True)
+    profile_path = args.profile or (run_root / PROFILE_FILENAME)
+    try:
+        if args.profile is not None or profile_path.is_file():
+            profile = load_ai42_profile(profile_path)
+        else:
+            profile = AI42ClassBalanceProfile.from_dataset(
+                dataset,
+                # The profile lineage is tied to the dataset's frozen split
+                # order, not the per-run hash-ranked optimizer order.
+                train_match_ids=split_ids["train"],
+                sequence_length=args.sequence_length,
+                batch_size=args.batch_size,
+            )
+            save_ai42_profile(profile_path, profile)
+    except AI42ProfileError as exc:
+        raise AI42TrainingError(f"class profile is invalid: {exc}") from exc
+    if profile.dataset_manifest_hash != dataset_hash:
+        raise AI42TrainingError("class profile dataset manifest hash is incompatible")
+    if profile.train_match_ids != tuple(split_ids["train"]):
+        raise AI42TrainingError("class profile ordered train IDs are incompatible")
+    if profile.class_balance_power != CLASS_BALANCE_POWER:
+        raise AI42TrainingError("class profile power is incompatible with AI-42 BC-v2")
+
     learner_config = AI42LearnerConfig(
         learning_rate=args.learning_rate,
         weight_decay=args.weight_decay,
-        class_balance_power=args.class_balance_power,
+        class_balance_power=profile.class_balance_power,
         max_gradient_norm=args.max_gradient_norm,
+        class_weights=profile.class_weights(),
         model_kwargs={
             "hidden_size": args.hidden_size,
             "model_width": args.model_width,
@@ -710,10 +947,44 @@ def train(args: argparse.Namespace, *, clock: Callable[[], float] = time.monoton
         batch_plan_version=BATCH_PLAN_VERSION,
         batch_plan_hash=plan["batch_plan_hash"],
         validation_probe_hash=plan["validation_probe_hash"],
+        profile_format=PROFILE_FORMAT,
+        profile_hash=profile.profile_hash,
+        profile_dataset_manifest_hash=profile.dataset_manifest_hash,
+        train_match_ids_hash=profile.train_match_ids_hash,
+        supervision_version=profile.supervision_version,
+        class_balance_power=profile.class_balance_power,
     )
 
     resume_path = args.resume or args.checkpoint
     resume_state = None
+    warm_start_state = None
+    warm_start_path = args.warm_start
+    if args.warm_start_accepted:
+        pointer_path = run_root / ACCEPTED_POINTER_FILENAME
+        pointer = _read_json(pointer_path, "accepted pointer")
+        expected_pointer_fields = {
+            "format", "generation", "checkpoint", "sha256", "bytes", "validation_loss",
+            "manifest_digest", "dataset_hash", "step", "epoch",
+        }
+        if not isinstance(pointer, Mapping) or set(pointer) != expected_pointer_fields or pointer.get("format") != ACCEPTED_POINTER_FORMAT:
+            raise AI42TrainingError("accepted pointer is invalid for warm start")
+        relative = pointer.get("checkpoint")
+        if not isinstance(relative, str) or Path(relative).is_absolute():
+            raise AI42TrainingError("accepted pointer checkpoint path is invalid")
+        warm_start_path = (run_root / relative).resolve()
+        generation_root = (run_root / CHECKPOINT_GENERATION_DIRNAME).resolve()
+        try:
+            warm_start_path.relative_to(generation_root)
+        except ValueError as exc:
+            raise AI42TrainingError("accepted pointer escapes the generation directory") from exc
+        if not warm_start_path.is_file() or pointer.get("bytes") != warm_start_path.stat().st_size or pointer.get("sha256") != _sha256_file(warm_start_path):
+            raise AI42TrainingError("accepted pointer checkpoint digest is invalid")
+    if warm_start_path is not None:
+        if resume_path is not None:
+            raise AI42TrainingError("--warm-start and resume are mutually exclusive")
+        warm_start_state = load_ai42_model_warm_start(
+            warm_start_path, actor, manifest, map_location=device,
+        )
     if resume_path is not None:
         if not resume_path.is_file():
             raise AI42TrainingError(f"resume checkpoint path does not exist: {resume_path}")
@@ -740,8 +1011,6 @@ def train(args: argparse.Namespace, *, clock: Callable[[], float] = time.monoton
     pre_train = evaluate_probe(learner, train_probe)
     pre_validation = evaluate_probe(learner, validation_probe)
 
-    run_root = args.output
-    run_root.mkdir(parents=True, exist_ok=True)
     accepted_path = run_root / "accepted.pt"
     best_path = run_root / "best.pt"
     pointer_path = run_root / ACCEPTED_POINTER_FILENAME
@@ -839,12 +1108,13 @@ def train(args: argparse.Namespace, *, clock: Callable[[], float] = time.monoton
         dataset, plan["validation_match_ids"], "validation", args, device,
     ))
     epsilon = float(args.validation_epsilon)
-    improved_from_baseline = post_validation.loss < (pre_validation.loss - epsilon)
+    gate = promotion_gate(pre_validation, post_validation)
+    improved_from_baseline = bool(gate["accepted"])
     improved_over_accepted = (
         (not prior_accepted_compatible)
         or (prior_accepted_loss is not None and post_validation.loss < (prior_accepted_loss - epsilon))
     )
-    accepted = bool(improved_from_baseline and improved_over_accepted)
+    accepted = bool(gate["accepted"] and improved_over_accepted)
     accuracy_regressions = {
         name: {
             "pre": pre_validation.head_accuracies.get(name),
@@ -868,6 +1138,7 @@ def train(args: argparse.Namespace, *, clock: Callable[[], float] = time.monoton
         "validation_post": post_validation.to_dict(),
         "validation_epsilon": epsilon,
         "accepted": accepted,
+        "promotion_gate": gate,
         "deadline_reached": deadline_reached,
         "batch_plan_hash": plan["batch_plan_hash"],
         "validation_probe_hash": plan["validation_probe_hash"],
@@ -876,6 +1147,28 @@ def train(args: argparse.Namespace, *, clock: Callable[[], float] = time.monoton
         "optimizer_steps_this_run": run_steps,
         "gradient_norm_mean": float(sum(gradient_norms) / len(gradient_norms)) if gradient_norms else 0.0,
         "training_loss_mean": float(sum(training_losses) / len(training_losses)) if training_losses else 0.0,
+        "profile": {
+            "path": str(profile_path),
+            "format": profile.format,
+            "hash": profile.profile_hash,
+            "dataset_manifest_hash": profile.dataset_manifest_hash,
+            "train_match_ids_hash": profile.train_match_ids_hash,
+            "class_balance_power": profile.class_balance_power,
+        },
+        "warm_start": None if warm_start_state is None else {
+            "source_path": warm_start_state.source_path,
+            "source_file_sha256": warm_start_state.source_file_sha256,
+            "source_manifest_digest": warm_start_state.source_manifest_digest,
+            "source_payload_digest": warm_start_state.source_payload_digest,
+            "source_model_hash": warm_start_state.source_model_hash,
+            "source_model_artifact_hash": warm_start_state.source_model_artifact_hash,
+            "source_dataset_hash": warm_start_state.source_dataset_hash,
+            "source_step": warm_start_state.source_step,
+            "source_epoch": warm_start_state.source_epoch,
+            "optimizer_restored": False,
+            "rng_restored": False,
+            "cursor_restored": False,
+        },
     }
     # latest is always a complete resumable candidate. Accepted promotion is
     # an immutable generation plus one authoritative pointer. The two legacy
@@ -953,6 +1246,9 @@ def train(args: argparse.Namespace, *, clock: Callable[[], float] = time.monoton
         "train_probe_post": post_train.to_dict(),
         "pre_validation": pre_validation.to_dict(),
         "post_validation": post_validation.to_dict(),
+        "promotion_gate": gate,
+        "profile": extra["profile"],
+        "warm_start": extra["warm_start"],
         "improvement": {
             "epsilon": epsilon,
             "from_baseline": improved_from_baseline,
@@ -1167,6 +1463,6 @@ atomic_write_json = _atomic_write_json
 sha256_file = _sha256_file
 
 __all__ = [
-    "AI42TrainingError", "DEFAULT_SEED", "MAX_OPTIMIZER_SECONDS", "ProbeSummary", "ValidationSummary",
-    "atomic_write_json", "build_parser", "evaluate_probe", "main", "preflight", "run_training", "sha256_file", "train",
+    "AI42TrainingError", "DEFAULT_SEED", "GATE_HEAD_ACCURACY_FLOOR", "GATE_LOSS_IMPROVEMENT", "GATE_CONTROL_RECALL_FLOOR", "MAX_OPTIMIZER_SECONDS", "ProbeSummary", "ValidationSummary",
+    "atomic_write_json", "build_parser", "evaluate_probe", "main", "preflight", "promotion_gate", "run_training", "sha256_file", "train",
 ]

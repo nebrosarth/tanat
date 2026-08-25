@@ -112,6 +112,40 @@ def _args(output: Path, *extra: str):
     ])
 
 
+def _mock_probe_summary(loss: float, control_loss: float | None = None) -> train_ai42_bc.ProbeSummary:
+    """Complete v2 evidence fixture for tests that exercise publication."""
+
+    quality = max(0.0, min(1.0, 1.0 - loss / 2.0))
+    control = {
+        "micro_accuracy": quality,
+        "supported_macro_f1": quality,
+        "balanced_accuracy": quality,
+        "per_class": {
+            str(index): {"support": 1 if index == 0 else 0, "recall": quality}
+            for index in range(4)
+        },
+        "count": 1,
+    }
+    heads = {
+        "control": control,
+        "kind": {"count": 1, "micro_accuracy": quality},
+        "target": {"count": 1, "micro_accuracy": quality},
+        "anchor": {"count": 1, "micro_accuracy": quality},
+    }
+    metrics = {
+        "heads": heads,
+        "action": {"count": 1, "end_to_end_accuracy": quality},
+        "offset": {"count": 1, "mean_manhattan_grid_distance": 1.0 - quality},
+    }
+    return train_ai42_bc.ProbeSummary(
+        loss, 1, 1, 1, 1,
+        {"control": loss if control_loss is None else control_loss},
+        head_accuracies={name: quality for name in ("control", "kind", "target", "anchor")},
+        head_denominators={name: 1 for name in ("control", "kind", "target", "anchor")},
+        metrics=metrics,
+    )
+
+
 class AI42BCTrainingTests(unittest.TestCase):
     def test_budget_has_hard_cap_and_fake_clock_stops_before_step(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -130,10 +164,8 @@ class AI42BCTrainingTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             output = Path(directory)
             summaries = iter((
-                train_ai42_bc.ProbeSummary(1.0, 1, 1, 0, 1, {"control": 1.0}),
-                train_ai42_bc.ProbeSummary(1.0, 1, 1, 0, 1, {"control": 1.0}),
-                train_ai42_bc.ProbeSummary(0.5, 1, 1, 0, 1, {"control": 0.5}),
-                train_ai42_bc.ProbeSummary(0.5, 1, 1, 0, 1, {"control": 0.5}),
+                _mock_probe_summary(1.0), _mock_probe_summary(1.0),
+                _mock_probe_summary(0.5), _mock_probe_summary(0.5),
             ))
             with mock.patch.object(train_ai42_bc, "load_dataset", return_value=_TinyDataset()), \
                  mock.patch.object(train_ai42_bc, "evaluate_probe", side_effect=lambda *_: next(summaries)):
@@ -153,10 +185,8 @@ class AI42BCTrainingTests(unittest.TestCase):
             ))
 
             summaries = iter((
-                train_ai42_bc.ProbeSummary(0.4, 1, 1, 0, 1, {"control": 0.4}),
-                train_ai42_bc.ProbeSummary(0.4, 1, 1, 0, 1, {"control": 0.4}),
-                train_ai42_bc.ProbeSummary(0.6, 1, 1, 0, 1, {"control": 0.6}),
-                train_ai42_bc.ProbeSummary(0.6, 1, 1, 0, 1, {"control": 0.6}),
+                _mock_probe_summary(0.4), _mock_probe_summary(0.4),
+                _mock_probe_summary(0.6), _mock_probe_summary(0.6),
             ))
             with mock.patch.object(train_ai42_bc, "load_dataset", return_value=_TinyDataset()), \
                  mock.patch.object(train_ai42_bc, "evaluate_probe", side_effect=lambda *_: next(summaries)):
@@ -286,10 +316,8 @@ class AI42BCTrainingTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             output = Path(directory)
             accepted_summaries = iter((
-                train_ai42_bc.ProbeSummary(1.0, 1, 1, 0, 1, {"control": 1.0}),
-                train_ai42_bc.ProbeSummary(1.0, 1, 1, 0, 1, {"control": 1.0}),
-                train_ai42_bc.ProbeSummary(0.5, 1, 1, 0, 1, {"control": 0.5}),
-                train_ai42_bc.ProbeSummary(0.5, 1, 1, 0, 1, {"control": 0.5}),
+                _mock_probe_summary(1.0), _mock_probe_summary(1.0),
+                _mock_probe_summary(0.5), _mock_probe_summary(0.5),
             ))
             with mock.patch.object(train_ai42_bc, "load_dataset", return_value=_TinyDataset()), \
                  mock.patch.object(train_ai42_bc, "evaluate_probe", side_effect=lambda *_: next(accepted_summaries)):
@@ -298,10 +326,8 @@ class AI42BCTrainingTests(unittest.TestCase):
             best_before = (output / "best.pt").read_bytes()
             pointer_before = (output / train_ai42_bc.ACCEPTED_POINTER_FILENAME).read_bytes()
             improved_summaries = iter((
-                train_ai42_bc.ProbeSummary(1.0, 1, 1, 0, 1, {"control": 1.0}),
-                train_ai42_bc.ProbeSummary(1.0, 1, 1, 0, 1, {"control": 1.0}),
-                train_ai42_bc.ProbeSummary(0.4, 1, 1, 0, 1, {"control": 0.4}),
-                train_ai42_bc.ProbeSummary(0.4, 1, 1, 0, 1, {"control": 0.4}),
+                _mock_probe_summary(1.0), _mock_probe_summary(1.0),
+                _mock_probe_summary(0.4), _mock_probe_summary(0.4),
             ))
             with mock.patch.object(train_ai42_bc, "load_dataset", return_value=_TinyDataset()), \
                  mock.patch.object(train_ai42_bc, "evaluate_probe", side_effect=lambda *_: next(improved_summaries)), \
@@ -316,10 +342,8 @@ class AI42BCTrainingTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             output = Path(directory)
             accepted_summaries = iter((
-                train_ai42_bc.ProbeSummary(1.0, 1, 1, 0, 1, {"control": 1.0}),
-                train_ai42_bc.ProbeSummary(1.0, 1, 1, 0, 1, {"control": 1.0}),
-                train_ai42_bc.ProbeSummary(0.5, 1, 1, 0, 1, {"control": 0.5}),
-                train_ai42_bc.ProbeSummary(0.5, 1, 1, 0, 1, {"control": 0.5}),
+                _mock_probe_summary(1.0), _mock_probe_summary(1.0),
+                _mock_probe_summary(0.5), _mock_probe_summary(0.5),
             ))
             with mock.patch.object(train_ai42_bc, "load_dataset", return_value=_TinyDataset()), \
                  mock.patch.object(train_ai42_bc, "evaluate_probe", side_effect=lambda *_: next(accepted_summaries)):
@@ -338,10 +362,8 @@ class AI42BCTrainingTests(unittest.TestCase):
             pointer_path.write_text(json.dumps(pointer), encoding="utf-8")
 
             summaries = iter((
-                train_ai42_bc.ProbeSummary(1.0, 1, 1, 0, 1, {"control": 1.0}),
-                train_ai42_bc.ProbeSummary(1.0, 1, 1, 0, 1, {"control": 1.0}),
-                train_ai42_bc.ProbeSummary(0.5, 1, 1, 0, 1, {"control": 0.5}),
-                train_ai42_bc.ProbeSummary(0.5, 1, 1, 0, 1, {"control": 0.5}),
+                _mock_probe_summary(1.0), _mock_probe_summary(1.0),
+                _mock_probe_summary(0.5), _mock_probe_summary(0.5),
             ))
             with mock.patch.object(train_ai42_bc, "load_dataset", return_value=_TinyDataset()), \
                  mock.patch.object(train_ai42_bc, "evaluate_probe", side_effect=lambda *_: next(summaries)):
@@ -354,10 +376,8 @@ class AI42BCTrainingTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             output = Path(directory)
             summaries = iter((
-                train_ai42_bc.ProbeSummary(1.0, 1, 1, 0, 1, {"control": 1.0}),
-                train_ai42_bc.ProbeSummary(1.0, 1, 1, 0, 1, {"control": 1.0}),
-                train_ai42_bc.ProbeSummary(0.5, 1, 1, 0, 1, {"control": 0.5}),
-                train_ai42_bc.ProbeSummary(0.5, 1, 1, 0, 1, {"control": 0.5}),
+                _mock_probe_summary(1.0), _mock_probe_summary(1.0),
+                _mock_probe_summary(0.5), _mock_probe_summary(0.5),
             ))
             with mock.patch.object(train_ai42_bc, "load_dataset", return_value=_TinyDataset()), \
                  mock.patch.object(train_ai42_bc, "evaluate_probe", side_effect=lambda *_: next(summaries)):
@@ -365,10 +385,8 @@ class AI42BCTrainingTests(unittest.TestCase):
             before = json.loads((output / train_ai42_bc.ACCEPTED_POINTER_FILENAME).read_text(encoding="utf-8"))
 
             summaries = iter((
-                train_ai42_bc.ProbeSummary(1.0, 1, 1, 0, 1, {"control": 1.0}),
-                train_ai42_bc.ProbeSummary(1.0, 1, 1, 0, 1, {"control": 1.0}),
-                train_ai42_bc.ProbeSummary(0.4, 1, 1, 0, 1, {"control": 0.4}),
-                train_ai42_bc.ProbeSummary(0.4, 1, 1, 0, 1, {"control": 0.4}),
+                _mock_probe_summary(1.0), _mock_probe_summary(1.0),
+                _mock_probe_summary(0.4), _mock_probe_summary(0.4),
             ))
             original_copy = train_ai42_bc._atomic_copy_file
             calls = []
