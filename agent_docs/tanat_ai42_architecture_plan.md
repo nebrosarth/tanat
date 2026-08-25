@@ -6,7 +6,11 @@ AI-42 должна стать обучаемой гибридной систем
 
 Целевая машина: RTX 5090, Ryzen 9 9950X3D, 64 GB DDR5. Модель проектируется для одной GPU и параллельных CPU headless-сред. Покупка предметов, прокачка и server-authoritative safety остаются скриптовыми до отдельного решения.
 
-В рамках этого пакета обучение не запускается. Разрешены только unit/integration tests, короткие protocol/inference smoke-проверки без optimizer updates и статическая проверка моделей.
+Основной пакет не запускает PPO, self-play или campaign training. Ограниченный
+BC-запуск разрешён только отдельной явной командой через `--execute` и
+пятиминутный лимит optimizer; остальные проверки остаются unit/integration
+tests, короткими protocol/inference smoke-проверками и статической проверкой
+моделей.
 
 ## 2. Архитектурные принципы
 
@@ -160,7 +164,8 @@ Dataset pipeline обязан публиковать class balance и accuracy/l
 
 ## 8. Запрещённые действия текущего пакета
 
-- запуск PPO, BC, self-play или campaign training;
+- запуск PPO, self-play или campaign training без отдельного разрешения;
+- запуск BC без явного `--execute` и лимита optimizer не более 300 секунд;
 - изменение live AI-профиля по умолчанию;
 - удаление checkpoints или существующих AI версий;
 - изменение reward weights без отдельной измерительной задачи;
@@ -187,11 +192,11 @@ Teacher row имеет строгую временную семантику: obs
 terminal state. Публикация dataset всегда выполняет strict replay; lineage
 `HOLD/CANCEL` принадлежит `original_ai30_intent`, а не external executed action.
 
-Обучение и optimizer updates не запускались. `--execute` намеренно остаётся
-закрыт до отдельной команды пользователя. Для первого реального BC нужны
-репрезентативный многоматчевый dataset и зафиксированный одинаковый Git SHA на
-локальной и учебной машинах. Real ONNX parity остаётся gate только для
-production inference/rollout, а не для CUDA-обучения.
+До отдельного разрешения обучение оставалось закрытым: preflight не вызывает
+`optimizer.step`, а `--execute` требуется для BC. Для разрешённого запуска
+зафиксированы одинаковый Git SHA на локальной и учебной машинах и
+репрезентативный многоматчевый dataset. Real ONNX parity остаётся gate только
+для production inference/rollout, а не для CUDA-обучения.
 
 ### 9.1 Behavior-cloning dataset milestone
 
@@ -213,5 +218,51 @@ s wall time. V2 был скомпактирован без decompression и reru
 Удалённые тесты: 13 passed. CUDA BC preflight прошёл с 12,118,772 params,
 finite loss `13.3901386261`, grad norm `11.6460485458`, checkpoint roundtrip
 `true` и `parameters_unchanged true`; `training_implemented false`. Optimizer
-step и training не выполнялись. Live deployment не выполнялся и не
-разрешён.
+step и training в этом preflight не выполнялись. Live deployment не выполнялся
+и не разрешён.
+
+### 9.2 Пяти минут behavior cloning и первый accepted run
+
+Executable workflow запускается из `tanat/server` на checkout с двумя
+зафиксированными revisions: `e0056a2` поверх `80c3600`. Его реализация —
+[`train_ai42_bc.py`](../server/ai40/src/tanat_ai40/train_ai42_bc.py), параметры —
+в [`ai42_bc_training.json`](../server/ai40/config/ai42_bc_training.json).
+Dataset должен быть
+валидированным и неизменяемым; для первого запуска использован
+`E:\code\Tanat Online\tanat\server\ai42_datasets\clone-v13-dataset01-v2`.
+Из `server` команда имеет вид:
+
+```powershell
+$env:PYTHONPATH = "$PWD\ai40\src"
+$dataset = 'E:\code\Tanat Online\tanat\server\ai42_datasets\clone-v13-dataset01-v2'
+$run = 'E:\code\Tanat Online\ai42_runs\bc5m-e0056a2-01'
+python -m tanat_ai40.train_ai42_bc `
+  --config .\ai40\config\ai42_bc_training.json `
+  --dataset $dataset --output $run --device cuda `
+  --batch-size 8 --max-optimizer-seconds 300 --execute
+```
+
+План batch-ов строится детерминированно: match IDs ранжируются SHA-256 и
+стратифицируются по `scenario`; в optimizer попадают только batch-ы с
+эффективной supervised-маской. Checkpoint сохраняет hash плана и точный
+`batch_cursor`, поэтому `--resume <run>\latest.pt` продолжает тот же поток;
+периодический и финальный candidate публикуются как `latest.pt`. Accepted
+promotion создаёт новую immutable generation, валидирует полный digest pointer,
+checkpoint и сериализованных artifact hashes, затем атомарно публикует
+`accepted_pointer.json`; `accepted.pt` и `best.pt` — только compatibility aliases.
+Конфигурация задаёт `max_steps=1000`; фактический run остановился на 131-м
+шаге из-за 300-секундного deadline.
+
+Первый удалённый run: `E:\code\Tanat Online\ai42_runs\bc5m-e0056a2-01`, CUDA,
+131 optimizer steps за 300 секунд; accepted generation SHA-256:
+`fe3c111789c9594a76a5ab7f125566ebc2ceae5642b94243c44b44c9c9482f3c`.
+Validation loss снизился с `13.2954028457` до `12.5962044984` (`-5.26%`),
+train probe — с `7.021938324` до `5.387267113` (`-23.28%`). При этом control
+accuracy снизилась с `.5592` до `.3164`, несмотря на улучшение control loss;
+offset составил `1.346%`. Это accepted BC candidate, но не доказательство
+live-интеграции или корректности gameplay.
+
+Следующие gates: frozen global class weights; confusion/per-class metrics;
+macro-F1 и balanced accuracy; end-to-end action correctness; offset top-k и
+distance; затем повторные 5-minute/resume прогоны и headless evaluation. В
+этом результате не выполнялись live deployment, ONNX или PPO.

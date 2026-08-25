@@ -72,8 +72,55 @@ python -m tanat_ai40.train_ai42_bc `
 Dataset destinations are immutable and must be absent or empty. The second
 command validates the dataset, recurrent batching, control/action losses,
 finite gradients, clipping and checkpoint roundtrip without calling
-`optimizer.step`; `--execute` is deliberately refused. ONNX is not required
-for PyTorch/CUDA training and remains a later production-inference gate.
+`optimizer.step`; without `--execute` it remains preflight-only. ONNX is not
+required for PyTorch/CUDA training and remains a later production-inference
+gate.
+
+### Executable five-minute AI-42 BC workflow
+
+The explicit training path is implemented by
+[`src/tanat_ai40/train_ai42_bc.py`](src/tanat_ai40/train_ai42_bc.py) and uses
+[`config/ai42_bc_training.json`](config/ai42_bc_training.json). It requires
+the same source revision on the training machine and the checkout: commit
+`e0056a2` atop `80c3600`. It requires `--execute`, uses CUDA, and caps
+optimizer time at 300 seconds. The first run used the immutable dataset at
+`E:\code\Tanat Online\tanat\server\ai42_datasets\clone-v13-dataset01-v2`.
+From `server` in PowerShell:
+
+```powershell
+$env:PYTHONPATH = "$PWD\ai40\src"
+$dataset = 'E:\code\Tanat Online\tanat\server\ai42_datasets\clone-v13-dataset01-v2'
+$run = 'E:\code\Tanat Online\ai42_runs\bc5m-e0056a2-01'
+python -m tanat_ai40.train_ai42_bc `
+  --config .\ai40\config\ai42_bc_training.json `
+  --dataset $dataset --output $run --device cuda `
+  --batch-size 8 --max-optimizer-seconds 300 --execute
+```
+
+The batch plan is deterministic: match IDs are SHA-256 hash-ranked and
+scenario-stratified. Only batches with effective supervised rows are eligible
+for optimizer updates. Checkpoints persist the plan hash and exact
+`batch_cursor`; resume with `--resume <run>\latest.pt` to continue the same
+stream. Periodic and final candidates are written to `latest.pt`. An accepted
+candidate is written as an immutable checkpoint generation, fully digest
+validated, and promoted through atomic `accepted_pointer.json`. `accepted.pt`
+and `best.pt` are compatibility aliases, not the authority.
+The config sets `max_steps=1000`; the actual run stopped at step 131 because
+the 300-second deadline was reached.
+
+First accepted run: `E:\code\Tanat Online\ai42_runs\bc5m-e0056a2-01`, CUDA,
+131 steps in 300 seconds. Accepted generation SHA-256:
+`fe3c111789c9594a76a5ab7f125566ebc2ceae5642b94243c44b44c9c9482f3c`.
+Validation loss changed from `13.2954028457` to `12.5962044984` (`-5.26%`);
+train probe changed from `7.021938324` to `5.387267113` (`-23.28%`). Control
+accuracy nevertheless fell from `.5592` to `.3164` while control loss
+improved; offset was `1.346%`. This is an accepted BC candidate, not live or
+gameplay proof.
+
+Next gates are frozen global class weights, confusion/per-class metrics,
+macro-F1, balanced accuracy, end-to-end action correctness, offset top-k and
+distance, followed by repeated five-minute/resume runs and headless
+evaluation. No live deployment, ONNX, or PPO was performed.
 
 Headless controller values are `0` for a generic external policy, `1` for
 AI-20, `2` for the scripted AI-30 teacher/opponent and `3` for AI-40. Mixed
