@@ -30,6 +30,7 @@ from tanat_ai40.learner_ai42 import (
     AI42Batch,
     AI42LearnerConfig,
     CheckpointError,
+    HEAD_CLASS_COUNTS,
     TeacherStatus,
     compute_behavior_cloning_loss,
     prepare_ai42_supervision,
@@ -89,6 +90,74 @@ def _outputs(batch: AI42Batch) -> dict[str, torch.Tensor]:
 
 
 class AI42BCV2Tests(unittest.TestCase):
+    def test_strict_override_config_and_profile_validation(self) -> None:
+        q3_path = Path(__file__).resolve().parents[1] / "config" / "ai42_bc_training_q3.json"
+        defaults = train_ai42_bc._training_config_defaults(q3_path)
+        self.assertEqual(defaults["learning_rate"], 0.0001)
+        self.assertEqual(
+            defaults["class_weight_overrides"]["control"],
+            [0.76592687, 0.68894406, 0.07211628, 2.47301279],
+        )
+
+        base = json.loads(q3_path.read_text(encoding="utf-8"))
+        malformed = {
+            "unknown head": {"bogus": [1.0]},
+            "wrong class length": {"control": [1.0, 1.0]},
+            "boolean value": {"control": [True, 1.0, 1.0, 1.0]},
+            "non-finite value": {"control": [float("nan"), 1.0, 1.0, 1.0]},
+            "null mapping": None,
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            for label, overrides in malformed.items():
+                payload = copy.deepcopy(base)
+                payload["learner"]["class_weight_overrides"] = overrides
+                path = Path(directory) / f"{label}.json"
+                path.write_text(json.dumps(payload), encoding="utf-8")
+                with self.subTest(label=label), self.assertRaises(train_ai42_bc.AI42LearnerError):
+                    train_ai42_bc._training_config_defaults(path)
+
+        profile = AI42ClassBalanceProfile.from_batches(
+            [_batch()], dataset_manifest_hash="a" * 64, train_match_ids=("train-a",),
+        )
+        valid_kind = [1.0 if count else 0.0 for count in profile.counts["kind"]]
+        final, normalized, override_hash = train_ai42_bc._merge_class_weight_overrides(
+            profile, {"control": [0.5, 0.5, 1.5, 1.5], "kind": valid_kind},
+        )
+        self.assertEqual(tuple(normalized["control"]), (0.5, 0.5, 1.5, 1.5))
+        self.assertEqual(tuple(final["control"]), (0.5, 0.5, 1.5, 1.5))
+        self.assertEqual(tuple(final["target"]), profile.weights["target"])
+        self.assertEqual(override_hash, train_ai42_bc.class_weight_overrides_hash(normalized))
+
+        invalid_absent = list(valid_kind)
+        invalid_absent[0] = 1.0
+        with self.assertRaisesRegex(train_ai42_bc.AI42TrainingError, "absent"):
+            train_ai42_bc._merge_class_weight_overrides(profile, {"kind": invalid_absent})
+        invalid_supported = list(valid_kind)
+        invalid_supported[next(index for index, count in enumerate(profile.counts["kind"]) if count)] = 0.0
+        with self.assertRaisesRegex(train_ai42_bc.AI42TrainingError, "supported"):
+            train_ai42_bc._merge_class_weight_overrides(profile, {"kind": invalid_supported})
+
+    def test_q3_override_has_exact_effective_mass_and_canonical_hash(self) -> None:
+        counts = [731804, 406788, 3886143, 113325]
+        weights = [0.76592687, 0.68894406, 0.07211628, 2.47301279]
+        all_counts = {head: [0] * HEAD_CLASS_COUNTS[head] for head in train_ai42_bc.HEAD_NAMES}
+        all_counts["control"] = counts
+        normalized = train_ai42_bc.validate_class_weight_overrides(
+            {"control": weights}, counts=all_counts,
+        )
+        masses = [count * weight for count, weight in zip(counts, normalized["control"])]
+        total = sum(masses)
+        for actual, expected in zip((mass / total for mass in masses), (0.4, 0.2, 0.2, 0.2)):
+            self.assertAlmostEqual(actual, expected, places=7)
+        self.assertAlmostEqual(sum(weights) / 4.0, 1.0, places=12)
+        canonical = json.dumps(
+            {"control": weights}, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False,
+        ).encode("utf-8")
+        self.assertEqual(
+            train_ai42_bc.class_weight_overrides_hash({"control": tuple(weights)}),
+            hashlib.sha256(canonical).hexdigest(),
+        )
+
     def test_profile_is_train_only_immutable_canonical_and_tamper_evident(self) -> None:
         batch = _batch()
         profile = AI42ClassBalanceProfile.from_batches(

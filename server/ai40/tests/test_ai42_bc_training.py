@@ -194,6 +194,30 @@ class AI42BCTrainingTests(unittest.TestCase):
             self.assertFalse(rejected["accepted"])
             self.assertEqual(first_accepted, (output / "accepted.pt").read_bytes())
 
+    def test_class_weight_provenance_is_bound_to_manifest_checkpoint_and_report(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory)
+            args = _args(output, "--max-steps", "1")
+            args.class_weight_overrides = {"control": [0.0, 1.0, 0.0, 0.0]}
+            summaries = iter((
+                _mock_probe_summary(1.0), _mock_probe_summary(1.0),
+                _mock_probe_summary(0.5), _mock_probe_summary(0.5),
+            ))
+            with mock.patch.object(train_ai42_bc, "load_dataset", return_value=_TinyDataset()), \
+                 mock.patch.object(train_ai42_bc, "evaluate_probe", side_effect=lambda *_: next(summaries)):
+                report = train_ai42_bc.train(args, clock=lambda: 0.0)
+
+            payload = torch.load(output / "latest.pt", map_location="cpu", weights_only=True)
+            manifest = payload["manifest"]
+            extra = payload["extra"]
+            self.assertEqual(manifest["class_weight_overrides"], {"control": [0.0, 1.0, 0.0, 0.0]})
+            self.assertEqual(manifest["class_weight_overrides_hash"], report["class_weight_overrides_hash"])
+            self.assertEqual(manifest["class_weights"], report["class_weights"])
+            self.assertEqual(extra["class_weight_overrides_hash"], report["class_weight_overrides_hash"])
+            self.assertEqual(extra["class_weights"], report["class_weights"])
+            self.assertEqual(extra["class_weight_provenance"]["final"], report["class_weights"])
+            self.assertEqual(report["manifest_digest"], train_ai42_bc.manifest_digest(manifest))
+
     def test_resume_restores_step_and_atomic_report_failure_preserves_old_file(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             output = Path(directory)
