@@ -161,6 +161,57 @@ macro-F1, balanced accuracy, end-to-end action correctness, offset top-k and
 distance, followed by repeated five-minute/resume runs and headless
 evaluation. No live deployment, ONNX, or PPO was performed.
 
+### Q4 result and headless rejection
+
+The Q4 five-minute CUDA proposal uses
+`config/ai42_bc_training_q4.json` and immutable dataset hash
+`98709a6c0606c4a4b64b59370236cab28f2d22ad0fbf7570567e61c32178ccae`.
+It completed 362 optimizer steps in exactly 300 optimizer seconds. Validation
+loss improved from `19.4502037027` to `14.1587547074`; control balanced
+accuracy improved from `.26828` to `.41805`, and end-to-end action accuracy
+improved from `1.500%` to `2.138%`. The immutable generation SHA-256 is
+`d7302ec8d2527b4a08511e93152fdc03d507b057c2057571acf25050fe981923`.
+
+That offline acceptance is not deployment acceptance. Protocol v14 is the
+evaluation-only AI-42 boundary. It keeps the v13 actor observations, lane
+contract, and reward, omits teacher-only response fields, and transports three
+runtime controls:
+
+- `ISSUE`: submit a new factorized action;
+- `HOLD`: preserve an authoritative active order;
+- `IDLE`: guarantee that no order remains active.
+
+The four-head checkpoint remains compatible: inference combines the trained
+`WAIT` and `CANCEL` probabilities into `IDLE`. The server returns one
+authoritative `active_order` bit per hero, so `HOLD` is masked after actual
+movement arrival, attack completion, cast completion, death, respawn, or
+reset. The v14 Python/Go schema hash is
+`a54f64514781db87ed2624720916c454d21a41ee2aabca6f094b0924e58e8bef`.
+
+Q4 was evaluated against AI-30 for 40 deterministic matches, alternating
+sides, with 32 workers and a 4,500-tick/15-minute cap. It lost all 40 matches
+on both sides, with zero invalid actions, and matches ended after 5.704 minutes
+on average. The policy emitted 322,200 moves, 374 waits, and zero attacks or
+skills. Held-out kind metrics explain the failure: move recall was `99.74%`,
+while attack, skill-1, and skill-2 recall were all zero despite non-zero
+support. Q4 is therefore an offline BC artifact only and must not be deployed.
+
+The promotion gate now fails closed when any supported action kind has zero
+recall and preserves a per-kind recall regression floor. Future five-minute
+proposals must first recover attack/skill coverage, then pass the same
+side-balanced AI-42-versus-AI-30 headless suite. This prevents aggregate loss
+or move-dominated micro-accuracy from promoting a non-combat policy.
+
+Run the evaluator from `server` with:
+
+```powershell
+$env:PYTHONPATH = "$PWD\ai40\src"
+python -m tanat_ai40.evaluate_ai42 <generation.pt> `
+  --config .\ai40\config\ai42_bc_training_q4.json `
+  --env .\assaultenv.exe --matches 40 --workers 32 `
+  --max-steps 4500 --device cuda --output <evaluation.json>
+```
+
 Headless controller values are `0` for a generic external policy, `1` for
 AI-20, `2` for the scripted AI-30 teacher/opponent and `3` for AI-40. Mixed
 controller teams remain supported, but `tanat-ai40-train` and

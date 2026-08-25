@@ -15,6 +15,7 @@ import torch
 
 from .env import (
     AI42_EVALUATION_PROTOCOL_VERSION,
+    AI42_EVALUATION_SCHEMA_HASH,
     AssaultVectorEnv,
     CONTROLLER_AI30,
     CONTROLLER_AI40,
@@ -338,6 +339,8 @@ def evaluate_vs_ai30(
     model_control_total = max(int(model_controls.sum()), 1)
     return {
         "format": "AI42-headless-evaluation-v1",
+        "protocol_version": AI42_EVALUATION_PROTOCOL_VERSION,
+        "protocol_schema_hash": AI42_EVALUATION_SCHEMA_HASH.hex(),
         "checkpoint": str(checkpoint.resolve()),
         "config": str(config.resolve()),
         "lineage": lineage,
@@ -363,6 +366,7 @@ def evaluate_vs_ai30(
         "mean_match_minutes": total_steps * 0.2 / 60.0 / matches,
         "action_counts": {name: int(actions[index]) for index, name in enumerate(ACTION_NAMES)},
         "action_rates": {name: float(actions[index] / action_total) for index, name in enumerate(ACTION_NAMES)},
+        "combat_action_count": int(actions[2:7].sum()),
         "model_control_counts": {
             name: int(model_controls[index]) for index, name in enumerate(CONTROL_NAMES)
         },

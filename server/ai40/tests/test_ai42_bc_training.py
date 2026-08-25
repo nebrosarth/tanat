@@ -128,7 +128,17 @@ def _mock_probe_summary(loss: float, control_loss: float | None = None) -> train
     }
     heads = {
         "control": control,
-        "kind": {"count": 1, "micro_accuracy": quality},
+        "kind": {
+            "count": 1,
+            "micro_accuracy": quality,
+            "per_class": {
+                str(index): {
+                    "support": 1 if index == 1 else 0,
+                    "recall": quality if index == 1 else 0.0,
+                }
+                for index in range(8)
+            },
+        },
         "target": {"count": 1, "micro_accuracy": quality},
         "anchor": {"count": 1, "micro_accuracy": quality},
     }
@@ -147,6 +157,19 @@ def _mock_probe_summary(loss: float, control_loss: float | None = None) -> train
 
 
 class AI42BCTrainingTests(unittest.TestCase):
+    def test_promotion_rejects_zero_recall_for_supported_action_kind(self) -> None:
+        baseline = _mock_probe_summary(1.0)
+        candidate = _mock_probe_summary(0.5)
+        baseline.metrics["heads"]["kind"]["per_class"]["1"]["support"] = 0
+        baseline.metrics["heads"]["kind"]["per_class"]["2"]["support"] = 1
+        baseline.metrics["heads"]["kind"]["per_class"]["2"]["recall"] = 0.0
+        candidate.metrics["heads"]["kind"]["per_class"]["1"]["support"] = 0
+        candidate.metrics["heads"]["kind"]["per_class"]["2"]["support"] = 1
+        candidate.metrics["heads"]["kind"]["per_class"]["2"]["recall"] = 0.0
+        gate = train_ai42_bc.promotion_gate(baseline, candidate)
+        self.assertFalse(gate["accepted"])
+        self.assertIn("kind_recall_2_coverage", gate["failed"])
+
     def test_budget_has_hard_cap_and_fake_clock_stops_before_step(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             args = _args(Path(directory), "--max-optimizer-seconds", "300")

@@ -956,6 +956,25 @@ def _validate_gate_metric_schema(summary: ProbeSummary, name: str) -> dict[str, 
         raise ValueError(f"{name}.metrics.heads.control has no supported classes")
     if sum(supports) != head_counts["control"]:
         raise ValueError(f"{name}.metrics.heads.control supports do not sum to its count")
+
+    kind_per_class = heads["kind"].get("per_class")
+    kind_class_keys = {str(index) for index in range(8)}
+    if not isinstance(kind_per_class, Mapping) or set(kind_per_class) != kind_class_keys:
+        raise ValueError(f"{name}.metrics.heads.kind.per_class must contain exactly classes 0..7")
+    kind_supports: list[int] = []
+    kind_recalls: list[float] = []
+    for class_name in sorted(kind_class_keys, key=int):
+        item = kind_per_class[class_name]
+        if not isinstance(item, Mapping) or "support" not in item or "recall" not in item:
+            raise ValueError(f"{name}.metrics.heads.kind.per_class.{class_name} is incomplete")
+        kind_supports.append(_gate_count(
+            item["support"], f"{name}.metrics.heads.kind.per_class.{class_name}.support",
+        ))
+        kind_recalls.append(_gate_float(
+            item["recall"], f"{name}.metrics.heads.kind.per_class.{class_name}.recall", maximum=1.0,
+        ))
+    if sum(kind_supports) != head_counts["kind"]:
+        raise ValueError(f"{name}.metrics.heads.kind supports do not sum to its count")
     control_count = _gate_count(summary.control_count, f"{name}.control_count", positive=True)
     if control_count != head_counts["control"]:
         raise ValueError(f"{name}.control_count does not match the control metric count")
@@ -972,6 +991,8 @@ def _validate_gate_metric_schema(summary: ProbeSummary, name: str) -> dict[str, 
         "control_balanced_accuracy": _gate_float(control.get("balanced_accuracy"), f"{name}.metrics.heads.control.balanced_accuracy", maximum=1.0),
         "control_supports": tuple(supports),
         "control_recalls": tuple(recalls),
+        "kind_supports": tuple(kind_supports),
+        "kind_recalls": tuple(kind_recalls),
         "head_counts": tuple(head_counts[head] for head in required_heads),
         "action_count": action_count,
         "kind_accuracy": _gate_float(heads["kind"].get("micro_accuracy"), f"{name}.metrics.heads.kind.micro_accuracy", maximum=1.0),
@@ -997,6 +1018,8 @@ def promotion_gate(baseline: ProbeSummary, candidate: ProbeSummary) -> dict[str,
             raise ValueError("baseline/candidate control supports do not match")
         if before["head_counts"] != after["head_counts"]:
             raise ValueError("baseline/candidate head counts do not match")
+        if before["kind_supports"] != after["kind_supports"]:
+            raise ValueError("baseline/candidate kind supports do not match")
         if before["action_count"] != after["action_count"]:
             raise ValueError("baseline/candidate action counts do not match")
         if before["offset_count"] != after["offset_count"]:
@@ -1022,6 +1045,14 @@ def promotion_gate(baseline: ProbeSummary, candidate: ProbeSummary) -> dict[str,
         )
     for head in ("kind", "target", "anchor"):
         checks[f"{head}_accuracy_floor"] = after[f"{head}_accuracy"] >= before[f"{head}_accuracy"] - GATE_HEAD_ACCURACY_FLOOR
+    for index, support in enumerate(before["kind_supports"]):
+        checks[f"kind_recall_{index}_coverage"] = (
+            support == 0 or after["kind_recalls"][index] > 0.0
+        )
+        checks[f"kind_recall_{index}_floor"] = (
+            support == 0
+            or after["kind_recalls"][index] >= before["kind_recalls"][index] - GATE_HEAD_ACCURACY_FLOOR
+        )
     checks["end_to_end_action_improves"] = after["action_accuracy"] > before["action_accuracy"]
     checks["offset_distance_no_worse"] = after["offset_distance"] <= before["offset_distance"]
     failed = sorted(name for name, passed in checks.items() if not passed)
