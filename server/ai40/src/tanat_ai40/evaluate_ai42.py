@@ -131,6 +131,7 @@ class AI42EvaluationActor:
         self.device = device
         self.h, self.c = actor.initial_state(batch_size, device)
         self.previous_dead = torch.zeros(batch_size, dtype=torch.bool, device=device)
+        self.active_order = torch.zeros(batch_size, dtype=torch.bool, device=device)
 
     def reset_workers(self, worker_indices: list[int]) -> None:
         for worker in worker_indices:
@@ -139,6 +140,7 @@ class AI42EvaluationActor:
             self.h[start:stop].zero_()
             self.c[start:stop].zero_()
             self.previous_dead[start:stop].zero_()
+            self.active_order[start:stop].zero_()
 
     def act(
         self, observations: Any, indices: np.ndarray,
@@ -161,6 +163,9 @@ class AI42EvaluationActor:
         recurrent_reset = dead | self.previous_dead
         self.h = torch.where(recurrent_reset.unsqueeze(1), torch.zeros_like(self.h), self.h)
         self.c = torch.where(recurrent_reset.unsqueeze(1), torch.zeros_like(self.c), self.c)
+        self.active_order = torch.where(
+            recurrent_reset, torch.zeros_like(self.active_order), self.active_order,
+        )
         self.previous_dead = dead
 
         with torch.no_grad(), torch.autocast(
@@ -182,7 +187,22 @@ class AI42EvaluationActor:
                     control_logits[:, [CONTROL_WAIT, CONTROL_CANCEL]], dim=1,
                 ),
             ), dim=1)
+            # HOLD is a transition, not a standalone action. Masking it until
+            # ISSUE creates a lineage prevents a class-imbalanced checkpoint
+            # from entering a permanent no-op state on the opening frame.
+            runtime_logits[:, RUNTIME_CONTROL_HOLD].masked_fill_(
+                ~self.active_order, -1e9,
+            )
             runtime_controls = runtime_logits.argmax(dim=1)
+            self.active_order = torch.where(
+                runtime_controls == RUNTIME_CONTROL_ISSUE,
+                torch.ones_like(self.active_order),
+                torch.where(
+                    runtime_controls == RUNTIME_CONTROL_IDLE,
+                    torch.zeros_like(self.active_order),
+                    self.active_order,
+                ),
+            )
             kinds = output["kind"].float().masked_fill(~kind_mask, -1e9).argmax(dim=1)
             rows = torch.arange(self.batch_size, device=self.device)
             effective_targets = _effective_target_mask_tensors(

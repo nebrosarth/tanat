@@ -7,8 +7,10 @@ import torch
 
 from tanat_ai40.env import ACTION_KINDS, HERO_COUNT, MAX_ENTITIES, NAVIGATION_ANCHORS, NAVIGATION_OFFSETS
 from tanat_ai40.evaluate_ai42 import AI42EvaluationActor, controllers_for_side
-from tanat_ai40.evaluate_ai42 import RUNTIME_CONTROL_IDLE, RUNTIME_CONTROL_ISSUE
-from tanat_ai40.model_ai42_actor import CONTROL_CANCEL, CONTROL_ISSUE
+from tanat_ai40.evaluate_ai42 import (
+    RUNTIME_CONTROL_HOLD, RUNTIME_CONTROL_IDLE, RUNTIME_CONTROL_ISSUE,
+)
+from tanat_ai40.model_ai42_actor import CONTROL_CANCEL, CONTROL_HOLD, CONTROL_ISSUE
 
 
 class _FixedActor(torch.nn.Module):
@@ -18,6 +20,7 @@ class _FixedActor(torch.nn.Module):
         super().__init__()
         self.marker = torch.nn.Parameter(torch.zeros(()))
         self.seen_h: list[torch.Tensor] = []
+        self.prefer_hold = False
 
     def initial_state(self, batch: int, device=None, dtype=None):
         dtype = dtype or torch.float32
@@ -31,7 +34,10 @@ class _FixedActor(torch.nn.Module):
         batch = hero.shape[0]
         control = torch.zeros((batch, 4), device=hero.device)
         control[:, CONTROL_ISSUE] = 10
-        control[-1, CONTROL_CANCEL] = 20
+        if self.prefer_hold:
+            control[:, CONTROL_HOLD] = 20
+        else:
+            control[-1, CONTROL_CANCEL] = 20
         kind = torch.zeros((batch, ACTION_KINDS), device=hero.device)
         kind[:, 3] = 10
         target = torch.zeros((batch, ACTION_KINDS, MAX_ENTITIES), device=hero.device)
@@ -84,6 +90,14 @@ class AI42EvaluationTests(unittest.TestCase):
         self.assertEqual(int(model[4]), CONTROL_CANCEL)
         self.assertEqual(int(runtime[0]), RUNTIME_CONTROL_ISSUE)
         self.assertEqual(int(runtime[4]), RUNTIME_CONTROL_IDLE)
+
+        actor.prefer_hold = True
+        _, runtime, model = evaluator.act(
+            [_Observations()], np.arange(5, dtype=np.intp),
+        )
+        self.assertTrue(np.all(model == CONTROL_HOLD))
+        self.assertTrue(np.all(runtime[:4] == RUNTIME_CONTROL_HOLD))
+        self.assertEqual(int(runtime[4]), RUNTIME_CONTROL_ISSUE)
 
     def test_death_and_first_respawn_tick_reset_recurrent_state(self) -> None:
         actor = _FixedActor()
