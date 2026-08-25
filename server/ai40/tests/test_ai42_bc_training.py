@@ -76,6 +76,32 @@ class _StratifiedDataset(_TinyDataset):
         }
 
 
+class _MixedControllerDataset(_TinyDataset):
+    """Starts with AI20 UNAVAILABLE-only slots, then supplies WAIT rows."""
+
+    def iter_matches(self, split: str):
+        ticks = 3
+        arrays = {
+            "hero": np.zeros((ticks, 10, 32), dtype="<f4"),
+            "abilities": np.zeros((ticks, 10, 4, 40), dtype="<f4"),
+            "entities": np.zeros((ticks, 10, 96, 16), dtype="<f4"),
+            "global": np.zeros((ticks, 10, 32), dtype="<f4"),
+            "entity_mask": np.zeros((ticks, 10, 96), dtype="u1"),
+            "kind_mask": np.ones((ticks, 10, 8), dtype="u1"),
+            "target_mask": np.zeros((ticks, 10, 96), dtype="u1"),
+            "skill_target_mask": np.zeros((ticks, 10, 4, 96), dtype="u1"),
+            "teacher_status": np.full((ticks, 10), TeacherStatus.WAIT, dtype="u1"),
+            "teacher_action": np.zeros((ticks, 10), dtype=ACTION_DTYPE),
+            "step": np.arange(ticks, dtype="<u4"),
+            "done": np.asarray([0, 0, 1], dtype="u1"),
+        }
+        arrays["teacher_status"][0, :] = TeacherStatus.UNAVAILABLE
+        arrays["entity_mask"][..., 0] = 1
+        arrays["target_mask"][..., 0] = 1
+        arrays["skill_target_mask"][..., 0, 0] = 1
+        yield f"{split}-000", arrays
+
+
 def _args(output: Path, *extra: str):
     return train_ai42_bc.build_parser().parse_args([
         "--execute", "--device", "cpu", "--dataset", "dummy", "--output", str(output),
@@ -196,6 +222,53 @@ class AI42BCTrainingTests(unittest.TestCase):
             self.assertEqual(
                 full_payload["artifact_hashes"]["optimizer"],
                 resumed_payload["artifact_hashes"]["optimizer"],
+            )
+
+    def test_mixed_controller_skips_empty_batches_and_resume_is_exact(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            dataset = _MixedControllerDataset()
+            args = _args(root / "probe")
+            raw_batches = list(train_ai42_bc.iter_ai42_dataset_batches(
+                dataset, split="train", sequence_length=1, batch_size=1,
+            ))
+            eligible_batches = list(train_ai42_bc._iter_plan_batches(
+                dataset, ("train-000",), "train", args, torch.device("cpu"),
+            ))
+            self.assertTrue(raw_batches[0].supervision_mask.sum().item() == 0)
+            self.assertGreater(len(raw_batches), len(eligible_batches))
+            self.assertTrue(all(bool(batch.supervision_mask.any()) for batch in eligible_batches))
+
+            full = root / "full"
+            partial = root / "partial"
+            with mock.patch.object(train_ai42_bc, "load_dataset", return_value=dataset):
+                full_report = train_ai42_bc.train(
+                    _args(full, "--max-steps", "2", "--checkpoint-interval", "1"), clock=lambda: 0.0,
+                )
+                first_report = train_ai42_bc.train(
+                    _args(partial, "--max-steps", "1", "--checkpoint-interval", "1"), clock=lambda: 0.0,
+                )
+                resumed_report = train_ai42_bc.train(
+                    _args(
+                        partial, "--max-steps", "2", "--checkpoint-interval", "1",
+                        "--resume", str(partial / "latest.pt"),
+                    ),
+                    clock=lambda: 0.0,
+                )
+            self.assertGreater(full_report["pre_validation"]["batches"], 0)
+            self.assertGreater(full_report["post_validation"]["batches"], 0)
+            self.assertEqual(first_report["batch_plan"]["batch_cursor"], 1)
+            self.assertEqual(resumed_report["batch_plan"]["batch_cursor"], 2)
+            full_payload = torch.load(full / "latest.pt", map_location="cpu", weights_only=True)
+            resumed_payload = torch.load(partial / "latest.pt", map_location="cpu", weights_only=True)
+            self.assertEqual(full_report["global_step"], resumed_report["global_step"])
+            for name in full_payload["model_state_dict"]:
+                torch.testing.assert_close(
+                    full_payload["model_state_dict"][name], resumed_payload["model_state_dict"][name],
+                    atol=0, rtol=0,
+                )
+            self.assertEqual(
+                full_payload["artifact_hashes"]["optimizer"], resumed_payload["artifact_hashes"]["optimizer"],
             )
 
     def test_validation_probe_is_seeded_hash_ranked_and_stratified(self) -> None:
@@ -326,6 +399,11 @@ class AI42BCTrainingTests(unittest.TestCase):
             def __init__(self):
                 self.results = iter((
                     SimpleNamespace(
+                        loss=torch.tensor(0.0), head_losses={"control": torch.tensor(0.0)},
+                        metrics={"supervised_count": 0, "action_count": 0, "control_count": 0,
+                                 "heads": {"control": {"count": 0}}},
+                    ),
+                    SimpleNamespace(
                         loss=torch.tensor(99.0),
                         head_losses={"control": torch.tensor(1.0), "kind": torch.tensor(10.0)},
                         metrics={"supervised_count": 4, "action_count": 3, "control_count": 1,
@@ -342,11 +420,21 @@ class AI42BCTrainingTests(unittest.TestCase):
             def loss(self, batch):
                 return next(self.results)
 
-        result = train_ai42_bc.evaluate_probe(FakeLearner(), (object(), object()))
+        result = train_ai42_bc.evaluate_probe(FakeLearner(), (object(), object(), object()))
         self.assertEqual(result.head_denominators, {"control": 4, "kind": 4})
         self.assertAlmostEqual(result.head_losses["control"], 2.5)
         self.assertAlmostEqual(result.head_losses["kind"], 8.0)
         self.assertAlmostEqual(result.loss, 2.0 * 2.5 + 3.0 * 8.0)
+
+        class EmptyLearner(FakeLearner):
+            def __init__(self):
+                self.results = iter((SimpleNamespace(
+                    loss=torch.tensor(0.0), head_losses={"control": torch.tensor(0.0)},
+                    metrics={"supervised_count": 0, "heads": {"control": {"count": 0}}},
+                ),))
+
+        with self.assertRaisesRegex(train_ai42_bc.AI42TrainingError, "probe is empty"):
+            train_ai42_bc.evaluate_probe(EmptyLearner(), (object(),))
 
     def test_production_batch_default_is_eight(self) -> None:
         self.assertEqual(train_ai42_bc.build_parser().parse_args([]).batch_size, 8)

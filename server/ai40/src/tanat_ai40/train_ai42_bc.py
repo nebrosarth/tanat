@@ -386,13 +386,24 @@ def _iter_plan_batches(
     if skip_batches < 0:
         raise AI42TrainingError("skip_batches must be non-negative")
     view = _OrderedDatasetView(dataset, match_ids, split)
-    for index, batch in enumerate(iter_ai42_dataset_batches(
+    eligible_index = 0
+    yielded = 0
+    for batch in iter_ai42_dataset_batches(
         view, split=split, sequence_length=args.sequence_length, batch_size=args.batch_size,
-    )):
-        if index < skip_batches:
+    ):
+        # Count only batches with effective ACTION/WAIT/HOLD/CANCEL rows. A
+        # deterministic dataset can begin with UNAVAILABLE-only controller
+        # slots; those batches are not optimizer examples and must not consume
+        # the persisted resume cursor.
+        if not bool(batch.supervision_mask.any()):
             continue
-        if max_batches is not None and index - skip_batches >= max_batches:
+        if eligible_index < skip_batches:
+            eligible_index += 1
+            continue
+        if max_batches is not None and yielded >= max_batches:
             break
+        eligible_index += 1
+        yielded += 1
         yield batch.to(device)
 
 
@@ -442,7 +453,10 @@ def evaluate_probe(learner: AI42Learner, batches: Iterable[AI42Batch]) -> ProbeS
                 result: LossResult = learner.loss(batch)
                 total_count = int(result.metrics.get("supervised_count", 0))
                 if total_count <= 0:
-                    raise AI42TrainingError("probe contains no supervised rows")
+                    # Direct callers may provide an unfiltered stream. Empty
+                    # batches are not evidence, but an entirely empty probe
+                    # remains an error below.
+                    continue
                 _finite_number(result.loss.detach().cpu().item(), "probe loss")
                 for name, value in result.head_losses.items():
                     head_metrics = result.metrics.get("heads", {}).get(name, {})
