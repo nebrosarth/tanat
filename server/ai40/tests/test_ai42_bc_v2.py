@@ -289,7 +289,17 @@ class AI42BCV2Tests(unittest.TestCase):
     def _summary(self, *, loss=1.0, mutate=None):
         heads = {
             "control": {"count": 7, "micro_accuracy": 0.5, "supported_macro_f1": 0.5, "balanced_accuracy": 0.5, "per_class": {str(i): {"support": 4 if i == 0 else 1, "recall": 0.5} for i in range(4)}},
-            "kind": {"count": 4, "micro_accuracy": 0.5},
+            "kind": {
+                "count": 4,
+                "micro_accuracy": 0.5,
+                "per_class": {
+                    str(i): {
+                        "support": 2 if i in (0, 1) else 0,
+                        "recall": 0.5 if i in (0, 1) else 0.0,
+                    }
+                    for i in range(8)
+                },
+            },
             "target": {"count": 2, "micro_accuracy": 0.5},
             "anchor": {"count": 1, "micro_accuracy": 0.5},
         }
@@ -331,6 +341,10 @@ class AI42BCV2Tests(unittest.TestCase):
             self.assertIn(f"{head}_accuracy_floor", failed)
         failed = train_ai42_bc.promotion_gate(baseline, candidate(lambda m: m["heads"]["control"]["per_class"]["0"].update(recall=0.47)))["failed"]
         self.assertIn("control_recall_0_floor", failed)
+        failed = train_ai42_bc.promotion_gate(baseline, candidate(lambda m: m["heads"]["kind"]["per_class"]["0"].update(recall=0.0)))["failed"]
+        self.assertIn("kind_recall_0_coverage", failed)
+        failed = train_ai42_bc.promotion_gate(baseline, candidate(lambda m: m["heads"]["kind"]["per_class"]["0"].update(recall=0.47)))["failed"]
+        self.assertIn("kind_recall_0_floor", failed)
         missing = train_ai42_bc.promotion_gate(train_ai42_bc.ProbeSummary(1, 1, 1, 1, 1, {}), good)
         self.assertFalse(missing["accepted"])
 
@@ -377,12 +391,16 @@ class AI42BCV2Tests(unittest.TestCase):
             "missing action count": changed(("action", "count")),
             "missing offset count": changed(("offset", "count")),
             "missing per-class data": changed(("heads", "control", "per_class")),
+            "missing kind per-class data": changed(("heads", "kind", "per_class")),
+            "missing kind recall": changed(("heads", "kind", "per_class", "0", "recall")),
             "NaN accuracy": changed(("heads", "kind", "micro_accuracy"), float("nan")),
             "infinite distance": changed(("offset", "mean_manhattan_grid_distance"), float("inf")),
             "string accuracy": changed(("heads", "kind", "micro_accuracy"), "0.5"),
             "boolean accuracy": changed(("heads", "kind", "micro_accuracy"), True),
             "boolean support": changed(("heads", "control", "per_class", "0", "support"), True),
             "support mismatch": changed(("heads", "control", "per_class", "0", "support"), 2),
+            "boolean kind support": changed(("heads", "kind", "per_class", "0", "support"), True),
+            "kind support mismatch": changed(("heads", "kind", "per_class", "0", "support"), 3),
             "head denominator mismatch": replace(good, head_denominators={**good.head_denominators, "target": 3}),
             "control summary mismatch": replace(good, control_count=8),
             "action summary mismatch": replace(good, action_count=5),
