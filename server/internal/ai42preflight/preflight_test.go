@@ -148,7 +148,7 @@ func TestLoadConfigRejectsUnknownAndAcceptsProductionConfig(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if config.Learner.LearningRate != 3e-4 || config.Model.ModelWidth != 192 || config.Model.EntityLayers != 2 {
+	if config.Learner.LearningRate != 3e-4 || config.Model.ModelWidth != 192 || config.Model.EntityLayers != 2 || config.ValidationBatchSize != 256 {
 		t.Fatalf("unexpected production config: %+v %+v", config.Model, config.Learner)
 	}
 	path = filepath.Join(t.TempDir(), "unknown.json")

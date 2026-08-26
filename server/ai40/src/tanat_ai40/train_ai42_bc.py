@@ -152,6 +152,26 @@ class ProbeSummary:
 ValidationSummary = ProbeSummary
 
 
+@dataclass(slots=True)
+class AI42TrainingContext:
+    """Validated immutable inputs shared by training and checkpoint evaluation."""
+
+    device: torch.device
+    dataset: Any
+    dataset_hash: str
+    split_ids: Mapping[str, Sequence[str]]
+    plan: Mapping[str, Any]
+    profile_path: Path
+    profile: AI42ClassBalanceProfile
+    class_weights: Mapping[str, Sequence[float]]
+    head_weights: Mapping[str, float]
+    head_weights_hash: str
+    learner_config: AI42LearnerConfig
+    actor: AI42Actor
+    learner: AI42Learner
+    manifest: Mapping[str, Any]
+
+
 def _read_json(path: Path, description: str) -> Any:
     try:
         return json.loads(path.read_text(encoding="utf-8"))
@@ -196,7 +216,7 @@ def _training_config_defaults(path: Path) -> dict[str, Any]:
     }
     optional_training = {
         "checkpoint_interval", "validation_matches", "gradient_accumulation_steps",
-        "retain_periodic_checkpoints", "supervision_controllers",
+        "retain_periodic_checkpoints", "supervision_controllers", "validation_batch_size",
     }
     if not isinstance(training, dict) or not required_training.issubset(training) or set(training) - required_training - optional_training:
         raise AI42LearnerError("training config.training is invalid")
@@ -248,6 +268,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-steps", type=int, default=1, help="total optimizer step target, including resumed steps")
     parser.add_argument("--epochs", type=int, default=1)
     parser.add_argument("--validation-batches", type=int, default=DEFAULT_VALIDATION_BATCHES)
+    parser.add_argument("--validation-batch-size", type=int)
     parser.add_argument("--validation-matches", type=int, default=None)
     parser.add_argument("--validation-epsilon", type=float, default=1e-4)
     parser.add_argument("--checkpoint-interval", type=int, default=DEFAULT_CHECKPOINT_INTERVAL)
@@ -314,6 +335,14 @@ def _validate_training_args(args: argparse.Namespace) -> None:
         raise AI42TrainingError("max-steps may be zero; epochs and validation-batches must be positive")
     if args.validation_matches is not None and args.validation_matches < 1:
         raise AI42TrainingError("validation-matches must be positive when provided")
+    if args.validation_batch_size is None:
+        args.validation_batch_size = args.batch_size
+    if (
+        isinstance(args.validation_batch_size, bool)
+        or not isinstance(args.validation_batch_size, int)
+        or not 1 <= args.validation_batch_size <= 512
+    ):
+        raise AI42TrainingError("validation-batch-size must be an integer in [1, 512]")
     if args.checkpoint_interval < 1:
         raise AI42TrainingError("checkpoint-interval must be positive")
     budget = _finite_number(args.max_optimizer_seconds, "max-optimizer-seconds")
@@ -978,19 +1007,14 @@ def promotion_gate(baseline: ProbeSummary, candidate: ProbeSummary) -> dict[str,
 _promotion_gate = promotion_gate
 
 
-def train(args: argparse.Namespace, *, clock: Callable[[], float] = time.monotonic) -> dict[str, Any]:
-    """Run one deterministic BC proposal and publish its evidence report."""
+def prepare_training_context(args: argparse.Namespace) -> AI42TrainingContext:
+    """Load and validate one BC dataset/model context without updating weights."""
 
-    if not getattr(args, "execute", False):
-        raise AI42TrainingError(
-            "--execute is required for training; run the native AI-42 preflight "
-            "wrapper before authorizing optimizer updates",
-        )
     _validate_training_args(args)
     if args.dataset is None:
-        raise AI42TrainingError("--dataset is required with --execute")
+        raise AI42TrainingError("--dataset is required")
     if args.output is None:
-        raise AI42TrainingError("--output/--run-dir is required with --execute")
+        raise AI42TrainingError("--output/--run-dir is required")
     if args.dataset_hash is not None and args.dataset_hash != args.dataset_hash.lower():
         raise AI42TrainingError("--dataset-hash must use lower-case SHA-256")
     device = _device_from_arg(args.device)
@@ -1076,6 +1100,48 @@ def train(args: argparse.Namespace, *, clock: Callable[[], float] = time.monoton
         head_weights_hash=normalized_head_weights_hash,
         supervision_controllers=list(args.supervision_controllers),
     )
+    return AI42TrainingContext(
+        device=device,
+        dataset=dataset,
+        dataset_hash=dataset_hash,
+        split_ids=split_ids,
+        plan=plan,
+        profile_path=profile_path,
+        profile=profile,
+        class_weights=final_class_weights,
+        head_weights=normalized_head_weights,
+        head_weights_hash=normalized_head_weights_hash,
+        learner_config=learner_config,
+        actor=actor,
+        learner=learner,
+        manifest=manifest,
+    )
+
+
+def train(args: argparse.Namespace, *, clock: Callable[[], float] = time.monotonic) -> dict[str, Any]:
+    """Run one deterministic BC proposal and publish its evidence report."""
+
+    if not getattr(args, "execute", False):
+        raise AI42TrainingError(
+            "--execute is required for training; run the native AI-42 preflight "
+            "wrapper before authorizing optimizer updates",
+        )
+    context = prepare_training_context(args)
+    device = context.device
+    dataset = context.dataset
+    dataset_hash = context.dataset_hash
+    split_ids = context.split_ids
+    plan = context.plan
+    run_root = args.output
+    profile_path = context.profile_path
+    profile = context.profile
+    final_class_weights = context.class_weights
+    normalized_head_weights = context.head_weights
+    normalized_head_weights_hash = context.head_weights_hash
+    learner_config = context.learner_config
+    actor = context.actor
+    learner = context.learner
+    manifest = context.manifest
 
     resume_path = args.resume
     resume_state = None
@@ -1128,8 +1194,10 @@ def train(args: argparse.Namespace, *, clock: Callable[[], float] = time.monoton
     train_probe = _iter_plan_batches(
         dataset, plan["train_probe_match_ids"], "train", args, device, max_batches=1,
     )
+    validation_args = argparse.Namespace(**vars(args))
+    validation_args.batch_size = args.validation_batch_size
     validation_probe = _iter_plan_batches(
-        dataset, plan["validation_match_ids"], "validation", args, device,
+        dataset, plan["validation_match_ids"], "validation", validation_args, device,
     )
     pre_train = evaluate_probe(learner, train_probe)
     pre_validation = evaluate_probe(learner, validation_probe)
@@ -1205,6 +1273,7 @@ def train(args: argparse.Namespace, *, clock: Callable[[], float] = time.monoton
                 periodic_extra = {
                     "batch_plan_hash": plan["batch_plan_hash"],
                     "validation_probe_hash": plan["validation_probe_hash"],
+                    "validation_batch_size": args.validation_batch_size,
                     "batch_cursor": batch_cursor,
                     "accepted": False,
                     "optimizer_steps_this_run": run_steps,
@@ -1259,7 +1328,7 @@ def train(args: argparse.Namespace, *, clock: Callable[[], float] = time.monoton
         dataset, plan["train_probe_match_ids"], "train", args, device, max_batches=1,
     ))
     post_validation = evaluate_probe(learner, _iter_plan_batches(
-        dataset, plan["validation_match_ids"], "validation", args, device,
+        dataset, plan["validation_match_ids"], "validation", validation_args, device,
     ))
     epsilon = float(args.validation_epsilon)
     gate = promotion_gate(pre_validation, post_validation)
@@ -1296,6 +1365,7 @@ def train(args: argparse.Namespace, *, clock: Callable[[], float] = time.monoton
         "deadline_reached": deadline_reached,
         "batch_plan_hash": plan["batch_plan_hash"],
         "validation_probe_hash": plan["validation_probe_hash"],
+        "validation_batch_size": args.validation_batch_size,
         "batch_cursor": batch_cursor,
         "checkpoint_kind": "final_latest",
         "optimizer_steps_this_run": run_steps,
@@ -1400,6 +1470,7 @@ def train(args: argparse.Namespace, *, clock: Callable[[], float] = time.monoton
         "head_weights": extra["head_weights"],
         "head_weights_hash": extra["head_weights_hash"],
         "gradient_accumulation_steps": plan["gradient_accumulation_steps"],
+        "validation_batch_size": args.validation_batch_size,
         "retain_periodic_checkpoints": bool(args.retain_periodic_checkpoints),
         "supervision_controllers": list(args.supervision_controllers),
         "warm_start": extra["warm_start"],
@@ -1508,6 +1579,6 @@ atomic_write_json = _atomic_write_json
 sha256_file = _sha256_file
 
 __all__ = [
-    "AI42TrainingError", "DEFAULT_SEED", "GATE_HEAD_ACCURACY_FLOOR", "GATE_LOSS_IMPROVEMENT", "MAX_OPTIMIZER_SECONDS", "ProbeSummary", "ValidationSummary",
-    "atomic_write_json", "build_parser", "evaluate_probe", "head_weights_hash", "main", "promotion_gate", "run_training", "sha256_file", "train", "validate_head_weights",
+    "AI42TrainingContext", "AI42TrainingError", "DEFAULT_SEED", "GATE_HEAD_ACCURACY_FLOOR", "GATE_LOSS_IMPROVEMENT", "MAX_OPTIMIZER_SECONDS", "ProbeSummary", "ValidationSummary",
+    "atomic_write_json", "build_parser", "evaluate_probe", "head_weights_hash", "main", "prepare_training_context", "promotion_gate", "run_training", "sha256_file", "train", "validate_head_weights",
 ]

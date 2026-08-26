@@ -185,6 +185,29 @@ The deterministic batch plan persists its hash and exact cursor. Resume with
 `--resume <run-directory>\latest.pt`. Accepted candidates are immutable
 generations selected through the atomically replaced `accepted_pointer.json`.
 
+Validation uses the same frozen sequences and class profile as training, but
+packs independent sequences with `training.validation_batch_size` (256 in the
+production config). This does not change recurrent boundaries or checkpoint
+lineage. On the RTX 5090 reference host it reduced one 16-match validation
+probe from roughly 154 seconds at batch 8 to 17.2 seconds at batch 256 while
+keeping loss within `1.4e-8` and action/navigation metrics unchanged.
+
+Retained checkpoints can be ranked without reloading the dataset for every
+candidate:
+
+```powershell
+python -m tanat_ai40.evaluate_ai42_bc_checkpoints `
+  --config .\ai40\config\ai42_bc_training.json `
+  --dataset <dataset-generation> --profile <class-profile.json> `
+  --checkpoint <step-000100.pt> --checkpoint <step-000200.pt> `
+  --output <curve-report.json> --selection-matches 1 `
+  --evaluation-batch-size 256 --patience 3 --device cuda
+```
+
+`--selection-matches` is a cheap, deterministic ranking probe. A selected
+candidate must still pass the full frozen validation probe and the existing
+promotion gate; the proxy never promotes a model by itself.
+
 DAgger collection remains the next data stage. It should collect policy-reached
 states with AI-30 intervention labels, alternate sides, and freeze policy,
 environment, writer, and ONNX hashes in generation provenance. Do not tune the

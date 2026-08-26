@@ -340,3 +340,82 @@ dataset, seed и пятиминутным optimizer budget. Он должен с
 результатами выше по end-to-end action accuracy, ISSUE/CANCEL recall, offset
 top-1 и Manhattan error; снижение только общего loss не является основанием для
 promotion.
+
+### 9.5 Hierarchical kind и первый принятый checkpoint
+
+Первый structured run `v7` выполнил 420 optimizer steps и снизил validation
+loss с `13.5477` до `10.3487`, а end-to-end accuracy поднял с `0.444%` до
+`5.540%`. Он не прошёл promotion: raw kind accuracy упала с `34.94%` до
+`13.50%`, а offset Manhattan error ухудшился с `4.3047` до `5.6515`. Причиной
+оказалось совместное inverse-frequency обучение восьми kind-классов: редкие
+skills вытеснили основной MOVE-класс. Этот checkpoint не является допустимым
+baseline, несмотря на высокий end-to-end результат.
+
+В revisions `aeb5fb6` и `24201af` kind разделён на coarse action group и
+условный выбор Skill1-Skill4. Публичный контракт по-прежнему возвращает восемь
+нормализованных kind log-probabilities. Kind weights стали uniform: coarse head
+обучается на всех ISSUE rows, skill head — только на skill rows. Navigation
+loss дополнен ожидаемым нормализованным Manhattan distance, который напрямую
+штрафует далёкие клетки. Actor содержит `2,169,836` параметров; estimator и
+фактическое число совпадают.
+
+Scratch run `v8` на том же dataset/seed выполнил 420 optimizer steps за 300
+секунд и стал первым принятым checkpoint новой архитектуры:
+
+- validation loss: `13.5298 -> 10.7181`;
+- end-to-end action accuracy: `0.432% -> 0.593%`;
+- raw kind accuracy: `77.88% -> 79.06%`;
+- raw control accuracy: `14.58% -> 38.39%`;
+- target accuracy: `5.11% -> 86.65%`;
+- offset Manhattan error: `6.3050 -> 5.7160`.
+
+Полная кривая retained checkpoints оказалась немонотонной:
+
+| step | validation loss | end-to-end |
+|---:|---:|---:|
+| 100 | 10.8369 | 0.000% |
+| 200 | 10.8810 | 0.325% |
+| 300 | 11.1568 | 0.030% |
+| 400 | 10.7957 | 0.128% |
+| 420 | 10.7181 | 0.593% |
+
+Следовательно, модель уже обучается, но нельзя обещать улучшение каждой
+отдельной эпохи/checkpoint. Корректный контракт — выбирать лучший checkpoint
+на frozen validation и не заменять accepted generation при регрессии.
+
+Контрольный run `v9` с learning rate `1e-4` снизил loss ещё сильнее, до
+`10.3934`, но end-to-end составил только `0.164%`, ниже начальных `0.432%`;
+promotion был отклонён. Production learning rate остаётся `3e-4`: одного
+сглаживания scalar loss недостаточно.
+
+### 9.6 Двухуровневая и ускоренная validation
+
+Первоначальный full probe состоял из 462 batch'ей по 8 sequences и 64
+последовательных actor steps. Это создавало около 29,500 мелких Python-driven
+GPU launches; во время замера RTX 5090 была загружена лишь на 16% и использовала
+2.6 GiB VRAM. Один checkpoint оценивался примерно 154 секунды.
+
+Validation batch отделён от training batch: training остаётся равным 8, а
+независимые validation sequences упаковываются по 256. На одном и том же
+checkpoint step 400 получены следующие результаты:
+
+| validation batch | physical batches | elapsed |
+|---:|---:|---:|
+| 8 | 462 | ~154 s |
+| 64 | 64 | 29.55 s |
+| 128 | 34 | 20.20 s |
+| 256 | 20 | 17.22 s |
+
+При batch 256 end-to-end и Manhattan metrics совпали точно, а отличие loss от
+batch 8 составило менее `1.4e-8`. Обычный no-update training smoke с pre- и
+post-validation, checkpoint validation и публикацией отчёта занял 41.3
+секунды вместо примерно 4.5 минуты. Production config явно фиксирует
+`validation_batch_size: 256`, native Go preflight проверяет и публикует это
+значение.
+
+Для частой проверки нескольких checkpoints добавлен однопроходный evaluator.
+Он загружает dataset один раз, проверяет exact checkpoint lineage и может
+ранжировать кандидатов на фиксированном `selection-matches` probe. Только
+лучший proxy-кандидат проходит полный probe; proxy не имеет права самостоятельно
+заменить accepted generation. Patience формирует early-stop signal, но не
+ослабляет полный promotion gate.

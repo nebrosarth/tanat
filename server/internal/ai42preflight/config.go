@@ -7,10 +7,11 @@ import (
 )
 
 var defaultConfig = Config{
-	ProtocolVersion: ProtocolVersion,
-	Model:           ModelConfig{HiddenSize: 192, ModelWidth: 192, EntityLayers: 2, NumHeads: 6, FFMultiplier: 4},
-	SequenceLength:  64,
-	BatchSize:       8,
+	ProtocolVersion:     ProtocolVersion,
+	Model:               ModelConfig{HiddenSize: 192, ModelWidth: 192, EntityLayers: 2, NumHeads: 6, FFMultiplier: 4},
+	SequenceLength:      64,
+	BatchSize:           8,
+	ValidationBatchSize: 8,
 	Learner: LearnerConfig{
 		LearningRate: 3e-4, WeightDecay: 1e-4, ClassBalancePower: 1.0, OffsetDistanceLossWeight: 1.0, MaxGradientNorm: 1.0,
 		HeadWeights: map[string]float64{"control": 1, "kind": 1, "target": 1, "offset": 1, "anchor": 1},
@@ -25,7 +26,7 @@ var modelFields = map[string]struct{}{
 var recurrentFields = map[string]struct{}{"sequence_length": {}, "batch_size": {}}
 var trainingFields = map[string]struct{}{
 	"seed": {}, "max_optimizer_seconds": {}, "max_steps": {}, "epochs": {}, "validation_batches": {}, "validation_epsilon": {},
-	"checkpoint_interval": {}, "validation_matches": {}, "supervision_controllers": {},
+	"checkpoint_interval": {}, "validation_matches": {}, "supervision_controllers": {}, "validation_batch_size": {},
 }
 
 // LoadConfig reads the single production training config. Training settings
@@ -119,7 +120,7 @@ func parseTrainingConfig(root map[string]any, config *Config) error {
 	if err != nil {
 		return err
 	}
-	if err := exactFields(training, map[string]struct{}{"seed": {}, "max_optimizer_seconds": {}, "max_steps": {}, "epochs": {}, "validation_batches": {}, "validation_epsilon": {}}, map[string]struct{}{"checkpoint_interval": {}, "validation_matches": {}, "supervision_controllers": {}}, "training config.training"); err != nil {
+	if err := exactFields(training, map[string]struct{}{"seed": {}, "max_optimizer_seconds": {}, "max_steps": {}, "epochs": {}, "validation_batches": {}, "validation_epsilon": {}}, map[string]struct{}{"checkpoint_interval": {}, "validation_matches": {}, "supervision_controllers": {}, "validation_batch_size": {}}, "training config.training"); err != nil {
 		return err
 	}
 	seed, err := asInt(training["seed"], "training config.training.seed", 0, 1<<32-1)
@@ -145,6 +146,14 @@ func parseTrainingConfig(root map[string]any, config *Config) error {
 		return err
 	}
 	config.ValidationProbeLimit = int(validationBatches)
+	config.ValidationBatchSize = config.BatchSize
+	if value, ok := training["validation_batch_size"]; ok {
+		validationBatchSize, err := asInt(value, "training config.training.validation_batch_size", 1, MaxValidationBatchSize)
+		if err != nil {
+			return err
+		}
+		config.ValidationBatchSize = int(validationBatchSize)
+	}
 	if value, ok := training["validation_matches"]; ok {
 		validationMatches, err := asInt(value, "training config.training.validation_matches", 1, 1<<31-1)
 		if err != nil {
@@ -278,6 +287,9 @@ func (config Config) Validate() error {
 	}
 	if config.BatchSize*config.SequenceLength > MaxBatchRows {
 		return fmt.Errorf("recurrent batch exceeds bounded row limit")
+	}
+	if config.ValidationBatchSize < 1 || config.ValidationBatchSize > MaxValidationBatchSize {
+		return fmt.Errorf("validation_batch_size must be in [1,%d]", MaxValidationBatchSize)
 	}
 	if config.Learner.ClassBalancePower != 1.0 {
 		return fmt.Errorf("AI-42 BC-v2 freezes class_balance_power at 1")

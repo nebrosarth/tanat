@@ -11,23 +11,24 @@ import (
 )
 
 const (
-	TorchProtocol      = "AI42-torch-preflight-v1"
-	BatchPlanVersion   = "AI42-bc-batch-plan-v2"
-	ProfileFormat      = "AI42-bc-class-profile-v7"
-	ProfileVersion     = ProfileFormat
-	SupervisionVersion = "AI42-supervision-v2"
-	ReplayScope        = "durable-v2"
-	ProtocolVersion    = 13
-	TorchWorkerModule  = "tanat_ai40.torch_probe_worker_ai42"
-	MaxWorkerRequest   = 64 * 1024 * 1024
-	MaxWorkerBundle    = 32 * 1024 * 1024
-	MaxWorkerStdout    = 64 * 1024 * 1024
-	MaxWorkerStderr    = 1 * 1024 * 1024
-	MaxWorkerTimeout   = 10 * time.Minute
-	MaxWarmStart       = 512 * 1024 * 1024
-	MaxSequenceLength  = 64
-	MaxBatchSize       = 64
-	MaxBatchRows       = MaxSequenceLength * MaxBatchSize
+	TorchProtocol          = "AI42-torch-preflight-v1"
+	BatchPlanVersion       = "AI42-bc-batch-plan-v2"
+	ProfileFormat          = "AI42-bc-class-profile-v7"
+	ProfileVersion         = ProfileFormat
+	SupervisionVersion     = "AI42-supervision-v2"
+	ReplayScope            = "durable-v2"
+	ProtocolVersion        = 13
+	TorchWorkerModule      = "tanat_ai40.torch_probe_worker_ai42"
+	MaxWorkerRequest       = 64 * 1024 * 1024
+	MaxWorkerBundle        = 32 * 1024 * 1024
+	MaxWorkerStdout        = 64 * 1024 * 1024
+	MaxWorkerStderr        = 1 * 1024 * 1024
+	MaxWorkerTimeout       = 10 * time.Minute
+	MaxWarmStart           = 512 * 1024 * 1024
+	MaxSequenceLength      = 64
+	MaxBatchSize           = 64
+	MaxValidationBatchSize = 512
+	MaxBatchRows           = MaxSequenceLength * MaxBatchSize
 )
 
 // TorchOutput is the bounded result of one worker process. ExitCode is kept
@@ -87,10 +88,11 @@ type LearnerConfig struct {
 // Config is the strict native preflight view of the production training
 // configuration. Training controls never authorize an optimizer update here.
 type Config struct {
-	ProtocolVersion int
-	Model           ModelConfig
-	SequenceLength  int
-	BatchSize       int
+	ProtocolVersion     int
+	Model               ModelConfig
+	SequenceLength      int
+	BatchSize           int
+	ValidationBatchSize int
 	// ValidationProbeLimit follows the trainer: an explicit
 	// validation_matches value wins, otherwise validation_batches is used.
 	// Zero means retain every validated match (the validation-only config has

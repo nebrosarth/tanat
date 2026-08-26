@@ -98,6 +98,7 @@ class AI42BCV2Tests(unittest.TestCase):
         self.assertEqual(defaults["num_heads"], 6)
         self.assertEqual(defaults["class_balance_power"], 1.0)
         self.assertEqual(defaults["offset_distance_loss_weight"], 1.0)
+        self.assertEqual(defaults["validation_batch_size"], 256)
         self.assertNotIn("class_weight_overrides", defaults)
         self.assertNotIn("combat_focus", defaults)
         self.assertNotIn("trainable_scope", defaults)
