@@ -107,6 +107,14 @@ class AI42BCV2Tests(unittest.TestCase):
             q4_defaults["head_weights"],
             train_ai42_bc.validate_head_weights(q4_defaults["head_weights"]),
         )
+        q5_path = Path(__file__).resolve().parents[1] / "config" / "ai42_bc_training_q5.json"
+        q5_defaults = train_ai42_bc._training_config_defaults(q5_path)
+        self.assertEqual(q5_defaults["head_weights"], {
+            "anchor": 0.5, "control": 1.0, "kind": 6.0, "offset": 0.5, "target": 1.0,
+        })
+        self.assertEqual(len(q5_defaults["class_weight_overrides"]["kind"]), 8)
+        self.assertEqual(q5_defaults["class_weight_overrides"]["kind"][0], 0.0)
+        self.assertEqual(q5_defaults["class_weight_overrides"]["kind"][7], 0.0)
 
         base = json.loads(q3_path.read_text(encoding="utf-8"))
         malformed = {

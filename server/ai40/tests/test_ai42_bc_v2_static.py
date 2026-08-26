@@ -27,6 +27,7 @@ class AI42BCV2StaticTests(unittest.TestCase):
         for name in (
             "ai42_bc_preflight.json", "ai42_bc_training.json",
             "ai42_bc_training_q3.json", "ai42_bc_training_q4.json",
+            "ai42_bc_training_q5.json",
         ):
             payload = json.loads((ROOT / "config" / name).read_text(encoding="utf-8"))
             self.assertEqual(payload["learner"]["class_balance_power"], 0.5)
@@ -55,6 +56,29 @@ class AI42BCV2StaticTests(unittest.TestCase):
         self.assertEqual(head_weights, {
             "control": 1.0, "kind": 1.5, "target": 1.0, "offset": 2.0, "anchor": 1.0,
         })
+
+    def test_q5_lineage_focuses_kind_without_changing_run_contract(self) -> None:
+        q4 = json.loads((ROOT / "config" / "ai42_bc_training_q4.json").read_text(encoding="utf-8"))
+        q5 = json.loads((ROOT / "config" / "ai42_bc_training_q5.json").read_text(encoding="utf-8"))
+        self.assertEqual(q5["model"], q4["model"])
+        self.assertEqual(q5["recurrent_batch"], q4["recurrent_batch"])
+        self.assertEqual(q5["training"], q4["training"])
+        for field in ("learning_rate", "weight_decay", "class_balance_power", "max_gradient_norm"):
+            self.assertEqual(q5["learner"][field], q4["learner"][field])
+        self.assertEqual(q5["learner"]["class_weight_overrides"]["control"], q4["learner"]["class_weight_overrides"]["control"])
+        self.assertEqual(q5["learner"]["head_weights"], {
+            "control": 1.0, "kind": 6.0, "target": 1.0, "offset": 0.5, "anchor": 0.5,
+        })
+
+        counts = [0, 568057, 152021, 9059, 1736, 705, 226, 0]
+        desired_mass = [0.0, 0.40, 0.30, 0.15, 0.06, 0.045, 0.045, 0.0]
+        weights = q5["learner"]["class_weight_overrides"]["kind"]
+        supported = [weight for count, weight in zip(counts, weights) if count]
+        self.assertAlmostEqual(sum(supported) / len(supported), 1.0, places=12)
+        masses = [count * weight for count, weight in zip(counts, weights)]
+        total_mass = sum(masses)
+        for actual, expected in zip(masses, desired_mass):
+            self.assertAlmostEqual(actual / total_mass, expected, places=12)
 
     def test_override_provenance_is_present_in_production_source(self) -> None:
         trainer = (ROOT / "src" / "tanat_ai40" / "train_ai42_bc.py").read_text(encoding="utf-8")
