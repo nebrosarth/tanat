@@ -274,6 +274,33 @@ The temporary AI-30 local/team profile is restored before the result leaves the
 server, so expert takeover cannot silently convert a policy slot or team into a
 scripted controller for later ticks.
 
+### AI-42 native-inference benchmark
+
+`tanat-ai42-benchmark-inference` exports an immutable generation to the complete
+actor-only ONNX interface and compares synchronous PyTorch and ONNX Runtime
+calls at the rollout boundary. The interface includes `control`, every action
+head, and recurrent `next_h`/`next_c`; export fails if parity does not hold.
+CUDA benchmarks also fail closed if ONNX Runtime silently falls back to CPU.
+
+On the RTX 3070 Laptop GPU, Q9 step 45 at batch 10 measured 14.69 ms per batch
+with eager PyTorch BF16 and 7.51 ms with ONNX Runtime CUDA, a 1.96x speedup.
+The full two-match evaluator attributed 88.9% of its 600-tick wall time to model
+inference and only 6.0% to the Go simulation. Peak PyTorch reserved VRAM was
+78 MiB, so this actor can coexist with a larger GPU workload by limiting its
+batch without treating VRAM as the primary bottleneck.
+
+For CUDA 12 PyTorch wheels use the `onnx-gpu` optional dependency. It pins ORT
+below 1.27 because ORT 1.27 and newer PyPI GPU wheels require CUDA 13; the
+benchmark preloads PyTorch's matching CUDA/cuDNN DLLs before creating the CUDA
+execution provider.
+
+```powershell
+tanat-ai42-benchmark-inference <generation.pt> `
+  --config .\ai40\config\ai42_bc_training_q9.json `
+  --batch 10 --iterations 100 --warmup 20 --device cuda `
+  --onnx <actor.onnx> --output <benchmark.json>
+```
+
 Run the evaluator from `server` with:
 
 ```powershell

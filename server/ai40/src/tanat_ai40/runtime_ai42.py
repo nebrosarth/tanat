@@ -67,6 +67,7 @@ ACTOR_INPUT_NAMES = (
     "c",
 )
 ACTOR_OUTPUT_NAMES = (
+    "control",
     "kind",
     "target",
     "offset",

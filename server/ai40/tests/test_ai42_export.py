@@ -105,9 +105,11 @@ class AI42ExportTest(unittest.TestCase):
             "hero", "abilities", "entities", "global_state", "entity_mask", "h", "c",
         ])
         self.assertEqual([*ACTOR_OUTPUT_NAMES], [
-            "kind", "target", "offset", "anchor", "timing", "timing_aux", "next_h", "next_c",
+            "control", "kind", "target", "offset", "anchor", "timing", "timing_aux",
+            "next_h", "next_c",
         ])
-        self.assertEqual(tuple(output[0].shape), (1, 8))
+        self.assertEqual(tuple(output[0].shape), (1, 4))
+        self.assertEqual(tuple(output[1].shape), (1, 8))
         self.assertEqual(tuple(output[-1].shape), (1, 8))
 
     def test_critic_cannot_be_exported(self) -> None:

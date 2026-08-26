@@ -82,14 +82,12 @@ class _EntityAttentionBlock(nn.Module):
         # contains zero because masked tokens were cleared above.
         safe_mask = entity_mask.clone()
         empty = ~entity_mask.any(dim=1)
-        dummy_slot = torch.cat(
-            (
-                torch.ones_like(safe_mask[:, :1]),
-                torch.zeros_like(safe_mask[:, 1:]),
-            ),
-            dim=1,
+        # Boolean-output ONNX Where is not implemented by all ORT execution
+        # providers.  OR-ing the empty-row marker into slot zero is exactly the
+        # same dummy-key rule and lowers to portable boolean operators.
+        safe_mask = torch.cat(
+            (safe_mask[:, :1] | empty.unsqueeze(1), safe_mask[:, 1:]), dim=1,
         )
-        safe_mask = torch.where(empty.unsqueeze(1), dummy_slot, safe_mask)
 
         normalized = self.norm_attention(tokens)
         attended, _ = self.attention(

@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import unittest
+from unittest import mock
+from pathlib import Path
 
 import numpy as np
 import torch
 
 from tanat_ai40.env import ACTION_KINDS, HERO_COUNT, MAX_ENTITIES, NAVIGATION_ANCHORS, NAVIGATION_OFFSETS
-from tanat_ai40.evaluate_ai42 import AI42EvaluationActor, controllers_for_side
+from tanat_ai40.evaluate_ai42 import AI42EvaluationActor, controllers_for_side, evaluate_vs_ai30
 from tanat_ai40.evaluate_ai42 import (
     RUNTIME_CONTROL_HOLD, RUNTIME_CONTROL_IDLE, RUNTIME_CONTROL_ISSUE,
 )
@@ -70,6 +72,37 @@ class _Observations:
         self.active_order = active_order
 
 
+class _TerminalObservations(_Observations):
+    def __init__(self):
+        super().__init__(active_order=np.zeros(HERO_COUNT, dtype=np.uint8))
+        self.step = 1
+        self.elapsed = 0.2
+        self.done = True
+        self.winner = 1
+        self.invalid = np.zeros(HERO_COUNT, dtype=np.uint8)
+        self.rewards = np.zeros(HERO_COUNT, dtype=np.float32)
+
+
+class _OneStepEnv:
+    def __init__(self, _executable, workers, _protocol):
+        self.workers = workers
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_args):
+        return None
+
+    def reset(self, *_args, **_kwargs):
+        return [_Observations(active_order=np.zeros(HERO_COUNT, dtype=np.uint8))]
+
+    def step(self, _actions):
+        return [_TerminalObservations()]
+
+    def reset_indices(self, *_args, **_kwargs):
+        raise AssertionError("terminal one-match evaluation must not reset a worker")
+
+
 class AI42EvaluationTests(unittest.TestCase):
     def test_controllers_alternate_candidate_side(self) -> None:
         self.assertEqual(controllers_for_side(1)[:5], (3,) * 5)
@@ -118,6 +151,26 @@ class AI42EvaluationTests(unittest.TestCase):
         self.assertTrue(torch.equal(actor.seen_h[1], torch.zeros_like(actor.seen_h[1])))
         self.assertTrue(torch.equal(actor.seen_h[2], torch.zeros_like(actor.seen_h[2])))
         self.assertTrue(torch.equal(actor.seen_h[3], torch.ones_like(actor.seen_h[3])))
+
+    def test_evaluation_reports_inference_and_environment_phase_profile(self) -> None:
+        actor = _FixedActor()
+        lineage = {"checkpoint_sha256": "0" * 64}
+        with (
+            mock.patch("tanat_ai40.evaluate_ai42.load_actor", return_value=(actor, lineage)),
+            mock.patch("tanat_ai40.evaluate_ai42.AssaultVectorEnv", _OneStepEnv),
+        ):
+            metrics = evaluate_vs_ai30(
+                Path("checkpoint.pt"), Path("config.json"), Path("assaultenv.exe"),
+                matches=1, workers=1, max_steps=1, device=torch.device("cpu"), seed=1,
+            )
+        profile = metrics["runtime_profile"]
+        self.assertEqual(profile["version"], 1)
+        self.assertEqual(profile["device"], "cpu")
+        self.assertEqual(profile["policy_batches"], 1)
+        self.assertEqual(profile["policy_rows"], HERO_COUNT // 2)
+        self.assertIsNone(profile["cuda_memory"])
+        self.assertGreaterEqual(profile["model_inference_seconds"], 0.0)
+        self.assertGreaterEqual(profile["environment_step_seconds"], 0.0)
 
 
 if __name__ == "__main__":

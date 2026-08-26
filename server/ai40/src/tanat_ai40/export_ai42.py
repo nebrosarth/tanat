@@ -76,6 +76,7 @@ class AI42ActorONNXWrapper(nn.Module):
     ) -> tuple[torch.Tensor, ...]:
         output = self.actor(hero, abilities, entities, global_state, entity_mask, h, c)
         return (
+            output["control"],
             output["kind"],
             output["target"],
             output["offset"],
@@ -280,7 +281,14 @@ def export_ai42_actor(
         }
     temporary_output = _temporary_path(output)
     temporary_sidecar = _temporary_path(sidecar) if sidecar is not None else None
+    mha_fastpath = torch.backends.mha.get_fastpath_enabled()
     try:
+        # Eval-mode MultiheadAttention otherwise selects the fused
+        # aten::_native_multi_head_attention fast path, which the ONNX exporter
+        # cannot lower.  The decomposed path is numerically equivalent and is
+        # composed of standard operators understood by ORT/TensorRT.  Keep the
+        # process-global setting scoped to this export even when export fails.
+        torch.backends.mha.set_fastpath_enabled(False)
         with torch.no_grad():
             torch.onnx.export(
                 wrapper,
@@ -303,6 +311,7 @@ def export_ai42_actor(
             artifacts.append((temporary_sidecar, sidecar))
         _replace_transactionally(artifacts)
     finally:
+        torch.backends.mha.set_fastpath_enabled(mha_fastpath)
         temporary_output.unlink(missing_ok=True)
         if temporary_sidecar is not None:
             temporary_sidecar.unlink(missing_ok=True)

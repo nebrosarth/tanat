@@ -247,7 +247,9 @@ def evaluate_vs_ai30(
 ) -> dict[str, Any]:
     if matches < 1 or workers < 1 or max_steps < 1:
         raise ValueError("matches, workers and max_steps must be positive")
+    load_started = time.perf_counter()
     actor, lineage = load_actor(checkpoint, config, device)
+    model_load_seconds = time.perf_counter() - load_started
     workers = min(workers, matches)
     roster_rng = np.random.default_rng(seed)
     next_match = workers
@@ -259,21 +261,34 @@ def evaluate_vs_ai30(
     runtime_controls = np.zeros(len(RUNTIME_CONTROL_NAMES), dtype=np.int64)
     invalid = total_steps = 0
     candidate_reward = 0.0
+    inference_seconds = 0.0
+    environment_step_seconds = 0.0
+    environment_reset_seconds = 0.0
+    policy_batches = 0
+    policy_rows = 0
+    if device.type == "cuda":
+        torch.cuda.reset_peak_memory_stats(device)
     started = time.perf_counter()
     with AssaultVectorEnv(executable, workers, AI42_EVALUATION_PROTOCOL_VERSION) as env:
+        reset_started = time.perf_counter()
         observations = env.reset(
             range(seed, seed + workers), max_steps,
             controller_sets=[controllers_for_side(side) for side in assignments],
             rosters=self_play_rosters(roster_rng, workers),
         )
+        environment_reset_seconds += time.perf_counter() - reset_started
         next_seed = seed + workers
         evaluator = AI42EvaluationActor(actor, workers * (HERO_COUNT // 2), device)
         completed = 0
         while completed < matches:
             indices = controlled_slot_indices(assignments)
+            inference_started = time.perf_counter()
             candidate_actions, candidate_runtime, candidate_model = evaluator.act(
                 observations, indices,
             )
+            inference_seconds += time.perf_counter() - inference_started
+            policy_batches += 1
+            policy_rows += int(indices.size)
             action_values = np.zeros((workers, HERO_COUNT, 5), dtype=np.int16)
             for index, side in enumerate(assignments):
                 if side == 0:
@@ -293,7 +308,9 @@ def evaluate_vs_ai30(
                 model_controls += np.bincount(
                     candidate_model[source], minlength=CONTROL_CLASSES,
                 )
+            step_started = time.perf_counter()
             results = env.step(action_values)
+            environment_step_seconds += time.perf_counter() - step_started
             reset_indices: list[int] = []
             reset_seeds: list[int] = []
             reset_controllers: list[tuple[int, ...]] = []
@@ -324,11 +341,13 @@ def evaluate_vs_ai30(
                 evaluator.reset_workers([index])
             observations = results
             if reset_indices:
+                reset_started = time.perf_counter()
                 replacements = env.reset_indices(
                     reset_indices, reset_seeds, max_steps,
                     controller_sets=reset_controllers,
                     rosters=self_play_rosters(roster_rng, len(reset_indices)),
                 )
+                environment_reset_seconds += time.perf_counter() - reset_started
                 for index, replacement in replacements.items():
                     observations[index] = replacement
     elapsed = time.perf_counter() - started
@@ -337,6 +356,13 @@ def evaluate_vs_ai30(
     action_total = max(int(actions.sum()), 1)
     runtime_control_total = max(int(runtime_controls.sum()), 1)
     model_control_total = max(int(model_controls.sum()), 1)
+    accounted_seconds = inference_seconds + environment_step_seconds + environment_reset_seconds
+    cuda_memory = None
+    if device.type == "cuda":
+        cuda_memory = {
+            "peak_allocated_bytes": int(torch.cuda.max_memory_allocated(device)),
+            "peak_reserved_bytes": int(torch.cuda.max_memory_reserved(device)),
+        }
     return {
         "format": "AI42-headless-evaluation-v1",
         "protocol_version": AI42_EVALUATION_PROTOCOL_VERSION,
@@ -386,6 +412,22 @@ def evaluate_vs_ai30(
         "protocol_faithful": True,
         "elapsed_seconds": elapsed,
         "matches_per_second": matches / max(elapsed, 1e-9),
+        "runtime_profile": {
+            "version": 1,
+            "device": str(device),
+            "model_load_seconds": model_load_seconds,
+            "model_inference_seconds": inference_seconds,
+            "environment_step_seconds": environment_step_seconds,
+            "environment_reset_seconds": environment_reset_seconds,
+            "accounted_seconds": accounted_seconds,
+            "unaccounted_seconds": max(0.0, elapsed - accounted_seconds),
+            "model_inference_share": inference_seconds / max(elapsed, 1e-9),
+            "environment_step_share": environment_step_seconds / max(elapsed, 1e-9),
+            "policy_batches": policy_batches,
+            "policy_rows": policy_rows,
+            "policy_rows_per_second": policy_rows / max(inference_seconds, 1e-9),
+            "cuda_memory": cuda_memory,
+        },
     }
 
 
