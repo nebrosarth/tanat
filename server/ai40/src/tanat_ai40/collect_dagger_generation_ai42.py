@@ -62,10 +62,26 @@ def build_dagger_schedule(
 ) -> tuple[dict[str, Any], tuple[MatchSpec, ...]]:
     if isinstance(matches, bool) or not isinstance(matches, int) or matches < 1:
         raise ValueError("matches must be a positive integer")
+    if matches % 2:
+        raise ValueError("matches must be even to balance both candidate sides")
     if isinstance(max_steps, bool) or not isinstance(max_steps, int) or max_steps < 1:
         raise ValueError("max_steps must be a positive integer")
-    if not math.isfinite(validation_fraction) or not 0 <= validation_fraction <= 1:
+    if (
+        isinstance(validation_fraction, bool)
+        or not isinstance(validation_fraction, (int, float))
+        or not math.isfinite(validation_fraction)
+        or not 0 <= validation_fraction <= 1
+    ):
         raise ValueError("validation_fraction must be between zero and one")
+    if isinstance(split_seed, bool) or not isinstance(split_seed, int):
+        raise ValueError("split_seed must be an integer")
+    side_matches = matches // 2
+    validation_per_side_float = side_matches * float(validation_fraction)
+    validation_per_side = round(validation_per_side_float)
+    if not math.isclose(validation_per_side_float, validation_per_side, abs_tol=1e-12):
+        raise ValueError(
+            "validation_fraction must select an integer number of matches per side"
+        )
     MarginInterventionGate(HERO_COUNT // 2, threshold, min_gap_ticks)
     seeds = deterministic_seed_schedule(seed, matches)
     specs = tuple(
@@ -73,7 +89,7 @@ def build_dagger_schedule(
             index=index,
             seed=match_seed,
             match_id=f"ai42-dagger-{seed}-{index:06d}",
-            scenario="ai42_dagger_vs_ai30",
+            scenario=f"ai42_dagger_candidate_side{index % 2 + 1}_vs_ai30",
             controller_by_slot=_controllers(index % 2 + 1),
             roster_ids=_roster(match_seed, index),
         )
@@ -102,6 +118,13 @@ def build_dagger_schedule(
         ],
         "max_steps": max_steps,
         "policy_lineage": lineage,
+        "scenario_mix": {
+            f"ai42_dagger_candidate_side{side}_vs_ai30": {
+                "train": side_matches - validation_per_side,
+                "validation": validation_per_side,
+            }
+            for side in (1, 2)
+        },
         "seed": seed,
         "split_seed": split_seed,
         "validation_fraction": validation_fraction,
@@ -375,7 +398,7 @@ def main() -> None:
     parser.add_argument("--intervention-margin", type=float, required=True)
     parser.add_argument("--intervention-gap-ticks", type=int, default=5)
     parser.add_argument("--split-seed", type=int, default=42)
-    parser.add_argument("--validation-fraction", type=float, default=0.125)
+    parser.add_argument("--validation-fraction", type=float, default=0.25)
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     args = parser.parse_args()
     result = collect_dagger_generation(

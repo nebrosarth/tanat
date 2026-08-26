@@ -300,9 +300,10 @@ tanat-ai42-collect-dagger <generation.pt> `
 batch of scalar simulation processes, alternates the candidate between sides,
 and publishes one immutable generation with one schedule and policy lineage.
 Every match is decoded, strictly replayed, and compressed by its own Go writer;
-the final merge copies compressed payloads without decompression. A two-match,
-two-worker, 200-tick integration run completed in 3.29 seconds (60.8 aggregate
-ticks/second), produced no invalid actions, and passed the strict dataset audit.
+the final merge copies compressed payloads without decompression. A four-match,
+four-worker, 400-tick integration run completed in 5.47 seconds (73.1 aggregate
+ticks/second), produced no invalid actions, and passed strict train/validation
+audits with one candidate-side-1 and one candidate-side-2 match in each split.
 
 ```powershell
 tanat-ai42-collect-dagger-generation <generation.pt> `
@@ -311,8 +312,12 @@ tanat-ai42-collect-dagger-generation <generation.pt> `
   --output <dataset-dir> --onnx <actor.onnx> `
   --seed 54200 --matches 8 --workers 4 --max-steps 4500 `
   --intervention-margin 0.08 --intervention-gap-ticks 5 `
-  --validation-fraction 0.125 --split-seed 42 --device cuda
+  --validation-fraction 0.25 --split-seed 42 --device cuda
 ```
+
+The match count must be even. Train/validation assignment is stratified by the
+candidate side, and the validation fraction must therefore select an integer
+number of matches from each side.
 
 ### AI-42 native-inference benchmark
 
