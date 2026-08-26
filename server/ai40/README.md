@@ -148,8 +148,10 @@ an LSTM state per hero. Non-skill actions are classified from recurrent state.
 Skill1-Skill4 are scored from their corresponding ability token plus recurrent
 context, preserving slot-specific cooldown/readiness information. The actor
 exports only the heads consumed by protocol v13: control, kind, target, offset,
-anchor, and recurrent state. Timing heads, a centralized critic, and a separate
-macro network are deferred until a real PPO or timing contract needs them.
+anchor, and recurrent state. Timing heads, a privileged centralized critic,
+and a separate macro network remain outside the runtime contract. PPO adds a
+small training-only value head over recurrent belief state; its value gradient
+is detached from the actor, so critic regression cannot erase BC behavior.
 
 Class balancing is derived once from the immutable training split profile.
 Manual class-weight overrides, repeated-kind curricula, and partial-head
@@ -232,6 +234,51 @@ python -m tanat_ai40.collect_dagger_generation_ai42 <checkpoint.pt> `
 The intervention strategy and its parameters are part of the immutable
 collector-v2 schedule. The legacy default remains `margin` with threshold
 `0.08` and a five-tick per-hero cooldown.
+
+Behavior cloning and DAgger are bootstrap stages, not the final optimization
+loop. Continue an accepted BC or PPO generation with fresh on-policy recurrent
+rollouts and clipped PPO:
+
+```powershell
+python -m tanat_ai40.train_ai42_ppo <champion-or-resume.pt> `
+  --config .\ai40\config\ai42_bc_training.json `
+  --env .\assaultenv.exe --output <ppo-run> --device cuda `
+  --workers 8 --rollout-steps 64 --train-seconds 900 `
+  --past-opponent-fraction 0.2
+```
+
+Eighty percent of the default worker batch is current-policy mirror self-play.
+The remaining twenty percent uses the immutable input checkpoint as a frozen
+past opponent, with candidate sides alternated. The learner replays complete
+per-hero sequences, computes terminal-aware GAE, and stores actor, critic,
+optimizer, lineage, RNG, and metrics in an atomic PPO checkpoint. Reward-free
+opening windows with an untrained zero critic perform no optimizer step.
+
+Never promote from training loss. Compare the candidate directly with its
+champion on alternating sides and identical seed policy:
+
+```powershell
+python -m tanat_ai40.evaluate_ai42_pair `
+  <ppo-run>\final.pt <champion.pt> `
+  --config .\ai40\config\ai42_bc_training.json `
+  --env .\assaultenv.exe --matches 40 --workers 8 --device cuda `
+  --output <ppo-run>\paired-evaluation.json
+```
+
+The paired report records wins/losses/draws, side splits, rewards, invalid
+actions, issued actions, match duration, and immutable checkpoint lineage.
+The existing `tanat-ai42-eval` remains the independent AI-30 anchor.
+
+The complete default 15-minute train/evaluate iteration is one command:
+
+```powershell
+python -m tanat_ai40.cycle_ai42_ppo <champion.pt> `
+  --config .\ai40\config\ai42_bc_training.json `
+  --env .\assaultenv.exe --output <cycle-directory> --device cuda
+```
+
+It evaluates candidate and champion on the same AI-30 seeds and writes a
+promotion recommendation. It never replaces a champion automatically.
 
 ONNX is the deployment/runtime format. Export validates the exact actor-only
 interface and PyTorch/ONNX parity; CUDA execution must fail closed if ONNX

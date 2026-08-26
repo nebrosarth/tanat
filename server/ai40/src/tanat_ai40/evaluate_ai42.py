@@ -73,11 +73,24 @@ def _model_kwargs(defaults: Mapping[str, Any]) -> dict[str, int]:
 
 
 def load_actor(checkpoint: Path, config_path: Path, device: torch.device) -> tuple[AI42Actor, dict[str, Any]]:
-    """Fully validate one immutable BC generation and load only its actor."""
+    """Fully validate one immutable BC/PPO generation and load only its actor."""
 
     defaults = _training_config_defaults(config_path)
     model_kwargs = _model_kwargs(defaults)
     actor = AI42Actor(**model_kwargs)
+    saved = torch.load(checkpoint, map_location="cpu", weights_only=True)
+    if isinstance(saved, Mapping) and saved.get("format") == "AI42-ppo-checkpoint-v1":
+        if dict(saved.get("model_kwargs", {})) != model_kwargs:
+            raise RuntimeError("AI-42 PPO model settings do not match evaluation config")
+        actor.load_state_dict(saved["actor_state_dict"], strict=True)
+        actor.to(device).eval().requires_grad_(False)
+        return actor, {
+            "checkpoint_sha256": _file_sha256(checkpoint),
+            "format": saved["format"],
+            "source_lineage": dict(saved.get("source_lineage", {})),
+            "step": int(saved.get("update", 0)),
+            "hero_steps": int(saved.get("hero_steps", 0)),
+        }
     artifact = inspect_ai42_checkpoint(checkpoint, model=actor, map_location="cpu")
     manifest = dict(artifact.manifest)
     required = {
@@ -106,7 +119,6 @@ def load_actor(checkpoint: Path, config_path: Path, device: torch.device) -> tup
     for field in ("model_hash", "config_hash", "dataset_hash"):
         if reconstructed[field] != manifest[field]:
             raise RuntimeError(f"AI-42 checkpoint {field} does not match evaluation lineage")
-    saved = torch.load(checkpoint, map_location="cpu", weights_only=True)
     actor.load_state_dict(saved["model_state_dict"], strict=True)
     actor.to(device).eval().requires_grad_(False)
     return actor, {
