@@ -202,6 +202,35 @@ proposals must first recover attack/skill coverage, then pass the same
 side-balanced AI-42-versus-AI-30 headless suite. This prevents aggregate loss
 or move-dominated micro-accuracy from promoting a non-combat policy.
 
+### Q5 combat-recovery result
+
+Q5 uses `config/ai42_bc_training_q5.json` and model-only warm-starts from the
+rejected Q4 generation. It gives the kind head 40%, 30%, 15%, 6%, 4.5% and
+4.5% of effective supervised mass for move, attack and skills 1-4,
+respectively. The kind head weight is `6.0`; offset and anchor are temporarily
+reduced to `0.5`. Model shape, dataset, split, seed and the 300-second optimizer
+budget are unchanged.
+
+The CUDA run completed 361 steps in exactly 300 optimizer seconds. Validation
+loss improved from `11.7898046763` to `10.1870572756`, kind balanced accuracy
+from `.39147` to `.52076`, and end-to-end action accuracy from `2.138%` to
+`2.412%`. Skill-1 recall recovered from zero to `62.5%` and skill-3 reached
+`100%`, but attack and skill-2 recall remained zero. Move recall fell from
+`99.736%` to `97.879%`, exceeding its one-percentage-point regression floor;
+offset distance also regressed. The fail-closed gate therefore rejected Q5 and
+created no accepted generation. The diagnostic `latest.pt` SHA-256 is
+`0a93dc5791a358a9e3b341c734abd666db110ada630a9d280d7512e71cd89085`.
+
+A protocol-faithful diagnostic evaluation of that rejected checkpoint emitted
+3,570 combat actions (3,067 attacks, 360 skill-1 and 143 skill-3), versus zero
+for Q4, with no invalid actions. It still lost all 40 side-balanced matches to
+AI-30; skill-2 and skill-4 were never emitted. Mean match duration increased
+from 5.704 to 7.454 minutes. Q5 is useful evidence that targeted kind weighting
+recovers combat, but it is not deployable. The run-report SHA-256 is
+`a85d514f2587dc9c3da45e80f0acc4b333cd5b0472c174635a40d6107a8066f4`;
+the diagnostic evaluation SHA-256 is
+`73f33ac99f17d7c98a1d179beb0dc3fb35f603f11e1658ebed7a6fd2715e11a8`.
+
 Run the evaluator from `server` with:
 
 ```powershell
