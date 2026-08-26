@@ -296,6 +296,24 @@ tanat-ai42-collect-dagger <generation.pt> `
   --intervention-margin 0.08 --intervention-gap-ticks 5 --device cuda
 ```
 
+`tanat-ai42-collect-dagger-generation` reuses one ONNX session across a bounded
+batch of scalar simulation processes, alternates the candidate between sides,
+and publishes one immutable generation with one schedule and policy lineage.
+Every match is decoded, strictly replayed, and compressed by its own Go writer;
+the final merge copies compressed payloads without decompression. A two-match,
+two-worker, 200-tick integration run completed in 3.29 seconds (60.8 aggregate
+ticks/second), produced no invalid actions, and passed the strict dataset audit.
+
+```powershell
+tanat-ai42-collect-dagger-generation <generation.pt> `
+  --config .\ai40\config\ai42_bc_training_q9.json `
+  --env <assaultenv.exe> --writer <ai42daggerwriter.exe> `
+  --output <dataset-dir> --onnx <actor.onnx> `
+  --seed 54200 --matches 8 --workers 4 --max-steps 4500 `
+  --intervention-margin 0.08 --intervention-gap-ticks 5 `
+  --validation-fraction 0.125 --split-seed 42 --device cuda
+```
+
 ### AI-42 native-inference benchmark
 
 `tanat-ai42-benchmark-inference` exports an immutable generation to the complete

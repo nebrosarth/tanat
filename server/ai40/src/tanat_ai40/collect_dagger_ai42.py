@@ -31,13 +31,70 @@ from .trajectory_ai42 import canonical_json_bytes
 TEACHER_LABEL_STATUSES = np.asarray((1, 2, 3, 4), dtype=np.uint8)
 
 
+class NativeDaggerWriter:
+    """One fail-closed Go shard writer fed by exact scalar protocol frames."""
+
+    def __init__(
+        self, executable: Path, schedule: Path, output: Path,
+        match_index: int, reserve_ticks: int,
+    ) -> None:
+        self.process = subprocess.Popen(
+            [
+                str(executable), "-schedule", str(schedule),
+                "-output", str(output), "-match-index", str(match_index),
+                "-reserve-ticks", str(reserve_ticks),
+            ],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            bufsize=0,
+        )
+        assert self.process.stdin and self.process.stdout and self.process.stderr
+
+    def write(self, request_frame: bytes, result_frame: bytes) -> None:
+        self.process.stdin.write(request_frame)
+        self.process.stdin.write(result_frame)
+
+    def _read_output(self) -> tuple[bytes, bytes]:
+        stdout = b"" if self.process.stdout.closed else self.process.stdout.read()
+        stderr = b"" if self.process.stderr.closed else self.process.stderr.read()
+        return stdout, stderr
+
+    def finish(self) -> tuple[bytes, bytes]:
+        if not self.process.stdin.closed:
+            self.process.stdin.close()
+        exit_code = self.process.wait(timeout=60)
+        stdout, stderr = self._read_output()
+        if exit_code != 0:
+            raise RuntimeError(
+                f"native DAgger writer exited {exit_code}: "
+                f"{stderr.decode(errors='replace')}"
+            )
+        return stdout, stderr
+
+    def abort(self) -> tuple[bytes, bytes]:
+        if self.process.poll() is None:
+            self.process.kill()
+        self.process.wait()
+        return self._read_output()
+
+    def close(self) -> None:
+        for stream in (self.process.stdin, self.process.stdout, self.process.stderr):
+            if stream is not None and not stream.closed:
+                stream.close()
+
+
 class MarginInterventionGate:
     """Deterministic per-hero cooldown over an empirically chosen margin."""
 
     def __init__(self, actors: int, threshold: float, min_gap_ticks: int) -> None:
-        if actors < 1 or not math.isfinite(threshold) or threshold < 0:
+        if isinstance(actors, bool) or not isinstance(actors, int) or actors < 1:
+            raise ValueError("actors must be a positive integer")
+        if not math.isfinite(threshold) or threshold < 0:
             raise ValueError("actors and finite non-negative threshold are required")
-        if isinstance(min_gap_ticks, bool) or min_gap_ticks < 1:
+        if (
+            isinstance(min_gap_ticks, bool)
+            or not isinstance(min_gap_ticks, int)
+            or min_gap_ticks < 1
+        ):
             raise ValueError("min_gap_ticks must be a positive integer")
         self.threshold = float(threshold)
         self.min_gap_ticks = int(min_gap_ticks)
@@ -140,16 +197,9 @@ def collect_dagger_match(
     )
     _atomic_write(schedule_path, canonical_json_bytes(schedule))
 
-    writer = subprocess.Popen(
-        [
-            str(writer_executable), "-schedule", str(schedule_path),
-            "-output", str(output), "-match-index", "0",
-            "-reserve-ticks", str(min(max_steps, 2048)),
-        ],
-        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-        bufsize=0,
+    writer = NativeDaggerWriter(
+        writer_executable, schedule_path, output, 0, min(max_steps, 2048),
     )
-    assert writer.stdin and writer.stdout and writer.stderr
     started = time.perf_counter()
     interventions = 0
     candidate_labels = 0
@@ -174,8 +224,7 @@ def collect_dagger_match(
                 wire[indices, 5] = selected.astype(np.int16)
                 observation = env.step(wire)
                 request_frame, result_frame = env.take_step_exchange()
-                writer.stdin.write(request_frame)
-                writer.stdin.write(result_frame)
+                writer.write(request_frame, result_frame)
                 interventions += int(selected.sum())
                 invalid_actions += int(observation.invalid[indices].sum())
                 candidate_reward += float(observation.rewards[indices].sum())
@@ -187,30 +236,15 @@ def collect_dagger_match(
                 ticks += 1
                 if observation.done:
                     break
-        writer.stdin.close()
-        exit_code = writer.wait(timeout=60)
-        writer_stdout, writer_stderr = writer.stdout.read(), writer.stderr.read()
-        if exit_code != 0:
-            raise RuntimeError(
-                f"native DAgger writer exited {exit_code}: "
-                f"{writer_stderr.decode(errors='replace')}"
-            )
+        writer_stdout, writer_stderr = writer.finish()
     except BaseException as exc:
-        if writer.poll() is None:
-            writer.kill()
-        writer.wait()
-        if writer.stdout is not None and not writer.stdout.closed:
-            writer_stdout = writer.stdout.read()
-        if writer.stderr is not None and not writer.stderr.closed:
-            writer_stderr = writer.stderr.read()
+        writer_stdout, writer_stderr = writer.abort()
         diagnostic = writer_stderr.decode(errors="replace").strip()
         raise RuntimeError(
             f"DAgger collection failed: {exc}; native writer: {diagnostic or '<no stderr>'}"
         ) from exc
     finally:
-        for stream in (writer.stdin, writer.stdout, writer.stderr):
-            if stream is not None and not stream.closed:
-                stream.close()
+        writer.close()
 
     elapsed = time.perf_counter() - started
     metrics = {

@@ -307,6 +307,21 @@ def _validate_staged_match(
         raise AI42DatasetError(f"staged match {spec.match_id} header metadata mismatch")
 
 
+def complete_go_staged_match(
+    root: str | Path,
+    spec: MatchSpec,
+    schedule: Mapping[str, Any],
+) -> None:
+    """Validate a producer result before atomically publishing its COMPLETE marker."""
+
+    root_path = Path(root)
+    _validate_staged_match(root_path, spec, schedule, require_complete=False)
+    marker = root_path / "COMPLETE"
+    temporary = marker.with_name(f".{marker.name}.tmp-{os.getpid()}-{time.time_ns()}")
+    temporary.write_bytes(COMPLETE_MARKER)
+    os.replace(temporary, marker)
+
+
 def _run_go_match(
     spec: MatchSpec,
     output: Path,
@@ -369,8 +384,7 @@ def _stage_one(
             generated.rmdir()
         else:
             runner(spec, schedule, temporary)
-        _validate_staged_match(temporary, spec, schedule, require_complete=False)
-        (temporary / "COMPLETE").write_bytes(COMPLETE_MARKER)
+        complete_go_staged_match(temporary, spec, schedule)
         os.replace(temporary, destination)
     except BaseException:
         shutil.rmtree(temporary, ignore_errors=True)
@@ -670,5 +684,6 @@ if __name__ == "__main__":
 
 __all__ = [
     "GO_SCHEDULE_SCHEMA_VERSION", "GO_STAGING_SCHEMA_VERSION",
-    "build_ai42_dataset_go", "build_go_schedule", "main", "merge_go_staging",
+    "build_ai42_dataset_go", "build_go_schedule", "complete_go_staged_match",
+    "main", "merge_go_staging",
 ]
