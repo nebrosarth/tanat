@@ -653,7 +653,7 @@ class AI42LearnerConfig:
 
     learning_rate: float = 3e-4
     weight_decay: float = 1e-4
-    class_balance_power: float = 0.5
+    class_balance_power: float = 0.75
     max_gradient_norm: float = 1.0
     head_weights: Mapping[str, float] = field(default_factory=lambda: {
         "control": 1.0, "kind": 1.0, "target": 1.0, "offset": 1.0, "anchor": 1.0,

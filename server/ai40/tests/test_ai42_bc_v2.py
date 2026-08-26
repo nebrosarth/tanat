@@ -96,6 +96,7 @@ class AI42BCV2Tests(unittest.TestCase):
         self.assertEqual(defaults["model_width"], 192)
         self.assertEqual(defaults["entity_layers"], 2)
         self.assertEqual(defaults["num_heads"], 6)
+        self.assertEqual(defaults["class_balance_power"], 0.75)
         self.assertNotIn("class_weight_overrides", defaults)
         self.assertNotIn("combat_focus", defaults)
         self.assertNotIn("trainable_scope", defaults)
@@ -112,6 +113,8 @@ class AI42BCV2Tests(unittest.TestCase):
         self.assertEqual(profile.counts["offset"][2], 1)
         self.assertEqual(profile.counts["anchor"][2], 1)
         self.assertAlmostEqual(sum(value for value in profile.weights["control"] if value) / 4.0, 1.0, places=6)
+        self.assertTrue(all(value == 1.0 for value in profile.weights["target"]))
+        self.assertTrue(all(value == 1.0 for value in profile.weights["offset"]))
         with self.assertRaises(TypeError):
             profile.counts["control"] = (1,)  # type: ignore[index]
         self.assertEqual(profile.to_json(), profile.to_json())

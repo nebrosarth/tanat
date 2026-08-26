@@ -322,7 +322,9 @@ def _validate_training_args(args: argparse.Namespace) -> None:
     if isinstance(args.seed, bool) or not isinstance(args.seed, int) or args.seed < 0:
         raise AI42TrainingError("seed must be a non-negative integer")
     if not math.isclose(float(args.class_balance_power), CLASS_BALANCE_POWER, rel_tol=0.0, abs_tol=0.0):
-        raise AI42TrainingError("AI-42 BC-v2 freezes class-balance-power at 0.5")
+        raise AI42TrainingError(
+            f"AI-42 BC-v2 freezes class-balance-power at {CLASS_BALANCE_POWER:g}"
+        )
     validate_head_weights(args.head_weights)
     if (
         isinstance(args.gradient_accumulation_steps, bool)

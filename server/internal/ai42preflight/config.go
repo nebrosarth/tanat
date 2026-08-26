@@ -12,7 +12,7 @@ var defaultConfig = Config{
 	SequenceLength:  64,
 	BatchSize:       8,
 	Learner: LearnerConfig{
-		LearningRate: 3e-4, WeightDecay: 1e-4, ClassBalancePower: 0.5, MaxGradientNorm: 1.0,
+		LearningRate: 3e-4, WeightDecay: 1e-4, ClassBalancePower: 0.75, MaxGradientNorm: 1.0,
 		HeadWeights: map[string]float64{"control": 1, "kind": 1, "target": 1, "offset": 1, "anchor": 1},
 	},
 	Seed: 4242, ValidationProbeLimit: 0,
@@ -275,8 +275,8 @@ func (config Config) Validate() error {
 	if config.BatchSize*config.SequenceLength > MaxBatchRows {
 		return fmt.Errorf("recurrent batch exceeds bounded row limit")
 	}
-	if config.Learner.ClassBalancePower != 0.5 {
-		return fmt.Errorf("AI-42 BC-v2 freezes class_balance_power at 0.5")
+	if config.Learner.ClassBalancePower != 0.75 {
+		return fmt.Errorf("AI-42 BC-v2 freezes class_balance_power at 0.75")
 	}
 	for name, value := range map[string]float64{"learning_rate": config.Learner.LearningRate, "weight_decay": config.Learner.WeightDecay, "class_balance_power": config.Learner.ClassBalancePower, "max_gradient_norm": config.Learner.MaxGradientNorm} {
 		if value != value || value > 1e308 || value < -1e308 {

@@ -606,7 +606,7 @@ func BenchmarkCanonicalWorkerRequest(b *testing.B) {
 	value := map[string]any{
 		"protocol": TorchProtocol, "request_sha256": strings.Repeat("a", 64), "seed": 4242, "device": "cpu",
 		"model":      map[string]any{"hidden_size": 192, "model_width": 192, "entity_layers": 2, "num_heads": 6, "ff_multiplier": 4},
-		"learner":    map[string]any{"learning_rate": 3e-4, "weight_decay": 1e-4, "class_balance_power": 0.5, "max_gradient_norm": 1.0},
+		"learner":    map[string]any{"learning_rate": 3e-4, "weight_decay": 1e-4, "class_balance_power": 0.75, "max_gradient_norm": 1.0},
 		"warm_start": map[string]any{"path": "warm.pt", "sha256": strings.Repeat("b", 64), "dataset_hash": strings.Repeat("c", 64), "allow_dataset_change": false},
 		"batch":      map[string]any{"kind": "bundle", "path": "batch.json", "sha256": strings.Repeat("c", 64)},
 	}

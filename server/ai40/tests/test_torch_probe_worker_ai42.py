@@ -30,7 +30,7 @@ MODEL = {
 LEARNER = {
     "learning_rate": 0.0003,
     "weight_decay": 0.0001,
-    "class_balance_power": 0.5,
+    "class_balance_power": 0.75,
     "max_gradient_norm": 1.0,
 }
 

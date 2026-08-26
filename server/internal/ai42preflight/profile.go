@@ -60,7 +60,7 @@ func profileUnsigned(datasetHash string, ids []string, idHash string, counts map
 	return map[string]any{
 		"format": ProfileFormat, "profile_version": ProfileVersion, "supervision_version": SupervisionVersion, "protocol_version": ProtocolVersion,
 		"dataset_schema_version": "AI42-dataset-v1", "shard_schema_version": "AI42-go-shard-v2", "dataset_manifest_hash": datasetHash,
-		"train_match_ids": append([]string(nil), ids...), "train_match_ids_hash": idHash, "class_balance_power": 0.5,
+		"train_match_ids": append([]string(nil), ids...), "train_match_ids_hash": idHash, "class_balance_power": 0.75,
 		"supervision_controllers": uint8sAny(controllers),
 		"counts":                  countPayload, "weights": weightPayload,
 	}
@@ -84,7 +84,7 @@ func classBalanceWeights(counts []int) []float64 {
 		if count > 0 {
 			// PyTorch's class_balance_weights operates in float32. Keep each
 			// intermediate rounded to float32 before converting for JSON.
-			value := float32(math.Sqrt(float64(total / float32(count))))
+			value := float32(math.Pow(float64(total/float32(count)), 0.75))
 			result[index] = float64(value)
 			mean += value
 		}
@@ -99,7 +99,7 @@ func classBalanceWeights(counts []int) []float64 {
 }
 
 func profileClassWeights(head string, counts []int) []float64 {
-	if head == "target" {
+	if head == "target" || head == "offset" {
 		result := make([]float64, len(counts))
 		for index := range result {
 			result[index] = 1
@@ -152,11 +152,11 @@ func loadExistingProfile(raw []byte, expected Profile) (Profile, error) {
 		return Profile{}, fmt.Errorf("profile train-match ID hash does not match its ordered IDs")
 	}
 	power, err := asNumber(root["class_balance_power"], "profile.class_balance_power")
-	if err != nil || power != 0.5 {
+	if err != nil || power != 0.75 {
 		if err != nil {
 			return Profile{}, err
 		}
-		return Profile{}, fmt.Errorf("AI-42 BC-v2 requires class_balance_power=0.5")
+		return Profile{}, fmt.Errorf("AI-42 BC-v2 requires class_balance_power=0.75")
 	}
 	controllers, err := controllerList(root["supervision_controllers"], "profile.supervision_controllers")
 	if err != nil {
@@ -271,7 +271,7 @@ func parseProfileWeights(value any, counts map[string][]int) (map[string][]float
 				}
 				return nil, fmt.Errorf("profile.weights[%s][%d] is invalid", head, index)
 			}
-			if head == "target" {
+			if head == "target" || head == "offset" {
 				if number <= 0 {
 					return nil, fmt.Errorf("profile target-slot weights must all be positive")
 				}

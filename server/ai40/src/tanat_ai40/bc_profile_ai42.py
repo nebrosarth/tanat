@@ -32,18 +32,22 @@ from .learner_ai42 import (
 )
 
 
-PROFILE_FORMAT = "AI42-bc-class-profile-v4"
+PROFILE_FORMAT = "AI42-bc-class-profile-v5"
 PROFILE_VERSION = PROFILE_FORMAT
 SUPERVISION_VERSION = "AI42-supervision-v2"
 PROTOCOL_VERSION = 13
-CLASS_BALANCE_POWER = 0.5
+CLASS_BALANCE_POWER = 0.75
 PROFILE_HEADS = HEAD_NAMES
+UNIFORM_FREQUENCY_HEADS = frozenset({"target", "offset"})
 
 
 def _profile_class_weights(head: str, counts: Sequence[int], power: float) -> torch.Tensor:
     # Target indices are exchangeable entity slots, not semantic classes.
     # Frequency weighting by slot number breaks target permutation equivariance.
-    if head == "target":
+    # Navigation offsets are spatial grid cells rather than semantic classes;
+    # inverse-frequency weights over-reward rare distant cells and can improve
+    # top-1 accuracy while making the expected movement error worse.
+    if head in UNIFORM_FREQUENCY_HEADS:
         return torch.ones(len(counts), dtype=torch.float32)
     return class_balance_weights(counts, power)
 
@@ -148,19 +152,19 @@ def _validate_counts_weights(counts: Any, weights: Any, power: float) -> tuple[d
             number = float(value)
             if not math.isfinite(number) or number < 0:
                 raise AI42ProfileError(f"profile weights[{head!r}][{index}] is non-finite or negative")
-            if head == "target":
+            if head in UNIFORM_FREQUENCY_HEADS:
                 if number <= 0.0:
-                    raise AI42ProfileError("profile target-slot weights must all be positive")
+                    raise AI42ProfileError(f"profile {head} weights must all be positive")
             else:
                 if checked_counts[index] == 0 and number != 0.0:
                     raise AI42ProfileError(f"profile weight for absent {head} class {index} must be zero")
                 if checked_counts[index] > 0 and number <= 0.0:
                     raise AI42ProfileError(f"profile weight for supported {head} class {index} must be positive")
             checked_weights.append(number)
-        if head == "target":
+        if head in UNIFORM_FREQUENCY_HEADS:
             mean = sum(checked_weights) / len(checked_weights)
             if not math.isfinite(mean) or not math.isclose(mean, 1.0, rel_tol=2e-6, abs_tol=2e-6):
-                raise AI42ProfileError("profile target-slot weights must be uniform mean-one")
+                raise AI42ProfileError(f"profile {head} weights must be uniform mean-one")
         elif present:
             mean = sum(checked_weights) / len(present)
             if not math.isfinite(mean) or not math.isclose(mean, 1.0, rel_tol=2e-6, abs_tol=2e-6):
@@ -205,7 +209,7 @@ def _validate_payload(value: Mapping[str, Any]) -> dict[str, Any]:
     if isinstance(power, bool) or not isinstance(power, (int, float)) or not math.isfinite(float(power)):
         raise AI42ProfileError("profile.class_balance_power must be finite")
     if float(power) != CLASS_BALANCE_POWER:
-        raise AI42ProfileError("AI-42 BC-v2 requires class_balance_power=0.5")
+        raise AI42ProfileError(f"AI-42 BC-v2 requires class_balance_power={CLASS_BALANCE_POWER:g}")
     controllers = value["supervision_controllers"]
     if (
         not isinstance(controllers, list)
