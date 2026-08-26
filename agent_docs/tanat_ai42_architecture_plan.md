@@ -48,10 +48,10 @@ tests, короткими protocol/inference smoke-проверками и ст�
 - отдельные контексты для навыков, телепортации и расходников;
 - macro assignment входит в actor observation как условие, а не как безусловная команда: retreat, stun, death и safety имеют приоритет.
 
-Micro-policy работает с текущей частотой 5 Гц. Compact BC-baseline содержит
-2,181,609 параметров. Размер увеличивается только при подтверждённом underfit на
-train и validation; timing head возвращается только после появления исполняемого
-сервером duration/repeat-контракта.
+Micro-policy работает с текущей частотой 5 Гц. Текущий structured compact actor
+содержит 2,169,643 параметра. Размер увеличивается только при подтверждённом
+underfit на train и validation; timing head возвращается только после появления
+исполняемого сервером duration/repeat-контракта.
 
 ### 3.3 Team macro policy
 
@@ -291,3 +291,52 @@ Actor-v2 checkpoint-несовместим с actor-v1. Первый v2 run на
 детерминированной инициализации seed 4242; следующие итерации используют
 warm-start после native preflight. До нового измерения старые результаты 9.1 и
 9.2 являются историческим baseline, а не оценкой compact v2.
+
+### 9.4 Аудит compact actor и structured heads
+
+На immutable dataset из раздела 9.1 выполнены три изолированных пятиминутных
+scratch-прогона compact actor v2. Во всех случаях optimizer работал примерно
+438–441 шаг, однако ни один candidate не прошёл acceptance: end-to-end action
+accuracy снизилась с начальных `1.1325%` до нуля.
+
+- Базовая конфигурация снизила validation loss с `13.1541` до `9.2346`, но
+  offset Manhattan error ухудшился с `7.4106` до `7.8550`; control ISSUE и
+  CANCEL получили нулевой recall.
+- Class-balance power `0.75` и uniform offset weights дали offset top-1
+  `3.5295%`, но Manhattan error `7.7023`, нулевой end-to-end result и тот же
+  нулевой recall ISSUE/CANCEL.
+- Полные inverse semantic weights и дополнительный coordinate loss снизили
+  validation loss с `14.6077` до `12.2998`, но дали offset top-1 `3.5180%`,
+  Manhattan error `7.7028` и снова нулевой end-to-end result.
+
+Распределение первых 441 optimizer batch совпало с полным train profile по
+control и kind proportions. Следовательно, проблема не вызвана неудачным
+префиксом детерминированного batch stream; дальнейшая настройка scalar weights
+без изменения представления признана исчерпанной.
+
+В revision `b189594` изменены только две выходные головы:
+
+- control факторизован как `ISSUE / continuation`, затем
+  `WAIT / HOLD / CANCEL` внутри continuation;
+- navigation offset факторизован на независимые row/column logits размером
+  9×9 и собирается обратно в прежний публичный массив из 81 logit.
+
+Внешний action/ONNX-контракт не изменился: control по-прежнему имеет четыре, а
+offset — 81 значение. Flat 81-way cross-entropy для аддитивной grid-head уже
+эквивалентна сумме row/column cross-entropy, поэтому экспериментальный
+coordinate auxiliary loss и его конфигурация удалены как дублирующее
+масштабирование той же ошибки. Encoder, два entity-attention блока, recurrent
+memory, ability specialization, kind, target и anchor heads не уменьшались.
+
+Итоговый actor содержит `2,169,643` параметра против `2,181,609` у предыдущей
+версии; уменьшение на 11,966 параметров полностью приходится на замену плоской
+81-way navigation projection факторизованной головой с поправкой на новый
+control head. Фактический parameter count совпал с независимыми estimators в
+smoke и native-worker контрактах. На RTX 5090 прошли 70 actor/runtime/BC/smoke
+тестов и 10 export/ONNX-тестов; Go preflight packages также прошли.
+
+Следующий ограниченный эксперимент — один scratch-run structured actor с тем же
+dataset, seed и пятиминутным optimizer budget. Он должен сравниваться с тремя
+результатами выше по end-to-end action accuracy, ISSUE/CANCEL recall, offset
+top-1 и Manhattan error; снижение только общего loss не является основанием для
+promotion.
