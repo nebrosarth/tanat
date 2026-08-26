@@ -179,7 +179,13 @@ class AI42BCV2Tests(unittest.TestCase):
         self.assertEqual(tuple(normalized["control"]), (0.5, 0.5, 1.5, 1.5))
         self.assertEqual(tuple(final["control"]), (0.5, 0.5, 1.5, 1.5))
         self.assertEqual(tuple(final["target"]), profile.weights["target"])
+        self.assertEqual(profile.weights["target"], (1.0,) * HEAD_CLASS_COUNTS["target"])
         self.assertEqual(override_hash, train_ai42_bc.class_weight_overrides_hash(normalized))
+
+        with self.assertRaisesRegex(train_ai42_bc.AI42TrainingError, "permutation-equivariant"):
+            train_ai42_bc._merge_class_weight_overrides(
+                profile, {"target": [1.0] * HEAD_CLASS_COUNTS["target"]},
+            )
 
         invalid_absent = list(valid_kind)
         invalid_absent[0] = 1.0

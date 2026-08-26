@@ -102,6 +102,24 @@ func TestMakeBatchPlanSupervisesOnlySelectedController(t *testing.T) {
 	}
 }
 
+func TestTargetProfileWeightsAreUniformAcrossExchangeableSlots(t *testing.T) {
+	counts := zeroCounts()
+	counts["target"][0] = 100
+	counts["target"][17] = 1
+	profile, err := buildProfile(strings.Repeat("a", 64), []string{"train-a"}, counts, []uint8{3})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for index, weight := range profile.Weights["target"] {
+		if weight != 1 {
+			t.Fatalf("target slot %d weight=%v, want 1", index, weight)
+		}
+	}
+	if _, err := mergeClassWeights(profile, map[string][]float64{"target": profile.Weights["target"]}); err == nil || !strings.Contains(err.Error(), "permutation-equivariant") {
+		t.Fatalf("target override error=%v", err)
+	}
+}
+
 func TestEligibilityEvidenceDoesNotOvercountControlMasks(t *testing.T) {
 	accumulator := newAccumulator(1)
 	row := testTargetRow("match-a", 0)

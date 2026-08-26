@@ -13,7 +13,7 @@ import (
 const (
 	TorchProtocol      = "AI42-torch-preflight-v1"
 	BatchPlanVersion   = "AI42-bc-batch-plan-v2"
-	ProfileFormat      = "AI42-bc-class-profile-v3"
+	ProfileFormat      = "AI42-bc-class-profile-v4"
 	ProfileVersion     = ProfileFormat
 	SupervisionVersion = "AI42-supervision-v2"
 	ReplayScope        = "durable-v2"

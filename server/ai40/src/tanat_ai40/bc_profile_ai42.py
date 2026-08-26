@@ -32,12 +32,20 @@ from .learner_ai42 import (
 )
 
 
-PROFILE_FORMAT = "AI42-bc-class-profile-v3"
+PROFILE_FORMAT = "AI42-bc-class-profile-v4"
 PROFILE_VERSION = PROFILE_FORMAT
 SUPERVISION_VERSION = "AI42-supervision-v2"
 PROTOCOL_VERSION = 13
 CLASS_BALANCE_POWER = 0.5
 PROFILE_HEADS = HEAD_NAMES
+
+
+def _profile_class_weights(head: str, counts: Sequence[int], power: float) -> torch.Tensor:
+    # Target indices are exchangeable entity slots, not semantic classes.
+    # Frequency weighting by slot number breaks target permutation equivariance.
+    if head == "target":
+        return torch.ones(len(counts), dtype=torch.float32)
+    return class_balance_weights(counts, power)
 
 
 class AI42ProfileError(AI42LearnerError):
@@ -140,18 +148,26 @@ def _validate_counts_weights(counts: Any, weights: Any, power: float) -> tuple[d
             number = float(value)
             if not math.isfinite(number) or number < 0:
                 raise AI42ProfileError(f"profile weights[{head!r}][{index}] is non-finite or negative")
-            if checked_counts[index] == 0 and number != 0.0:
-                raise AI42ProfileError(f"profile weight for absent {head} class {index} must be zero")
-            if checked_counts[index] > 0 and number <= 0.0:
-                raise AI42ProfileError(f"profile weight for supported {head} class {index} must be positive")
+            if head == "target":
+                if number <= 0.0:
+                    raise AI42ProfileError("profile target-slot weights must all be positive")
+            else:
+                if checked_counts[index] == 0 and number != 0.0:
+                    raise AI42ProfileError(f"profile weight for absent {head} class {index} must be zero")
+                if checked_counts[index] > 0 and number <= 0.0:
+                    raise AI42ProfileError(f"profile weight for supported {head} class {index} must be positive")
             checked_weights.append(number)
-        if present:
+        if head == "target":
+            mean = sum(checked_weights) / len(checked_weights)
+            if not math.isfinite(mean) or not math.isclose(mean, 1.0, rel_tol=2e-6, abs_tol=2e-6):
+                raise AI42ProfileError("profile target-slot weights must be uniform mean-one")
+        elif present:
             mean = sum(checked_weights) / len(present)
             if not math.isfinite(mean) or not math.isclose(mean, 1.0, rel_tol=2e-6, abs_tol=2e-6):
                 raise AI42ProfileError(f"profile weights[{head!r}] are not mean-one over supported classes")
         elif any(checked_weights):
             raise AI42ProfileError(f"profile weights[{head!r}] must be all zero when the head is absent")
-        expected_weights = class_balance_weights(checked_counts, power).detach().cpu().tolist()
+        expected_weights = _profile_class_weights(head, checked_counts, power).detach().cpu().tolist()
         for index, (actual, expected) in enumerate(zip(checked_weights, expected_weights)):
             if not math.isclose(actual, float(expected), rel_tol=1e-6, abs_tol=1e-7):
                 raise AI42ProfileError(f"profile weights[{head!r}][{index}] do not match the frozen class counts")
@@ -326,7 +342,7 @@ class AI42ClassBalanceProfile:
         if seen < 1:
             raise AI42ProfileError("training stream contains no supported supervision")
         weights = {
-            head: tuple(float(value) for value in class_balance_weights(counts[head], CLASS_BALANCE_POWER).tolist())
+            head: tuple(float(value) for value in _profile_class_weights(head, counts[head], CLASS_BALANCE_POWER).tolist())
             for head in PROFILE_HEADS
         }
         return cls(

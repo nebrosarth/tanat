@@ -130,6 +130,12 @@ into a new immutable DAgger generation. The worker still validates the whole
 source checkpoint and proves that optimizer state, RNG state and cursor were
 not restored.
 
+Class-profile v4 keeps inverse-frequency balancing for semantic heads, but
+forces every `target` class weight to exactly `1`. Target indices are
+exchangeable entity slots rather than semantic classes; weighting them by
+slot frequency would break the actor's target permutation equivariance.
+Target class-weight overrides are therefore rejected.
+
 ### Executable five-minute AI-42 BC workflow
 
 The explicit training path is implemented by

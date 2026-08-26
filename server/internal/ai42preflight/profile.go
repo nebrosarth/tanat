@@ -30,7 +30,7 @@ func buildProfile(datasetHash string, trainIDs []string, counts map[string][]int
 		if !ok {
 			return Profile{}, fmt.Errorf("class counts are missing %s", head)
 		}
-		weights[head] = classBalanceWeights(values)
+		weights[head] = profileClassWeights(head, values)
 	}
 	idHash, err := canonicalHash(trainIDs)
 	if err != nil {
@@ -98,9 +98,23 @@ func classBalanceWeights(counts []int) []float64 {
 	return result
 }
 
+func profileClassWeights(head string, counts []int) []float64 {
+	if head == "target" {
+		result := make([]float64, len(counts))
+		for index := range result {
+			result[index] = 1
+		}
+		return result
+	}
+	return classBalanceWeights(counts)
+}
+
 func mergeClassWeights(profile Profile, overrides map[string][]float64) (map[string][]float64, error) {
 	result := cloneWeights(profile.Weights)
 	for head, values := range overrides {
+		if head == "target" {
+			return nil, fmt.Errorf("target class-weight overrides are forbidden because entity slots are permutation-equivariant")
+		}
 		counts, ok := profile.Counts[head]
 		if !ok {
 			return nil, fmt.Errorf("class-weight override contains unknown head %q", head)
@@ -302,10 +316,15 @@ func parseProfileWeights(value any, counts map[string][]int) (map[string][]float
 				}
 				return nil, fmt.Errorf("profile.weights[%s][%d] is invalid", head, index)
 			}
-			if counts[head][index] == 0 && number != 0 {
+			if head == "target" {
+				if number <= 0 {
+					return nil, fmt.Errorf("profile target-slot weights must all be positive")
+				}
+				supported++
+				mean += number
+			} else if counts[head][index] == 0 && number != 0 {
 				return nil, fmt.Errorf("profile weight for absent %s class %d must be zero", head, index)
-			}
-			if counts[head][index] > 0 {
+			} else if counts[head][index] > 0 {
 				if number <= 0 {
 					return nil, fmt.Errorf("profile weight for supported %s class %d must be positive", head, index)
 				}

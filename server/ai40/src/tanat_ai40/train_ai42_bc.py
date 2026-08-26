@@ -299,6 +299,10 @@ def _merge_class_weight_overrides(
 ) -> tuple[dict[str, tuple[float, ...]], dict[str, tuple[float, ...]], str]:
     """Validate overrides against a loaded profile, then merge over its weights."""
 
+    if isinstance(value, Mapping) and "target" in value:
+        raise AI42TrainingError(
+            "target class-weight overrides are forbidden because entity slots are permutation-equivariant",
+        )
     normalized = validate_class_weight_overrides(value, counts=profile.counts)
     final = profile.class_weights()
     final.update(normalized)
