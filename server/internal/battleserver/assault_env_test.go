@@ -671,7 +671,7 @@ func TestAssaultTeacherFrameBindsPreDecisionObservationAndTransition(t *testing.
 	// the frame rather than silently rebuilding a post-decision observation or
 	// advancing the teacher state a second time to HOLD.
 	env.heroes[0].x += 100
-	result := env.resultLockedWithTeacher(nil, env.clock.Now(), &frame)
+	result := env.resultLockedWithTeacher(nil, env.clock.Now(), &frame, false)
 	if got := result.Observations[0].Hero[AssaultHeroFeatureSize-1]; got != marker {
 		t.Fatalf("teacher observation marker=%g, want pre-decision %g", got, marker)
 	}
@@ -700,7 +700,7 @@ func TestAssaultTeacherFrameTerminalRetiresEarlierTickDecision(t *testing.T) {
 	frame.projections[0] = assaultTeacherProjection{active: true, representable: true, action: action}
 	env.step = env.maxSteps
 
-	result := env.resultLockedWithTeacher(nil, env.clock.Now(), &frame)
+	result := env.resultLockedWithTeacher(nil, env.clock.Now(), &frame, false)
 	if !result.Done || result.TeacherStatus[0] != AssaultTeacherStatusCancel {
 		t.Fatalf("terminal teacher frame done/status=%v/%d, want true/CANCEL", result.Done, result.TeacherStatus[0])
 	}
@@ -952,6 +952,47 @@ func TestAssaultDAggerInterventionUsesAI30ForOneTickAndRestoresController(t *tes
 	interventions[1] = 2
 	if _, err := env.StepIntervened(actions, controls, interventions); err == nil {
 		t.Fatal("invalid intervention byte was accepted")
+	}
+}
+
+func TestAssaultDAggerPreservesTeacherLineageBetweenPeriodicQueries(t *testing.T) {
+	var controllers [AssaultHeroCount]AssaultControllerV1
+	for i := range controllers {
+		controllers[i] = AssaultControllerAI40
+	}
+	env := NewAssaultEnv()
+	defer env.Close()
+	env.ConfigureTeacherActions(true)
+	if _, err := env.Reset(AssaultResetV1{Seed: 150043, MaxSteps: 20, Controllers: controllers}); err != nil {
+		t.Fatal(err)
+	}
+	want := assaultTeacherState{
+		active: true,
+		action: HeroActionV1{Kind: AssaultActionMove, Direction: 41},
+	}
+	env.inst.mu.Lock()
+	env.teacherState[0] = want
+	env.inst.mu.Unlock()
+
+	var actions [AssaultHeroCount]HeroActionV1
+	var controls [AssaultHeroCount]AssaultControlV1
+	var interventions [AssaultHeroCount]uint8
+	result, err := env.StepIntervened(actions, controls, interventions)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.TeacherStatus[0] != AssaultTeacherStatusUnavailable {
+		t.Fatalf("non-query status=%d, want UNAVAILABLE", result.TeacherStatus[0])
+	}
+	if env.teacherState[0] != want {
+		t.Fatalf("DAgger non-query reset teacher lineage: got %+v, want %+v", env.teacherState[0], want)
+	}
+
+	if _, err := env.StepControlled(actions, controls); err != nil {
+		t.Fatal(err)
+	}
+	if env.teacherState[0] != (assaultTeacherState{}) {
+		t.Fatalf("ordinary controlled step retained DAgger lineage: %+v", env.teacherState[0])
 	}
 }
 

@@ -45,6 +45,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--output", type=Path, required=True, help="atomic compact curve report")
     parser.add_argument("--device", default="auto")
     parser.add_argument("--dataset-hash")
+    parser.add_argument(
+        "--supervision-controller", action="append", type=int,
+        dest="supervision_controllers",
+        help="restrict evaluation to a controller ID; repeat for multiple IDs",
+    )
     parser.add_argument("--epsilon", type=float, default=1e-4)
     parser.add_argument(
         "--selection-matches", type=int,
@@ -73,6 +78,8 @@ def _training_args(args: argparse.Namespace) -> argparse.Namespace:
     ]
     if args.dataset_hash is not None:
         raw.extend(("--dataset-hash", str(args.dataset_hash)))
+    for controller in args.supervision_controllers or ():
+        raw.extend(("--supervision-controller", str(controller)))
     return parser.parse_args(raw)
 
 

@@ -186,7 +186,7 @@ class AI42DatasetBuilderTest(unittest.TestCase):
                     "scenario": "ai30_mirror",
                     "roster_ids": list(range(HERO_COUNT)),
                     "side_by_slot": [0] * 5 + [1] * 5,
-                    "controller_by_slot": [2] * HERO_COUNT,
+                    "controller_by_slot": [2] * 5 + [3] * 5,
                 }],
                 "shards": [{"raw_bytes": 100, "stored_bytes": 50}],
             }
@@ -216,6 +216,15 @@ class AI42DatasetBuilderTest(unittest.TestCase):
             "server_rejected": 1,
             "timeout": 1,
             "unknown": 1,
+        })
+        self.assertEqual(summary["by_controller"]["2"]["action_kinds"], {
+            "move": 1, "skill_1": 1,
+        })
+        self.assertEqual(summary["by_controller"]["2"]["skills"], {"skill_1": 1})
+        self.assertEqual(summary["by_controller"]["3"]["action_kinds"], {})
+        self.assertEqual(summary["by_controller"]["3"]["skills"], {})
+        self.assertEqual(summary["by_controller"]["3"]["teacher_statuses"], {
+            "cancel": 1, "hold": 1, "none": 1, "unavailable": 1, "wait": 1,
         })
 
     def test_resume_rejects_contract_change_and_reuses_completed_matches(self):

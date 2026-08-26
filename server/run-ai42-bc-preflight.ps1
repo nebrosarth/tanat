@@ -65,7 +65,8 @@ $candidates += Get-ChildItem -LiteralPath $packageRoot -Directory -Filter ".venv
     ForEach-Object { Join-Path $_.FullName "Scripts\python.exe" }
 $python = $candidates | Where-Object { Test-Path -LiteralPath $_ -PathType Leaf } | Select-Object -First 1
 if (-not $python) {
-    $pythonCommand = Get-Command python -CommandType Application -ErrorAction SilentlyContinue
+    $pythonCommand = Get-Command python -CommandType Application -ErrorAction SilentlyContinue |
+        Select-Object -First 1
     if (-not $pythonCommand) {
         throw "No Python interpreter found for the AI-42 Torch worker. Install Python/Torch or create ai40\.venv."
     }

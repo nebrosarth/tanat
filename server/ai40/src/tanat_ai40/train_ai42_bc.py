@@ -233,8 +233,14 @@ def _training_config_defaults(path: Path) -> dict[str, Any]:
         **training,
         "gradient_accumulation_steps": training.get("gradient_accumulation_steps", 1),
         "retain_periodic_checkpoints": training.get("retain_periodic_checkpoints", False),
-        "supervision_controllers": validate_supervision_controllers(
-            training.get("supervision_controllers")
+        # ``argparse`` append actions need ``None`` or a mutable list as their
+        # default. Keep an omitted config value as ``None`` so an explicit CLI
+        # controller replaces the all-controller fallback instead of extending
+        # it; validation later freezes the parsed value to a tuple.
+        "supervision_controllers": (
+            list(validate_supervision_controllers(training["supervision_controllers"]))
+            if training.get("supervision_controllers") is not None
+            else None
         ),
     }
 

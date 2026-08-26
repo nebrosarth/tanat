@@ -63,6 +63,15 @@ class CheckpointCurveTests(unittest.TestCase):
 
         self.assertEqual(args.evaluation_batch_size, 64)
 
+    def test_supervision_controller_is_forwardable(self) -> None:
+        args = build_parser().parse_args([
+            "--config", "config.json", "--dataset", "dataset", "--profile", "profile.json",
+            "--checkpoint", "step.pt", "--output", "curve.json",
+            "--supervision-controller", "3",
+        ])
+
+        self.assertEqual(args.supervision_controllers, [3])
+
 
 if __name__ == "__main__":
     unittest.main()

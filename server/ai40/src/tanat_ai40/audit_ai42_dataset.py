@@ -71,6 +71,37 @@ def _stats(values: Sequence[float | int]) -> dict[str, float | int | None]:
     }
 
 
+def _new_action_audit() -> dict[str, Counter[str]]:
+    return {
+        "teacher_statuses": Counter(),
+        "action_kinds": Counter(),
+        "skills": Counter(),
+        "rejections": Counter(),
+    }
+
+
+def _accumulate_action_audit(
+    audit: Mapping[str, Counter[str]],
+    statuses: np.ndarray,
+    actions: np.ndarray,
+    rejections: np.ndarray,
+) -> None:
+    for value in statuses.reshape(-1):
+        audit["teacher_statuses"][_STATUS_NAMES.get(int(value), f"unknown_{int(value)}")] += 1
+    action_kinds = actions["kind"][statuses == TEACHER_STATUS_ACTION]
+    for value in action_kinds.reshape(-1):
+        name = _KIND_NAMES.get(int(value), f"unknown_{int(value)}")
+        audit["action_kinds"][name] += 1
+        if 3 <= int(value) <= 6:
+            audit["skills"][name] += 1
+    for value in rejections.reshape(-1):
+        audit["rejections"][_REJECTION_NAMES.get(int(value), f"unknown_{int(value)}")] += 1
+
+
+def _serialize_action_audit(audit: Mapping[str, Counter[str]]) -> dict[str, dict[str, int]]:
+    return {name: _counter(counter) for name, counter in audit.items()}
+
+
 def audit_ai42_dataset(
     root: str | Path,
     *,
@@ -93,10 +124,8 @@ def audit_ai42_dataset(
         for entry in dataset.manifest["matches"]
         if split is None or entry["split"] == split
     }
-    status_counts: Counter[str] = Counter()
-    kind_counts: Counter[str] = Counter()
-    skill_counts: Counter[str] = Counter()
-    rejection_counts: Counter[str] = Counter()
+    action_audit = _new_action_audit()
+    action_audit_by_controller: dict[str, dict[str, Counter[str]]] = {}
     winner_counts: Counter[str] = Counter()
     scenario_counts: Counter[str] = Counter()
     roster_counts: Counter[str] = Counter()
@@ -124,18 +153,20 @@ def audit_ai42_dataset(
         winners = np.asarray(arrays["winner"])
         winner_counts[str(int(winners[-1]))] += 1
         statuses = np.asarray(arrays["teacher_status"], dtype=np.int64)
-        for value in statuses.reshape(-1):
-            status_counts[_STATUS_NAMES.get(int(value), f"unknown_{int(value)}")] += 1
         actions = np.asarray(arrays["teacher_action"])
-        action_kinds = actions["kind"][statuses == TEACHER_STATUS_ACTION]
-        for value in action_kinds.reshape(-1):
-            name = _KIND_NAMES.get(int(value), f"unknown_{int(value)}")
-            kind_counts[name] += 1
-            if 3 <= int(value) <= 6:
-                skill_counts[name] += 1
         rejections = np.asarray(arrays["rejection_reason"], dtype=np.int64)
-        for value in rejections.reshape(-1):
-            rejection_counts[_REJECTION_NAMES.get(int(value), f"unknown_{int(value)}")] += 1
+        _accumulate_action_audit(action_audit, statuses, actions, rejections)
+        controllers = np.asarray(entry["controller_by_slot"])
+        for controller in np.unique(controllers):
+            name = str(controller)
+            controller_audit = action_audit_by_controller.setdefault(name, _new_action_audit())
+            slot_mask = controllers == controller
+            _accumulate_action_audit(
+                controller_audit,
+                statuses[:, slot_mask],
+                actions[:, slot_mask],
+                rejections[:, slot_mask],
+            )
         scenario_counts[entry["scenario"]] += 1
         for value in entry["roster_ids"]:
             roster_counts[str(value)] += 1
@@ -164,10 +195,11 @@ def audit_ai42_dataset(
             "seconds": _stats(duration_seconds),
         },
         "winners": _counter(winner_counts),
-        "teacher_statuses": _counter(status_counts),
-        "action_kinds": _counter(kind_counts),
-        "skills": _counter(skill_counts),
-        "rejections": _counter(rejection_counts),
+        **_serialize_action_audit(action_audit),
+        "by_controller": {
+            name: _serialize_action_audit(controller_audit)
+            for name, controller_audit in sorted(action_audit_by_controller.items())
+        },
         "terminal": {
             "matches": len(entries),
             "terminal_ticks": terminal_ticks,

@@ -78,7 +78,6 @@ $report = Join-Path $run 'preflight_report.json'
   --warm-start $warmStart `
   --output $run `
   --report $report `
-  --supervision-controller 3 `
   --allow-warm-start-dataset-change `
   --device cuda
 ```
@@ -95,7 +94,6 @@ export PYTHONPATH="$PWD/ai40/src"
   --warm-start <accepted-checkpoint.pt> \
   --output <preflight-run-dir> \
   --report <preflight-run-dir>/preflight_report.json \
-  --supervision-controller 3 \
   --allow-warm-start-dataset-change \
   --device cuda
 ```
@@ -119,12 +117,13 @@ report. `train_ai42_bc` no longer runs a Python preflight: invoking it without
 required for PyTorch/CUDA training and remains a later production-inference
 gate.
 
-`--supervision-controller` is repeatable. DAgger generations use controller
-`3` for the AI-42 candidate and controller `2` for the AI-30 opponent, so
-preflight and training select only controller `3`. This preserves complete
-recurrent sequences for the candidate while preventing ordinary opponent
-labels from overwhelming the intervention/correction signal. Omitting the
-flag retains the backward-compatible all-controller profile.
+`--supervision-controller` is repeatable and remains available for diagnostics.
+Production DAgger training keeps both controller `3` (the AI-42 candidate with
+periodic AI-30 corrections) and controller `2` (the full AI-30 opponent replay).
+The opponent is playing against the candidate, so its trajectory is fresh
+expert data from the current policy distribution; dropping it causes the sparse
+intervention labels to overwrite ordinary attack and control behavior. Omitting
+the flag selects the production all-controller profile.
 The dataset-change flag is required only when an accepted model is carried
 into a new immutable DAgger generation. The worker still validates the whole
 source checkpoint and proves that optimizer state, RNG state and cursor were
@@ -220,6 +219,11 @@ bad action. A policy that is confidently wrong should use the deterministic
 periodic mixture instead. With five controlled heroes and a five-tick period,
 one different hero yields its decision to AI-30 each tick, so every hero gets
 one correction per simulated second without replacing the whole team at once:
+
+The environment preserves each candidate hero's last queried expert lineage
+between periodic queries. Non-query ticks remain `UNAVAILABLE`, while the next
+real query can therefore emit `HOLD` or `CANCEL` instead of turning every
+correction into a fresh `ACTION`.
 
 ```powershell
 python -m tanat_ai40.collect_dagger_generation_ai42 <checkpoint.pt> `

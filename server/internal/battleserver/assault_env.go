@@ -658,7 +658,7 @@ func (e *AssaultEnv) executeStepIntervened(
 	if haveTeacherFrame {
 		teacherOverride = &teacherFrame
 	}
-	result := e.resultLockedWithTeacher(&invalid, now, teacherOverride)
+	result := e.resultLockedWithTeacher(&invalid, now, teacherOverride, interventions != nil)
 	if interventions != nil {
 		for slot, intervene := range interventions {
 			if intervene != 0 && result.TeacherStatus[slot] == AssaultTeacherStatusAction {
@@ -1587,11 +1587,12 @@ func assaultShapingTimeWeight(elapsedSeconds float64) float64 {
 }
 
 func (e *AssaultEnv) resultLocked(invalid *[AssaultHeroCount]uint8, now float64) StepResultV1 {
-	return e.resultLockedWithTeacher(invalid, now, nil)
+	return e.resultLockedWithTeacher(invalid, now, nil, false)
 }
 
 func (e *AssaultEnv) resultLockedWithTeacher(
 	invalid *[AssaultHeroCount]uint8, now float64, teacherFrame *assaultTeacherFrame,
+	preserveExternalTeacherState bool,
 ) StepResultV1 {
 	rewardHash := AssaultRewardHashV2
 	if e.strategicReward {
@@ -1686,6 +1687,13 @@ func (e *AssaultEnv) resultLockedWithTeacher(
 				e.controllers[i] = AssaultControllerAI30
 				action, status = e.assaultTeacherTransitionFromProjectionLocked(i, projection)
 				e.controllers[i] = oldController
+			} else if preserveExternalTeacherState && assaultControllerUsesActions(e.controllers[i]) {
+				// DAgger queries a controlled hero periodically. Preserve the last
+				// expert lineage between queries so the next projection can emit
+				// HOLD or CANCEL instead of treating every query as a fresh ACTION.
+				// The missing query remains UNAVAILABLE and never supervises the
+				// actor with a guessed counterfactual control.
+				status = AssaultTeacherStatusUnavailable
 			} else {
 				action, status = e.assaultTeacherTransitionLocked(i, &r.Observations[i], r.Done, now)
 			}
