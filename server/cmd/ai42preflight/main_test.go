@@ -38,11 +38,20 @@ func TestParseOptionsRequiresExplicitWorkerAndTimeout(t *testing.T) {
 }
 
 func TestParseOptionsBuildsOnlyFixedWorkerModule(t *testing.T) {
-	options, err := parseOptions([]string{"--torch-python", os.Args[0], "--worker-timeout", "1s"})
+	options, err := parseOptions([]string{"--torch-python", os.Args[0], "--worker-timeout", "1s", "--supervision-controller", "3", "--allow-warm-start-dataset-change"})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(options.WorkerCommand) != 3 || options.WorkerCommand[0] != options.TorchPythonPath || options.WorkerCommand[1] != "-m" || options.WorkerCommand[2] != ai42preflight.TorchWorkerModule {
 		t.Fatalf("worker command=%q", options.WorkerCommand)
+	}
+	if len(options.SupervisionControllers) != 1 || options.SupervisionControllers[0] != 3 {
+		t.Fatalf("supervision controllers=%v", options.SupervisionControllers)
+	}
+	if !options.AllowWarmStartDatasetChange {
+		t.Fatal("warm-start dataset-change authorization was not parsed")
+	}
+	if _, err := parseOptions([]string{"--torch-python", os.Args[0], "--worker-timeout", "1s", "--supervision-controller", "4"}); err == nil {
+		t.Fatal("out-of-range supervision controller was accepted")
 	}
 }

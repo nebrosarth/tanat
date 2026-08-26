@@ -8,15 +8,16 @@ import (
 var profileHeads = []string{"control", "kind", "target", "offset", "anchor"}
 
 type Profile struct {
-	DatasetManifestHash string
-	TrainMatchIDs       []string
-	TrainMatchIDsHash   string
-	Counts              map[string][]int
-	Weights             map[string][]float64
-	ProfileHash         string
+	DatasetManifestHash    string
+	TrainMatchIDs          []string
+	TrainMatchIDsHash      string
+	Counts                 map[string][]int
+	Weights                map[string][]float64
+	ProfileHash            string
+	SupervisionControllers []uint8
 }
 
-func buildProfile(datasetHash string, trainIDs []string, counts map[string][]int) (Profile, error) {
+func buildProfile(datasetHash string, trainIDs []string, counts map[string][]int, controllers []uint8) (Profile, error) {
 	if !validHash(datasetHash) {
 		return Profile{}, fmt.Errorf("dataset manifest hash is not a lower-case SHA-256")
 	}
@@ -35,15 +36,15 @@ func buildProfile(datasetHash string, trainIDs []string, counts map[string][]int
 	if err != nil {
 		return Profile{}, err
 	}
-	unsigned := profileUnsigned(datasetHash, trainIDs, idHash, counts, weights)
+	unsigned := profileUnsigned(datasetHash, trainIDs, idHash, counts, weights, controllers)
 	encoded, err := canonicalJSON(unsigned)
 	if err != nil {
 		return Profile{}, err
 	}
-	return Profile{DatasetManifestHash: datasetHash, TrainMatchIDs: append([]string(nil), trainIDs...), TrainMatchIDsHash: idHash, Counts: cloneCounts(counts), Weights: cloneWeights(weights), ProfileHash: sha256Hex(encoded)}, nil
+	return Profile{DatasetManifestHash: datasetHash, TrainMatchIDs: append([]string(nil), trainIDs...), TrainMatchIDsHash: idHash, Counts: cloneCounts(counts), Weights: cloneWeights(weights), ProfileHash: sha256Hex(encoded), SupervisionControllers: append([]uint8(nil), controllers...)}, nil
 }
 
-func profileUnsigned(datasetHash string, ids []string, idHash string, counts map[string][]int, weights map[string][]float64) map[string]any {
+func profileUnsigned(datasetHash string, ids []string, idHash string, counts map[string][]int, weights map[string][]float64, controllers []uint8) map[string]any {
 	countPayload, weightPayload := map[string]any{}, map[string]any{}
 	for _, head := range profileHeads {
 		countValues := make([]any, len(counts[head]))
@@ -60,7 +61,8 @@ func profileUnsigned(datasetHash string, ids []string, idHash string, counts map
 		"format": ProfileFormat, "profile_version": ProfileVersion, "supervision_version": SupervisionVersion, "protocol_version": ProtocolVersion,
 		"dataset_schema_version": "AI42-dataset-v1", "shard_schema_version": "AI42-go-shard-v2", "dataset_manifest_hash": datasetHash,
 		"train_match_ids": append([]string(nil), ids...), "train_match_ids_hash": idHash, "class_balance_power": 0.5,
-		"counts": countPayload, "weights": weightPayload,
+		"supervision_controllers": uint8sAny(controllers),
+		"counts":                  countPayload, "weights": weightPayload,
 	}
 }
 
@@ -147,7 +149,7 @@ func loadExistingProfile(raw []byte, expected Profile) (Profile, error) {
 	if err != nil {
 		return Profile{}, err
 	}
-	required := map[string]struct{}{"format": {}, "profile_version": {}, "supervision_version": {}, "protocol_version": {}, "dataset_schema_version": {}, "shard_schema_version": {}, "dataset_manifest_hash": {}, "train_match_ids": {}, "train_match_ids_hash": {}, "class_balance_power": {}, "counts": {}, "weights": {}, "profile_hash": {}}
+	required := map[string]struct{}{"format": {}, "profile_version": {}, "supervision_version": {}, "protocol_version": {}, "dataset_schema_version": {}, "shard_schema_version": {}, "dataset_manifest_hash": {}, "train_match_ids": {}, "train_match_ids_hash": {}, "class_balance_power": {}, "supervision_controllers": {}, "counts": {}, "weights": {}, "profile_hash": {}}
 	if err := exactFields(root, required, nil, "profile"); err != nil {
 		return Profile{}, err
 	}
@@ -187,6 +189,10 @@ func loadExistingProfile(raw []byte, expected Profile) (Profile, error) {
 		}
 		return Profile{}, fmt.Errorf("AI-42 BC-v2 requires class_balance_power=0.5")
 	}
+	controllers, err := controllerList(root["supervision_controllers"], "profile.supervision_controllers")
+	if err != nil {
+		return Profile{}, err
+	}
 	counts, err := parseProfileCounts(root["counts"])
 	if err != nil {
 		return Profile{}, err
@@ -195,7 +201,7 @@ func loadExistingProfile(raw []byte, expected Profile) (Profile, error) {
 	if err != nil {
 		return Profile{}, err
 	}
-	unsigned := profileUnsigned(datasetHash, ids, idHash, counts, weights)
+	unsigned := profileUnsigned(datasetHash, ids, idHash, counts, weights, controllers)
 	encoded, err := canonicalJSON(unsigned)
 	if err != nil {
 		return Profile{}, err
@@ -204,7 +210,7 @@ func loadExistingProfile(raw []byte, expected Profile) (Profile, error) {
 	if profileHash != sha256Hex(encoded) {
 		return Profile{}, fmt.Errorf("profile_hash does not match profile contents")
 	}
-	if datasetHash != expected.DatasetManifestHash || !sameStrings(ids, expected.TrainMatchIDs) || !sameCounts(counts, expected.Counts) {
+	if datasetHash != expected.DatasetManifestHash || !sameStrings(ids, expected.TrainMatchIDs) || !sameCounts(counts, expected.Counts) || !sameUint8s(controllers, expected.SupervisionControllers) {
 		return Profile{}, fmt.Errorf("profile lineage or counts are incompatible with verified dataset")
 	}
 	for _, head := range profileHeads {
@@ -214,7 +220,28 @@ func loadExistingProfile(raw []byte, expected Profile) (Profile, error) {
 			}
 		}
 	}
-	return Profile{DatasetManifestHash: datasetHash, TrainMatchIDs: ids, TrainMatchIDsHash: idHash, Counts: counts, Weights: weights, ProfileHash: profileHash}, nil
+	return Profile{DatasetManifestHash: datasetHash, TrainMatchIDs: ids, TrainMatchIDsHash: idHash, Counts: counts, Weights: weights, ProfileHash: profileHash, SupervisionControllers: controllers}, nil
+}
+
+func controllerList(value any, name string) ([]uint8, error) {
+	raw, ok := value.([]any)
+	if !ok || len(raw) == 0 {
+		return nil, fmt.Errorf("%s must be a non-empty controller list", name)
+	}
+	result := make([]uint8, len(raw))
+	previous := int64(-1)
+	for index, item := range raw {
+		controller, err := asInt(item, fmt.Sprintf("%s[%d]", name, index), 0, 3)
+		if err != nil {
+			return nil, err
+		}
+		if controller <= previous {
+			return nil, fmt.Errorf("%s must contain sorted unique controllers", name)
+		}
+		previous = controller
+		result[index] = uint8(controller)
+	}
+	return result, nil
 }
 
 func parseProfileCounts(value any) (map[string][]int, error) {
@@ -355,6 +382,18 @@ func sameCounts(left, right map[string][]int) bool {
 			if left[head][index] != right[head][index] {
 				return false
 			}
+		}
+	}
+	return true
+}
+
+func sameUint8s(left, right []uint8) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for index := range left {
+		if left[index] != right[index] {
+			return false
 		}
 	}
 	return true

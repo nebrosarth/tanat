@@ -69,7 +69,10 @@ def _request(checkpoint: Path, checkpoint_hash: str, batch: dict[str, object]) -
         "device": "cpu",
         "model": MODEL,
         "learner": LEARNER,
-        "warm_start": {"path": str(checkpoint), "sha256": checkpoint_hash},
+        "warm_start": {
+            "path": str(checkpoint), "sha256": checkpoint_hash,
+            "dataset_hash": "a" * 64, "allow_dataset_change": False,
+        },
         "batch": {"kind": "inline", "sha256": hashlib.sha256(batch_bytes).hexdigest(), "value": batch},
     }
     unsigned = {key: value for key, value in request.items() if key != "request_sha256"}
@@ -112,6 +115,26 @@ class TorchAI42ProbeWorkerTests(unittest.TestCase):
         self.assertEqual(result["warm_start"]["source_step"], 9)
         self.assertEqual(result["warm_start"]["source_cursor"], 17)
         self.assertEqual(result["hashes"]["model_after_warm_start"], result["hashes"]["model_after"])
+
+    def test_worker_requires_explicit_dataset_change_authorization(self) -> None:
+        with tempfile.TemporaryDirectory() as directory_name:
+            checkpoint, checkpoint_hash = self._checkpoint(Path(directory_name))
+            denied = _request(checkpoint, checkpoint_hash, _batch())
+            denied["warm_start"]["dataset_hash"] = "b" * 64
+            _rebind(denied)
+            denied_response = json.loads(process_request(canonical_json_bytes(denied)))
+            self.assertFalse(denied_response["ok"])
+
+            allowed = copy.deepcopy(denied)
+            allowed["warm_start"]["allow_dataset_change"] = True
+            _rebind(allowed)
+            allowed_response = json.loads(process_request(canonical_json_bytes(allowed)))
+
+        self.assertTrue(allowed_response["ok"])
+        self.assertTrue(allowed_response["result"]["warm_start"]["dataset_changed"])
+        self.assertTrue(allowed_response["result"]["warm_start"]["dataset_change_allowed"])
+        self.assertTrue(allowed_response["result"]["invariants"]["optimizer_not_restored"])
+        self.assertTrue(allowed_response["result"]["invariants"]["rng_not_restored"])
 
     def test_worker_rejects_noncanonical_unknown_and_hash_bound_requests(self) -> None:
         with tempfile.TemporaryDirectory() as directory_name:

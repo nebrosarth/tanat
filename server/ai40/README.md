@@ -78,6 +78,8 @@ $report = Join-Path $run 'preflight_report.json'
   --warm-start $warmStart `
   --output $run `
   --report $report `
+  --supervision-controller 3 `
+  --allow-warm-start-dataset-change `
   --device cuda
 ```
 
@@ -93,6 +95,8 @@ export PYTHONPATH="$PWD/ai40/src"
   --warm-start <accepted-checkpoint.pt> \
   --output <preflight-run-dir> \
   --report <preflight-run-dir>/preflight_report.json \
+  --supervision-controller 3 \
+  --allow-warm-start-dataset-change \
   --device cuda
 ```
 
@@ -114,6 +118,17 @@ report. `train_ai42_bc` no longer runs a Python preflight: invoking it without
 `--execute` fails closed with the native-wrapper instruction. ONNX is not
 required for PyTorch/CUDA training and remains a later production-inference
 gate.
+
+`--supervision-controller` is repeatable. DAgger generations use controller
+`3` for the AI-42 candidate and controller `2` for the AI-30 opponent, so Q9
+preflight and training select only controller `3`. This preserves complete
+recurrent sequences for the candidate while preventing ordinary opponent
+labels from overwhelming the intervention/correction signal. Omitting the
+flag retains the backward-compatible all-controller profile.
+The dataset-change flag is required only when an accepted model is carried
+into a new immutable DAgger generation. The worker still validates the whole
+source checkpoint and proves that optimizer state, RNG state and cursor were
+not restored.
 
 ### Executable five-minute AI-42 BC workflow
 

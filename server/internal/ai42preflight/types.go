@@ -12,10 +12,10 @@ import (
 
 const (
 	TorchProtocol      = "AI42-torch-preflight-v1"
-	BatchPlanVersion   = "AI42-bc-batch-plan-v1"
-	ProfileFormat      = "AI42-bc-class-profile-v2"
+	BatchPlanVersion   = "AI42-bc-batch-plan-v2"
+	ProfileFormat      = "AI42-bc-class-profile-v3"
 	ProfileVersion     = ProfileFormat
-	SupervisionVersion = "AI42-supervision-v1"
+	SupervisionVersion = "AI42-supervision-v2"
 	ReplayScope        = "durable-v2"
 	ProtocolVersion    = 13
 	TorchWorkerModule  = "tanat_ai40.torch_probe_worker_ai42"
@@ -97,22 +97,27 @@ type Config struct {
 	// validation_matches value wins, otherwise validation_batches is used.
 	// Zero means retain every validated match (the validation-only config has
 	// no trainer sampling limit).
-	ValidationProbeLimit int
-	Learner              LearnerConfig
-	Seed                 uint32
+	ValidationProbeLimit   int
+	Learner                LearnerConfig
+	Seed                   uint32
+	SupervisionControllers []uint8
 }
 
 // Options controls one preflight execution.
 type Options struct {
-	ConfigPath    string
-	DatasetPath   string
-	DatasetHash   string
-	ProfilePath   string
-	ProfileHash   string
-	WarmStartPath string
-	OutputPath    string
-	ReportPath    string
-	Device        string
+	ConfigPath                  string
+	DatasetPath                 string
+	DatasetHash                 string
+	ProfilePath                 string
+	ProfileHash                 string
+	WarmStartPath               string
+	OutputPath                  string
+	ReportPath                  string
+	Device                      string
+	AllowWarmStartDatasetChange bool
+	// SupervisionControllers, when non-empty, overrides the training config
+	// for this exact preflight invocation.
+	SupervisionControllers []uint8
 	// TorchPythonPath is the only production worker selector. Run always
 	// invokes TorchWorkerModule and never accepts caller-provided arguments.
 	TorchPythonPath string

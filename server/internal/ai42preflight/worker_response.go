@@ -8,12 +8,12 @@ var workerResultFields = map[string]struct{}{"protocol": {}, "ai42_protocol_vers
 var workerLossFields = map[string]struct{}{"value": {}, "gradient_norm": {}, "gradient_norm_after_repeat": {}, "gradient_digest_before_clip": {}, "gradient_digest": {}, "repeat_gradient_digest": {}, "summary": {}}
 var workerLossSummaryFields = map[string]struct{}{"loss": {}, "head_losses": {}, "metrics": {}, "class_counts": {}, "control_counts": {}, "skill_metrics": {}, "head_weighted_numerators": {}, "head_weighted_denominators": {}}
 var workerBatchFields = map[string]struct{}{"kind": {}, "sha256": {}, "batch_size": {}, "sequence_length": {}, "supervised_count": {}}
-var workerWarmFields = map[string]struct{}{"file_sha256": {}, "manifest_digest": {}, "payload_digest": {}, "model_hash": {}, "model_artifact_hash": {}, "optimizer_artifact_hash": {}, "rng_artifact_hash": {}, "dataset_hash": {}, "source_step": {}, "source_epoch": {}, "source_cursor": {}}
+var workerWarmFields = map[string]struct{}{"file_sha256": {}, "manifest_digest": {}, "payload_digest": {}, "model_hash": {}, "model_artifact_hash": {}, "optimizer_artifact_hash": {}, "rng_artifact_hash": {}, "dataset_hash": {}, "dataset_changed": {}, "dataset_change_allowed": {}, "source_step": {}, "source_epoch": {}, "source_cursor": {}}
 var workerHashFields = map[string]struct{}{"request_sha256": {}, "warm_start_sha256": {}, "model_before_warm_start": {}, "model_after_warm_start": {}, "model_after": {}, "optimizer_before": {}, "optimizer_after": {}, "rng_before_warm_start": {}, "rng_after_warm_start": {}, "rng_after": {}, "forward_first": {}, "forward_second": {}, "roundtrip_payload": {}}
 var workerTimingFields = map[string]struct{}{"forward": {}, "backward_and_clip": {}, "checkpoint_roundtrip": {}, "total": {}}
 var workerInvariantFields = map[string]struct{}{"finite_outputs": {}, "finite_loss": {}, "finite_gradients": {}, "gradient_clip_checked": {}, "deterministic_recurrent_forward": {}, "deterministic_masked_backward": {}, "parameters_unchanged": {}, "optimizer_unchanged": {}, "rng_unchanged": {}, "optimizer_not_restored": {}, "rng_not_restored": {}, "cursor_not_restored": {}, "optimizer_step_called": {}, "optimizer_authorized": {}, "final_report_published": {}, "checkpoint_roundtrip": {}, "exact_checkpoint_bytes_loaded": {}, "checkpoint_source_unchanged": {}}
 
-func validateWorkerOutput(output TorchOutput, requestHash, bundleHash, warmHash, datasetHash string, supervised, expectedBatchSize int, config Config) (map[string]any, error) {
+func validateWorkerOutput(output TorchOutput, requestHash, bundleHash, warmHash, datasetHash string, allowDatasetChange bool, supervised, expectedBatchSize int, config Config) (map[string]any, error) {
 	if len(output.Stdout) > MaxWorkerStdout || len(output.Stderr) > MaxWorkerStderr {
 		return nil, fmt.Errorf("Torch worker output exceeded bounded stream limits")
 	}
@@ -119,7 +119,17 @@ func validateWorkerOutput(output TorchOutput, requestHash, bundleHash, warmHash,
 			return nil, fmt.Errorf("worker warm-start %s is not a valid hash", key)
 		}
 	}
-	if warmStart["dataset_hash"] != datasetHash {
+	sourceDatasetHash := warmStart["dataset_hash"].(string)
+	datasetChanged := sourceDatasetHash != datasetHash
+	workerChanged, err := asBool(warmStart["dataset_changed"], "worker.result.warm_start.dataset_changed")
+	if err != nil || workerChanged != datasetChanged {
+		return nil, fmt.Errorf("worker warm-start dataset-change evidence does not match lineage")
+	}
+	workerAllowed, err := asBool(warmStart["dataset_change_allowed"], "worker.result.warm_start.dataset_change_allowed")
+	if err != nil || workerAllowed != allowDatasetChange {
+		return nil, fmt.Errorf("worker warm-start dataset-change authorization does not match request")
+	}
+	if datasetChanged && !allowDatasetChange {
 		return nil, fmt.Errorf("worker warm-start dataset hash does not match verified generation")
 	}
 	for _, key := range []string{"source_step", "source_epoch"} {

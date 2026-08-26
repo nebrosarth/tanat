@@ -9,16 +9,33 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"time"
 
 	"tanatserver/internal/ai42preflight"
 )
+
+type controllerFlags []uint8
+
+func (values *controllerFlags) String() string {
+	return fmt.Sprint([]uint8(*values))
+}
+
+func (values *controllerFlags) Set(raw string) error {
+	parsed, err := strconv.Atoi(raw)
+	if err != nil || parsed < 0 || parsed > 3 {
+		return fmt.Errorf("must be an integer in [0,3]")
+	}
+	*values = append(*values, uint8(parsed))
+	return nil
+}
 
 func parseOptions(args []string) (ai42preflight.Options, error) {
 	set := flag.NewFlagSet("ai42preflight", flag.ContinueOnError)
 	set.SetOutput(io.Discard)
 	set.Usage = func() {}
 	var options ai42preflight.Options
+	var supervisionControllers controllerFlags
 	var torchPython string
 	var timeout string
 	set.StringVar(&options.ConfigPath, "config", "", "strict AI-42 preflight config")
@@ -30,6 +47,8 @@ func parseOptions(args []string) (ai42preflight.Options, error) {
 	set.StringVar(&options.OutputPath, "output", "", "preflight artifact directory")
 	set.StringVar(&options.ReportPath, "report", "", "canonical report path")
 	set.StringVar(&options.Device, "device", "auto", "Torch device")
+	set.BoolVar(&options.AllowWarmStartDatasetChange, "allow-warm-start-dataset-change", false, "allow a model-only warm start from another verified dataset")
+	set.Var(&supervisionControllers, "supervision-controller", "controller ID to supervise; repeat for multiple IDs")
 	set.StringVar(&torchPython, "torch-python", "", "Python executable for the fixed Torch probe worker module")
 	set.StringVar(&timeout, "worker-timeout", "", "worker timeout, for example 5m")
 	if err := set.Parse(args); err != nil {
@@ -53,6 +72,7 @@ func parseOptions(args []string) (ai42preflight.Options, error) {
 		return ai42preflight.Options{}, fmt.Errorf("--torch-python: %w", err)
 	}
 	options.TorchPythonPath = torchPython
+	options.SupervisionControllers = append([]uint8(nil), supervisionControllers...)
 	options.WorkerCommand = []string{torchPython, "-m", ai42preflight.TorchWorkerModule}
 	if timeout == "" {
 		return ai42preflight.Options{}, fmt.Errorf("--worker-timeout is required")
@@ -83,7 +103,7 @@ func validateExecutablePath(path string) error {
 
 func printUsage(writer io.Writer) {
 	_, _ = fmt.Fprintln(writer, "Usage: ai42preflight --config FILE --dataset DIR --warm-start FILE --output DIR --torch-python FILE --worker-timeout DURATION [flags]")
-	_, _ = fmt.Fprintln(writer, "Flags: --config --dataset --dataset-hash --profile --profile-hash --warm-start --output --report --device --torch-python --worker-timeout")
+	_, _ = fmt.Fprintln(writer, "Flags: --config --dataset --dataset-hash --profile --profile-hash --warm-start --output --report --device --supervision-controller --allow-warm-start-dataset-change --torch-python --worker-timeout")
 }
 
 func main() {

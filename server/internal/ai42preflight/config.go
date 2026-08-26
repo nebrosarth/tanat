@@ -16,6 +16,7 @@ var defaultConfig = Config{
 		HeadWeights: map[string]float64{"control": 1, "kind": 1, "target": 1, "offset": 1, "anchor": 1},
 	},
 	Seed: 4242, ValidationProbeLimit: 0,
+	SupervisionControllers: []uint8{0, 1, 2, 3},
 }
 
 var modelFields = map[string]struct{}{
@@ -26,7 +27,7 @@ var preflightLearnerFields = map[string]struct{}{"class_balance_power": {}, "max
 var trainingLearnerFields = map[string]struct{}{"class_balance_power": {}, "max_gradient_norm": {}, "learning_rate": {}, "weight_decay": {}, "class_weight_overrides": {}, "head_weights": {}}
 var trainingFields = map[string]struct{}{
 	"seed": {}, "max_optimizer_seconds": {}, "max_steps": {}, "epochs": {}, "validation_batches": {}, "validation_epsilon": {},
-	"checkpoint_interval": {}, "validation_matches": {},
+	"checkpoint_interval": {}, "validation_matches": {}, "supervision_controllers": {},
 }
 
 // LoadConfig reads either the strict validation config or the strict Q3
@@ -172,7 +173,7 @@ func parseTrainingConfig(root map[string]any, config *Config) error {
 	if err != nil {
 		return err
 	}
-	if err := exactFields(training, map[string]struct{}{"seed": {}, "max_optimizer_seconds": {}, "max_steps": {}, "epochs": {}, "validation_batches": {}, "validation_epsilon": {}}, map[string]struct{}{"checkpoint_interval": {}, "validation_matches": {}}, "training config.training"); err != nil {
+	if err := exactFields(training, map[string]struct{}{"seed": {}, "max_optimizer_seconds": {}, "max_steps": {}, "epochs": {}, "validation_batches": {}, "validation_epsilon": {}}, map[string]struct{}{"checkpoint_interval": {}, "validation_matches": {}, "supervision_controllers": {}}, "training config.training"); err != nil {
 		return err
 	}
 	seed, err := asInt(training["seed"], "training config.training.seed", 0, 1<<32-1)
@@ -216,6 +217,30 @@ func parseTrainingConfig(root map[string]any, config *Config) error {
 		if _, err := asInt(value, "training config.training.checkpoint_interval", 1, 1<<31-1); err != nil {
 			return err
 		}
+	}
+	if value, ok := training["supervision_controllers"]; ok {
+		values, ok := value.([]any)
+		if !ok || len(values) == 0 {
+			return fmt.Errorf("training config.training.supervision_controllers must be a non-empty array")
+		}
+		seen := [4]bool{}
+		for index, value := range values {
+			controller, err := asInt(value, fmt.Sprintf("training config.training.supervision_controllers[%d]", index), 0, 3)
+			if err != nil {
+				return err
+			}
+			if seen[controller] {
+				return fmt.Errorf("training config.training.supervision_controllers contains duplicate %d", controller)
+			}
+			seen[controller] = true
+		}
+		controllers := make([]uint8, 0, len(values))
+		for controller, present := range seen {
+			if present {
+				controllers = append(controllers, uint8(controller))
+			}
+		}
+		config.SupervisionControllers = controllers
 	}
 	return nil
 }
@@ -363,6 +388,16 @@ func (config Config) Validate() error {
 	}
 	if !positive {
 		return fmt.Errorf("head_weights must enable at least one loss head")
+	}
+	if len(config.SupervisionControllers) == 0 {
+		return fmt.Errorf("supervision_controllers must not be empty")
+	}
+	seenControllers := [4]bool{}
+	for _, controller := range config.SupervisionControllers {
+		if controller > 3 || seenControllers[controller] {
+			return fmt.Errorf("supervision_controllers must contain unique IDs in [0,3]")
+		}
+		seenControllers[controller] = true
 	}
 	return nil
 }

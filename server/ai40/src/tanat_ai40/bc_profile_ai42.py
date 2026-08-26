@@ -32,9 +32,9 @@ from .learner_ai42 import (
 )
 
 
-PROFILE_FORMAT = "AI42-bc-class-profile-v2"
+PROFILE_FORMAT = "AI42-bc-class-profile-v3"
 PROFILE_VERSION = PROFILE_FORMAT
-SUPERVISION_VERSION = "AI42-supervision-v1"
+SUPERVISION_VERSION = "AI42-supervision-v2"
 PROTOCOL_VERSION = 13
 CLASS_BALANCE_POWER = 0.5
 PROFILE_HEADS = HEAD_NAMES
@@ -89,6 +89,7 @@ def _unsigned_payload(
     counts: Mapping[str, Sequence[int]],
     weights: Mapping[str, Sequence[float]],
     class_balance_power: float,
+    supervision_controllers: Sequence[int],
 ) -> dict[str, Any]:
     return {
         "format": PROFILE_FORMAT,
@@ -101,6 +102,7 @@ def _unsigned_payload(
         "train_match_ids": list(train_match_ids),
         "train_match_ids_hash": ordered_train_id_hash(train_match_ids),
         "class_balance_power": float(class_balance_power),
+        "supervision_controllers": list(supervision_controllers),
         "counts": {head: list(counts[head]) for head in PROFILE_HEADS},
         "weights": {head: list(weights[head]) for head in PROFILE_HEADS},
     }
@@ -163,7 +165,7 @@ def _validate_payload(value: Mapping[str, Any]) -> dict[str, Any]:
         "format", "profile_version", "supervision_version", "protocol_version",
         "dataset_schema_version", "shard_schema_version", "dataset_manifest_hash",
         "train_match_ids", "train_match_ids_hash", "class_balance_power",
-        "counts", "weights", "profile_hash",
+        "supervision_controllers", "counts", "weights", "profile_hash",
     }
     if not isinstance(value, Mapping) or set(value) != required:
         raise AI42ProfileError("profile field set is incomplete or contains unknown fields")
@@ -188,6 +190,14 @@ def _validate_payload(value: Mapping[str, Any]) -> dict[str, Any]:
         raise AI42ProfileError("profile.class_balance_power must be finite")
     if float(power) != CLASS_BALANCE_POWER:
         raise AI42ProfileError("AI-42 BC-v2 requires class_balance_power=0.5")
+    controllers = value["supervision_controllers"]
+    if (
+        not isinstance(controllers, list)
+        or not controllers
+        or any(isinstance(item, bool) or not isinstance(item, int) or item not in range(4) for item in controllers)
+        or controllers != sorted(set(controllers))
+    ):
+        raise AI42ProfileError("profile.supervision_controllers must contain sorted unique IDs in [0, 3]")
     counts, weights = _validate_counts_weights(value["counts"], value["weights"], float(power))
     unsigned = _unsigned_payload(
         dataset_manifest_hash=dataset_hash,
@@ -197,6 +207,7 @@ def _validate_payload(value: Mapping[str, Any]) -> dict[str, Any]:
         counts=counts,
         weights=weights,
         class_balance_power=float(power),
+        supervision_controllers=controllers,
     )
     if value["profile_hash"] != _profile_hash(unsigned):
         raise AI42ProfileError("profile_hash does not match profile contents")
@@ -217,6 +228,7 @@ class AI42ClassBalanceProfile:
     counts: Mapping[str, tuple[int, ...]]
     weights: Mapping[str, tuple[float, ...]]
     class_balance_power: float = CLASS_BALANCE_POWER
+    supervision_controllers: tuple[int, ...] = tuple(range(4))
     format: str = PROFILE_FORMAT
     profile_version: str = PROFILE_VERSION
     supervision_version: str = SUPERVISION_VERSION
@@ -241,6 +253,7 @@ class AI42ClassBalanceProfile:
                 counts=counts,
                 weights=weights,
                 class_balance_power=power,
+                supervision_controllers=self.supervision_controllers,
             )
             payload = {
                 "format": self.format,
@@ -253,6 +266,7 @@ class AI42ClassBalanceProfile:
                 "train_match_ids": list(ids),
                 "train_match_ids_hash": ids_hash,
                 "class_balance_power": power,
+                "supervision_controllers": list(self.supervision_controllers),
                 "counts": {head: list(counts[head]) for head in PROFILE_HEADS},
                 "weights": {head: list(weights[head]) for head in PROFILE_HEADS},
                 "profile_hash": self.profile_hash or _profile_hash(unsigned),
@@ -269,6 +283,7 @@ class AI42ClassBalanceProfile:
         object.__setattr__(self, "counts", MappingProxyType({head: tuple(normalized["counts"][head]) for head in PROFILE_HEADS}))
         object.__setattr__(self, "weights", MappingProxyType({head: tuple(normalized["weights"][head]) for head in PROFILE_HEADS}))
         object.__setattr__(self, "class_balance_power", float(normalized["class_balance_power"]))
+        object.__setattr__(self, "supervision_controllers", tuple(normalized["supervision_controllers"]))
         object.__setattr__(self, "train_match_ids_hash", normalized["train_match_ids_hash"])
         object.__setattr__(self, "profile_hash", normalized["profile_hash"])
 
@@ -283,6 +298,7 @@ class AI42ClassBalanceProfile:
         train_ids: Sequence[str] | None = None,
         dataset_schema_version: str = "AI42-dataset-v2",
         shard_schema_version: str = "AI42-go-shard-v2",
+        supervision_controllers: Sequence[int] = tuple(range(4)),
     ) -> "AI42ClassBalanceProfile":
         supplied_hashes = [value for value in (dataset_manifest_hash, dataset_hash) if value is not None]
         if len(supplied_hashes) != 1:
@@ -321,6 +337,7 @@ class AI42ClassBalanceProfile:
             counts={head: tuple(values) for head, values in counts.items()},
             weights=weights,
             class_balance_power=CLASS_BALANCE_POWER,
+            supervision_controllers=tuple(supervision_controllers),
             train_match_ids_hash=ordered_train_id_hash(ids),
             profile_hash=_profile_hash(_unsigned_payload(
                 dataset_manifest_hash=dataset_hash,
@@ -330,6 +347,7 @@ class AI42ClassBalanceProfile:
                 counts=counts,
                 weights=weights,
                 class_balance_power=CLASS_BALANCE_POWER,
+                supervision_controllers=tuple(supervision_controllers),
             )),
         )
 
@@ -342,6 +360,7 @@ class AI42ClassBalanceProfile:
         train_ids: Sequence[str] | None = None,
         sequence_length: int = 64,
         batch_size: int = 8,
+        supervision_controllers: Sequence[int] = tuple(range(4)),
     ) -> "AI42ClassBalanceProfile":
         if train_match_ids is not None and train_ids is not None:
             raise AI42ProfileError("provide only one ordered train-ID sequence")
@@ -372,11 +391,15 @@ class AI42ClassBalanceProfile:
                         yield match_id, available[match_id]
         manifest = getattr(dataset, "manifest", {})
         return cls.from_batches(
-            iter_ai42_dataset_batches(_OrderedView(), split="train", sequence_length=sequence_length, batch_size=batch_size),
+            iter_ai42_dataset_batches(
+                _OrderedView(), split="train", sequence_length=sequence_length,
+                batch_size=batch_size, supervision_controllers=supervision_controllers,
+            ),
             dataset_manifest_hash=str(getattr(dataset, "manifest_hash", manifest.get("manifest_hash", ""))),
             train_match_ids=ids,
             dataset_schema_version=str(manifest.get("dataset_schema_version", "AI42-dataset-v2")),
             shard_schema_version=str(manifest.get("shard_schema_version", "AI42-go-shard-v2")),
+            supervision_controllers=supervision_controllers,
         )
 
     @classmethod
@@ -390,6 +413,7 @@ class AI42ClassBalanceProfile:
             counts={head: tuple(normalized["counts"][head]) for head in PROFILE_HEADS},
             weights={head: tuple(normalized["weights"][head]) for head in PROFILE_HEADS},
             class_balance_power=normalized["class_balance_power"],
+            supervision_controllers=tuple(normalized["supervision_controllers"]),
             format=normalized["format"], profile_version=normalized["profile_version"],
             supervision_version=normalized["supervision_version"], protocol_version=normalized["protocol_version"],
             train_match_ids_hash=normalized["train_match_ids_hash"], profile_hash=normalized["profile_hash"],
@@ -425,6 +449,7 @@ class AI42ClassBalanceProfile:
             "train_match_ids": list(self.train_match_ids),
             "train_match_ids_hash": self.train_match_ids_hash,
             "class_balance_power": self.class_balance_power,
+            "supervision_controllers": list(self.supervision_controllers),
             "counts": {head: list(self.counts[head]) for head in PROFILE_HEADS},
             "weights": {head: list(self.weights[head]) for head in PROFILE_HEADS},
             "profile_hash": self.profile_hash,

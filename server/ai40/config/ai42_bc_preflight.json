@@ -10,7 +10,7 @@
   },
   "recurrent_batch": {
     "sequence_length": 64,
-    "batch_size": 32
+    "batch_size": 8
   },
   "learner": {
     "class_balance_power": 0.5,

@@ -24,6 +24,12 @@ func run(parent context.Context, options Options) (Report, error) {
 	if err != nil {
 		return nil, err
 	}
+	if len(options.SupervisionControllers) != 0 {
+		config.SupervisionControllers = append([]uint8(nil), options.SupervisionControllers...)
+		sort.Slice(config.SupervisionControllers, func(i, j int) bool {
+			return config.SupervisionControllers[i] < config.SupervisionControllers[j]
+		})
+	}
 	if err := config.Validate(); err != nil {
 		return nil, err
 	}
@@ -117,7 +123,7 @@ func run(parent context.Context, options Options) (Report, error) {
 		return nil, fmt.Errorf("dataset changed during full verification")
 	}
 	evidence.IdentityChecks++
-	profile, err := accumulator.profile(generation.ManifestHash())
+	profile, err := accumulator.profile(generation.ManifestHash(), config)
 	if err != nil {
 		return nil, err
 	}
@@ -196,7 +202,7 @@ func run(parent context.Context, options Options) (Report, error) {
 		"protocol": TorchProtocol, "seed": int(config.Seed), "device": options.Device,
 		"model":      map[string]any{"hidden_size": config.Model.HiddenSize, "model_width": config.Model.ModelWidth, "entity_layers": config.Model.EntityLayers, "num_heads": config.Model.NumHeads, "ff_multiplier": config.Model.FFMultiplier, "timing_bins": config.Model.TimingBins},
 		"learner":    map[string]any{"learning_rate": config.Learner.LearningRate, "weight_decay": config.Learner.WeightDecay, "class_balance_power": config.Learner.ClassBalancePower, "max_gradient_norm": config.Learner.MaxGradientNorm, "head_weights": scalarWeightsAsAny(config.Learner.HeadWeights), "class_weights": weightsAsAny(finalWeights)},
-		"warm_start": map[string]any{"path": options.WarmStartPath, "sha256": warmHash},
+		"warm_start": map[string]any{"path": options.WarmStartPath, "sha256": warmHash, "dataset_hash": generation.ManifestHash(), "allow_dataset_change": options.AllowWarmStartDatasetChange},
 		"batch":      map[string]any{"kind": "bundle", "path": bundlePath, "sha256": bundleHash},
 	}
 	unsignedBytes, err := canonicalJSON(requestValue)
@@ -254,7 +260,7 @@ func run(parent context.Context, options Options) (Report, error) {
 	if profileAfterWorker.Hash != profileFileHash || profileAfterWorker.Size != profileFileSize {
 		return nil, fmt.Errorf("class profile changed during worker execution")
 	}
-	workerResult, err := validateWorkerOutput(workerOutput, requestHash, bundleHash, warmHash, generation.ManifestHash(), supervised, len(plan.Sequences), config)
+	workerResult, err := validateWorkerOutput(workerOutput, requestHash, bundleHash, warmHash, generation.ManifestHash(), options.AllowWarmStartDatasetChange, supervised, len(plan.Sequences), config)
 	if err != nil {
 		return nil, err
 	}
@@ -638,7 +644,10 @@ func hashFileEvidence(path string, limit int) (contentFileEvidence, error) {
 }
 
 func profileBytes(profile Profile) ([]byte, error) {
-	unsigned := profileUnsigned(profile.DatasetManifestHash, profile.TrainMatchIDs, profile.TrainMatchIDsHash, profile.Counts, profile.Weights)
+	unsigned := profileUnsigned(
+		profile.DatasetManifestHash, profile.TrainMatchIDs, profile.TrainMatchIDsHash,
+		profile.Counts, profile.Weights, profile.SupervisionControllers,
+	)
 	unsigned["profile_hash"] = profile.ProfileHash
 	return canonicalJSON(unsigned)
 }

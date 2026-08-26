@@ -485,6 +485,7 @@ def iter_ai42_dataset_batches(
     split: str = "train",
     sequence_length: int = 64,
     batch_size: int = 32,
+    supervision_controllers: Sequence[int] | None = None,
 ) -> Iterable[AI42Batch]:
     """Stream deterministic, match-isolated recurrent batches from AI42Dataset.
 
@@ -502,6 +503,44 @@ def iter_ai42_dataset_batches(
         raise AI42LearnerError("batch_size must be positive")
     if not hasattr(dataset, "iter_matches") or not callable(dataset.iter_matches):
         raise AI42LearnerError("dataset must be a validated AI42Dataset")
+    controller_filter: frozenset[int] | None = None
+    controller_by_match: dict[str, tuple[int, ...]] = {}
+    if supervision_controllers is not None:
+        if (
+            isinstance(supervision_controllers, (str, bytes))
+            or not isinstance(supervision_controllers, Sequence)
+            or not supervision_controllers
+            or any(
+                isinstance(value, bool) or not isinstance(value, int) or value not in range(4)
+                for value in supervision_controllers
+            )
+        ):
+            raise AI42LearnerError("supervision_controllers must contain unique controller IDs in [0, 3]")
+        controller_filter = frozenset(supervision_controllers)
+        if len(controller_filter) != len(supervision_controllers):
+            raise AI42LearnerError("supervision_controllers must contain unique controller IDs in [0, 3]")
+        # Selecting every known controller is the backward-compatible,
+        # unfiltered mode. It must continue to work with validated legacy
+        # adapters that predate per-match controller metadata.
+        if controller_filter == frozenset(range(4)):
+            controller_filter = None
+    if controller_filter is not None:
+        manifest = getattr(dataset, "manifest", None)
+        entries = manifest.get("matches") if isinstance(manifest, Mapping) else None
+        if not isinstance(entries, list):
+            raise AI42LearnerError("controller-filtered batching requires match metadata")
+        for entry in entries:
+            if not isinstance(entry, Mapping):
+                raise AI42LearnerError("controller-filtered batching found malformed match metadata")
+            match_id, controllers = entry.get("match_id"), entry.get("controller_by_slot")
+            if (
+                not isinstance(match_id, str)
+                or not isinstance(controllers, list)
+                or len(controllers) != HERO_COUNT
+                or any(isinstance(value, bool) or not isinstance(value, int) for value in controllers)
+            ):
+                raise AI42LearnerError("controller-filtered batching found malformed match metadata")
+            controller_by_match[match_id] = tuple(controllers)
 
     pending: list[dict[str, np.ndarray | int]] = []
 
@@ -548,7 +587,16 @@ def iter_ai42_dataset_batches(
         if done.shape != (ticks,) or np.any(done[:-1] != 0) or done[-1] != 1:
             raise AI42LearnerError(f"dataset match {match_id!r} has an invalid terminal boundary")
 
-        for hero_slot in range(HERO_COUNT):
+        hero_slots = range(HERO_COUNT)
+        if controller_filter is not None:
+            controllers = controller_by_match.get(str(match_id))
+            if controllers is None:
+                raise AI42LearnerError(f"dataset match {match_id!r} has no controller metadata")
+            hero_slots = tuple(
+                slot for slot, controller in enumerate(controllers)
+                if controller in controller_filter
+            )
+        for hero_slot in hero_slots:
             dead = np.asarray(arrays["hero"][:, hero_slot, 9] >= 0.5, dtype=np.bool_)
             for start in range(0, ticks, sequence_length):
                 stop = min(start + sequence_length, ticks)

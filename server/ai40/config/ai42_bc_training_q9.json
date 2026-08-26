@@ -39,6 +39,7 @@
     "checkpoint_interval": 5,
     "gradient_accumulation_steps": 8,
     "retain_periodic_checkpoints": true,
+    "supervision_controllers": [3],
     "combat_focus": {
       "enabled": true,
       "kinds": [2, 3, 4, 5, 6],

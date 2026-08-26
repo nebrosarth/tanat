@@ -54,12 +54,12 @@ func TestPythonParityHashesForOrderedIDsAndBatchPlan(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got, want := strings.Join(plan.TrainMatchIDs, ","), "match-b,match-a"; got != want {
+	if got, want := strings.Join(plan.TrainMatchIDs, ","), "match-a,match-b"; got != want {
 		t.Fatalf("ranked train IDs=%s, want %s", got, want)
 	}
 	for name, want := range map[string]string{
-		"plan":       "1620922d049ec8a05aad8b3c4cb5c217ef4c9f0881efbe23a3fb8e3a890ed26c",
-		"validation": "df87420f47180c03d5113b099915139883545abe96926e4553bf90c7f37430e1",
+		"plan":       "b1ec2f03ecc8027d8c3cecfcd0a65efd961fbcd42d29eaa0a28dfc07826fd8ef",
+		"validation": "5747bab193b724249cbc6f51315797d18f10b0f0759e2294fb41e8f4c1cf60a8",
 		"split":      "8d587f040eaaa11031e6764410d5562060b13b73aa76862e74ad00db7627b6a4",
 	} {
 		got := map[string]string{"plan": plan.Hash, "validation": plan.ValidationHash, "split": plan.SplitHash}[name]
@@ -83,6 +83,22 @@ func TestMakeBatchPlanSkipsFirstEmptyPhysicalBatch(t *testing.T) {
 	}
 	if len(plan.Sequences) != 2 || plan.Sequences[0].Hero != 2 || plan.Sequences[1].Hero != 3 {
 		t.Fatalf("selected sequences=%+v", plan.Sequences)
+	}
+}
+
+func TestMakeBatchPlanSupervisesOnlySelectedController(t *testing.T) {
+	info := matchInfo{ID: "match-a", Split: "train", Scenario: "test", TickCount: 1}
+	info.ControllerBySlot[7] = 3
+	plan, err := makeBatchPlan(
+		[]matchInfo{info},
+		map[string]*matchEvidence{"match-a": {SupervisedByWindow: []uint16{1 << 7}}},
+		Config{Seed: 7, SequenceLength: 1, BatchSize: 1, SupervisionControllers: []uint8{3}},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(plan.Sequences) != 1 || plan.Sequences[0].Hero != 7 {
+		t.Fatalf("selected sequences=%+v, want only controller-3 hero 7", plan.Sequences)
 	}
 }
 
@@ -499,6 +515,25 @@ func TestRunRejectsWarmStartDatasetLineageMismatch(t *testing.T) {
 	}
 }
 
+func TestRunAllowsExplicitModelOnlyWarmStartDatasetChange(t *testing.T) {
+	dataset := writeTestGeneration(t)
+	warmPath := filepath.Join(t.TempDir(), "warm.pt")
+	if err := os.WriteFile(warmPath, []byte("checkpoint"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	runner := &fakeRunner{datasetHash: strings.Repeat("f", 64)}
+	options := runOptions(dataset, warmPath, filepath.Join(t.TempDir(), "run"), runner)
+	options.AllowWarmStartDatasetChange = true
+	report, err := Run(context.Background(), options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	warm := report["warm_start"].(map[string]any)
+	if warm["dataset_changed"] != true || warm["dataset_change_allowed"] != true {
+		t.Fatalf("warm-start evidence=%v", warm)
+	}
+}
+
 func TestWarmStartHashRejectsFileLargerThan512MiB(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "oversized.pt")
 	file, err := os.Create(path)
@@ -553,7 +588,7 @@ func TestValidateWorkerOutputRejectsProtocolFaults(t *testing.T) {
 	}
 	for _, testCase := range cases {
 		t.Run(testCase.name, func(t *testing.T) {
-			_, err := validateWorkerOutput(testCase.output, strings.Repeat("a", 64), strings.Repeat("b", 64), strings.Repeat("c", 64), strings.Repeat("d", 64), 1, 1, defaultConfig)
+			_, err := validateWorkerOutput(testCase.output, strings.Repeat("a", 64), strings.Repeat("b", 64), strings.Repeat("c", 64), strings.Repeat("d", 64), false, 1, 1, defaultConfig)
 			if err == nil || !strings.Contains(err.Error(), testCase.want) {
 				t.Fatalf("error=%v, want substring %q", err, testCase.want)
 			}
@@ -566,7 +601,7 @@ func BenchmarkCanonicalWorkerRequest(b *testing.B) {
 		"protocol": TorchProtocol, "request_sha256": strings.Repeat("a", 64), "seed": 4242, "device": "cpu",
 		"model":      map[string]any{"hidden_size": 384, "model_width": 384, "entity_layers": 4, "num_heads": 8, "ff_multiplier": 4, "timing_bins": 4},
 		"learner":    map[string]any{"learning_rate": 3e-4, "weight_decay": 1e-4, "class_balance_power": 0.5, "max_gradient_norm": 1.0},
-		"warm_start": map[string]any{"path": "warm.pt", "sha256": strings.Repeat("b", 64)},
+		"warm_start": map[string]any{"path": "warm.pt", "sha256": strings.Repeat("b", 64), "dataset_hash": strings.Repeat("c", 64), "allow_dataset_change": false},
 		"batch":      map[string]any{"kind": "bundle", "path": "batch.json", "sha256": strings.Repeat("c", 64)},
 	}
 	b.ReportAllocs()
@@ -675,7 +710,7 @@ func (runner *fakeRunner) Run(_ context.Context, request []byte) (TorchOutput, e
 	result := map[string]any{
 		"protocol": TorchProtocol, "ai42_protocol_version": ProtocolVersion, "device": "cpu", "parameter_count": 1, "estimated_parameter_count": 1,
 		"batch":      map[string]any{"kind": "bundle", "sha256": bundleHash, "batch_size": 8, "sequence_length": 64, "supervised_count": 8},
-		"warm_start": map[string]any{"file_sha256": warmHash, "manifest_digest": strings.Repeat("a", 64), "payload_digest": strings.Repeat("a", 64), "model_hash": strings.Repeat("a", 64), "model_artifact_hash": strings.Repeat("a", 64), "optimizer_artifact_hash": strings.Repeat("a", 64), "rng_artifact_hash": strings.Repeat("a", 64), "dataset_hash": runner.datasetHash, "source_step": 0, "source_epoch": 0, "source_cursor": nil},
+		"warm_start": map[string]any{"file_sha256": warmHash, "manifest_digest": strings.Repeat("a", 64), "payload_digest": strings.Repeat("a", 64), "model_hash": strings.Repeat("a", 64), "model_artifact_hash": strings.Repeat("a", 64), "optimizer_artifact_hash": strings.Repeat("a", 64), "rng_artifact_hash": strings.Repeat("a", 64), "dataset_hash": runner.datasetHash, "dataset_changed": runner.datasetHash != warm["dataset_hash"], "dataset_change_allowed": warm["allow_dataset_change"], "source_step": 0, "source_epoch": 0, "source_cursor": nil},
 		"loss":       map[string]any{"value": 0.0, "gradient_norm": 0.0, "gradient_norm_after_repeat": 0.0, "gradient_digest_before_clip": strings.Repeat("a", 64), "gradient_digest": strings.Repeat("a", 64), "repeat_gradient_digest": strings.Repeat("a", 64), "summary": map[string]any{"loss": 0.0, "head_losses": map[string]any{}, "metrics": map[string]any{}, "class_counts": map[string]any{}, "control_counts": map[string]any{}, "skill_metrics": map[string]any{}, "head_weighted_numerators": map[string]any{}, "head_weighted_denominators": map[string]any{}}}, "hashes": hashFields, "timings_ms": map[string]any{"forward": 0.0, "backward_and_clip": 0.0, "checkpoint_roundtrip": 0.0, "total": 0.0}, "invariants": invariants,
 	}
 	response, err := canonicalJSON(map[string]any{"protocol": TorchProtocol, "request_sha256": requestHash, "ok": true, "error": nil, "result": result})

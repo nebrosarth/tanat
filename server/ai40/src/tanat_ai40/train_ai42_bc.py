@@ -60,7 +60,7 @@ MAX_OPTIMIZER_SECONDS = 300.0
 DEFAULT_SEED = 4242
 DEFAULT_VALIDATION_BATCHES = 16
 DEFAULT_CHECKPOINT_INTERVAL = 100
-BATCH_PLAN_VERSION = "AI42-bc-batch-plan-v1"
+BATCH_PLAN_VERSION = "AI42-bc-batch-plan-v2"
 ACCEPTED_POINTER_FORMAT = "AI42-bc-accepted-pointer-v1"
 ACCEPTED_POINTER_FILENAME = "accepted_pointer.json"
 CHECKPOINT_GENERATION_DIRNAME = "checkpoint_generations"
@@ -157,6 +157,20 @@ def combat_focus_hash(value: Mapping[str, Any] | None) -> str:
         normalized, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False,
     ).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
+
+
+def validate_supervision_controllers(value: Any) -> tuple[int, ...]:
+    if value is None:
+        return tuple(range(4))
+    if (
+        isinstance(value, (str, bytes))
+        or not isinstance(value, (list, tuple))
+        or not value
+        or any(isinstance(item, bool) or not isinstance(item, int) or item not in range(4) for item in value)
+        or len(set(value)) != len(value)
+    ):
+        raise AI42TrainingError("training.supervision_controllers must contain unique IDs in [0, 3]")
+    return tuple(sorted(value))
 
 
 def validate_head_weights(value: Any) -> dict[str, float]:
@@ -399,7 +413,7 @@ def _training_config_defaults(path: Path) -> dict[str, Any]:
     }
     optional_training = {
         "checkpoint_interval", "validation_matches", "combat_focus", "gradient_accumulation_steps",
-        "retain_periodic_checkpoints",
+        "retain_periodic_checkpoints", "supervision_controllers",
     }
     if not isinstance(training, dict) or not required_training.issubset(training) or set(training) - required_training - optional_training:
         raise AI42LearnerError("training config.training is invalid")
@@ -424,6 +438,9 @@ def _training_config_defaults(path: Path) -> dict[str, Any]:
         "combat_focus": normalized_combat_focus,
         "gradient_accumulation_steps": training.get("gradient_accumulation_steps", 1),
         "retain_periodic_checkpoints": training.get("retain_periodic_checkpoints", False),
+        "supervision_controllers": validate_supervision_controllers(
+            training.get("supervision_controllers")
+        ),
     }
 
 
@@ -453,6 +470,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--combat-focus", dest="combat_focus", default=dict(DEFAULT_COMBAT_FOCUS), help=argparse.SUPPRESS)
     parser.add_argument("--gradient-accumulation-steps", type=int, default=1, help="number of deterministic focused batches combined into one optimizer step")
     parser.add_argument("--retain-periodic-checkpoints", action="store_true", help="retain immutable step checkpoints for bounded candidate selection")
+    parser.add_argument("--supervision-controller", action="append", type=int, dest="supervision_controllers", help="restrict supervision to a controller ID; repeat for multiple IDs")
     parser.add_argument("--seed", type=int, default=DEFAULT_SEED)
     parser.add_argument("--max-optimizer-seconds", type=float, default=MAX_OPTIMIZER_SECONDS)
     parser.add_argument("--max-steps", type=int, default=1, help="total optimizer step target, including resumed steps")
@@ -546,6 +564,7 @@ def _validate_training_args(args: argparse.Namespace) -> None:
         raise AI42TrainingError("gradient_accumulation_steps must be an integer in [1, 64]")
     if not isinstance(args.retain_periodic_checkpoints, bool):
         raise AI42TrainingError("retain_periodic_checkpoints must be boolean")
+    args.supervision_controllers = validate_supervision_controllers(args.supervision_controllers)
     if args.resume is not None and (args.warm_start is not None or args.warm_start_accepted):
         raise AI42TrainingError("--warm-start and --resume are mutually exclusive")
     if args.checkpoint is not None and (args.warm_start is not None or args.warm_start_accepted):
@@ -729,6 +748,7 @@ def _iter_plan_batches(
 
     for source_batch in iter_ai42_dataset_batches(
         view, split=split, sequence_length=args.sequence_length, batch_size=args.batch_size,
+        supervision_controllers=args.supervision_controllers,
     ):
         # Count only batches with effective ACTION/WAIT/HOLD/CANCEL rows. A
         # deterministic dataset can begin with UNAVAILABLE-only controller
@@ -765,10 +785,20 @@ def _batch_plan(dataset: Any, args: argparse.Namespace) -> dict[str, Any]:
         "combat_focus": focus,
         "combat_focus_hash": combat_focus_hash(focus),
         "gradient_accumulation_steps": args.gradient_accumulation_steps,
+        "supervision_controllers": list(args.supervision_controllers),
     }
     digest = hashlib.sha256(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
     validation_digest = hashlib.sha256(
-        json.dumps({"version": BATCH_PLAN_VERSION, "seed": args.seed, "match_ids": list(validation_match_ids)}, sort_keys=True, separators=(",", ":")).encode("utf-8"),
+        json.dumps(
+            {
+                "version": BATCH_PLAN_VERSION,
+                "seed": args.seed,
+                "match_ids": list(validation_match_ids),
+                "supervision_controllers": list(args.supervision_controllers),
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8"),
     ).hexdigest()
     return {
         **payload,
@@ -1259,6 +1289,7 @@ def train(args: argparse.Namespace, *, clock: Callable[[], float] = time.monoton
                 train_match_ids=split_ids["train"],
                 sequence_length=args.sequence_length,
                 batch_size=args.batch_size,
+                supervision_controllers=args.supervision_controllers,
             )
             save_ai42_profile(profile_path, profile)
     except AI42ProfileError as exc:
@@ -1269,6 +1300,8 @@ def train(args: argparse.Namespace, *, clock: Callable[[], float] = time.monoton
         raise AI42TrainingError("class profile ordered train IDs are incompatible")
     if profile.class_balance_power != CLASS_BALANCE_POWER:
         raise AI42TrainingError("class profile power is incompatible with AI-42 BC-v2")
+    if profile.supervision_controllers != tuple(args.supervision_controllers):
+        raise AI42TrainingError("class profile supervision controllers are incompatible")
     try:
         final_class_weights, normalized_overrides, overrides_hash = _merge_class_weight_overrides(
             profile, getattr(args, "class_weight_overrides", None),
@@ -1320,6 +1353,7 @@ def train(args: argparse.Namespace, *, clock: Callable[[], float] = time.monoton
         head_weights_hash=normalized_head_weights_hash,
         combat_focus=plan["combat_focus"],
         combat_focus_hash=plan["combat_focus_hash"],
+        supervision_controllers=list(args.supervision_controllers),
     )
 
     resume_path = args.resume or args.checkpoint
@@ -1674,6 +1708,7 @@ def train(args: argparse.Namespace, *, clock: Callable[[], float] = time.monoton
         "combat_focus_hash": extra["combat_focus_hash"],
         "gradient_accumulation_steps": plan["gradient_accumulation_steps"],
         "retain_periodic_checkpoints": bool(args.retain_periodic_checkpoints),
+        "supervision_controllers": list(args.supervision_controllers),
         "warm_start": extra["warm_start"],
         "improvement": {
             "epsilon": epsilon,
@@ -1710,6 +1745,7 @@ def train(args: argparse.Namespace, *, clock: Callable[[], float] = time.monoton
             "combat_focus": plan["combat_focus"],
             "combat_focus_hash": plan["combat_focus_hash"],
             "gradient_accumulation_steps": plan["gradient_accumulation_steps"],
+            "supervision_controllers": plan["supervision_controllers"],
             "retained_periodic_checkpoints": sorted(
                 str(path) for path in (run_root / "periodic").glob("step-*.pt")
             ) if args.retain_periodic_checkpoints else [],

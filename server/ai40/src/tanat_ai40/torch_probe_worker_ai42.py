@@ -107,7 +107,7 @@ _LEARNER_FIELDS = frozenset({
 _LEARNER_REQUIRED = frozenset({
     "learning_rate", "weight_decay", "class_balance_power", "max_gradient_norm",
 })
-_WARM_START_FIELDS = frozenset({"path", "sha256"})
+_WARM_START_FIELDS = frozenset({"path", "sha256", "dataset_hash", "allow_dataset_change"})
 _INLINE_FIELDS = frozenset({"kind", "sha256", "value"})
 _BUNDLE_FIELDS = frozenset({"kind", "sha256", "path"})
 _OBSERVATION_FIELDS = frozenset({"hero", "abilities", "entities", "global_state", "hero_ids"})
@@ -587,6 +587,9 @@ def _validate_request(request: Any) -> dict[str, Any]:
     _exact_fields(warm_start, _WARM_START_FIELDS, "request.warm_start", required=_WARM_START_FIELDS)
     _string(warm_start["path"], "request.warm_start.path")
     _sha256(warm_start["sha256"], "request.warm_start.sha256")
+    _sha256(warm_start["dataset_hash"], "request.warm_start.dataset_hash")
+    if not isinstance(warm_start["allow_dataset_change"], bool):
+        raise TorchPreflightError("request.warm_start.allow_dataset_change must be boolean", code="schema_error")
 
     batch = request["batch"]
     if not isinstance(batch, Mapping) or "kind" not in batch:
@@ -727,6 +730,8 @@ def run_preflight(request: Mapping[str, Any]) -> dict[str, Any]:
         )
         source_manifest = dict(source_artifact.manifest)
         source_dataset_hash = str(source_manifest["dataset_hash"])
+        target_dataset_hash = str(warm_spec["dataset_hash"])
+        allow_dataset_change = bool(warm_spec["allow_dataset_change"])
         compatibility_fields = {
             field: source_manifest[field]
             for field in ("protocol_version", "dataset_schema_version", "shard_schema_version")
@@ -735,7 +740,7 @@ def run_preflight(request: Mapping[str, Any]) -> dict[str, Any]:
         if "protocol_version" in compatibility_fields and compatibility_fields["protocol_version"] != AI42_PROTOCOL_VERSION:
             raise TorchPreflightError("warm-start protocol version is incompatible", code="protocol_mismatch")
         expected_manifest = build_learner_manifest(
-            actor, config, source_dataset_hash, **compatibility_fields,
+            actor, config, target_dataset_hash, **compatibility_fields,
         )
 
         optimizer_before = _artifact_digest(learner.optimizer.state_dict())
@@ -743,6 +748,7 @@ def run_preflight(request: Mapping[str, Any]) -> dict[str, Any]:
         model_before_warm = _model_digest(actor)
         warm_started = load_ai42_model_warm_start(
             warm_path, actor, expected_manifest, map_location=device,
+            allow_dataset_change=allow_dataset_change,
         )
         optimizer_after_warm = _artifact_digest(learner.optimizer.state_dict())
         rng_after_warm = _rng_digest()
@@ -907,6 +913,8 @@ def run_preflight(request: Mapping[str, Any]) -> dict[str, Any]:
                 "optimizer_artifact_hash": source_artifact.artifact_hashes["optimizer"],
                 "rng_artifact_hash": source_artifact.artifact_hashes["rng"],
                 "dataset_hash": warm_started.source_dataset_hash,
+                "dataset_changed": warm_started.source_dataset_hash != target_dataset_hash,
+                "dataset_change_allowed": allow_dataset_change,
                 "source_step": warm_started.source_step,
                 "source_epoch": warm_started.source_epoch,
                 "source_cursor": source_artifact.extra.get("batch_cursor"),

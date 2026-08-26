@@ -14,15 +14,17 @@ import (
 )
 
 type matchInfo struct {
-	ID        string
-	Split     string
-	Scenario  string
-	TickCount int
-	FirstStep uint32
+	ID               string
+	Split            string
+	Scenario         string
+	TickCount        int
+	FirstStep        uint32
+	ControllerBySlot [ai42dataset.HeroCount]uint8
 }
 
 type matchEvidence struct {
 	Counts             map[string][]int
+	CountsByHero       [ai42dataset.HeroCount]map[string][]int
 	SupervisedByWindow []uint16
 }
 
@@ -44,7 +46,11 @@ func (a *profileAccumulator) onMatch(value ai42dataset.MatchMetadata) error {
 	if value.MatchID == "" || (value.Split != "train" && value.Split != "validation") {
 		return fmt.Errorf("dataset match %q has an invalid split", value.MatchID)
 	}
+	if len(value.ControllerBySlot) != ai42dataset.HeroCount {
+		return fmt.Errorf("dataset match %q has invalid controller metadata", value.MatchID)
+	}
 	info := matchInfo{ID: value.MatchID, Split: value.Split, Scenario: value.Scenario, TickCount: value.TickCount, FirstStep: value.FirstStep}
+	copy(info.ControllerBySlot[:], value.ControllerBySlot)
 	if _, exists := a.ByID[info.ID]; exists {
 		return fmt.Errorf("dataset match %q was reported twice", info.ID)
 	}
@@ -81,14 +87,20 @@ func (a *profileAccumulator) onRow(row ai42dataset.Row) error {
 		if status >= 1 && status <= 4 {
 			evidence.SupervisedByWindow[window] |= uint16(1) << hero
 		}
+		if evidence.CountsByHero[hero] == nil {
+			evidence.CountsByHero[hero] = zeroCounts()
+		}
 		if err := addRowCounts(evidence.Counts, row, hero); err != nil {
+			return fmt.Errorf("dataset row %q hero %d: %w", row.MatchID, hero, err)
+		}
+		if err := addRowCounts(evidence.CountsByHero[hero], row, hero); err != nil {
 			return fmt.Errorf("dataset row %q hero %d: %w", row.MatchID, hero, err)
 		}
 	}
 	return nil
 }
 
-func (a *profileAccumulator) profile(datasetHash string) (Profile, error) {
+func (a *profileAccumulator) profile(datasetHash string, config Config) (Profile, error) {
 	trainIDs := make([]string, 0)
 	counts := zeroCounts()
 	for _, info := range a.Matches {
@@ -100,13 +112,40 @@ func (a *profileAccumulator) profile(datasetHash string) (Profile, error) {
 		if evidence == nil {
 			return Profile{}, fmt.Errorf("train match %q produced no rows", info.ID)
 		}
-		for _, head := range profileHeads {
-			for index, value := range evidence.Counts[head] {
-				counts[head][index] += value
+		for hero, controller := range info.ControllerBySlot {
+			if !supervisesController(config, controller) {
+				continue
+			}
+			for _, head := range profileHeads {
+				for index, value := range evidence.CountsByHero[hero][head] {
+					counts[head][index] += value
+				}
 			}
 		}
 	}
-	return buildProfile(datasetHash, trainIDs, counts)
+	return buildProfile(datasetHash, trainIDs, counts, config.SupervisionControllers)
+}
+
+func supervisesController(config Config, controller uint8) bool {
+	// Zero-value Config is used by bounded unit helpers; production Config.Validate
+	// requires an explicit non-empty set. Preserve the historical all-controller
+	// behavior for those pure helper calls.
+	if len(config.SupervisionControllers) == 0 {
+		return true
+	}
+	for _, wanted := range config.SupervisionControllers {
+		if controller == wanted {
+			return true
+		}
+	}
+	return false
+}
+
+func effectiveSupervisionControllers(config Config) []uint8 {
+	if len(config.SupervisionControllers) == 0 {
+		return []uint8{0, 1, 2, 3}
+	}
+	return config.SupervisionControllers
 }
 
 func verifyDataset(ctx context.Context, generation *ai42dataset.Generation, accumulator *profileAccumulator) (ai42dataset.VerificationReport, int, error) {
@@ -245,7 +284,7 @@ func makeBatchPlan(matches []matchInfo, evidence map[string]*matchEvidence, conf
 	}
 	trainIDs := rankedIDs(train, "train", config.Seed, 0)
 	validationIDs := rankedIDs(validation, "validation", config.Seed, config.ValidationProbeLimit)
-	payload := map[string]any{"version": BatchPlanVersion, "seed": int(config.Seed), "sequence_length": config.SequenceLength, "batch_size": config.BatchSize, "train_match_ids": stringsAny(trainIDs), "validation_match_ids": stringsAny(validationIDs)}
+	payload := map[string]any{"version": BatchPlanVersion, "seed": int(config.Seed), "sequence_length": config.SequenceLength, "batch_size": config.BatchSize, "train_match_ids": stringsAny(trainIDs), "validation_match_ids": stringsAny(validationIDs), "supervision_controllers": uint8sAny(effectiveSupervisionControllers(config))}
 	hash, err := canonicalHash(payload)
 	if err != nil {
 		return batchPlan{}, err
@@ -254,7 +293,7 @@ func makeBatchPlan(matches []matchInfo, evidence map[string]*matchEvidence, conf
 	if err != nil {
 		return batchPlan{}, err
 	}
-	validationHash, err := canonicalHash(map[string]any{"version": BatchPlanVersion, "seed": int(config.Seed), "match_ids": stringsAny(validationIDs)})
+	validationHash, err := canonicalHash(map[string]any{"version": BatchPlanVersion, "seed": int(config.Seed), "match_ids": stringsAny(validationIDs), "supervision_controllers": uint8sAny(effectiveSupervisionControllers(config))})
 	if err != nil {
 		return batchPlan{}, err
 	}
@@ -285,6 +324,9 @@ func makeBatchPlan(matches []matchInfo, evidence map[string]*matchEvidence, conf
 		}
 		windows := (info.TickCount + config.SequenceLength - 1) / config.SequenceLength
 		for hero := 0; hero < ai42dataset.HeroCount; hero++ {
+			if !supervisesController(config, info.ControllerBySlot[hero]) {
+				continue
+			}
 			for window := 0; window < windows; window++ {
 				if window >= len(matchEvidence.SupervisedByWindow) {
 					return batchPlan{}, fmt.Errorf("train match %q has incomplete compact eligibility evidence", id)
@@ -389,6 +431,14 @@ func stringsAny(values []string) []any {
 	result := make([]any, len(values))
 	for index, value := range values {
 		result[index] = value
+	}
+	return result
+}
+
+func uint8sAny(values []uint8) []any {
+	result := make([]any, len(values))
+	for index, value := range values {
+		result[index] = int(value)
 	}
 	return result
 }
