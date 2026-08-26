@@ -36,7 +36,13 @@ from .env import (
     NAVIGATION_ANCHORS,
     NAVIGATION_OFFSETS,
 )
-from .model_ai42_actor import AI42Actor, CONTROL_CLASSES, parameter_count
+from .model_ai42_actor import (
+    AI42Actor,
+    CONTROL_CLASSES,
+    CONTROL_CONTINUATION_CLASSES,
+    NAVIGATION_GRID_SIZE,
+    parameter_count,
+)
 from .trajectory_ai42 import AI42_TRAJECTORY_SCHEMA_HASH
 
 
@@ -148,6 +154,7 @@ def _estimated_model_parameters(
     hidden_size: int,
     model_width: int,
     entity_layers: int,
+    ff_multiplier: int,
 ) -> int:
     """Estimate AI42Actor parameters without constructing tensors."""
 
@@ -168,20 +175,21 @@ def _estimated_model_parameters(
     attention = (
         4 * model_width * model_width + 4 * model_width
         + 4 * model_width
-        + linear(model_width, model_width * 4)
-        + linear(model_width * 4, model_width)
+        + linear(model_width, model_width * ff_multiplier)
+        + linear(model_width * ff_multiplier, model_width)
     )
     total += entity_layers * attention
     total += projection(model_width, model_width)
     total += projection(1, model_width)
     total += 16 * hidden_size * model_width + 4 * hidden_size * hidden_size + 8 * hidden_size
     total += projection(hidden_size, model_width)
-    total += linear(hidden_size, CONTROL_CLASSES)
+    total += linear(hidden_size, 2)
+    total += linear(hidden_size, CONTROL_CONTINUATION_CLASSES)
     total += linear(hidden_size, ACTION_KINDS - ABILITY_COUNT)
     total += linear(model_width, 1)
     total += ACTION_KINDS * model_width
     total += 2 * linear(model_width, model_width)
-    total += linear(model_width, NAVIGATION_OFFSETS)
+    total += 2 * linear(model_width, NAVIGATION_GRID_SIZE)
     total += linear(model_width, NAVIGATION_ANCHORS)
     return total
 
@@ -258,6 +266,7 @@ def _validate_smoke_config(
         hidden_size=hidden_size,
         model_width=model_width,
         entity_layers=entity_layers,
+        ff_multiplier=4,
     )
     if estimated_parameters > MAX_MODEL_PARAMETERS:
         raise ValueError(

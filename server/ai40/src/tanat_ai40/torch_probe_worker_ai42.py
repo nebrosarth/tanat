@@ -19,7 +19,6 @@ The request shape is intentionally narrow::
                 "ff_multiplier": 1},
       "learner": {"learning_rate": 0.0003, "weight_decay": 0.0001,
                    "class_balance_power": 1.0,
-                   "offset_coordinate_loss_weight": 0.5,
                    "max_gradient_norm": 1.0},
       "warm_start": {"path": "checkpoint.pt", "sha256": "..."},
       "batch": {"kind": "inline", "sha256": "...", "value": { ... }}
@@ -77,7 +76,12 @@ from .learner_ai42 import (
     load_ai42_model_warm_start,
     save_ai42_checkpoint,
 )
-from .model_ai42_actor import AI42Actor, parameter_count
+from .model_ai42_actor import (
+    AI42Actor,
+    CONTROL_CONTINUATION_CLASSES,
+    NAVIGATION_GRID_SIZE,
+    parameter_count,
+)
 from .trajectory_ai42 import canonical_json_bytes
 
 
@@ -103,11 +107,10 @@ _MODEL_FIELDS = frozenset({
 })
 _LEARNER_FIELDS = frozenset({
     "learning_rate", "weight_decay", "class_balance_power",
-    "offset_coordinate_loss_weight", "max_gradient_norm", "head_weights", "class_weights",
+    "max_gradient_norm", "head_weights", "class_weights",
 })
 _LEARNER_REQUIRED = frozenset({
-    "learning_rate", "weight_decay", "class_balance_power",
-    "offset_coordinate_loss_weight", "max_gradient_norm",
+    "learning_rate", "weight_decay", "class_balance_power", "max_gradient_norm",
 })
 _WARM_START_FIELDS = frozenset({"path", "sha256", "dataset_hash", "allow_dataset_change"})
 _INLINE_FIELDS = frozenset({"kind", "sha256", "value"})
@@ -425,12 +428,13 @@ def _estimated_model_parameters(model: Mapping[str, Any]) -> int:
     total += projection(1, width)
     total += 16 * hidden * width + 4 * hidden * hidden + 8 * hidden
     total += projection(hidden, width)
-    total += linear(hidden, 4)
+    total += linear(hidden, 2)
+    total += linear(hidden, CONTROL_CONTINUATION_CLASSES)
     total += linear(hidden, ACTION_KINDS - ABILITY_COUNT)
     total += linear(width, 1)
     total += ACTION_KINDS * width
     total += 2 * linear(width, width)
-    total += linear(width, NAVIGATION_OFFSETS)
+    total += 2 * linear(width, NAVIGATION_GRID_SIZE)
     total += linear(width, NAVIGATION_ANCHORS)
     return total
 

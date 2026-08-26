@@ -79,6 +79,33 @@ class AI42ActorTest(unittest.TestCase):
         self.assertNotIn("critic", forward_parameters)
         self.assertNotIn("full_state", forward_parameters)
 
+    def test_structured_heads_preserve_public_probabilities_and_grid(self):
+        output = self.run_policy()
+        torch.testing.assert_close(
+            output["control"].exp().sum(dim=-1),
+            torch.ones(output["control"].shape[0]),
+        )
+
+        grid = output["offset"].reshape(3, ACTION_KINDS, 9, 9)
+        interaction = (
+            grid
+            - grid[..., :, :1]
+            - grid[..., :1, :]
+            + grid[..., :1, :1]
+        )
+        torch.testing.assert_close(interaction, torch.zeros_like(interaction))
+
+    def test_parameter_estimate_matches_structured_actor(self):
+        from tanat_ai40.smoke_ai42_actor import _estimated_model_parameters
+
+        expected = _estimated_model_parameters(
+            hidden_size=40,
+            model_width=32,
+            entity_layers=2,
+            ff_multiplier=2,
+        )
+        self.assertEqual(parameter_count(self.policy), expected)
+
     def test_entity_slot_permutation_only_permutates_target_logits(self):
         output = self.run_policy()
         permutation = torch.tensor([2, 0, 3, 1, 6, 5, 4])

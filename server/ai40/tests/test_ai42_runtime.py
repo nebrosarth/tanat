@@ -61,8 +61,9 @@ class AI42RuntimeTest(unittest.TestCase):
             ff_multiplier=1,
         ).eval()
         with torch.no_grad():
-            self.actor.control_head.bias.fill_(-100.0)
-            self.actor.control_head.bias[CONTROL_ISSUE] = 100.0
+            self.actor.control_head.boundary.weight.zero_()
+            self.actor.control_head.boundary.bias.fill_(-100.0)
+            self.actor.control_head.boundary.bias[CONTROL_ISSUE] = 100.0
 
     @staticmethod
     def observation(entity_slots: int = 5) -> dict[str, torch.Tensor]:

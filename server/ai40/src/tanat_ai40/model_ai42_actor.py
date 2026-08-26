@@ -38,6 +38,8 @@ CONTROL_HOLD = 2
 CONTROL_CANCEL = 3
 CONTROL_CLASSES = 4
 CONTROL_NAMES = ("issue", "wait", "hold", "cancel")
+CONTROL_CONTINUATION_CLASSES = CONTROL_CLASSES - 1
+NAVIGATION_GRID_SIZE = 9
 
 
 class _Projection(nn.Sequential):
@@ -102,6 +104,38 @@ class _EntityAttentionBlock(nn.Module):
 
         tokens = tokens + self.feedforward(self.norm_feedforward(tokens))
         return torch.where(valid, tokens, torch.zeros_like(tokens))
+
+
+class _HierarchicalControlHead(nn.Module):
+    """Factor ISSUE-vs-continuation before WAIT/HOLD/CANCEL."""
+
+    def __init__(self, input_size: int):
+        super().__init__()
+        self.boundary = nn.Linear(input_size, 2)
+        self.continuation = nn.Linear(input_size, CONTROL_CONTINUATION_CLASSES)
+
+    def forward(self, value: torch.Tensor) -> torch.Tensor:
+        boundary = torch.log_softmax(self.boundary(value), dim=-1)
+        continuation = torch.log_softmax(self.continuation(value), dim=-1)
+        return torch.cat(
+            (boundary[..., :1], boundary[..., 1:2] + continuation), dim=-1,
+        )
+
+
+class _FactorizedGridHead(nn.Module):
+    """Produce the public 81-cell logits from independent 9-way axes."""
+
+    def __init__(self, input_size: int):
+        super().__init__()
+        if NAVIGATION_OFFSETS != NAVIGATION_GRID_SIZE * NAVIGATION_GRID_SIZE:
+            raise ValueError("navigation offset vocabulary is not a 9x9 grid")
+        self.row = nn.Linear(input_size, NAVIGATION_GRID_SIZE)
+        self.column = nn.Linear(input_size, NAVIGATION_GRID_SIZE)
+
+    def forward(self, value: torch.Tensor) -> torch.Tensor:
+        row = self.row(value).unsqueeze(-1)
+        column = self.column(value).unsqueeze(-2)
+        return (row + column).flatten(start_dim=-2)
 
 
 class AI42Actor(nn.Module):
@@ -184,7 +218,7 @@ class AI42Actor(nn.Module):
 
         # Control is emitted directly from recurrent memory and gates the
         # action-parameter heads during teacher replay and inference.
-        self.control_head = nn.Linear(hidden_size, CONTROL_CLASSES)
+        self.control_head = _HierarchicalControlHead(hidden_size)
         # Non-skill actions are classified from recurrent state.  Each skill
         # logit is scored from its own ability token plus that same state, so
         # cooldown/readiness of Skill1 cannot be erased by mean pooling with
@@ -194,11 +228,11 @@ class AI42Actor(nn.Module):
         self.action_kind_embedding = nn.Embedding(ACTION_KINDS, model_width)
         self.target_query = nn.Linear(model_width, model_width)
         self.entity_key = nn.Linear(model_width, model_width)
-        self.offset_head = nn.Linear(model_width, NAVIGATION_OFFSETS)
+        self.offset_head = _FactorizedGridHead(model_width)
         self.anchor_head = nn.Linear(model_width, NAVIGATION_ANCHORS)
 
     @property
-    def direction_head(self) -> nn.Linear:
+    def direction_head(self) -> nn.Module:
         """AI-41 spelling for the 81-way local navigation head."""
 
         return self.offset_head
