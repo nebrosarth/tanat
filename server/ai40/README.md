@@ -289,6 +289,12 @@ inference and only 6.0% to the Go simulation. Peak PyTorch reserved VRAM was
 78 MiB, so this actor can coexist with a larger GPU workload by limiting its
 batch without treating VRAM as the primary bottleneck.
 
+The same two-match, two-worker, 600-tick rollout completed in 7.76 seconds with
+the ONNX Runtime backend versus 18.46 seconds with PyTorch BF16 (2.38x end-to-end).
+Policy throughput increased from 366 to 1,026 rows/second, with zero invalid
+actions. The evaluator exports the exact loaded checkpoint before opening the
+session and records the selected backend in `runtime_profile`.
+
 For CUDA 12 PyTorch wheels use the `onnx-gpu` optional dependency. It pins ORT
 below 1.27 because ORT 1.27 and newer PyPI GPU wheels require CUDA 13; the
 benchmark preloads PyTorch's matching CUDA/cuDNN DLLs before creating the CUDA
@@ -308,7 +314,8 @@ $env:PYTHONPATH = "$PWD\ai40\src"
 python -m tanat_ai40.evaluate_ai42 <generation.pt> `
   --config .\ai40\config\ai42_bc_training_q4.json `
   --env .\assaultenv.exe --matches 40 --workers 32 `
-  --max-steps 4500 --device cuda --output <evaluation.json>
+  --max-steps 4500 --device cuda --backend onnxruntime `
+  --onnx <actor.onnx> --output <evaluation.json>
 ```
 
 Headless controller values are `0` for a generic external policy, `1` for

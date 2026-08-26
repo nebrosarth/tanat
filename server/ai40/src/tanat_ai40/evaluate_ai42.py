@@ -244,11 +244,25 @@ def evaluate_vs_ai30(
     max_steps: int,
     device: torch.device,
     seed: int = 42_000,
+    backend: str = "torch",
+    onnx_path: Path | None = None,
 ) -> dict[str, Any]:
     if matches < 1 or workers < 1 or max_steps < 1:
         raise ValueError("matches, workers and max_steps must be positive")
+    if backend not in {"torch", "onnxruntime"}:
+        raise ValueError("backend must be torch or onnxruntime")
+    if backend == "onnxruntime" and onnx_path is None:
+        raise ValueError("onnxruntime backend requires onnx_path")
     load_started = time.perf_counter()
-    actor, lineage = load_actor(checkpoint, config, device)
+    actor_device = device if backend == "torch" else torch.device("cpu")
+    actor, lineage = load_actor(checkpoint, config, actor_device)
+    onnx_session = None
+    if backend == "onnxruntime":
+        from .export_ai42 import export_ai42_actor
+        from .inference_ai42_onnx import create_onnx_session
+
+        export_ai42_actor(actor, onnx_path)
+        onnx_session = create_onnx_session(str(onnx_path), cuda=device.type == "cuda")
     model_load_seconds = time.perf_counter() - load_started
     workers = min(workers, matches)
     roster_rng = np.random.default_rng(seed)
@@ -266,7 +280,7 @@ def evaluate_vs_ai30(
     environment_reset_seconds = 0.0
     policy_batches = 0
     policy_rows = 0
-    if device.type == "cuda":
+    if backend == "torch" and device.type == "cuda":
         torch.cuda.reset_peak_memory_stats(device)
     started = time.perf_counter()
     with AssaultVectorEnv(executable, workers, AI42_EVALUATION_PROTOCOL_VERSION) as env:
@@ -278,7 +292,16 @@ def evaluate_vs_ai30(
         )
         environment_reset_seconds += time.perf_counter() - reset_started
         next_seed = seed + workers
-        evaluator = AI42EvaluationActor(actor, workers * (HERO_COUNT // 2), device)
+        if backend == "torch":
+            evaluator = AI42EvaluationActor(actor, workers * (HERO_COUNT // 2), device)
+        else:
+            from .inference_ai42_onnx import AI42ONNXEvaluationActor
+
+            evaluator = AI42ONNXEvaluationActor(
+                onnx_session,
+                workers * (HERO_COUNT // 2),
+                actor.hidden_size,
+            )
         completed = 0
         while completed < matches:
             indices = controlled_slot_indices(assignments)
@@ -358,7 +381,7 @@ def evaluate_vs_ai30(
     model_control_total = max(int(model_controls.sum()), 1)
     accounted_seconds = inference_seconds + environment_step_seconds + environment_reset_seconds
     cuda_memory = None
-    if device.type == "cuda":
+    if backend == "torch" and device.type == "cuda":
         cuda_memory = {
             "peak_allocated_bytes": int(torch.cuda.max_memory_allocated(device)),
             "peak_reserved_bytes": int(torch.cuda.max_memory_reserved(device)),
@@ -414,6 +437,7 @@ def evaluate_vs_ai30(
         "matches_per_second": matches / max(elapsed, 1e-9),
         "runtime_profile": {
             "version": 1,
+            "backend": backend,
             "device": str(device),
             "model_load_seconds": model_load_seconds,
             "model_inference_seconds": inference_seconds,
@@ -440,12 +464,14 @@ def main() -> None:
     parser.add_argument("--workers", type=int, default=32)
     parser.add_argument("--max-steps", type=int, default=4_500)
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
+    parser.add_argument("--backend", choices=("torch", "onnxruntime"), default="torch")
+    parser.add_argument("--onnx", type=Path)
     parser.add_argument("--seed", type=int, default=42_000)
     parser.add_argument("--output", type=Path)
     args = parser.parse_args()
     metrics = evaluate_vs_ai30(
         args.checkpoint, args.config, args.env, args.matches, args.workers,
-        args.max_steps, torch.device(args.device), args.seed,
+        args.max_steps, torch.device(args.device), args.seed, args.backend, args.onnx,
     )
     rendered = json.dumps(metrics, ensure_ascii=False, indent=2, allow_nan=False)
     if args.output:

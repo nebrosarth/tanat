@@ -104,6 +104,22 @@ class _OneStepEnv:
 
 
 class AI42EvaluationTests(unittest.TestCase):
+    def test_onnx_backend_requires_an_explicit_artifact_path(self) -> None:
+        with self.assertRaisesRegex(ValueError, "requires onnx_path"):
+            evaluate_vs_ai30(
+                Path("checkpoint.pt"), Path("config.json"), Path("assaultenv.exe"),
+                matches=1, workers=1, max_steps=1, device=torch.device("cpu"),
+                backend="onnxruntime",
+            )
+
+    def test_unknown_backend_fails_before_loading_a_checkpoint(self) -> None:
+        with self.assertRaisesRegex(ValueError, "backend must be"):
+            evaluate_vs_ai30(
+                Path("checkpoint.pt"), Path("config.json"), Path("assaultenv.exe"),
+                matches=1, workers=1, max_steps=1, device=torch.device("cpu"),
+                backend="unknown",
+            )
+
     def test_controllers_alternate_candidate_side(self) -> None:
         self.assertEqual(controllers_for_side(1)[:5], (3,) * 5)
         self.assertEqual(controllers_for_side(1)[5:], (2,) * 5)
@@ -165,6 +181,7 @@ class AI42EvaluationTests(unittest.TestCase):
             )
         profile = metrics["runtime_profile"]
         self.assertEqual(profile["version"], 1)
+        self.assertEqual(profile["backend"], "torch")
         self.assertEqual(profile["device"], "cpu")
         self.assertEqual(profile["policy_batches"], 1)
         self.assertEqual(profile["policy_rows"], HERO_COUNT // 2)
