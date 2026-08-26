@@ -85,6 +85,10 @@ class AI42ActorTest(unittest.TestCase):
             output["control"].exp().sum(dim=-1),
             torch.ones(output["control"].shape[0]),
         )
+        torch.testing.assert_close(
+            output["kind"].exp().sum(dim=-1),
+            torch.ones(output["kind"].shape[0]),
+        )
 
         grid = output["offset"].reshape(3, ACTION_KINDS, 9, 9)
         interaction = (

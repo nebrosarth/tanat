@@ -198,7 +198,7 @@ func run(parent context.Context, options Options) (Report, error) {
 	requestValue := map[string]any{
 		"protocol": TorchProtocol, "seed": int(config.Seed), "device": options.Device,
 		"model":      map[string]any{"hidden_size": config.Model.HiddenSize, "model_width": config.Model.ModelWidth, "entity_layers": config.Model.EntityLayers, "num_heads": config.Model.NumHeads, "ff_multiplier": config.Model.FFMultiplier},
-		"learner":    map[string]any{"learning_rate": config.Learner.LearningRate, "weight_decay": config.Learner.WeightDecay, "class_balance_power": config.Learner.ClassBalancePower, "max_gradient_norm": config.Learner.MaxGradientNorm, "head_weights": scalarWeightsAsAny(config.Learner.HeadWeights), "class_weights": weightsAsAny(finalWeights)},
+		"learner":    map[string]any{"learning_rate": config.Learner.LearningRate, "weight_decay": config.Learner.WeightDecay, "class_balance_power": config.Learner.ClassBalancePower, "offset_distance_loss_weight": config.Learner.OffsetDistanceLossWeight, "max_gradient_norm": config.Learner.MaxGradientNorm, "head_weights": scalarWeightsAsAny(config.Learner.HeadWeights), "class_weights": weightsAsAny(finalWeights)},
 		"warm_start": map[string]any{"path": options.WarmStartPath, "sha256": warmHash, "dataset_hash": generation.ManifestHash(), "allow_dataset_change": options.AllowWarmStartDatasetChange},
 		"batch":      map[string]any{"kind": "bundle", "path": bundlePath, "sha256": bundleHash},
 	}

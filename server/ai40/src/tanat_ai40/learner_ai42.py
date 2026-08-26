@@ -54,6 +54,7 @@ from .model_ai42_actor import (
     CONTROL_ISSUE,
     CONTROL_NAMES,
     CONTROL_WAIT,
+    NAVIGATION_GRID_SIZE,
 )
 
 
@@ -654,6 +655,7 @@ class AI42LearnerConfig:
     learning_rate: float = 3e-4
     weight_decay: float = 1e-4
     class_balance_power: float = 1.0
+    offset_distance_loss_weight: float = 1.0
     max_gradient_norm: float = 1.0
     head_weights: Mapping[str, float] = field(default_factory=lambda: {
         "control": 1.0, "kind": 1.0, "target": 1.0, "offset": 1.0, "anchor": 1.0,
@@ -663,7 +665,8 @@ class AI42LearnerConfig:
 
     def __post_init__(self) -> None:
         for name in (
-            "learning_rate", "weight_decay", "class_balance_power", "max_gradient_norm",
+            "learning_rate", "weight_decay", "class_balance_power",
+            "offset_distance_loss_weight", "max_gradient_norm",
         ):
             number = float(getattr(self, name))
             if not math.isfinite(number) or number < 0.0 or (name == "max_gradient_norm" and number == 0.0):
@@ -687,6 +690,7 @@ class AI42LearnerConfig:
             "learning_rate": self.learning_rate,
             "weight_decay": self.weight_decay,
             "class_balance_power": self.class_balance_power,
+            "offset_distance_loss_weight": self.offset_distance_loss_weight,
             "max_gradient_norm": self.max_gradient_norm,
             "head_weights": dict(self.head_weights),
             "class_weights": {key: list(value) for key, value in self.class_weights.items()},
@@ -927,6 +931,25 @@ def _head_loss(
         selected_logits = logits[active]
         masked_logits = selected_logits.masked_fill(~selected_mask, -torch.inf)
         per_item = F.cross_entropy(masked_logits, selected_labels, reduction="none")
+        expected_distance = per_item.new_zeros(per_item.shape)
+        if head == "offset" and config.offset_distance_loss_weight > 0.0:
+            if classes != NAVIGATION_GRID_SIZE * NAVIGATION_GRID_SIZE:
+                raise AI42LearnerError("offset vocabulary is not a square navigation grid")
+            cells = torch.arange(classes, device=logits.device)
+            row_distance = (
+                torch.div(cells, NAVIGATION_GRID_SIZE, rounding_mode="floor").unsqueeze(0)
+                - torch.div(selected_labels, NAVIGATION_GRID_SIZE, rounding_mode="floor").unsqueeze(1)
+            ).abs()
+            column_distance = (
+                cells.remainder(NAVIGATION_GRID_SIZE).unsqueeze(0)
+                - selected_labels.remainder(NAVIGATION_GRID_SIZE).unsqueeze(1)
+            ).abs()
+            normalized_distance = (row_distance + column_distance).to(dtype=per_item.dtype)
+            normalized_distance /= float(2 * (NAVIGATION_GRID_SIZE - 1))
+            expected_distance = (
+                torch.softmax(masked_logits, dim=-1) * normalized_distance
+            ).sum(dim=-1)
+            per_item = per_item + float(config.offset_distance_loss_weight) * expected_distance
         counts = _counts(labels, active, classes)
         weights = _weights_for(config, head, counts, logits.device)
         sample_weights = weights[selected_labels]
@@ -958,6 +981,10 @@ def _head_loss(
         "class_counts": counts,
         "weighted_numerator": weighted_numerator_value,
         "weighted_denominator": weighted_denominator_value,
+        "expected_normalized_manhattan_loss": (
+            float(expected_distance.mean().detach().cpu().item())
+            if bool(active.any()) and head == "offset" else 0.0
+        ),
     }
     return value, metrics, counts
 

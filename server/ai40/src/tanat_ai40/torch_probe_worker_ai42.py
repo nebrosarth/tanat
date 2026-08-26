@@ -19,6 +19,7 @@ The request shape is intentionally narrow::
                 "ff_multiplier": 1},
       "learner": {"learning_rate": 0.0003, "weight_decay": 0.0001,
                    "class_balance_power": 1.0,
+                   "offset_distance_loss_weight": 1.0,
                    "max_gradient_norm": 1.0},
       "warm_start": {"path": "checkpoint.pt", "sha256": "..."},
       "batch": {"kind": "inline", "sha256": "...", "value": { ... }}
@@ -79,6 +80,7 @@ from .learner_ai42 import (
 from .model_ai42_actor import (
     AI42Actor,
     CONTROL_CONTINUATION_CLASSES,
+    KIND_GROUP_CLASSES,
     NAVIGATION_GRID_SIZE,
     parameter_count,
 )
@@ -107,10 +109,11 @@ _MODEL_FIELDS = frozenset({
 })
 _LEARNER_FIELDS = frozenset({
     "learning_rate", "weight_decay", "class_balance_power",
-    "max_gradient_norm", "head_weights", "class_weights",
+    "offset_distance_loss_weight", "max_gradient_norm", "head_weights", "class_weights",
 })
 _LEARNER_REQUIRED = frozenset({
-    "learning_rate", "weight_decay", "class_balance_power", "max_gradient_norm",
+    "learning_rate", "weight_decay", "class_balance_power",
+    "offset_distance_loss_weight", "max_gradient_norm",
 })
 _WARM_START_FIELDS = frozenset({"path", "sha256", "dataset_hash", "allow_dataset_change"})
 _INLINE_FIELDS = frozenset({"kind", "sha256", "value"})
@@ -430,7 +433,7 @@ def _estimated_model_parameters(model: Mapping[str, Any]) -> int:
     total += projection(hidden, width)
     total += linear(hidden, 2)
     total += linear(hidden, CONTROL_CONTINUATION_CLASSES)
-    total += linear(hidden, ACTION_KINDS - ABILITY_COUNT)
+    total += linear(hidden, KIND_GROUP_CLASSES)
     total += linear(width, 1)
     total += ACTION_KINDS * width
     total += 2 * linear(width, width)

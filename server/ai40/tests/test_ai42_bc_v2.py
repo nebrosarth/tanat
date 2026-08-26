@@ -97,6 +97,7 @@ class AI42BCV2Tests(unittest.TestCase):
         self.assertEqual(defaults["entity_layers"], 2)
         self.assertEqual(defaults["num_heads"], 6)
         self.assertEqual(defaults["class_balance_power"], 1.0)
+        self.assertEqual(defaults["offset_distance_loss_weight"], 1.0)
         self.assertNotIn("class_weight_overrides", defaults)
         self.assertNotIn("combat_focus", defaults)
         self.assertNotIn("trainable_scope", defaults)
@@ -113,6 +114,7 @@ class AI42BCV2Tests(unittest.TestCase):
         self.assertEqual(profile.counts["offset"][2], 1)
         self.assertEqual(profile.counts["anchor"][2], 1)
         self.assertAlmostEqual(sum(value for value in profile.weights["control"] if value) / 4.0, 1.0, places=6)
+        self.assertTrue(all(value == 1.0 for value in profile.weights["kind"]))
         self.assertTrue(all(value == 1.0 for value in profile.weights["target"]))
         self.assertTrue(all(value == 1.0 for value in profile.weights["offset"]))
         with self.assertRaises(TypeError):
@@ -181,6 +183,31 @@ class AI42BCV2Tests(unittest.TestCase):
         self.assertEqual(metrics["action"]["count"], 4)
         self.assertEqual(metrics["action"]["end_to_end_correct"], 3)
         json.dumps(metrics, sort_keys=True, allow_nan=False)
+
+    def test_offset_loss_directly_penalizes_expected_grid_distance(self) -> None:
+        batch = _batch()
+        actor = AI42Actor(
+            hidden_size=8, model_width=8, entity_layers=1,
+            num_heads=2, ff_multiplier=1,
+        )
+        near = _outputs(batch)
+        far = {name: value.clone() for name, value in near.items()}
+        far["offset"][0, 0, 1, 5] = -100.0
+        far["offset"][0, 0, 1, 80] = 11.0
+        config = AI42LearnerConfig(
+            model_kwargs={
+                "hidden_size": 8, "model_width": 8, "entity_layers": 1,
+                "num_heads": 2, "ff_multiplier": 1,
+            },
+            offset_distance_loss_weight=1.0,
+        )
+        near_result = compute_behavior_cloning_loss(actor, batch, config, outputs=near)
+        far_result = compute_behavior_cloning_loss(actor, batch, config, outputs=far)
+        self.assertGreater(
+            far_result.metrics["heads"]["offset"]["expected_normalized_manhattan_loss"],
+            near_result.metrics["heads"]["offset"]["expected_normalized_manhattan_loss"],
+        )
+        self.assertGreater(far_result.head_losses["offset"], near_result.head_losses["offset"])
 
     def test_weighted_probe_aggregation_is_partition_invariant(self) -> None:
         class FakeLearner:

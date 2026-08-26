@@ -40,6 +40,7 @@ from .model_ai42_actor import (
     AI42Actor,
     CONTROL_CLASSES,
     CONTROL_CONTINUATION_CLASSES,
+    KIND_GROUP_CLASSES,
     NAVIGATION_GRID_SIZE,
     parameter_count,
 )
@@ -185,7 +186,7 @@ def _estimated_model_parameters(
     total += projection(hidden_size, model_width)
     total += linear(hidden_size, 2)
     total += linear(hidden_size, CONTROL_CONTINUATION_CLASSES)
-    total += linear(hidden_size, ACTION_KINDS - ABILITY_COUNT)
+    total += linear(hidden_size, KIND_GROUP_CLASSES)
     total += linear(model_width, 1)
     total += ACTION_KINDS * model_width
     total += 2 * linear(model_width, model_width)

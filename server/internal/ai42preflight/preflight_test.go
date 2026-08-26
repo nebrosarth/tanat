@@ -152,7 +152,7 @@ func TestLoadConfigRejectsUnknownAndAcceptsProductionConfig(t *testing.T) {
 		t.Fatalf("unexpected production config: %+v %+v", config.Model, config.Learner)
 	}
 	path = filepath.Join(t.TempDir(), "unknown.json")
-	if err := os.WriteFile(path, []byte(`{"protocol_version":13,"model":{"hidden_size":1,"model_width":1,"entity_layers":1,"num_heads":1,"ff_multiplier":1},"recurrent_batch":{"sequence_length":1,"batch_size":1},"learner":{"learning_rate":0.0003,"weight_decay":0.0001,"class_balance_power":0.5,"max_gradient_norm":1,"unknown":true},"training":{"seed":4242,"max_optimizer_seconds":300,"max_steps":1,"epochs":1,"validation_batches":1,"validation_epsilon":0.0001}}`), 0o600); err != nil {
+	if err := os.WriteFile(path, []byte(`{"protocol_version":13,"model":{"hidden_size":1,"model_width":1,"entity_layers":1,"num_heads":1,"ff_multiplier":1},"recurrent_batch":{"sequence_length":1,"batch_size":1},"learner":{"learning_rate":0.0003,"weight_decay":0.0001,"class_balance_power":0.5,"offset_distance_loss_weight":1,"max_gradient_norm":1,"unknown":true},"training":{"seed":4242,"max_optimizer_seconds":300,"max_steps":1,"epochs":1,"validation_batches":1,"validation_epsilon":0.0001}}`), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := LoadConfig(path); err == nil || !strings.Contains(err.Error(), "unknown") {
@@ -606,7 +606,7 @@ func BenchmarkCanonicalWorkerRequest(b *testing.B) {
 	value := map[string]any{
 		"protocol": TorchProtocol, "request_sha256": strings.Repeat("a", 64), "seed": 4242, "device": "cpu",
 		"model":      map[string]any{"hidden_size": 192, "model_width": 192, "entity_layers": 2, "num_heads": 6, "ff_multiplier": 4},
-		"learner":    map[string]any{"learning_rate": 3e-4, "weight_decay": 1e-4, "class_balance_power": 1.0, "max_gradient_norm": 1.0},
+		"learner":    map[string]any{"learning_rate": 3e-4, "weight_decay": 1e-4, "class_balance_power": 1.0, "offset_distance_loss_weight": 1.0, "max_gradient_norm": 1.0},
 		"warm_start": map[string]any{"path": "warm.pt", "sha256": strings.Repeat("b", 64), "dataset_hash": strings.Repeat("c", 64), "allow_dataset_change": false},
 		"batch":      map[string]any{"kind": "bundle", "path": "batch.json", "sha256": strings.Repeat("c", 64)},
 	}

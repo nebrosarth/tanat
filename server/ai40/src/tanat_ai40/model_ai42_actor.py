@@ -40,6 +40,8 @@ CONTROL_CLASSES = 4
 CONTROL_NAMES = ("issue", "wait", "hold", "cancel")
 CONTROL_CONTINUATION_CLASSES = CONTROL_CLASSES - 1
 NAVIGATION_GRID_SIZE = 9
+KIND_GROUP_CLASSES = 5
+KIND_SKILL_START = 3
 
 
 class _Projection(nn.Sequential):
@@ -138,6 +140,28 @@ class _FactorizedGridHead(nn.Module):
         return (row + column).flatten(start_dim=-2)
 
 
+class _HierarchicalKindHead(nn.Module):
+    """Choose a coarse action group, then one ability inside SKILL."""
+
+    def __init__(self, input_size: int):
+        super().__init__()
+        self.group = nn.Linear(input_size, KIND_GROUP_CLASSES)
+
+    def forward(self, value: torch.Tensor, skill_logits: torch.Tensor) -> torch.Tensor:
+        if skill_logits.shape[-1] != ABILITY_COUNT:
+            raise ValueError("skill logits must contain exactly four abilities")
+        group = torch.log_softmax(self.group(value), dim=-1)
+        skill = torch.log_softmax(skill_logits, dim=-1)
+        return torch.cat(
+            (
+                group[..., :3],
+                group[..., 3:4] + skill,
+                group[..., 4:],
+            ),
+            dim=-1,
+        )
+
+
 class AI42Actor(nn.Module):
     """Entity-centric, recurrent micro actor for one controlled hero.
 
@@ -182,8 +206,8 @@ class AI42Actor(nn.Module):
             raise ValueError("model_width must be divisible by num_heads")
         if ff_multiplier < 1:
             raise ValueError("ff_multiplier must be positive")
-        if not 0 <= ability_action_start <= ACTION_KINDS - ABILITY_COUNT:
-            raise ValueError("ability action range does not fit in ACTION_KINDS")
+        if ability_action_start != KIND_SKILL_START:
+            raise ValueError("AI-42 skill actions must occupy kinds 3..6")
 
         self.hidden_size = hidden_size
         self.model_width = model_width
@@ -223,7 +247,7 @@ class AI42Actor(nn.Module):
         # logit is scored from its own ability token plus that same state, so
         # cooldown/readiness of Skill1 cannot be erased by mean pooling with
         # the other three abilities.
-        self.kind_head = nn.Linear(hidden_size, ACTION_KINDS - ABILITY_COUNT)
+        self.kind_head = _HierarchicalKindHead(hidden_size)
         self.ability_kind_head = nn.Linear(model_width, 1)
         self.action_kind_embedding = nn.Embedding(ACTION_KINDS, model_width)
         self.target_query = nn.Linear(model_width, model_width)
@@ -388,19 +412,11 @@ class AI42Actor(nn.Module):
         )
 
         control_logits = self.control_head(h)
-        non_skill_logits = self.kind_head(h)
         skill_start = self.ability_action_start
         skill_logits = self.ability_kind_head(
             action_context[:, skill_start:skill_start + ABILITY_COUNT]
         ).squeeze(-1)
-        kind_logits = torch.cat(
-            (
-                non_skill_logits[:, :skill_start],
-                skill_logits,
-                non_skill_logits[:, skill_start:],
-            ),
-            dim=-1,
-        )
+        kind_logits = self.kind_head(h, skill_logits)
         offset_logits = self.offset_head(action_context)
         anchor_logits = self.anchor_head(action_context)
         return {

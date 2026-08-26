@@ -32,17 +32,20 @@ from .learner_ai42 import (
 )
 
 
-PROFILE_FORMAT = "AI42-bc-class-profile-v6"
+PROFILE_FORMAT = "AI42-bc-class-profile-v7"
 PROFILE_VERSION = PROFILE_FORMAT
 SUPERVISION_VERSION = "AI42-supervision-v2"
 PROTOCOL_VERSION = 13
 CLASS_BALANCE_POWER = 1.0
 PROFILE_HEADS = HEAD_NAMES
-UNIFORM_FREQUENCY_HEADS = frozenset({"target", "offset"})
+UNIFORM_FREQUENCY_HEADS = frozenset({"kind", "target", "offset"})
 
 
 def _profile_class_weights(head: str, counts: Sequence[int], power: float) -> torch.Tensor:
-    # Target indices are exchangeable entity slots, not semantic classes.
+    # Kind is a normalized group->skill hierarchy. Natural-frequency CE on
+    # its public logits trains the coarse group on all ISSUE rows and the
+    # conditional ability choice only on skill rows, without allowing a rare
+    # skill to erase MOVE. Target indices are exchangeable entity slots.
     # Frequency weighting by slot number breaks target permutation equivariance.
     # Navigation offsets are spatial grid cells rather than semantic classes;
     # inverse-frequency weights over-reward rare distant cells and can improve

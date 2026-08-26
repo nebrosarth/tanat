@@ -31,6 +31,7 @@ LEARNER = {
     "learning_rate": 0.0003,
     "weight_decay": 0.0001,
     "class_balance_power": 1.0,
+    "offset_distance_loss_weight": 1.0,
     "max_gradient_norm": 1.0,
 }
 

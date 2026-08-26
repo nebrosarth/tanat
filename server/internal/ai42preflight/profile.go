@@ -99,7 +99,7 @@ func classBalanceWeights(counts []int) []float64 {
 }
 
 func profileClassWeights(head string, counts []int) []float64 {
-	if head == "target" || head == "offset" {
+	if head == "kind" || head == "target" || head == "offset" {
 		result := make([]float64, len(counts))
 		for index := range result {
 			result[index] = 1
@@ -271,9 +271,9 @@ func parseProfileWeights(value any, counts map[string][]int) (map[string][]float
 				}
 				return nil, fmt.Errorf("profile.weights[%s][%d] is invalid", head, index)
 			}
-			if head == "target" || head == "offset" {
+			if head == "kind" || head == "target" || head == "offset" {
 				if number <= 0 {
-					return nil, fmt.Errorf("profile target-slot weights must all be positive")
+					return nil, fmt.Errorf("profile uniform weights for %s must all be positive", head)
 				}
 				supported++
 				mean += number
