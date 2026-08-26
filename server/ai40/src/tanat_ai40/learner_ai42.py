@@ -655,6 +655,7 @@ class AI42LearnerConfig:
     weight_decay: float = 1e-4
     class_balance_power: float = 0.5
     max_gradient_norm: float = 1.0
+    trainable_scope: str = "all"
     head_weights: Mapping[str, float] = field(default_factory=lambda: {
         "control": 1.0, "kind": 1.0, "target": 1.0, "offset": 1.0, "anchor": 1.0,
     })
@@ -667,6 +668,8 @@ class AI42LearnerConfig:
             if not math.isfinite(number) or number < 0.0 or (name == "max_gradient_norm" and number == 0.0):
                 raise AI42LearnerError(f"{name} must be finite and positive where required")
         valid_heads = {"control", "kind", "target", "offset", "anchor"}
+        if self.trainable_scope not in {"all", "supervised_heads"}:
+            raise AI42LearnerError("trainable_scope must be 'all' or 'supervised_heads'")
         for name, value in self.head_weights.items():
             if name not in valid_heads or not math.isfinite(float(value)) or float(value) < 0:
                 raise AI42LearnerError(f"invalid head weight {name!r}")
@@ -686,6 +689,7 @@ class AI42LearnerConfig:
             "weight_decay": self.weight_decay,
             "class_balance_power": self.class_balance_power,
             "max_gradient_norm": self.max_gradient_norm,
+            "trainable_scope": self.trainable_scope,
             "head_weights": dict(self.head_weights),
             "class_weights": {key: list(value) for key, value in self.class_weights.items()},
             "model_kwargs": dict(self.model_kwargs),
@@ -1194,9 +1198,33 @@ class AI42Learner:
     def __init__(self, actor: AI42Actor, config: AI42LearnerConfig | None = None, *, optimizer: torch.optim.Optimizer | None = None):
         self.actor = actor
         self.config = AI42LearnerConfig() if config is None else config
+        trainable = self._configure_trainable_parameters()
         self.optimizer = optimizer or torch.optim.AdamW(
-            self.actor.parameters(), lr=self.config.learning_rate, weight_decay=self.config.weight_decay,
+            trainable, lr=self.config.learning_rate, weight_decay=self.config.weight_decay,
         )
+
+    def _configure_trainable_parameters(self) -> list[nn.Parameter]:
+        """Select the optimizer surface without changing the actor artifact.
+
+        ``supervised_heads`` adapts only the terminal modules directly owned
+        by the five supervised losses.  The observation encoders, attention,
+        recurrent core, and shared action context remain fixed, preventing a
+        rare-kind update from moving every other decision boundary.
+        """
+
+        prefixes = (
+            "control_head.", "kind_head.", "target_query.", "entity_key.",
+            "offset_head.", "anchor_head.",
+        )
+        selected: list[nn.Parameter] = []
+        for name, parameter in self.actor.named_parameters():
+            enabled = self.config.trainable_scope == "all" or name.startswith(prefixes)
+            parameter.requires_grad_(enabled)
+            if enabled:
+                selected.append(parameter)
+        if not selected:
+            raise AI42LearnerError("trainable_scope selected no actor parameters")
+        return selected
 
     def forward(self, batch: AI42Batch, *, initial_state: tuple[Tensor, Tensor] | None = None) -> dict[str, Tensor]:
         return forward_batch(self.actor, batch, initial_state=initial_state)

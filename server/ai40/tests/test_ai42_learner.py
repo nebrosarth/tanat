@@ -125,6 +125,36 @@ class AI42LearnerTest(unittest.TestCase):
         for name, value in self.actor.state_dict().items():
             torch.testing.assert_close(value, before[name])
 
+    def test_supervised_head_scope_freezes_shared_representation(self) -> None:
+        learner = AI42Learner(
+            self.actor,
+            AI42LearnerConfig(learning_rate=1e-3, trainable_scope="supervised_heads"),
+        )
+        before = {name: value.detach().clone() for name, value in self.actor.state_dict().items()}
+        learner.backward(self.batch())
+        learner.clip_gradients()
+        learner.optimizer_step()
+        changed = {
+            name for name, value in self.actor.state_dict().items()
+            if not torch.equal(value, before[name])
+        }
+        self.assertTrue(changed)
+        self.assertTrue(all(name.startswith((
+            "control_head.", "kind_head.", "target_query.", "entity_key.",
+            "offset_head.", "anchor_head.",
+        )) for name in changed))
+        self.assertTrue(all(
+            parameter.requires_grad == name.startswith((
+                "control_head.", "kind_head.", "target_query.", "entity_key.",
+                "offset_head.", "anchor_head.",
+            ))
+            for name, parameter in self.actor.named_parameters()
+        ))
+
+    def test_trainable_scope_is_strict(self) -> None:
+        with self.assertRaisesRegex(AI42LearnerError, "trainable_scope"):
+            AI42LearnerConfig(trainable_scope="backbone")
+
     @unittest.skipUnless(torch.cuda.is_available(), "CUDA batch-device gate")
     def test_batch_to_cuda_moves_every_tensor_field(self) -> None:
         moved = self.batch().to("cuda")

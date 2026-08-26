@@ -13,7 +13,8 @@ var defaultConfig = Config{
 	BatchSize:       8,
 	Learner: LearnerConfig{
 		LearningRate: 3e-4, WeightDecay: 1e-4, ClassBalancePower: 0.5, MaxGradientNorm: 1.0,
-		HeadWeights: map[string]float64{"control": 1, "kind": 1, "target": 1, "offset": 1, "anchor": 1},
+		TrainableScope: "all",
+		HeadWeights:    map[string]float64{"control": 1, "kind": 1, "target": 1, "offset": 1, "anchor": 1},
 	},
 	Seed: 4242, ValidationProbeLimit: 0,
 	SupervisionControllers: []uint8{0, 1, 2, 3},
@@ -24,7 +25,7 @@ var modelFields = map[string]struct{}{
 }
 var recurrentFields = map[string]struct{}{"sequence_length": {}, "batch_size": {}}
 var preflightLearnerFields = map[string]struct{}{"class_balance_power": {}, "max_gradient_norm": {}, "timing_loss_enabled": {}, "optimizer_step_allowed_in_preflight": {}}
-var trainingLearnerFields = map[string]struct{}{"class_balance_power": {}, "max_gradient_norm": {}, "learning_rate": {}, "weight_decay": {}, "class_weight_overrides": {}, "head_weights": {}}
+var trainingLearnerFields = map[string]struct{}{"class_balance_power": {}, "max_gradient_norm": {}, "learning_rate": {}, "weight_decay": {}, "class_weight_overrides": {}, "head_weights": {}, "trainable_scope": {}}
 var trainingFields = map[string]struct{}{
 	"seed": {}, "max_optimizer_seconds": {}, "max_steps": {}, "epochs": {}, "validation_batches": {}, "validation_epsilon": {},
 	"checkpoint_interval": {}, "validation_matches": {}, "supervision_controllers": {},
@@ -140,7 +141,7 @@ func parseTrainingConfig(root map[string]any, config *Config) error {
 		return err
 	}
 	requiredLearner := map[string]struct{}{"class_balance_power": {}, "max_gradient_norm": {}, "learning_rate": {}, "weight_decay": {}}
-	if err := exactFields(learner, requiredLearner, map[string]struct{}{"class_weight_overrides": {}, "head_weights": {}}, "training config.learner"); err != nil {
+	if err := exactFields(learner, requiredLearner, map[string]struct{}{"class_weight_overrides": {}, "head_weights": {}, "trainable_scope": {}}, "training config.learner"); err != nil {
 		return err
 	}
 	config.Learner.ClassBalancePower, err = asNumber(learner["class_balance_power"], "training config.learner.class_balance_power")
@@ -168,6 +169,13 @@ func parseTrainingConfig(root map[string]any, config *Config) error {
 		if err := parseHeadWeights(raw, &config.Learner.HeadWeights); err != nil {
 			return err
 		}
+	}
+	if raw, ok := learner["trainable_scope"]; ok {
+		scope, err := asString(raw, "training config.learner.trainable_scope")
+		if err != nil {
+			return err
+		}
+		config.Learner.TrainableScope = scope
 	}
 	training, err := object(root["training"], "training config.training")
 	if err != nil {
@@ -374,6 +382,9 @@ func (config Config) Validate() error {
 	}
 	if config.Learner.LearningRate <= 0 || config.Learner.WeightDecay < 0 || config.Learner.MaxGradientNorm <= 0 {
 		return fmt.Errorf("learner rates and gradient norm are outside their valid ranges")
+	}
+	if config.Learner.TrainableScope != "all" && config.Learner.TrainableScope != "supervised_heads" {
+		return fmt.Errorf("trainable_scope must be all or supervised_heads")
 	}
 	if len(config.Learner.HeadWeights) != 5 {
 		return fmt.Errorf("head_weights must contain exactly the five AI-42 loss heads")

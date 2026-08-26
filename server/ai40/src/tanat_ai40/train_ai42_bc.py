@@ -405,7 +405,7 @@ def _training_config_defaults(path: Path) -> dict[str, Any]:
     required_learner = {
         "class_balance_power", "max_gradient_norm", "learning_rate", "weight_decay",
     }
-    optional_learner = {"class_weight_overrides", "head_weights"}
+    optional_learner = {"class_weight_overrides", "head_weights", "trainable_scope"}
     if (
         not isinstance(learner, dict)
         or not required_learner.issubset(learner)
@@ -438,6 +438,7 @@ def _training_config_defaults(path: Path) -> dict[str, Any]:
             head: list(values) for head, values in normalized_overrides.items()
         },
         "head_weights": normalized_head_weights,
+        "trainable_scope": learner.get("trainable_scope", "all"),
         **training,
         "combat_focus": normalized_combat_focus,
         "gradient_accumulation_steps": training.get("gradient_accumulation_steps", 1),
@@ -471,6 +472,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--weight-decay", type=float, default=1e-4)
     parser.add_argument("--class-weight-overrides", dest="class_weight_overrides", default=None, help=argparse.SUPPRESS)
     parser.add_argument("--head-weights", dest="head_weights", default=dict(DEFAULT_HEAD_WEIGHTS), help=argparse.SUPPRESS)
+    parser.add_argument("--trainable-scope", choices=("all", "supervised_heads"), default="all", help=argparse.SUPPRESS)
     parser.add_argument("--combat-focus", dest="combat_focus", default=dict(DEFAULT_COMBAT_FOCUS), help=argparse.SUPPRESS)
     parser.add_argument("--gradient-accumulation-steps", type=int, default=1, help="number of deterministic focused batches combined into one optimizer step")
     parser.add_argument("--retain-periodic-checkpoints", action="store_true", help="retain immutable step checkpoints for bounded candidate selection")
@@ -1322,6 +1324,7 @@ def train(args: argparse.Namespace, *, clock: Callable[[], float] = time.monoton
         weight_decay=args.weight_decay,
         class_balance_power=profile.class_balance_power,
         max_gradient_norm=args.max_gradient_norm,
+        trainable_scope=args.trainable_scope,
         head_weights=normalized_head_weights,
         class_weights=final_class_weights,
         model_kwargs={
@@ -1502,6 +1505,7 @@ def train(args: argparse.Namespace, *, clock: Callable[[], float] = time.monoton
                     "class_weight_provenance": class_weight_provenance,
                     "head_weights": normalized_head_weights,
                     "head_weights_hash": normalized_head_weights_hash,
+                    "trainable_scope": args.trainable_scope,
                 }
                 checkpoint_started = float(clock())
                 if args.retain_periodic_checkpoints:
@@ -1604,6 +1608,7 @@ def train(args: argparse.Namespace, *, clock: Callable[[], float] = time.monoton
         "class_weight_provenance": class_weight_provenance,
         "head_weights": normalized_head_weights,
         "head_weights_hash": normalized_head_weights_hash,
+        "trainable_scope": args.trainable_scope,
         "combat_focus": plan["combat_focus"],
         "combat_focus_hash": plan["combat_focus_hash"],
         "warm_start": None if warm_start_state is None else {
@@ -1708,6 +1713,7 @@ def train(args: argparse.Namespace, *, clock: Callable[[], float] = time.monoton
         "class_weight_provenance": extra["class_weight_provenance"],
         "head_weights": extra["head_weights"],
         "head_weights_hash": extra["head_weights_hash"],
+        "trainable_scope": extra["trainable_scope"],
         "combat_focus": extra["combat_focus"],
         "combat_focus_hash": extra["combat_focus_hash"],
         "gradient_accumulation_steps": plan["gradient_accumulation_steps"],

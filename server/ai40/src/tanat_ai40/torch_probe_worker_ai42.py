@@ -102,7 +102,7 @@ _MODEL_FIELDS = frozenset({
 })
 _LEARNER_FIELDS = frozenset({
     "learning_rate", "weight_decay", "class_balance_power",
-    "max_gradient_norm", "head_weights", "class_weights",
+    "max_gradient_norm", "head_weights", "class_weights", "trainable_scope",
 })
 _LEARNER_REQUIRED = frozenset({
     "learning_rate", "weight_decay", "class_balance_power", "max_gradient_norm",
@@ -573,6 +573,10 @@ def _validate_request(request: Any) -> dict[str, Any]:
         for name, item in learner["head_weights"].items():
             _string(name, "request.learner.head_weights key")
             _finite_number(item, f"request.learner.head_weights[{name!r}]")
+    if "trainable_scope" in learner:
+        scope = _string(learner["trainable_scope"], "request.learner.trainable_scope")
+        if scope not in {"all", "supervised_heads"}:
+            raise TorchPreflightError("request.learner.trainable_scope is invalid", code="schema_error")
     if "class_weights" in learner:
         if not isinstance(learner["class_weights"], Mapping):
             raise TorchPreflightError("request.learner.class_weights must be an object", code="schema_error")
@@ -699,6 +703,8 @@ def run_preflight(request: Mapping[str, Any]) -> dict[str, Any]:
         for name in ("head_weights", "class_weights"):
             if name in validated["learner"]:
                 learner_kwargs[name] = validated["learner"][name]
+        if "trainable_scope" in validated["learner"]:
+            learner_kwargs["trainable_scope"] = validated["learner"]["trainable_scope"]
         config = AI42LearnerConfig(model_kwargs=model_kwargs, **learner_kwargs)
 
         warm_spec = validated["warm_start"]
@@ -817,9 +823,8 @@ def run_preflight(request: Mapping[str, Any]) -> dict[str, Any]:
                 roundtrip_path, expected_manifest, model=actor, map_location=device,
             )
             clone = copy.deepcopy(actor)
-            clone_optimizer = torch.optim.AdamW(
-                clone.parameters(), lr=config.learning_rate, weight_decay=config.weight_decay,
-            )
+            clone_learner = AI42Learner(clone, config)
+            clone_optimizer = clone_learner.optimizer
             resumed = load_ai42_checkpoint(
                 roundtrip_path, clone, clone_optimizer, expected_manifest,
                 map_location=device, restore_rng=False,

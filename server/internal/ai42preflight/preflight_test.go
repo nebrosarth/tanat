@@ -163,6 +163,18 @@ func TestLoadConfigRejectsUnknownAndAcceptsQ3Overrides(t *testing.T) {
 	if !reflect.DeepEqual(q4Config.Learner.HeadWeights, wantHeadWeights) {
 		t.Fatalf("unexpected Q4 head weights: %#v", q4Config.Learner.HeadWeights)
 	}
+	scopePath := filepath.Join(t.TempDir(), "scope.json")
+	scopeConfig := `{"protocol_version":13,"model":{"hidden_size":8,"model_width":8,"entity_layers":1,"num_heads":2,"ff_multiplier":1,"timing_bins":2},"recurrent_batch":{"sequence_length":4,"batch_size":2},"learner":{"learning_rate":0.00001,"weight_decay":0.0001,"class_balance_power":0.5,"max_gradient_norm":1,"trainable_scope":"supervised_heads"},"training":{"seed":4242,"max_optimizer_seconds":300,"max_steps":1,"epochs":1,"validation_batches":1,"validation_epsilon":0.0001}}`
+	if err := os.WriteFile(scopePath, []byte(scopeConfig), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	scoped, err := LoadConfig(scopePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if scoped.Learner.TrainableScope != "supervised_heads" {
+		t.Fatalf("unexpected trainable scope: %q", scoped.Learner.TrainableScope)
+	}
 	path := filepath.Join(t.TempDir(), "unknown.json")
 	if err := os.WriteFile(path, []byte(`{"protocol_version":13,"model":{"hidden_size":1,"model_width":1,"entity_layers":1,"num_heads":1,"ff_multiplier":1,"timing_bins":1},"recurrent_batch":{"sequence_length":1,"batch_size":1},"learner":{"class_balance_power":0.5,"max_gradient_norm":1,"timing_loss_enabled":false,"optimizer_step_allowed_in_preflight":false,"unknown":true}}`), 0o600); err != nil {
 		t.Fatal(err)
