@@ -2,7 +2,10 @@ package ai42preflight
 
 import (
 	"fmt"
+	"strings"
 )
+
+const maxWorkerFailureDiagnostic = 4096
 
 var workerResultFields = map[string]struct{}{"protocol": {}, "ai42_protocol_version": {}, "device": {}, "parameter_count": {}, "estimated_parameter_count": {}, "batch": {}, "warm_start": {}, "loss": {}, "hashes": {}, "timings_ms": {}, "invariants": {}}
 var workerLossFields = map[string]struct{}{"value": {}, "gradient_norm": {}, "gradient_norm_after_repeat": {}, "gradient_digest_before_clip": {}, "gradient_digest": {}, "repeat_gradient_digest": {}, "summary": {}}
@@ -18,6 +21,16 @@ func validateWorkerOutput(output TorchOutput, requestHash, bundleHash, warmHash,
 		return nil, fmt.Errorf("Torch worker output exceeded bounded stream limits")
 	}
 	if output.ExitCode != 0 {
+		diagnostic := strings.TrimSpace(string(output.Stderr))
+		if diagnostic == "" {
+			diagnostic = strings.TrimSpace(string(output.Stdout))
+		}
+		if len(diagnostic) > maxWorkerFailureDiagnostic {
+			diagnostic = diagnostic[:maxWorkerFailureDiagnostic] + "..."
+		}
+		if diagnostic != "" {
+			return nil, fmt.Errorf("Torch worker exited with code %d: %s", output.ExitCode, diagnostic)
+		}
 		return nil, fmt.Errorf("Torch worker exited with code %d", output.ExitCode)
 	}
 	value, err := decodeCanonical(output.Stdout, "Torch worker response", MaxWorkerStdout)

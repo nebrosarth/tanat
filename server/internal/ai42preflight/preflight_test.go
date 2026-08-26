@@ -588,7 +588,7 @@ func TestValidateWorkerOutputRejectsProtocolFaults(t *testing.T) {
 		output TorchOutput
 		want   string
 	}{
-		{name: "nonzero exit", output: TorchOutput{ExitCode: 7}, want: "exited"},
+		{name: "nonzero exit", output: TorchOutput{ExitCode: 7, Stderr: []byte("failure detail")}, want: "failure detail"},
 		{name: "noncanonical JSON", output: TorchOutput{Stdout: []byte("{ }")}, want: "canonical"},
 		{name: "unknown root shape", output: TorchOutput{Stdout: []byte("{}")}, want: "missing"},
 	}
