@@ -977,6 +977,36 @@ func TestAssaultEnvSkipsExternalObservationsForScriptedSlots(t *testing.T) {
 	}
 }
 
+func TestAssaultTangrenChannelMaskAllowsMovementAndBlocksAbilities(t *testing.T) {
+	env := NewAssaultEnv()
+	defer env.Close()
+	cfg := externalAssaultReset(150043, 20)
+	cfg.Roster[0] = 18 // Tangren
+	if _, err := env.Reset(cfg); err != nil {
+		t.Fatal(err)
+	}
+
+	env.inst.mu.Lock()
+	defer env.inst.mu.Unlock()
+	c := env.heroes[0]
+	hs := c.huntState
+	hs.skillLevel[0] = 1
+	hs.skillLevel[2] = 1
+	if !env.server.startSkillOrderLocked(c, 1, -1, 0, 0, true) {
+		t.Fatal("Tangren's first skill was not accepted")
+	}
+	result := env.resultLocked(nil, env.clock.Now())
+	mask := result.Observations[0].ActionMask
+	if mask.Kinds[AssaultActionMove] != 1 {
+		t.Fatal("Tangren's movement channel masked movement")
+	}
+	for kind := AssaultActionSkill1; kind <= AssaultActionSkill4; kind++ {
+		if mask.Kinds[kind] != 0 {
+			t.Fatalf("Tangren's movement channel exposed ability kind %d", kind)
+		}
+	}
+}
+
 func TestAssaultEnvAI40MirrorUsesOnlyExternalSharedPolicy(t *testing.T) {
 	env := NewAssaultEnv()
 	defer env.Close()

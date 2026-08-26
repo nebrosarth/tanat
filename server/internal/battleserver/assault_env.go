@@ -1291,7 +1291,7 @@ func (e *AssaultEnv) observationForConnWithScratchLocked(
 				break
 			}
 		}
-		if !hs.st.silenced(now) {
+		if !hs.st.silenced(now) && !abilityUseBlockedByChannelLocked(hs, now) {
 			for skill := 0; skill < 4; skill++ {
 				level := int(hs.skillLevel[skill])
 				def := hs.skillDef(skill + 1)
