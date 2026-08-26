@@ -51,6 +51,51 @@ func TestAI42EvaluationControlledActionIsByteExact(t *testing.T) {
 	}
 }
 
+func TestAI42DAggerInterventionWireIsByteExact(t *testing.T) {
+	const schemaWant = "06369e1df3d48649c080938403ff0f5d7310a74b65b33903d1454872a45d1a28"
+	if got := hex.EncodeToString(AI42DAggerSchemaHash[:]); got != schemaWant {
+		t.Fatalf("AI-42 DAgger schema hash drift: got %s, want %s", got, schemaWant)
+	}
+	payload := make([]byte, daggerActionPayloadSize)
+	payload[0] = byte(battleserver.AssaultControlIssue)
+	payload[1] = byte(battleserver.AssaultActionAttack)
+	binary.LittleEndian.PutUint16(payload[2:4], 0x1234)
+	payload[6] = 1
+	request, err := ReadRequest(bytes.NewReader(requestFrameVersion(
+		VersionAI42DAgger, CommandStep, payload,
+	)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if request.Interventions[0] != 1 || request.Actions[0].Target != 0x1234 {
+		t.Fatalf("decoded DAgger request=%+v intervention=%d", request.Actions[0], request.Interventions[0])
+	}
+	payload[6] = 2
+	if _, err := ReadRequest(bytes.NewReader(requestFrameVersion(
+		VersionAI42DAgger, CommandStep, payload,
+	))); err == nil || !strings.Contains(err.Error(), "intervention[0]") {
+		t.Fatalf("invalid intervention was accepted: %v", err)
+	}
+
+	var result battleserver.StepResultV1
+	result.RewardHash = battleserver.AssaultRewardHashV5
+	result.TeacherStatus[0] = battleserver.AssaultTeacherStatusAction
+	result.ActiveOrder[0] = 1
+	var out bytes.Buffer
+	if err := NewResultEncoder().WriteVersion(&out, &result, VersionAI42DAgger); err != nil {
+		t.Fatal(err)
+	}
+	body, err := readFrame(&out)
+	if err != nil {
+		t.Fatal(err)
+	}
+	layout := newResultFrameLayout(VersionAI42DAgger)
+	if body[layout.teacherStatusOffset] != battleserver.AssaultTeacherStatusAction ||
+		body[layout.activeOrderOffset] != 1 {
+		t.Fatal("v15 teacher/active-order fields did not round-trip")
+	}
+}
+
 func TestAI42EvaluationActiveOrderResponseIsByteExact(t *testing.T) {
 	var result battleserver.StepResultV1
 	result.RewardHash = battleserver.AssaultRewardHashV5

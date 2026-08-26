@@ -50,7 +50,10 @@ const (
 	// VersionAI42Evaluation keeps v13 actor observations/rewards but removes
 	// teacher-only response fields and adds one explicit control byte to every
 	// submitted action. It is evaluation-only; v13 dataset lineage is unchanged.
-	VersionAI42Evaluation     uint16 = 14
+	VersionAI42Evaluation uint16 = 14
+	// VersionAI42DAgger adds a one-byte expert-intervention mask per actor and
+	// returns both teacher/execution telemetry and authoritative active order.
+	VersionAI42DAgger         uint16 = 15
 	CommandReset              uint16 = 1
 	CommandStep               uint16 = 2
 	CommandClose              uint16 = 3
@@ -68,21 +71,23 @@ func versionHasAbilities(version uint16) bool {
 		version == VersionAI41Evaluation || version == VersionAI41Navigation ||
 		version == VersionAI41NavigationEvaluation || version == VersionAI41Strategic ||
 		version == VersionAI41StrategicEvaluation || version == VersionAI41Teacher ||
-		version == VersionAI42 || version == VersionAI42Evaluation
+		version == VersionAI42 || version == VersionAI42Evaluation || version == VersionAI42DAgger
 }
 
 func versionHasNavigation(version uint16) bool {
 	return version == VersionAI41Navigation || version == VersionAI41NavigationEvaluation ||
 		version == VersionAI41Strategic || version == VersionAI41StrategicEvaluation ||
 		version == VersionAI41Teacher || version == VersionAI42 ||
-		version == VersionAI42Evaluation
+		version == VersionAI42Evaluation || version == VersionAI42DAgger
 }
 
 func versionHasTeacher(version uint16) bool {
 	return version == VersionAI41Teacher || version == VersionAI42
 }
 
-func versionHasAI42(version uint16) bool { return version == VersionAI42 }
+func versionHasAI42(version uint16) bool {
+	return version == VersionAI42 || version == VersionAI42DAgger
+}
 
 func layoutHasAbilities(version uint16) bool {
 	return versionHasAbilities(version)
@@ -101,25 +106,29 @@ func supportedVersion(version uint16) bool {
 // hash intentionally remains the existing strategic V5 hash.
 var AI42SchemaHash = sha256.Sum256([]byte(ai42SchemaText()))
 var AI42EvaluationSchemaHash = sha256.Sum256([]byte(ai42EvaluationSchemaText()))
+var AI42DAggerSchemaHash = sha256.Sum256([]byte(ai42DAggerSchemaText()))
 var AI42RewardHash = battleserver.AssaultRewardHashV5
 
 var magic = [4]byte{'T', 'A', 'N', 'T'}
 
 type Request struct {
-	Version        uint16
-	Command        uint16
-	Reset          battleserver.AssaultResetV1
-	Actions        [battleserver.AssaultHeroCount]battleserver.HeroActionV1
-	Controls       [battleserver.AssaultHeroCount]battleserver.AssaultControlV1
-	VectorResets   []battleserver.AssaultResetV1
-	VectorIndices  []uint32
-	VectorActions  [][battleserver.AssaultHeroCount]battleserver.HeroActionV1
-	VectorControls [][battleserver.AssaultHeroCount]battleserver.AssaultControlV1
+	Version             uint16
+	Command             uint16
+	Reset               battleserver.AssaultResetV1
+	Actions             [battleserver.AssaultHeroCount]battleserver.HeroActionV1
+	Controls            [battleserver.AssaultHeroCount]battleserver.AssaultControlV1
+	VectorResets        []battleserver.AssaultResetV1
+	VectorIndices       []uint32
+	VectorActions       [][battleserver.AssaultHeroCount]battleserver.HeroActionV1
+	VectorControls      [][battleserver.AssaultHeroCount]battleserver.AssaultControlV1
+	Interventions       [battleserver.AssaultHeroCount]uint8
+	VectorInterventions [][battleserver.AssaultHeroCount]uint8
 }
 
 const resetPayloadSize = 8 + 4 + battleserver.AssaultHeroCount*4 + battleserver.AssaultHeroCount
 const actionPayloadSize = battleserver.AssaultHeroCount * 5
 const controlledActionPayloadSize = battleserver.AssaultHeroCount * 6
+const daggerActionPayloadSize = battleserver.AssaultHeroCount * 7
 
 func decodeReset(p []byte) (battleserver.AssaultResetV1, error) {
 	var reset battleserver.AssaultResetV1
@@ -192,6 +201,40 @@ func decodeControlledActions(p []byte) (
 	return actions, controls, nil
 }
 
+func decodeDaggerActions(p []byte) (
+	[battleserver.AssaultHeroCount]battleserver.HeroActionV1,
+	[battleserver.AssaultHeroCount]battleserver.AssaultControlV1,
+	[battleserver.AssaultHeroCount]uint8,
+	error,
+) {
+	var actions [battleserver.AssaultHeroCount]battleserver.HeroActionV1
+	var controls [battleserver.AssaultHeroCount]battleserver.AssaultControlV1
+	var interventions [battleserver.AssaultHeroCount]uint8
+	if len(p) != daggerActionPayloadSize {
+		return actions, controls, interventions, fmt.Errorf(
+			"assault protocol: field=STEP.dagger_actions offset=%d: got %d bytes, want %d",
+			8+len(p), len(p), daggerActionPayloadSize,
+		)
+	}
+	for i := range actions {
+		off := i * 7
+		controls[i] = battleserver.AssaultControlV1(p[off])
+		actions[i] = battleserver.HeroActionV1{
+			Kind:      battleserver.AssaultActionKindV1(p[off+1]),
+			Target:    binary.LittleEndian.Uint16(p[off+2 : off+4]),
+			Direction: p[off+4], Distance: p[off+5],
+		}
+		interventions[i] = p[off+6]
+		if interventions[i] > 1 {
+			return actions, controls, interventions, fmt.Errorf(
+				"assault protocol: field=STEP.intervention[%d] offset=%d: invalid value %d",
+				i, 8+off+6, interventions[i],
+			)
+		}
+	}
+	return actions, controls, interventions, nil
+}
+
 func ReadRequest(r io.Reader) (Request, error) {
 	body, err := readFrame(r)
 	if err != nil {
@@ -218,7 +261,9 @@ func ReadRequest(r io.Reader) (Request, error) {
 			return Request{}, err
 		}
 	case CommandStep:
-		if version == VersionAI42Evaluation {
+		if version == VersionAI42DAgger {
+			request.Actions, request.Controls, request.Interventions, err = decodeDaggerActions(p)
+		} else if version == VersionAI42Evaluation {
 			request.Actions, request.Controls, err = decodeControlledActions(p)
 		} else {
 			request.Actions, err = decodeActions(p)
@@ -260,7 +305,9 @@ func ReadRequest(r io.Reader) (Request, error) {
 		count := int(binary.LittleEndian.Uint32(p[:4]))
 		p = p[4:]
 		itemSize := actionPayloadSize
-		if version == VersionAI42Evaluation {
+		if version == VersionAI42DAgger {
+			itemSize = daggerActionPayloadSize
+		} else if version == VersionAI42Evaluation {
 			itemSize = controlledActionPayloadSize
 		}
 		want := count * itemSize
@@ -276,11 +323,18 @@ func ReadRequest(r io.Reader) (Request, error) {
 				12+want, len(p)-want)
 		}
 		request.VectorActions = make([][battleserver.AssaultHeroCount]battleserver.HeroActionV1, count)
-		if version == VersionAI42Evaluation {
+		if version == VersionAI42Evaluation || version == VersionAI42DAgger {
 			request.VectorControls = make([][battleserver.AssaultHeroCount]battleserver.AssaultControlV1, count)
 		}
+		if version == VersionAI42DAgger {
+			request.VectorInterventions = make([][battleserver.AssaultHeroCount]uint8, count)
+		}
 		for i := range request.VectorActions {
-			if version == VersionAI42Evaluation {
+			if version == VersionAI42DAgger {
+				request.VectorActions[i], request.VectorControls[i], request.VectorInterventions[i], err = decodeDaggerActions(
+					p[i*itemSize : (i+1)*itemSize],
+				)
+			} else if version == VersionAI42Evaluation {
 				request.VectorActions[i], request.VectorControls[i], err = decodeControlledActions(
 					p[i*itemSize : (i+1)*itemSize],
 				)
@@ -443,6 +497,9 @@ func newResultFrameLayout(version uint16) resultFrameLayout {
 		executedActionsOffset = add("result.executed_actions", battleserver.AssaultHeroCount*5)
 		executedValidOffset = add("result.executed_valid", battleserver.AssaultHeroCount)
 		rejectionReasonOffset = add("result.rejection_reason", battleserver.AssaultHeroCount)
+		if version == VersionAI42DAgger {
+			activeOrderOffset = add("result.active_order", battleserver.AssaultHeroCount)
+		}
 	} else if version == VersionAI42Evaluation {
 		activeOrderOffset = add("result.active_order", battleserver.AssaultHeroCount)
 	}
@@ -497,6 +554,8 @@ func resultHeaderHashes(version uint16, result *battleserver.StepResultV1) ([32]
 		return AI42SchemaHash, AI42RewardHash, nil
 	case VersionAI42Evaluation:
 		return AI42EvaluationSchemaHash, AI42RewardHash, nil
+	case VersionAI42DAgger:
+		return AI42DAggerSchemaHash, AI42RewardHash, nil
 	default:
 		return [32]byte{}, [32]byte{}, fmt.Errorf("assault protocol: field=frame.version offset=4: unsupported version %d", version)
 	}
@@ -566,6 +625,9 @@ func newVectorResultLayoutVersion(count int, version uint16) vectorResultLayout 
 		layout.executedActions = take("result.executed_actions", actors*5)
 		layout.executedValid = take("result.executed_valid", actors)
 		layout.rejectionReason = take("result.rejection_reason", actors)
+		if version == VersionAI42DAgger {
+			layout.activeOrder = take("result.active_order", actors)
+		}
 	} else if version == VersionAI42Evaluation {
 		layout.activeOrder = take("result.active_order", actors)
 	}
@@ -601,6 +663,17 @@ func ai42EvaluationSchemaText() string {
 	vector := newVectorResultLayoutVersion(1, VersionAI42Evaluation)
 	return "tanat.assault.ai42.evaluation.v14|frame=little-endian|" +
 		"input=control,kind,target,offset81,anchor15|control=issue,hold,idle|" +
+		"skill_navigation=offset81_only|" +
+		"scalar.body=" + strconv.Itoa(scalar.bodySize) + "|scalar.fields=" + layoutFieldsText(scalar.fields) +
+		"|vector.body=" + strconv.Itoa(vector.size) + "|vector.fields=" + layoutFieldsText(vector.fields)
+}
+
+func ai42DAggerSchemaText() string {
+	scalar := newResultFrameLayout(VersionAI42DAgger)
+	vector := newVectorResultLayoutVersion(1, VersionAI42DAgger)
+	return "tanat.assault.ai42.dagger.v15|frame=little-endian|" +
+		"input=control,kind,target,offset81,anchor15,intervention01|control=issue,hold,idle|" +
+		"teacher_status=none,action,wait,hold,cancel,unavailable|" +
 		"skill_navigation=offset81_only|" +
 		"scalar.body=" + strconv.Itoa(scalar.bodySize) + "|scalar.fields=" + layoutFieldsText(scalar.fields) +
 		"|vector.body=" + strconv.Itoa(vector.size) + "|vector.fields=" + layoutFieldsText(vector.fields)
@@ -705,6 +778,9 @@ func encodeResultRecord(body []byte, result *battleserver.StepResultV1, version 
 		}
 		putBytes(result.ExecutedValid[:])
 		putBytes(result.RejectionReason[:])
+		if version == VersionAI42DAgger {
+			putBytes(result.ActiveOrder[:])
+		}
 	} else if version == VersionAI42Evaluation {
 		putBytes(result.ActiveOrder[:])
 	}
@@ -863,6 +939,9 @@ func (e *VectorResultEncoder) WriteVersion(w io.Writer, results []*battleserver.
 					body[start+4] = action.Distance
 					body[layout.executedValid+actor] = value.ExecutedValid[heroIndex]
 					body[layout.rejectionReason+actor] = value.RejectionReason[heroIndex]
+					if version == VersionAI42DAgger {
+						body[layout.activeOrder+actor] = value.ActiveOrder[heroIndex]
+					}
 				} else if version == VersionAI42Evaluation {
 					body[layout.activeOrder+actor] = value.ActiveOrder[heroIndex]
 				}

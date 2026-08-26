@@ -467,9 +467,36 @@ func (e *AssaultEnv) StepControlled(
 	return e.executeStep(actions, &controls)
 }
 
+// StepIntervened executes the AI-42 DAgger contract. A marked external slot
+// yields this decision tick to its retained scripted brain; the resulting
+// AI-30 transition is returned through the teacher fields.
+func (e *AssaultEnv) StepIntervened(
+	actions [AssaultHeroCount]HeroActionV1,
+	controls [AssaultHeroCount]AssaultControlV1,
+	interventions [AssaultHeroCount]uint8,
+) (StepResultV1, error) {
+	for slot, value := range interventions {
+		if value > 1 {
+			return StepResultV1{}, fmt.Errorf("assault: intervention slot %d has invalid value %d", slot, value)
+		}
+		if value != 0 && !assaultControllerUsesActions(e.controllers[slot]) {
+			return StepResultV1{}, fmt.Errorf("assault: intervention slot %d is not externally controlled", slot)
+		}
+	}
+	return e.executeStepIntervened(actions, &controls, &interventions)
+}
+
 func (e *AssaultEnv) executeStep(
 	actions [AssaultHeroCount]HeroActionV1,
 	controls *[AssaultHeroCount]AssaultControlV1,
+) (StepResultV1, error) {
+	return e.executeStepIntervened(actions, controls, nil)
+}
+
+func (e *AssaultEnv) executeStepIntervened(
+	actions [AssaultHeroCount]HeroActionV1,
+	controls *[AssaultHeroCount]AssaultControlV1,
+	interventions *[AssaultHeroCount]uint8,
 ) (StepResultV1, error) {
 	if e.closed || e.server == nil || e.inst == nil || e.clock == nil {
 		return StepResultV1{}, errors.New("assault: Step called before Reset or after Close")
@@ -488,6 +515,13 @@ func (e *AssaultEnv) executeStep(
 	e.inst.mu.Lock()
 	for i := 0; i < AssaultHeroCount; i++ {
 		if !assaultControllerUsesActions(e.controllers[i]) {
+			rejectionReason[i] = AssaultRejectionReasonUnknown
+			continue
+		}
+		if interventions != nil && interventions[i] != 0 {
+			// Expert takeover starts from a clean authoritative order. The AI-30
+			// decision later in this same simulation tick becomes the replacement.
+			e.cancelExternalActionLocked(i)
 			rejectionReason[i] = AssaultRejectionReasonUnknown
 			continue
 		}
@@ -532,6 +566,24 @@ func (e *AssaultEnv) executeStep(
 	var teacherFrame assaultTeacherFrame
 	haveTeacherFrame := false
 	if !e.inst.dota.ended {
+		originalHumanVersion := e.inst.dota.botAIVersionByTeam[dotaTeamHuman]
+		originalElfVersion := e.inst.dota.botAIVersionByTeam[dotaTeamElf]
+		restoreTeamVersions := func() {
+			e.inst.dota.botAIVersionByTeam[dotaTeamHuman] = originalHumanVersion
+			e.inst.dota.botAIVersionByTeam[dotaTeamElf] = originalElfVersion
+		}
+		if interventions != nil {
+			for slot, intervene := range interventions {
+				if intervene == 0 {
+					continue
+				}
+				team := dotaTeamHuman
+				if slot >= AssaultHeroCount/2 {
+					team = dotaTeamElf
+				}
+				e.inst.dota.botAIVersionByTeam[team] = 30
+			}
+		}
 		e.server.botRebalanceLanesLocked(e.inst, now)
 		e.server.botPlanTeamsLocked(e.inst, now)
 		var rep *conn
@@ -541,8 +593,32 @@ func (e *AssaultEnv) executeStep(
 			}
 			e.server.memberTickLocked(c, now)
 			rep = c
+			slot := e.assaultHeroSlot(c)
+			if interventions != nil && slot >= 0 && interventions[slot] != 0 {
+				brain := e.brains[slot]
+				if brain == nil {
+					restoreTeamVersions()
+					e.inst.mu.Unlock()
+					return StepResultV1{}, fmt.Errorf("assault: intervention slot %d has no scripted brain", slot)
+				}
+				e.assaultVisionOK = false
+				observation := e.observationLocked(slot, now)
+				oldVersion, oldSet := brain.aiVersion, brain.aiVersionSet
+				oldController := e.controllers[slot]
+				brain.aiVersion, brain.aiVersionSet = 30, true
+				e.controllers[slot] = AssaultControllerAI30
+				e.server.botTickLocked(brain, now)
+				teacherFrame.present[slot] = true
+				teacherFrame.observations[slot] = observation
+				teacherFrame.projections[slot] = e.assaultTeacherProjectionLocked(
+					slot, &observation, false, now,
+				)
+				e.controllers[slot] = oldController
+				brain.aiVersion, brain.aiVersionSet = oldVersion, oldSet
+				haveTeacherFrame = true
+				continue
+			}
 			if brain := e.inst.bots[c.objID]; brain != nil && botAIVersionForBrain(brain) != 40 {
-				slot := e.assaultHeroSlot(c)
 				if e.teacherActions && slot >= 0 && e.controllers[slot] == AssaultControllerAI30 {
 					// memberTickLocked has applied authoritative lifecycle changes,
 					// while botTickLocked has not yet chosen this hero's next order.
@@ -564,6 +640,7 @@ func (e *AssaultEnv) executeStep(
 				}
 			}
 		}
+		restoreTeamVersions()
 		e.server.botAI40BatchTickLocked(e.inst, now)
 		// External policies still use the exact scripted purchase/skill rules.
 		for i, brain := range e.brains {
@@ -582,6 +659,15 @@ func (e *AssaultEnv) executeStep(
 		teacherOverride = &teacherFrame
 	}
 	result := e.resultLockedWithTeacher(&invalid, now, teacherOverride)
+	if interventions != nil {
+		for slot, intervene := range interventions {
+			if intervene != 0 && result.TeacherStatus[slot] == AssaultTeacherStatusAction {
+				executed[slot] = result.TeacherIntent[slot]
+				executedValid[slot] = 1
+				rejectionReason[slot] = AssaultRejectionReasonNone
+			}
+		}
+	}
 	result.ExecutedActions = executed
 	result.ExecutedValid = executedValid
 	result.RejectionReason = rejectionReason
@@ -1593,7 +1679,13 @@ func (e *AssaultEnv) resultLockedWithTeacher(
 					// same simulation tick and retires its lineage exactly once.
 					projection = e.assaultTeacherProjectionLocked(i, &r.Observations[i], true, now)
 				}
+				// An intervention frame belongs to an external slot whose durable
+				// controller has already been restored. Re-enter the AI-30 identity
+				// only for lineage/status projection; no world action is run here.
+				oldController := e.controllers[i]
+				e.controllers[i] = AssaultControllerAI30
 				action, status = e.assaultTeacherTransitionFromProjectionLocked(i, projection)
+				e.controllers[i] = oldController
 			} else {
 				action, status = e.assaultTeacherTransitionLocked(i, &r.Observations[i], r.Done, now)
 			}

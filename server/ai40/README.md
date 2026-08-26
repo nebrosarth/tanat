@@ -259,6 +259,21 @@ attack rate remains too high and it won only from side 1 in this fixed-side
 evaluation schedule. The next data stage must aggregate policy-reached combat
 states and teacher corrections instead of further tuning global class counts.
 
+### Intervention DAgger protocol
+
+Protocol v15 is the append-only intervention boundary for the next dataset.
+It extends each v14 controlled action with one `intervention` byte. A marked
+external/AI-40 slot suppresses its submitted command for that decision tick,
+clears the active external order, and lets the retained AI-30 brain execute one
+authoritative replacement decision. The response combines v13 teacher intent,
+status and execution telemetry with v14 `active_order`. Invalid intervention
+bytes and scripted-controller intervention attempts fail closed. Scalar and
+vector schema SHA-256:
+`06369e1df3d48649c080938403ff0f5d7310a74b65b33903d1454872a45d1a28`.
+The temporary AI-30 local/team profile is restored before the result leaves the
+server, so expert takeover cannot silently convert a policy slot or team into a
+scripted controller for later ticks.
+
 Run the evaluator from `server` with:
 
 ```powershell

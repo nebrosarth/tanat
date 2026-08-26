@@ -43,6 +43,7 @@ AI41_TEACHER_PROTOCOL_VERSION = 12
 AI42_PROTOCOL_VERSION = 13
 AI42_RESERVED_PROTOCOL_VERSION = AI42_PROTOCOL_VERSION
 AI42_EVALUATION_PROTOCOL_VERSION = 14
+AI42_DAGGER_PROTOCOL_VERSION = 15
 MAGIC = b"TANT"
 COMMAND_RESET = 1
 COMMAND_STEP = 2
@@ -102,6 +103,8 @@ AI42_SCHEMA = ""
 AI42_SCHEMA_HASH = b""
 AI42_EVALUATION_SCHEMA = ""
 AI42_EVALUATION_SCHEMA_HASH = b""
+AI42_DAGGER_SCHEMA = ""
+AI42_DAGGER_SCHEMA_HASH = b""
 # v13 deliberately uses the established strategic V5 reward semantics/hash.
 AI42_REWARD_SCHEMA = AI41_STRATEGIC_REWARD_SCHEMA
 AI42_REWARD_HASH = AI41_STRATEGIC_REWARD_HASH
@@ -119,6 +122,7 @@ def _protocol_has_abilities(protocol_version: int) -> bool:
         AI41_TEACHER_PROTOCOL_VERSION,
         AI42_PROTOCOL_VERSION,
         AI42_EVALUATION_PROTOCOL_VERSION,
+        AI42_DAGGER_PROTOCOL_VERSION,
     )
 
 
@@ -127,6 +131,8 @@ def _protocol_schema_hash(protocol_version: int) -> bytes:
         return AI42_SCHEMA_HASH
     if protocol_version == AI42_EVALUATION_PROTOCOL_VERSION:
         return AI42_EVALUATION_SCHEMA_HASH
+    if protocol_version == AI42_DAGGER_PROTOCOL_VERSION:
+        return AI42_DAGGER_SCHEMA_HASH
     if protocol_version in (
         AI41_NAVIGATION_PROTOCOL_VERSION,
         AI41_NAVIGATION_EVALUATION_PROTOCOL_VERSION,
@@ -149,6 +155,7 @@ def _protocol_reward_hash(protocol_version: int) -> bytes:
         AI41_TEACHER_PROTOCOL_VERSION,
         AI42_PROTOCOL_VERSION,
         AI42_EVALUATION_PROTOCOL_VERSION,
+        AI42_DAGGER_PROTOCOL_VERSION,
     ):
         return AI41_STRATEGIC_REWARD_HASH
     return (AI41_REWARD_HASH if protocol_version in (
@@ -184,6 +191,10 @@ CONTROLLED_ACTION_DTYPE = np.dtype([
     ("control", "u1"), ("kind", "u1"), ("target", "<u2"),
     ("direction", "u1"), ("distance", "u1"),
 ], align=False)
+DAGGER_ACTION_DTYPE = np.dtype([
+    ("control", "u1"), ("kind", "u1"), ("target", "<u2"),
+    ("direction", "u1"), ("distance", "u1"), ("intervention", "u1"),
+], align=False)
 RESET_PAYLOAD_SIZE = 8 + 4 + HERO_COUNT * 4 + HERO_COUNT
 VECTOR_RESULT_HEADER_SIZE = 76
 MAX_FRAME_SIZE = 64 << 20
@@ -199,7 +210,7 @@ def _layout_has_teacher(protocol_version: int) -> bool:
 
 
 def _layout_is_ai42(protocol_version: int) -> bool:
-    return protocol_version == AI42_PROTOCOL_VERSION
+    return protocol_version in (AI42_PROTOCOL_VERSION, AI42_DAGGER_PROTOCOL_VERSION)
 
 
 @dataclass(frozen=True, slots=True)
@@ -251,6 +262,8 @@ def _result_layout(protocol_version: int, count: int = 1, vector: bool = False) 
             add("result.executed_actions", actors * ACTION_DTYPE.itemsize)
             add("result.executed_valid", actors)
             add("result.rejection_reason", actors)
+            if protocol_version == AI42_DAGGER_PROTOCOL_VERSION:
+                add("result.active_order", actors)
         elif protocol_version == AI42_EVALUATION_PROTOCOL_VERSION:
             add("result.active_order", actors)
     else:
@@ -280,6 +293,8 @@ def _result_layout(protocol_version: int, count: int = 1, vector: bool = False) 
             add("result.executed_actions", HERO_COUNT * ACTION_DTYPE.itemsize)
             add("result.executed_valid", HERO_COUNT)
             add("result.rejection_reason", HERO_COUNT)
+            if protocol_version == AI42_DAGGER_PROTOCOL_VERSION:
+                add("result.active_order", HERO_COUNT)
         elif protocol_version == AI42_EVALUATION_PROTOCOL_VERSION:
             add("result.active_order", HERO_COUNT)
     return _FrameLayout(offset, tuple(fields))
@@ -328,6 +343,23 @@ AI42_EVALUATION_SCHEMA = _ai42_evaluation_schema_text()
 AI42_EVALUATION_SCHEMA_HASH = hashlib.sha256(
     AI42_EVALUATION_SCHEMA.encode("utf-8")
 ).digest()
+
+
+def _ai42_dagger_schema_text() -> str:
+    scalar = _result_layout(AI42_DAGGER_PROTOCOL_VERSION)
+    vector = _result_layout(AI42_DAGGER_PROTOCOL_VERSION, count=1, vector=True)
+    return (
+        "tanat.assault.ai42.dagger.v15|frame=little-endian|"
+        "input=control,kind,target,offset81,anchor15,intervention01|control=issue,hold,idle|"
+        "teacher_status=none,action,wait,hold,cancel,unavailable|"
+        "skill_navigation=offset81_only|"
+        f"scalar.body={scalar.size}|scalar.fields={_layout_fields_text(scalar)}|"
+        f"vector.body={vector.size}|vector.fields={_layout_fields_text(vector)}"
+    )
+
+
+AI42_DAGGER_SCHEMA = _ai42_dagger_schema_text()
+AI42_DAGGER_SCHEMA_HASH = hashlib.sha256(AI42_DAGGER_SCHEMA.encode("utf-8")).digest()
 
 
 def _layout_size_error(layout: _FrameLayout, got: int) -> "AssaultProtocolError | None":
@@ -481,12 +513,13 @@ class AssaultEnvProcess:
     def step(self, actions: Iterable[HeroAction]) -> StepResult:
         if isinstance(actions, np.ndarray):
             values = np.asarray(actions)
-            controlled = self.protocol_version == AI42_EVALUATION_PROTOCOL_VERSION
-            columns = 5 if controlled else 4
+            dagger = self.protocol_version == AI42_DAGGER_PROTOCOL_VERSION
+            controlled = self.protocol_version == AI42_EVALUATION_PROTOCOL_VERSION or dagger
+            columns = 6 if dagger else (5 if controlled else 4)
             if values.shape != (HERO_COUNT, columns):
                 raise ValueError(f"action array must have shape (10, {columns})")
             packed = np.empty(
-                HERO_COUNT, dtype=CONTROLLED_ACTION_DTYPE if controlled else ACTION_DTYPE,
+                HERO_COUNT, dtype=DAGGER_ACTION_DTYPE if dagger else (CONTROLLED_ACTION_DTYPE if controlled else ACTION_DTYPE),
             )
             offset = 0
             if controlled:
@@ -496,11 +529,14 @@ class AssaultEnvProcess:
             packed["target"] = values[:, offset + 1]
             packed["direction"] = values[:, offset + 2]
             packed["distance"] = values[:, offset + 3]
+            if dagger:
+                packed["intervention"] = values[:, offset + 4]
             payload = packed.tobytes()
             self._write(COMMAND_STEP, payload)
             return self._read_result()
-        if self.protocol_version == AI42_EVALUATION_PROTOCOL_VERSION:
-            raise TypeError("AI-42 evaluation actions must be a (10, 5) NumPy array")
+        if self.protocol_version in (AI42_EVALUATION_PROTOCOL_VERSION, AI42_DAGGER_PROTOCOL_VERSION):
+            columns = 6 if self.protocol_version == AI42_DAGGER_PROTOCOL_VERSION else 5
+            raise TypeError(f"AI-42 controlled actions must be a (10, {columns}) NumPy array")
         values = list(actions)
         if len(values) != HERO_COUNT:
             raise ValueError("actions must contain exactly 10 HeroAction values")
@@ -612,6 +648,9 @@ class AssaultEnvProcess:
             offset += HERO_COUNT
             rejection_reason = np.frombuffer(body, dtype=np.uint8, count=HERO_COUNT, offset=offset)
             offset += HERO_COUNT
+            if self.protocol_version == AI42_DAGGER_PROTOCOL_VERSION:
+                active_order = np.frombuffer(body, dtype=np.uint8, count=HERO_COUNT, offset=offset)
+                offset += HERO_COUNT
         elif self.protocol_version == AI42_EVALUATION_PROTOCOL_VERSION:
             active_order = np.frombuffer(
                 body, dtype=np.uint8, count=HERO_COUNT, offset=offset,
@@ -811,6 +850,8 @@ class AssaultVectorProcess:
             batched["executed_actions"] = take(ACTION_DTYPE, (actors,), "result.executed_actions")
             batched["executed_valid"] = take("u1", (actors,), "result.executed_valid")
             batched["rejection_reason"] = take("u1", (actors,), "result.rejection_reason")
+            if self.protocol_version == AI42_DAGGER_PROTOCOL_VERSION:
+                batched["active_order"] = take("u1", (actors,), "result.active_order")
         elif self.protocol_version == AI42_EVALUATION_PROTOCOL_VERSION:
             batched["active_order"] = take("u1", (actors,), "result.active_order")
         if offset != size:
@@ -893,8 +934,9 @@ class AssaultVectorProcess:
         return {int(pair[0]): result for pair, result in zip(pairs, results)}
 
     def step(self, actions: Iterable[Iterable[HeroAction]] | np.ndarray) -> list[StepResult]:
-        controlled = self.protocol_version == AI42_EVALUATION_PROTOCOL_VERSION
-        columns = 5 if controlled else 4
+        dagger = self.protocol_version == AI42_DAGGER_PROTOCOL_VERSION
+        controlled = self.protocol_version == AI42_EVALUATION_PROTOCOL_VERSION or dagger
+        columns = 6 if dagger else (5 if controlled else 4)
         if isinstance(actions, np.ndarray):
             values = np.asarray(actions)
             if values.shape != (self.workers, HERO_COUNT, columns):
@@ -904,7 +946,7 @@ class AssaultVectorProcess:
         else:
             if controlled:
                 raise TypeError(
-                    "AI-42 evaluation actions must be a (workers, 10, 5) NumPy array"
+                    f"AI-42 controlled actions must be a (workers, 10, {columns}) NumPy array"
                 )
             workers = [list(worker_actions) for worker_actions in actions]
             if len(workers) != self.workers or any(len(worker) != HERO_COUNT for worker in workers):
@@ -915,7 +957,7 @@ class AssaultVectorProcess:
             ])
         packed = np.empty(
             (self.workers, HERO_COUNT),
-            dtype=CONTROLLED_ACTION_DTYPE if controlled else ACTION_DTYPE,
+            dtype=DAGGER_ACTION_DTYPE if dagger else (CONTROLLED_ACTION_DTYPE if controlled else ACTION_DTYPE),
         )
         offset = 0
         if controlled:
@@ -925,6 +967,8 @@ class AssaultVectorProcess:
         packed["target"] = values[:, :, offset + 1]
         packed["direction"] = values[:, :, offset + 2]
         packed["distance"] = values[:, :, offset + 3]
+        if dagger:
+            packed["intervention"] = values[:, :, offset + 4]
         payload = bytearray(4 + packed.nbytes)
         struct.pack_into("<I", payload, 0, self.workers)
         memoryview(payload)[4:] = packed.view(np.uint8).reshape(-1)

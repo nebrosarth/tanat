@@ -18,10 +18,11 @@ import (
 )
 
 type vectorJob struct {
-	index    int
-	reset    *battleserver.AssaultResetV1
-	actions  *[battleserver.AssaultHeroCount]battleserver.HeroActionV1
-	controls *[battleserver.AssaultHeroCount]battleserver.AssaultControlV1
+	index         int
+	reset         *battleserver.AssaultResetV1
+	actions       *[battleserver.AssaultHeroCount]battleserver.HeroActionV1
+	controls      *[battleserver.AssaultHeroCount]battleserver.AssaultControlV1
+	interventions *[battleserver.AssaultHeroCount]uint8
 }
 
 type vectorWorker struct {
@@ -46,26 +47,27 @@ func protocolModes(version uint16) (contract, wrongLane, navigation, strategic, 
 		version == assaultproto.VersionAI41StrategicEvaluation ||
 		version == assaultproto.VersionAI41Teacher ||
 		version == assaultproto.VersionAI42 ||
-		version == assaultproto.VersionAI42Evaluation
+		version == assaultproto.VersionAI42Evaluation || version == assaultproto.VersionAI42DAgger
 	wrongLane = version == assaultproto.VersionAI41WrongLane ||
 		version == assaultproto.VersionAI41Navigation ||
 		version == assaultproto.VersionAI41Strategic ||
 		version == assaultproto.VersionAI41Teacher ||
 		version == assaultproto.VersionAI42 ||
-		version == assaultproto.VersionAI42Evaluation
+		version == assaultproto.VersionAI42Evaluation || version == assaultproto.VersionAI42DAgger
 	navigation = version == assaultproto.VersionAI41Navigation ||
 		version == assaultproto.VersionAI41NavigationEvaluation ||
 		version == assaultproto.VersionAI41Strategic ||
 		version == assaultproto.VersionAI41StrategicEvaluation ||
 		version == assaultproto.VersionAI41Teacher ||
 		version == assaultproto.VersionAI42 ||
-		version == assaultproto.VersionAI42Evaluation
+		version == assaultproto.VersionAI42Evaluation || version == assaultproto.VersionAI42DAgger
 	strategic = version == assaultproto.VersionAI41Strategic ||
 		version == assaultproto.VersionAI41StrategicEvaluation ||
 		version == assaultproto.VersionAI41Teacher ||
 		version == assaultproto.VersionAI42 ||
-		version == assaultproto.VersionAI42Evaluation
-	teacher = version == assaultproto.VersionAI41Teacher || version == assaultproto.VersionAI42
+		version == assaultproto.VersionAI42Evaluation || version == assaultproto.VersionAI42DAgger
+	teacher = version == assaultproto.VersionAI41Teacher || version == assaultproto.VersionAI42 ||
+		version == assaultproto.VersionAI42DAgger
 	return
 }
 
@@ -86,6 +88,8 @@ func newVectorRunner(count int) *vectorRunner {
 				w := r.workers[job.index]
 				if job.reset != nil {
 					w.result, w.err = w.env.Reset(*job.reset)
+				} else if job.interventions != nil {
+					w.result, w.err = w.env.StepIntervened(*job.actions, *job.controls, *job.interventions)
 				} else if job.controls != nil {
 					w.result, w.err = w.env.StepControlled(*job.actions, *job.controls)
 				} else {
@@ -171,12 +175,13 @@ func (r *vectorRunner) resetIndices(
 }
 
 func (r *vectorRunner) step(actions [][battleserver.AssaultHeroCount]battleserver.HeroActionV1) error {
-	return r.stepControlled(actions, nil)
+	return r.stepControlled(actions, nil, nil)
 }
 
 func (r *vectorRunner) stepControlled(
 	actions [][battleserver.AssaultHeroCount]battleserver.HeroActionV1,
 	controls [][battleserver.AssaultHeroCount]battleserver.AssaultControlV1,
+	interventions [][battleserver.AssaultHeroCount]uint8,
 ) error {
 	if len(actions) != len(r.workers) {
 		return fmt.Errorf("vector action count %d, want %d", len(actions), len(r.workers))
@@ -186,6 +191,9 @@ func (r *vectorRunner) stepControlled(
 		job := vectorJob{index: i, actions: &actions[i]}
 		if controls != nil {
 			job.controls = &controls[i]
+		}
+		if interventions != nil {
+			job.interventions = &interventions[i]
 		}
 		r.jobs <- job
 	}
@@ -279,7 +287,9 @@ func run(input io.Reader, output io.Writer) error {
 			}
 		case assaultproto.CommandStep:
 			var result battleserver.StepResultV1
-			if request.Version == assaultproto.VersionAI42Evaluation {
+			if request.Version == assaultproto.VersionAI42DAgger {
+				result, err = env.StepIntervened(request.Actions, request.Controls, request.Interventions)
+			} else if request.Version == assaultproto.VersionAI42Evaluation {
 				result, err = env.StepControlled(request.Actions, request.Controls)
 			} else {
 				result, err = env.Step(request.Actions)
@@ -317,8 +327,12 @@ func run(input io.Reader, output io.Writer) error {
 				continue
 			}
 			var stepErr error
-			if request.Version == assaultproto.VersionAI42Evaluation {
-				stepErr = vector.stepControlled(request.VectorActions, request.VectorControls)
+			if request.Version == assaultproto.VersionAI42DAgger {
+				stepErr = vector.stepControlled(
+					request.VectorActions, request.VectorControls, request.VectorInterventions,
+				)
+			} else if request.Version == assaultproto.VersionAI42Evaluation {
+				stepErr = vector.stepControlled(request.VectorActions, request.VectorControls, nil)
 			} else {
 				stepErr = vector.step(request.VectorActions)
 			}

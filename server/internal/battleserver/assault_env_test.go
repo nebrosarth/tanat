@@ -920,6 +920,41 @@ func TestAssaultTeacherUnavailableIsOnlyForNonAI30TeacherSlots(t *testing.T) {
 	}
 }
 
+func TestAssaultDAggerInterventionUsesAI30ForOneTickAndRestoresController(t *testing.T) {
+	var controllers [AssaultHeroCount]AssaultControllerV1
+	for i := range controllers {
+		controllers[i] = AssaultControllerAI40
+	}
+	env := NewAssaultEnv()
+	defer env.Close()
+	env.ConfigureTeacherActions(true)
+	if _, err := env.Reset(AssaultResetV1{Seed: 150042, MaxSteps: 20, Controllers: controllers}); err != nil {
+		t.Fatal(err)
+	}
+	var actions [AssaultHeroCount]HeroActionV1
+	var controls [AssaultHeroCount]AssaultControlV1
+	var interventions [AssaultHeroCount]uint8
+	interventions[0] = 1
+	result, err := env.StepIntervened(actions, controls, interventions)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.TeacherStatus[0] == AssaultTeacherStatusUnavailable {
+		t.Fatal("intervened AI-40 slot did not receive an AI-30 teacher transition")
+	}
+	if env.controllers[0] != AssaultControllerAI40 || botAIVersionForBrain(env.brains[0]) != 40 {
+		t.Fatalf("intervention leaked controller/profile: controller=%d AI=%d",
+			env.controllers[0], botAIVersionForBrain(env.brains[0]))
+	}
+	if env.inst.dota.botAIVersionByTeam[dotaTeamHuman] != 40 {
+		t.Fatal("intervention leaked the temporary team orchestrator profile")
+	}
+	interventions[1] = 2
+	if _, err := env.StepIntervened(actions, controls, interventions); err == nil {
+		t.Fatal("invalid intervention byte was accepted")
+	}
+}
+
 func TestAssaultEnvSkipsExternalObservationsForScriptedSlots(t *testing.T) {
 	env := NewAssaultEnv()
 	defer env.Close()

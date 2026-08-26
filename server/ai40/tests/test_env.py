@@ -16,8 +16,9 @@ from tanat_ai40.env import (
     AI41_STRATEGIC_PROTOCOL_VERSION, AI41_TEACHER_PROTOCOL_VERSION,
     AI41_STRATEGIC_REWARD_HASH, AI42_EVALUATION_PROTOCOL_VERSION,
     AI42_EVALUATION_SCHEMA, AI42_EVALUATION_SCHEMA_HASH,
+    AI42_DAGGER_PROTOCOL_VERSION, AI42_DAGGER_SCHEMA, AI42_DAGGER_SCHEMA_HASH,
     AI42_PROTOCOL_VERSION, AI42_REWARD_HASH, AI42_SCHEMA, AI42_SCHEMA_HASH,
-    CONTROLLED_ACTION_DTYPE, COMMAND_VECTOR_STEP,
+    CONTROLLED_ACTION_DTYPE, DAGGER_ACTION_DTYPE, COMMAND_VECTOR_STEP,
     AssaultEnvProcess, AssaultProtocolError, AssaultVectorEnv, AssaultVectorProcess,
     HeroAction, HERO_COUNT,
     MAGIC, RESPONSE_RESULT, SCHEMA_HASH, STDERR_TAIL_BYTES, _result_layout,
@@ -296,6 +297,43 @@ class ProtocolContractTest(unittest.TestCase):
         )._read_result()
         self.assertEqual(int(result.active_order[3]), 1)
         self.assertEqual(int(result.active_order.sum()), 1)
+
+    def test_ai42_dagger_wire_combines_teacher_and_active_order(self):
+        self.assertEqual(
+            AI42_DAGGER_SCHEMA_HASH,
+            hashlib.sha256(AI42_DAGGER_SCHEMA.encode()).digest(),
+        )
+        self.assertEqual(
+            AI42_DAGGER_SCHEMA_HASH.hex(),
+            "06369e1df3d48649c080938403ff0f5d7310a74b65b33903d1454872a45d1a28",
+        )
+        process = object.__new__(AssaultVectorProcess)
+        process.protocol_version = AI42_DAGGER_PROTOCOL_VERSION
+        process.workers = 1
+        captured = {}
+        process._write = lambda command, payload: captured.update(
+            command=command, payload=bytes(payload),
+        )
+        process._read_vector_results = lambda count: []
+        values = np.zeros((1, HERO_COUNT, 6), dtype=np.int16)
+        values[0, 0] = [0, 2, 0x1234, 0, 0, 1]
+        process.step(values)
+        packed = np.frombuffer(
+            captured["payload"], dtype=DAGGER_ACTION_DTYPE,
+            count=HERO_COUNT, offset=4,
+        )
+        self.assertEqual(tuple(packed[0]), (0, 2, 0x1234, 0, 0, 1))
+
+        layout = _result_layout(AI42_DAGGER_PROTOCOL_VERSION)
+        body = bytearray(layout.size)
+        self._header(body, AI42_DAGGER_PROTOCOL_VERSION, RESPONSE_RESULT)
+        offsets = {name: offset for name, offset, _ in layout.fields}
+        body[offsets["result.teacher_status"]] = 1
+        body[offsets["result.active_order"]] = 1
+        frame = struct.pack("<I", len(body)) + body
+        result = self._scalar_env(frame, AI42_DAGGER_PROTOCOL_VERSION)._read_result()
+        self.assertEqual(int(result.teacher_status[0]), 1)
+        self.assertEqual(int(result.active_order[0]), 1)
 
     def test_ai42_scalar_parser_reads_append_fields_exactly(self):
         layout = _result_layout(AI42_PROTOCOL_VERSION)
