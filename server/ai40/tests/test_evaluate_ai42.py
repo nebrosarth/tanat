@@ -186,6 +186,7 @@ class AI42EvaluationTests(unittest.TestCase):
         self.assertEqual(profile["policy_batches"], 1)
         self.assertEqual(profile["policy_rows"], HERO_COUNT // 2)
         self.assertIsNone(profile["cuda_memory"])
+        self.assertIsNone(profile["decision_margin"])
         self.assertGreaterEqual(profile["model_inference_seconds"], 0.0)
         self.assertGreaterEqual(profile["environment_step_seconds"], 0.0)
 

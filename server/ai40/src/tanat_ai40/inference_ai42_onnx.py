@@ -63,6 +63,13 @@ def _logsumexp_pair(first: np.ndarray, second: np.ndarray) -> np.ndarray:
     return maximum + np.log(np.exp(first - maximum) + np.exp(second - maximum))
 
 
+def _top_two_margin(logits: np.ndarray) -> np.ndarray:
+    if logits.ndim != 2 or logits.shape[1] < 2:
+        raise ValueError("margin logits must be rank two with at least two classes")
+    top_two = np.partition(logits, logits.shape[1] - 2, axis=1)[:, -2:]
+    return top_two.max(axis=1) - top_two.min(axis=1)
+
+
 class AI42ONNXEvaluationActor:
     """Fixed-shape greedy actor with fail-closed ONNX output validation."""
 
@@ -87,6 +94,7 @@ class AI42ONNXEvaluationActor:
         self.c = np.zeros((batch_size, hidden_size), dtype=np.float32)
         self.previous_dead = np.zeros(batch_size, dtype=np.bool_)
         self.active_order = np.zeros(batch_size, dtype=np.bool_)
+        self.last_decision_margin = np.full(batch_size, np.nan, dtype=np.float32)
 
     def reset_workers(self, worker_indices: Sequence[int]) -> None:
         workers = self.batch_size // self.heroes_per_worker
@@ -99,6 +107,7 @@ class AI42ONNXEvaluationActor:
             self.c[start:stop] = 0
             self.previous_dead[start:stop] = False
             self.active_order[start:stop] = False
+            self.last_decision_margin[start:stop] = np.nan
 
     def act(
         self, observations: Sequence[Any], indices: np.ndarray,
@@ -200,6 +209,20 @@ class AI42ONNXEvaluationActor:
         offsets = output["offset"][rows, kinds].argmax(axis=1)
         anchors = output["anchor"][rows, kinds].argmax(axis=1)
         anchors = np.where(skill_rows, 0, anchors)
+        control_margin = _top_two_margin(runtime_logits)
+        kind_margin = _top_two_margin(np.where(kind_mask, output["kind"], -1e9))
+        selected_target_logits = np.where(
+            effective_targets,
+            output["target"][rows, kinds],
+            -1e9,
+        )
+        target_margin = _top_two_margin(selected_target_logits)
+        issue_margin = np.minimum(kind_margin, target_margin)
+        self.last_decision_margin[:] = np.where(
+            runtime_controls == RUNTIME_CONTROL_ISSUE,
+            np.minimum(control_margin, issue_margin),
+            control_margin,
+        ).astype(np.float32, copy=False)
         actions = np.stack((kinds, targets, offsets, anchors), axis=1).astype(np.int16)
         actions = np.where(
             (runtime_controls == RUNTIME_CONTROL_ISSUE)[:, None],

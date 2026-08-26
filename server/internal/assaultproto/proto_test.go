@@ -85,6 +85,7 @@ func TestAI42DAggerInterventionWireIsByteExact(t *testing.T) {
 	if err := NewResultEncoder().WriteVersion(&out, &result, VersionAI42DAgger); err != nil {
 		t.Fatal(err)
 	}
+	frame := append([]byte(nil), out.Bytes()...)
 	body, err := readFrame(&out)
 	if err != nil {
 		t.Fatal(err)
@@ -93,6 +94,47 @@ func TestAI42DAggerInterventionWireIsByteExact(t *testing.T) {
 	if body[layout.teacherStatusOffset] != battleserver.AssaultTeacherStatusAction ||
 		body[layout.activeOrderOffset] != 1 {
 		t.Fatal("v15 teacher/active-order fields did not round-trip")
+	}
+	decoded, err := ReadResultVersion(bytes.NewReader(frame), VersionAI42DAgger)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if decoded.TeacherStatus[0] != battleserver.AssaultTeacherStatusAction || decoded.ActiveOrder[0] != 1 {
+		t.Fatalf("decoded v15 fields drifted: teacher=%d active=%d", decoded.TeacherStatus[0], decoded.ActiveOrder[0])
+	}
+}
+
+func TestReadResultVersionRoundTripsCompleteAI42DAggerRecord(t *testing.T) {
+	var source battleserver.StepResultV1
+	source.RewardHash = battleserver.AssaultRewardHashV5
+	source.Step, source.Elapsed, source.Done, source.Winner = 17, 3.4, true, -1
+	source.Invalid[2], source.Reward[2] = 1, -2.5
+	source.Observations[2].Hero[3] = 4.5
+	source.Observations[2].Abilities[1][7] = 5.5
+	source.Observations[2].Entities[9][11] = 6.5
+	source.Observations[2].Global[4] = 7.5
+	source.Observations[2].EntityMask[9] = 1
+	source.Observations[2].ActionMask.Kinds[3] = 1
+	source.Observations[2].ActionMask.Targets[9] = 1
+	source.Observations[2].ActionMask.SkillTarget[1][9] = 1
+	source.TeacherIntent[2] = battleserver.HeroActionV1{Kind: 3, Target: 9, Direction: 8, Distance: 7}
+	source.TeacherStatus[2] = battleserver.AssaultTeacherStatusAction
+	source.ExecutedActions[2] = battleserver.HeroActionV1{Kind: 4, Target: 8, Direction: 7, Distance: 6}
+	source.ExecutedValid[2], source.RejectionReason[2], source.ActiveOrder[2] = 1, 0, 1
+	var encoded bytes.Buffer
+	if err := NewResultEncoder().WriteVersion(&encoded, &source, VersionAI42DAgger); err != nil {
+		t.Fatal(err)
+	}
+	decoded, err := ReadResultVersion(&encoded, VersionAI42DAgger)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if decoded.Step != source.Step || decoded.Elapsed != source.Elapsed || decoded.Done != source.Done || decoded.Winner != source.Winner ||
+		decoded.Invalid != source.Invalid || decoded.Reward != source.Reward || decoded.Observations != source.Observations ||
+		decoded.TeacherIntent != source.TeacherIntent || decoded.TeacherStatus != source.TeacherStatus ||
+		decoded.ExecutedActions != source.ExecutedActions || decoded.ExecutedValid != source.ExecutedValid ||
+		decoded.RejectionReason != source.RejectionReason || decoded.ActiveOrder != source.ActiveOrder {
+		t.Fatal("decoded v15 scalar result differs from encoded source")
 	}
 }
 

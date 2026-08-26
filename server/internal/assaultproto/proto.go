@@ -389,6 +389,144 @@ func WriteResult(w io.Writer, result battleserver.StepResultV1) error {
 	return NewResultEncoder().Write(w, &result)
 }
 
+// ReadResultVersion decodes one scalar result frame for a fixed protocol
+// version. It is the inverse of ResultEncoder.WriteVersion and lets native
+// capture sidecars consume the exact bytes already returned to a policy
+// process instead of rebuilding large observation arrays through Python.
+func ReadResultVersion(r io.Reader, expectedVersion uint16) (battleserver.StepResultV1, error) {
+	var result battleserver.StepResultV1
+	if !supportedVersion(expectedVersion) {
+		return result, fmt.Errorf("assault protocol: unsupported expected result version %d", expectedVersion)
+	}
+	body, err := readFrame(r)
+	if err != nil {
+		return result, err
+	}
+	if len(body) < 8 || !bytes.Equal(body[:4], magic[:]) {
+		return result, errors.New("assault protocol: field=frame.magic offset=0: bad magic")
+	}
+	version := binary.LittleEndian.Uint16(body[4:6])
+	if version != expectedVersion {
+		return result, fmt.Errorf(
+			"assault protocol: field=frame.version offset=4: got %d, want %d",
+			version, expectedVersion,
+		)
+	}
+	response := binary.LittleEndian.Uint16(body[6:8])
+	if response == ResponseError {
+		return result, fmt.Errorf("assault protocol: remote error: %s", string(body[8:]))
+	}
+	if response != ResponseResult {
+		return result, fmt.Errorf("assault protocol: field=frame.response offset=6: got %d, want %d", response, ResponseResult)
+	}
+	layout := newResultFrameLayout(version)
+	if err := resultSizeError(layout, len(body)); err != nil {
+		return result, err
+	}
+	copy(result.SchemaHash[:], body[8:40])
+	copy(result.RewardHash[:], body[40:72])
+	if _, _, err := resultHeaderHashes(version, &result); err != nil {
+		return result, err
+	}
+	if version != Version {
+		expectedSchema, expectedReward, _ := resultHeaderHashes(version, &result)
+		if result.SchemaHash != expectedSchema {
+			return result, fmt.Errorf("assault protocol: field=result.schema_hash offset=8: mismatch")
+		}
+		if result.RewardHash != expectedReward {
+			return result, fmt.Errorf("assault protocol: field=result.reward_hash offset=40: mismatch")
+		}
+	}
+	if err := decodeResultRecord(body[resultHeaderSize:], version, &result); err != nil {
+		return battleserver.StepResultV1{}, err
+	}
+	return result, nil
+}
+
+func decodeResultRecord(body []byte, version uint16, result *battleserver.StepResultV1) error {
+	layout := newResultFrameLayout(version)
+	if len(body) != layout.recordSize {
+		return resultSizeError(layout, len(body)+resultHeaderSize)
+	}
+	off := 0
+	takeBytes := func(destination []byte) {
+		copy(destination, body[off:off+len(destination)])
+		off += len(destination)
+	}
+	takeU32 := func() uint32 {
+		value := binary.LittleEndian.Uint32(body[off : off+4])
+		off += 4
+		return value
+	}
+	takeF32 := func() float32 { return math.Float32frombits(takeU32()) }
+	takeF32s := func(destination []float32) {
+		for index := range destination {
+			destination[index] = takeF32()
+		}
+	}
+	takeAction := func() battleserver.HeroActionV1 {
+		value := battleserver.HeroActionV1{
+			Kind:      battleserver.AssaultActionKindV1(body[off]),
+			Target:    binary.LittleEndian.Uint16(body[off+1 : off+3]),
+			Direction: body[off+3], Distance: body[off+4],
+		}
+		off += 5
+		return value
+	}
+
+	result.Step = takeU32()
+	result.Elapsed = takeF32()
+	result.Done = body[off] != 0
+	off += 4
+	result.Winner = int32(takeU32())
+	takeBytes(result.Invalid[:])
+	takeF32s(result.Reward[:])
+	for hero := range result.Observations {
+		observation := &result.Observations[hero]
+		takeF32s(observation.Hero[:])
+		if layoutHasAbilities(version) {
+			for ability := range observation.Abilities {
+				takeF32s(observation.Abilities[ability][:])
+			}
+		}
+		for entity := range observation.Entities {
+			takeF32s(observation.Entities[entity][:])
+		}
+		takeF32s(observation.Global[:])
+		takeBytes(observation.EntityMask[:])
+		takeBytes(observation.ActionMask.Kinds[:])
+		takeBytes(observation.ActionMask.Targets[:])
+		for skill := range observation.ActionMask.SkillTarget {
+			takeBytes(observation.ActionMask.SkillTarget[skill][:])
+		}
+	}
+	if version == VersionAI41Teacher {
+		for slot := range result.TeacherActions {
+			result.TeacherActions[slot] = takeAction()
+		}
+		takeBytes(result.TeacherValid[:])
+	} else if versionHasAI42(version) {
+		for slot := range result.TeacherIntent {
+			result.TeacherIntent[slot] = takeAction()
+		}
+		takeBytes(result.TeacherStatus[:])
+		for slot := range result.ExecutedActions {
+			result.ExecutedActions[slot] = takeAction()
+		}
+		takeBytes(result.ExecutedValid[:])
+		takeBytes(result.RejectionReason[:])
+		if version == VersionAI42DAgger {
+			takeBytes(result.ActiveOrder[:])
+		}
+	} else if version == VersionAI42Evaluation {
+		takeBytes(result.ActiveOrder[:])
+	}
+	if off != len(body) {
+		return fmt.Errorf("assault protocol: field=result.trailing offset=%d: got %d bytes", resultHeaderSize+off, len(body)-off)
+	}
+	return nil
+}
+
 const resultBodySize = 138 + battleserver.AssaultHeroCount*(battleserver.AssaultHeroFeatureSize*4+
 	battleserver.AssaultMaxEntities*battleserver.AssaultEntityFeatures*4+
 	battleserver.AssaultGlobalFeatures*4+

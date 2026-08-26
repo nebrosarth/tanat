@@ -280,6 +280,7 @@ def evaluate_vs_ai30(
     environment_reset_seconds = 0.0
     policy_batches = 0
     policy_rows = 0
+    decision_margin_samples: list[np.ndarray] = []
     if backend == "torch" and device.type == "cuda":
         torch.cuda.reset_peak_memory_stats(device)
     started = time.perf_counter()
@@ -312,6 +313,9 @@ def evaluate_vs_ai30(
             inference_seconds += time.perf_counter() - inference_started
             policy_batches += 1
             policy_rows += int(indices.size)
+            margins = getattr(evaluator, "last_decision_margin", None)
+            if margins is not None:
+                decision_margin_samples.append(np.asarray(margins, dtype=np.float32).copy())
             action_values = np.zeros((workers, HERO_COUNT, 5), dtype=np.int16)
             for index, side in enumerate(assignments):
                 if side == 0:
@@ -386,6 +390,20 @@ def evaluate_vs_ai30(
             "peak_allocated_bytes": int(torch.cuda.max_memory_allocated(device)),
             "peak_reserved_bytes": int(torch.cuda.max_memory_reserved(device)),
         }
+    margin_profile = None
+    if decision_margin_samples:
+        margins = np.concatenate(decision_margin_samples)
+        quantiles = np.quantile(margins, [0.1, 0.25, 0.5, 0.75, 0.9])
+        margin_profile = {
+            "count": int(margins.size),
+            "min": float(margins.min()),
+            "p10": float(quantiles[0]),
+            "p25": float(quantiles[1]),
+            "p50": float(quantiles[2]),
+            "p75": float(quantiles[3]),
+            "p90": float(quantiles[4]),
+            "max": float(margins.max()),
+        }
     return {
         "format": "AI42-headless-evaluation-v1",
         "protocol_version": AI42_EVALUATION_PROTOCOL_VERSION,
@@ -450,6 +468,7 @@ def evaluate_vs_ai30(
             "policy_batches": policy_batches,
             "policy_rows": policy_rows,
             "policy_rows_per_second": policy_rows / max(inference_seconds, 1e-9),
+            "decision_margin": margin_profile,
             "cuda_memory": cuda_memory,
         },
     }

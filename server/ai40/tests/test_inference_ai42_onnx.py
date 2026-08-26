@@ -90,6 +90,8 @@ class AI42ONNXInferenceTests(unittest.TestCase):
         self.assertEqual(int(model[4]), CONTROL_CANCEL)
         self.assertEqual(int(runtime[0]), 0)
         self.assertEqual(int(runtime[4]), 2)
+        self.assertEqual(actor.last_decision_margin.shape, (5,))
+        self.assertTrue(np.isfinite(actor.last_decision_margin).all())
 
         session.prefer_hold = True
         _, runtime, model = actor.act([_Observation()], indices)
@@ -108,6 +110,7 @@ class AI42ONNXInferenceTests(unittest.TestCase):
         actor.reset_workers([1])
         self.assertTrue(np.all(actor.h[:5] == 3))
         self.assertTrue(np.all(actor.h[5:] == 0))
+        self.assertTrue(np.isnan(actor.last_decision_margin[5:]).all())
         with self.assertRaises(IndexError):
             actor.reset_workers([2])
 

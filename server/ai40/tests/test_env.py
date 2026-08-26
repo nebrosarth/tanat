@@ -18,7 +18,7 @@ from tanat_ai40.env import (
     AI42_EVALUATION_SCHEMA, AI42_EVALUATION_SCHEMA_HASH,
     AI42_DAGGER_PROTOCOL_VERSION, AI42_DAGGER_SCHEMA, AI42_DAGGER_SCHEMA_HASH,
     AI42_PROTOCOL_VERSION, AI42_REWARD_HASH, AI42_SCHEMA, AI42_SCHEMA_HASH,
-    CONTROLLED_ACTION_DTYPE, DAGGER_ACTION_DTYPE, COMMAND_VECTOR_STEP,
+    CONTROLLED_ACTION_DTYPE, DAGGER_ACTION_DTYPE, COMMAND_STEP, COMMAND_VECTOR_STEP,
     AssaultEnvProcess, AssaultProtocolError, AssaultVectorEnv, AssaultVectorProcess,
     HeroAction, HERO_COUNT,
     MAGIC, RESPONSE_RESULT, SCHEMA_HASH, STDERR_TAIL_BYTES, _result_layout,
@@ -334,6 +334,23 @@ class ProtocolContractTest(unittest.TestCase):
         result = self._scalar_env(frame, AI42_DAGGER_PROTOCOL_VERSION)._read_result()
         self.assertEqual(int(result.teacher_status[0]), 1)
         self.assertEqual(int(result.active_order[0]), 1)
+
+    def test_scalar_step_exchange_preserves_exact_v15_frames_once(self):
+        layout = _result_layout(AI42_DAGGER_PROTOCOL_VERSION)
+        body = bytearray(layout.size)
+        self._header(body, AI42_DAGGER_PROTOCOL_VERSION, RESPONSE_RESULT)
+        response_frame = struct.pack("<I", len(body)) + body
+        process = self._scalar_env(response_frame, AI42_DAGGER_PROTOCOL_VERSION)
+        process._in = io.BytesIO()
+        process._last_step_request = None
+        process._last_step_result = None
+        process._write(COMMAND_STEP, bytes(HERO_COUNT * DAGGER_ACTION_DTYPE.itemsize))
+        process._read_result()
+        request, response = process.take_step_exchange()
+        self.assertEqual(request, process._in.getvalue())
+        self.assertEqual(response, response_frame)
+        with self.assertRaisesRegex(AssaultProtocolError, "no complete"):
+            process.take_step_exchange()
 
     def test_ai42_scalar_parser_reads_append_fields_exactly(self):
         layout = _result_layout(AI42_PROTOCOL_VERSION)

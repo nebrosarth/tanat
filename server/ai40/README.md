@@ -274,6 +274,28 @@ The temporary AI-30 local/team profile is restored before the result leaves the
 server, so expert takeover cannot silently convert a policy slot or team into a
 scripted controller for later ticks.
 
+`tanat-ai42-collect-dagger` runs one Q9 policy side through ONNX Runtime and
+streams each exact v15 scalar STEP request/result pair to `ai42daggerwriter`.
+The Go writer decodes those existing frames directly into the native columnar
+capture, performs strict replay once, and atomically publishes an AI42GS2 shard;
+it never rebuilds observations as per-tick Python records. The schedule freezes
+checkpoint lineage, side, roster, and intervention parameters into dataset
+provenance. The intervention threshold is mandatory rather than hidden in the
+collector. On Q9 step 45, the measured masked top-two margin distribution was
+p25=0.0806 and p50=0.1776; a 50-tick smoke with threshold 0.08 and a five-tick
+per-hero gap produced 17 interventions, 16 policy-side teacher labels, and zero
+invalid actions, then passed the strict dataset audit.
+
+```powershell
+go build -o <ai42daggerwriter.exe> .\cmd\ai42daggerwriter
+tanat-ai42-collect-dagger <generation.pt> `
+  --config .\ai40\config\ai42_bc_training_q9.json `
+  --env <assaultenv.exe> --writer <ai42daggerwriter.exe> `
+  --output <dataset-dir> --onnx <actor.onnx> `
+  --seed 54001 --candidate-side 1 --max-steps 4500 `
+  --intervention-margin 0.08 --intervention-gap-ticks 5 --device cuda
+```
+
 ### AI-42 native-inference benchmark
 
 `tanat-ai42-benchmark-inference` exports an immutable generation to the complete

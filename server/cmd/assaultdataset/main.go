@@ -5,7 +5,6 @@
 package main
 
 import (
-	"crypto/sha256"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -18,26 +17,10 @@ import (
 	"time"
 
 	"tanatserver/internal/ai42dataset"
+	"tanatserver/internal/ai42schedule"
 	"tanatserver/internal/assaultproto"
 	"tanatserver/internal/battleserver"
 )
-
-type scheduleFile struct {
-	MaxSteps           uint32      `json:"max_steps"`
-	SplitSeed          int64       `json:"split_seed"`
-	ValidationFraction float64     `json:"validation_fraction"`
-	MatchSchedule      []matchSpec `json:"match_schedule"`
-}
-
-type matchSpec struct {
-	Index       int     `json:"index"`
-	MatchID     string  `json:"match_id"`
-	Seed        int64   `json:"seed"`
-	Scenario    string  `json:"scenario"`
-	Controllers []int   `json:"controller_by_slot"`
-	Roster      []int32 `json:"roster_ids"`
-	Sides       []uint8 `json:"side_by_slot"`
-}
 
 const defaultInitialReserveTicks = 2048
 
@@ -79,24 +62,10 @@ func main() {
 		fatal("-match-index must be non-negative")
 	}
 
-	var runtimeManifest []byte
-	var err error
 	scheduleStarted := time.Now()
-	if *schedulePath == "-" {
-		runtimeManifest, err = io.ReadAll(os.Stdin)
-	} else {
-		runtimeManifest, err = os.ReadFile(*schedulePath)
-	}
+	runtimeManifest, schedule, err := ai42schedule.Read(*schedulePath, os.Stdin)
 	if err != nil {
-		fatal("read schedule: %v", err)
-	}
-	_, err = ai42dataset.CanonicalizeJSON(runtimeManifest)
-	if err != nil {
-		fatal("schedule JSON must already be canonical: %v", err)
-	}
-	var schedule scheduleFile
-	if err := json.Unmarshal(runtimeManifest, &schedule); err != nil {
-		fatal("decode schedule: %v", err)
+		fatal("%v", err)
 	}
 	if *matchIndex >= len(schedule.MatchSchedule) {
 		fatal("match index %d is outside schedule length %d", *matchIndex, len(schedule.MatchSchedule))
@@ -106,31 +75,11 @@ func main() {
 	if steps == 0 {
 		fatal("max_steps must be positive")
 	}
-	if err := validateSpec(spec); err != nil {
-		fatal("schedule entry: %v", err)
-	}
 	scheduleSeconds := time.Since(scheduleStarted).Seconds()
 	stopCPUProfile := startCPUProfile(*cpuProfilePath)
 
 	setupStarted := time.Now()
-	metadata := ai42dataset.Metadata{
-		ProtocolVersion:      ai42dataset.ProtocolVersion,
-		TickHz:               ai42dataset.FrameRateHz,
-		MatchID:              spec.MatchID,
-		RuntimeManifest:      runtimeManifest,
-		RuntimeManifestHash:  sha256.Sum256(runtimeManifest),
-		SchemaHash:           ai42dataset.AI42SchemaHash,
-		RewardHash:           ai42dataset.AI42RewardHash,
-		TrajectorySchemaHash: ai42dataset.AI42TrajectorySchemaHash,
-		Seed:                 spec.Seed,
-		Scenario:             spec.Scenario,
-	}
-	for slot := 0; slot < ai42dataset.HeroCount; slot++ {
-		metadata.HeroIDs[slot] = fmt.Sprintf("%s:hero:%02d", spec.MatchID, slot)
-		metadata.ControllerBySlot[slot] = uint8(spec.Controllers[slot])
-		metadata.RosterIDs[slot] = spec.Roster[slot]
-		metadata.SideBySlot[slot] = spec.Sides[slot]
-	}
+	metadata := spec.Metadata(runtimeManifest)
 	capture, err := ai42dataset.NewCapture(metadata)
 	if err != nil {
 		fatal("create native capture: %v", err)
@@ -290,38 +239,6 @@ func writeMetrics(path string, metrics performanceMetrics) {
 	if err := os.Rename(temporaryName, path); err != nil {
 		fatal("publish performance metrics: %v", err)
 	}
-}
-
-func validateSpec(spec matchSpec) error {
-	if spec.MatchID == "" || spec.Scenario == "" {
-		return fmt.Errorf("match_id and scenario are required")
-	}
-	if len(spec.Controllers) != ai42dataset.HeroCount || len(spec.Roster) != ai42dataset.HeroCount || len(spec.Sides) != ai42dataset.HeroCount {
-		return fmt.Errorf("controller, roster, and side schedules must contain ten slots")
-	}
-	seen := make(map[int32]struct{}, ai42dataset.HeroCount)
-	zero, one := 0, 0
-	for slot := 0; slot < ai42dataset.HeroCount; slot++ {
-		if spec.Controllers[slot] < 0 || spec.Controllers[slot] > 3 {
-			return fmt.Errorf("controller_by_slot[%d]=%d is outside 0..3", slot, spec.Controllers[slot])
-		}
-		if _, ok := seen[spec.Roster[slot]]; ok {
-			return fmt.Errorf("roster_ids[%d] duplicates %d", slot, spec.Roster[slot])
-		}
-		seen[spec.Roster[slot]] = struct{}{}
-		switch spec.Sides[slot] {
-		case 0:
-			zero++
-		case 1:
-			one++
-		default:
-			return fmt.Errorf("side_by_slot[%d] must be 0 or 1", slot)
-		}
-	}
-	if zero != 5 || one != 5 {
-		return fmt.Errorf("side_by_slot must contain five slots per side")
-	}
-	return nil
 }
 
 func fatal(format string, args ...any) {

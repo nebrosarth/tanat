@@ -462,6 +462,8 @@ class AssaultEnvProcess:
         assert self.process.stdin and self.process.stdout
         self._in: BinaryIO = self.process.stdin
         self._out: BinaryIO = self.process.stdout
+        self._last_step_request: bytes | None = None
+        self._last_step_result: bytes | None = None
         # The simulation is a long-running child and can emit Go diagnostics at
         # any time.  Leaving stderr unread eventually fills the OS pipe and
         # makes a healthy child block inside a tick, indistinguishable from a
@@ -570,8 +572,30 @@ class AssaultEnvProcess:
 
     def _write(self, command: int, payload: bytes) -> None:
         body = MAGIC + struct.pack("<HH", self.protocol_version, command) + payload
-        self._in.write(struct.pack("<I", len(body)) + body)
+        frame = struct.pack("<I", len(body)) + body
+        if command == COMMAND_STEP:
+            self._last_step_request = frame
+            self._last_step_result = None
+        else:
+            self._last_step_request = None
+            self._last_step_result = None
+        self._in.write(frame)
         self._in.flush()
+
+    def take_step_exchange(self) -> tuple[bytes, bytes]:
+        """Return and clear the most recent scalar STEP request/result frames.
+
+        A streaming native collector must call this immediately after ``step``;
+        a later command intentionally replaces the bounded one-exchange slot.
+        """
+
+        request = getattr(self, "_last_step_request", None)
+        result = getattr(self, "_last_step_result", None)
+        if request is None or result is None:
+            raise AssaultProtocolError("no complete scalar STEP exchange is available")
+        self._last_step_request = None
+        self._last_step_result = None
+        return request, result
 
     def _read_exact(self, size: int, field: str = "frame.body", offset: int = 0) -> bytes:
         chunks = bytearray()
@@ -587,7 +611,8 @@ class AssaultEnvProcess:
         return bytes(chunks)
 
     def _read_result(self) -> StepResult:
-        size = struct.unpack("<I", self._read_exact(4, "frame.length"))[0]
+        prefix = self._read_exact(4, "frame.length")
+        size = struct.unpack("<I", prefix)[0]
         if size < 8 or size > MAX_FRAME_SIZE:
             raise AssaultProtocolError(f"field=frame.length offset=0: invalid frame length {size}")
         body = self._read_exact(size, "frame.body")
@@ -658,6 +683,8 @@ class AssaultEnvProcess:
             offset += HERO_COUNT
         if offset != len(body):
             raise AssaultProtocolError(f"field=result.trailing offset={offset}: got {len(body)-offset} bytes")
+        if getattr(self, "_last_step_request", None) is not None:
+            self._last_step_result = prefix + body
         return StepResult(step, elapsed, bool(done), winner, invalid, rewards, hero, entities,
                           global_state, entity_mask, kind_mask, target_mask, skill_target_mask,
                           abilities, teacher_actions, teacher_valid, teacher_intent,
