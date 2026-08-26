@@ -11,6 +11,11 @@ class AI42DAggerGenerationTests(unittest.TestCase):
         kwargs = dict(
             seed=91, matches=4, max_steps=600,
             lineage={"checkpoint_sha256": "b" * 64}, threshold=0.08,
+            runtime_lineage={
+                "environment": {"name": "env", "sha256": "c" * 64, "size_bytes": 1},
+                "onnx_actor": {"name": "actor", "sha256": "d" * 64, "size_bytes": 2},
+                "writer": {"name": "writer", "sha256": "e" * 64, "size_bytes": 3},
+            },
             min_gap_ticks=5, split_seed=7, validation_fraction=0.5,
         )
         first, first_specs = build_dagger_schedule(**kwargs)
@@ -29,6 +34,7 @@ class AI42DAggerGenerationTests(unittest.TestCase):
                 f"ai42_dagger_candidate_side{index % 2 + 1}_vs_ai30",
             )
         self.assertEqual(first["policy_lineage"], kwargs["lineage"])
+        self.assertEqual(first["runtime_lineage"], kwargs["runtime_lineage"])
         self.assertEqual(first["scenario_mix"], {
             "ai42_dagger_candidate_side1_vs_ai30": {
                 "train": 1, "validation": 1,
@@ -42,31 +48,43 @@ class AI42DAggerGenerationTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "matches"):
             build_dagger_schedule(
                 seed=1, matches=0, max_steps=1, lineage={}, threshold=0.1,
+                runtime_lineage={},
                 min_gap_ticks=1, split_seed=1, validation_fraction=0,
             )
         with self.assertRaisesRegex(ValueError, "validation_fraction"):
             build_dagger_schedule(
                 seed=1, matches=2, max_steps=1, lineage={}, threshold=0.1,
+                runtime_lineage={},
                 min_gap_ticks=1, split_seed=1, validation_fraction=2,
             )
         with self.assertRaisesRegex(ValueError, "matches"):
             build_dagger_schedule(
                 seed=1, matches=1.5, max_steps=1, lineage={}, threshold=0.1,
+                runtime_lineage={},
                 min_gap_ticks=1, split_seed=1, validation_fraction=0,
             )
         with self.assertRaisesRegex(ValueError, "balance"):
             build_dagger_schedule(
                 seed=1, matches=3, max_steps=1, lineage={}, threshold=0.1,
+                runtime_lineage={},
                 min_gap_ticks=1, split_seed=1, validation_fraction=0,
             )
         with self.assertRaisesRegex(ValueError, "integer number"):
             build_dagger_schedule(
                 seed=1, matches=4, max_steps=1, lineage={}, threshold=0.1,
+                runtime_lineage={},
                 min_gap_ticks=1, split_seed=1, validation_fraction=0.25,
             )
         with self.assertRaisesRegex(ValueError, "max_steps"):
             build_dagger_schedule(
                 seed=1, matches=2, max_steps=1.5, lineage={}, threshold=0.1,
+                runtime_lineage={},
+                min_gap_ticks=1, split_seed=1, validation_fraction=0,
+            )
+        with self.assertRaisesRegex(ValueError, "runtime_lineage"):
+            build_dagger_schedule(
+                seed=1, matches=2, max_steps=1, lineage={}, threshold=0.1,
+                runtime_lineage={},
                 min_gap_ticks=1, split_seed=1, validation_fraction=0,
             )
 

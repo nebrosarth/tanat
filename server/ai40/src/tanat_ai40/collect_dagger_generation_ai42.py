@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import argparse
+from collections.abc import Mapping
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
+import hashlib
 import json
 import math
 from pathlib import Path
@@ -55,8 +57,45 @@ def _roster(seed: int, index: int) -> tuple[int, ...]:
     return tuple(int(value) for value in rng.permutation(AI40_ROSTER))
 
 
+def _artifact_lineage(path: Path) -> dict[str, Any]:
+    digest = hashlib.sha256()
+    size = 0
+    with path.open("rb") as stream:
+        while chunk := stream.read(1024 * 1024):
+            digest.update(chunk)
+            size += len(chunk)
+    return {"name": path.name, "sha256": digest.hexdigest(), "size_bytes": size}
+
+
+def _runtime_lineage(value: Mapping[str, Any]) -> dict[str, dict[str, Any]]:
+    expected = {"environment", "onnx_actor", "writer"}
+    if not isinstance(value, Mapping) or set(value) != expected:
+        raise ValueError("runtime_lineage must contain environment, onnx_actor, and writer")
+    normalized: dict[str, dict[str, Any]] = {}
+    for label in sorted(expected):
+        artifact = value[label]
+        if not isinstance(artifact, Mapping) or set(artifact) != {
+            "name", "sha256", "size_bytes",
+        }:
+            raise ValueError(f"runtime_lineage.{label} has an invalid artifact contract")
+        name, digest, size = artifact["name"], artifact["sha256"], artifact["size_bytes"]
+        if not isinstance(name, str) or not name:
+            raise ValueError(f"runtime_lineage.{label}.name must be non-empty")
+        if (
+            not isinstance(digest, str)
+            or len(digest) != 64
+            or any(character not in "0123456789abcdef" for character in digest)
+        ):
+            raise ValueError(f"runtime_lineage.{label}.sha256 must be lowercase SHA-256")
+        if isinstance(size, bool) or not isinstance(size, int) or size < 1:
+            raise ValueError(f"runtime_lineage.{label}.size_bytes must be positive")
+        normalized[label] = {"name": name, "sha256": digest, "size_bytes": size}
+    return normalized
+
+
 def build_dagger_schedule(
     *, seed: int, matches: int, max_steps: int, lineage: dict[str, Any],
+    runtime_lineage: dict[str, Any],
     threshold: float, min_gap_ticks: int, split_seed: int,
     validation_fraction: float,
 ) -> tuple[dict[str, Any], tuple[MatchSpec, ...]]:
@@ -83,6 +122,7 @@ def build_dagger_schedule(
             "validation_fraction must select an integer number of matches per side"
         )
     MarginInterventionGate(HERO_COUNT // 2, threshold, min_gap_ticks)
+    normalized_runtime_lineage = _runtime_lineage(runtime_lineage)
     seeds = deterministic_seed_schedule(seed, matches)
     specs = tuple(
         MatchSpec(
@@ -118,6 +158,7 @@ def build_dagger_schedule(
         ],
         "max_steps": max_steps,
         "policy_lineage": lineage,
+        "runtime_lineage": normalized_runtime_lineage,
         "scenario_mix": {
             f"ai42_dagger_candidate_side{side}_vs_ai30": {
                 "train": side_matches - validation_per_side,
@@ -333,13 +374,19 @@ def collect_dagger_generation(
     if staging.exists():
         raise FileExistsError(f"DAgger staging already exists: {staging}")
     actor, lineage = load_actor(checkpoint, config, torch.device("cpu"))
-    schedule, specs = build_dagger_schedule(
-        seed=seed, matches=matches, max_steps=max_steps, lineage=lineage,
-        threshold=intervention_margin, min_gap_ticks=intervention_gap_ticks,
-        split_seed=split_seed, validation_fraction=validation_fraction,
-    )
     export_ai42_actor(actor, onnx_path)
     session = create_onnx_session(str(onnx_path), cuda=device.type == "cuda")
+    runtime_lineage = {
+        "environment": _artifact_lineage(env_executable),
+        "onnx_actor": _artifact_lineage(onnx_path),
+        "writer": _artifact_lineage(writer_executable),
+    }
+    schedule, specs = build_dagger_schedule(
+        seed=seed, matches=matches, max_steps=max_steps, lineage=lineage,
+        runtime_lineage=runtime_lineage, threshold=intervention_margin,
+        min_gap_ticks=intervention_gap_ticks, split_seed=split_seed,
+        validation_fraction=validation_fraction,
+    )
     staging.joinpath("matches").mkdir(parents=True)
     schedule_path = staging / "schedule.json"
     _atomic_write(schedule_path, canonical_json_bytes(schedule))

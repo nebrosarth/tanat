@@ -300,7 +300,10 @@ tanat-ai42-collect-dagger <generation.pt> `
 batch of scalar simulation processes, alternates the candidate between sides,
 and publishes one immutable generation with one schedule and policy lineage.
 Every match is decoded, strictly replayed, and compressed by its own Go writer;
-the final merge copies compressed payloads without decompression. A four-match,
+the final merge copies compressed payloads without decompression. The schedule
+also records SHA-256 and byte size for the exact environment, writer, and ONNX
+artifacts, so a server-semantics change creates distinguishable provenance even
+when tensor and reward schemas stay compatible. A four-match,
 four-worker, 400-tick integration run completed in 5.47 seconds (73.1 aggregate
 ticks/second), produced no invalid actions, and passed strict train/validation
 audits with one candidate-side-1 and one candidate-side-2 match in each split.
