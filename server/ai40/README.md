@@ -213,6 +213,26 @@ states with AI-30 intervention labels, alternate sides, and freeze policy,
 environment, writer, and ONNX hashes in generation provenance. Do not tune the
 architecture or promotion gate against the same validation matches.
 
+Use margin interventions only when low confidence is a reliable proxy for a
+bad action. A policy that is confidently wrong should use the deterministic
+periodic mixture instead. With five controlled heroes and a five-tick period,
+one different hero yields its decision to AI-30 each tick, so every hero gets
+one correction per simulated second without replacing the whole team at once:
+
+```powershell
+python -m tanat_ai40.collect_dagger_generation_ai42 <checkpoint.pt> `
+  --config .\ai40\config\ai42_bc_training.json `
+  --env .\assaultenv.exe --writer .\ai42daggerwriter.exe `
+  --output <dagger-dataset> --onnx <frozen-actor.onnx> `
+  --seed 52000 --matches 32 --workers 8 --max-steps 4500 `
+  --intervention-strategy periodic --intervention-gap-ticks 5 `
+  --split-seed 4242 --validation-fraction 0.25 --device cpu
+```
+
+The intervention strategy and its parameters are part of the immutable
+collector-v2 schedule. The legacy default remains `margin` with threshold
+`0.08` and a five-tick per-hero cooldown.
+
 ONNX is the deployment/runtime format. Export validates the exact actor-only
 interface and PyTorch/ONNX parity; CUDA execution must fail closed if ONNX
 Runtime silently falls back to CPU.

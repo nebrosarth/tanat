@@ -44,6 +44,25 @@ class AI42DAggerGenerationTests(unittest.TestCase):
             },
         })
 
+    def test_periodic_schedule_records_unambiguous_policy(self) -> None:
+        runtime_lineage = {
+            "environment": {"name": "env", "sha256": "c" * 64, "size_bytes": 1},
+            "onnx_actor": {"name": "actor", "sha256": "d" * 64, "size_bytes": 2},
+            "writer": {"name": "writer", "sha256": "e" * 64, "size_bytes": 3},
+        }
+        schedule, _ = build_dagger_schedule(
+            seed=91, matches=4, max_steps=600,
+            lineage={"checkpoint_sha256": "b" * 64}, threshold=0.08,
+            runtime_lineage=runtime_lineage, min_gap_ticks=5,
+            split_seed=7, validation_fraction=0.5,
+            intervention_strategy="periodic",
+        )
+        self.assertEqual(schedule["intervention_policy"], {
+            "strategy": "periodic", "period_ticks": 5,
+            "staggered_by_actor": True,
+        })
+        self.assertEqual(schedule["contract_version"], "AI42-dagger-collector-v2")
+
     def test_schedule_validation_fails_before_launching_workers(self) -> None:
         with self.assertRaisesRegex(ValueError, "matches"):
             build_dagger_schedule(

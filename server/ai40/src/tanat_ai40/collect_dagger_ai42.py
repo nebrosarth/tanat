@@ -111,6 +111,57 @@ class MarginInterventionGate:
         return selected
 
 
+class PeriodicInterventionGate:
+    """Deterministic expert mixture staggered across controlled actors."""
+
+    def __init__(self, actors: int, period_ticks: int) -> None:
+        if isinstance(actors, bool) or not isinstance(actors, int) or actors < 1:
+            raise ValueError("actors must be a positive integer")
+        if (
+            isinstance(period_ticks, bool)
+            or not isinstance(period_ticks, int)
+            or period_ticks < 1
+        ):
+            raise ValueError("period_ticks must be a positive integer")
+        self.phases = np.arange(actors, dtype=np.int64) % period_ticks
+        self.period_ticks = int(period_ticks)
+
+    def select(self, margins: np.ndarray, alive: np.ndarray, tick: int) -> np.ndarray:
+        margins = np.asarray(margins, dtype=np.float32)
+        alive = np.asarray(alive, dtype=np.bool_)
+        if margins.shape != self.phases.shape or alive.shape != margins.shape:
+            raise ValueError("margin/alive vectors do not match intervention actors")
+        return alive & (self.phases == int(tick) % self.period_ticks)
+
+
+def build_intervention_gate(
+    actors: int, strategy: str, threshold: float, gap_ticks: int,
+) -> MarginInterventionGate | PeriodicInterventionGate:
+    if strategy == "margin":
+        return MarginInterventionGate(actors, threshold, gap_ticks)
+    if strategy == "periodic":
+        return PeriodicInterventionGate(actors, gap_ticks)
+    raise ValueError("intervention_strategy must be margin or periodic")
+
+
+def intervention_policy(
+    strategy: str, threshold: float, gap_ticks: int,
+) -> dict[str, Any]:
+    gate = build_intervention_gate(1, strategy, threshold, gap_ticks)
+    if isinstance(gate, MarginInterventionGate):
+        return {
+            "strategy": "margin",
+            "metric": "minimum-masked-top2-logit-margin",
+            "threshold": threshold,
+            "min_gap_ticks": gap_ticks,
+        }
+    return {
+        "strategy": "periodic",
+        "period_ticks": gap_ticks,
+        "staggered_by_actor": True,
+    }
+
+
 def _controllers(candidate_side: int) -> tuple[int, ...]:
     if candidate_side == 1:
         return (CONTROLLER_AI40,) * 5 + (CONTROLLER_AI30,) * 5
@@ -127,17 +178,16 @@ def _candidate_indices(candidate_side: int) -> np.ndarray:
 def _build_schedule(
     *, seed: int, max_steps: int, candidate_side: int, roster: tuple[int, ...],
     lineage: dict[str, Any], threshold: float, min_gap_ticks: int,
+    intervention_strategy: str = "margin",
 ) -> dict[str, Any]:
     match_id = f"ai42-dagger-{seed}-side{candidate_side}"
     return {
-        "backend": "onnxruntime-dagger-v1",
+        "backend": "onnxruntime-dagger-v2",
         "command": "tanat-ai42-collect-dagger",
-        "contract_version": "AI42-dagger-collector-v1",
-        "intervention_policy": {
-            "metric": "minimum-masked-top2-logit-margin",
-            "threshold": threshold,
-            "min_gap_ticks": min_gap_ticks,
-        },
+        "contract_version": "AI42-dagger-collector-v2",
+        "intervention_policy": intervention_policy(
+            intervention_strategy, threshold, min_gap_ticks,
+        ),
         "match_schedule": [{
             "controller_by_slot": list(_controllers(candidate_side)),
             "index": 0,
@@ -174,6 +224,7 @@ def collect_dagger_match(
     candidate_side: int,
     intervention_margin: float,
     intervention_gap_ticks: int,
+    intervention_strategy: str = "margin",
     device: torch.device,
     schedule_path: Path | None = None,
 ) -> dict[str, Any]:
@@ -187,13 +238,17 @@ def collect_dagger_match(
     session = create_onnx_session(str(onnx_path), cuda=device.type == "cuda")
     evaluator = AI42ONNXEvaluationActor(session, HERO_COUNT // 2, actor.hidden_size)
     indices = _candidate_indices(candidate_side)
-    gate = MarginInterventionGate(indices.size, intervention_margin, intervention_gap_ticks)
+    gate = build_intervention_gate(
+        indices.size, intervention_strategy, intervention_margin,
+        intervention_gap_ticks,
+    )
     rng = np.random.default_rng(seed)
     roster = tuple(int(value) for value in rng.permutation(AI40_ROSTER))
     schedule = _build_schedule(
         seed=seed, max_steps=max_steps, candidate_side=candidate_side,
         roster=roster, lineage=lineage, threshold=intervention_margin,
         min_gap_ticks=intervention_gap_ticks,
+        intervention_strategy=intervention_strategy,
     )
     _atomic_write(schedule_path, canonical_json_bytes(schedule))
 
@@ -284,8 +339,11 @@ def main() -> None:
     parser.add_argument("--seed", type=int, required=True)
     parser.add_argument("--max-steps", type=int, default=4_500)
     parser.add_argument("--candidate-side", type=int, choices=(1, 2), required=True)
-    parser.add_argument("--intervention-margin", type=float, required=True)
+    parser.add_argument("--intervention-margin", type=float, default=0.08)
     parser.add_argument("--intervention-gap-ticks", type=int, default=5)
+    parser.add_argument(
+        "--intervention-strategy", choices=("margin", "periodic"), default="margin",
+    )
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     args = parser.parse_args()
     metrics = collect_dagger_match(
@@ -293,6 +351,7 @@ def main() -> None:
         seed=args.seed, max_steps=args.max_steps, candidate_side=args.candidate_side,
         intervention_margin=args.intervention_margin,
         intervention_gap_ticks=args.intervention_gap_ticks,
+        intervention_strategy=args.intervention_strategy,
         device=torch.device(args.device), schedule_path=args.schedule,
     )
     print(json.dumps(metrics, ensure_ascii=False, indent=2, allow_nan=False))

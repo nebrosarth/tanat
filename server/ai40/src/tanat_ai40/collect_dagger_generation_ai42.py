@@ -21,10 +21,13 @@ from .build_ai42_dataset_go import complete_go_staged_match, merge_go_staging
 from .collect_dagger_ai42 import (
     MarginInterventionGate,
     NativeDaggerWriter,
+    PeriodicInterventionGate,
     TEACHER_LABEL_STATUSES,
     _atomic_write,
     _candidate_indices,
     _controllers,
+    build_intervention_gate,
+    intervention_policy,
 )
 from .env import AI40_ROSTER, AI42_DAGGER_PROTOCOL_VERSION, HERO_COUNT, AssaultEnvProcess
 from .evaluate_ai42 import load_actor
@@ -40,7 +43,7 @@ class _MatchRuntime:
     env: AssaultEnvProcess
     writer: NativeDaggerWriter
     observation: Any
-    gate: MarginInterventionGate
+    gate: MarginInterventionGate | PeriodicInterventionGate
     ticks: int = 0
     interventions: int = 0
     candidate_labels: int = 0
@@ -97,7 +100,7 @@ def build_dagger_schedule(
     *, seed: int, matches: int, max_steps: int, lineage: dict[str, Any],
     runtime_lineage: dict[str, Any],
     threshold: float, min_gap_ticks: int, split_seed: int,
-    validation_fraction: float,
+    validation_fraction: float, intervention_strategy: str = "margin",
 ) -> tuple[dict[str, Any], tuple[MatchSpec, ...]]:
     if isinstance(matches, bool) or not isinstance(matches, int) or matches < 1:
         raise ValueError("matches must be a positive integer")
@@ -121,7 +124,9 @@ def build_dagger_schedule(
         raise ValueError(
             "validation_fraction must select an integer number of matches per side"
         )
-    MarginInterventionGate(HERO_COUNT // 2, threshold, min_gap_ticks)
+    build_intervention_gate(
+        HERO_COUNT // 2, intervention_strategy, threshold, min_gap_ticks,
+    )
     normalized_runtime_lineage = _runtime_lineage(runtime_lineage)
     seeds = deterministic_seed_schedule(seed, matches)
     specs = tuple(
@@ -136,14 +141,12 @@ def build_dagger_schedule(
         for index, match_seed in enumerate(seeds)
     )
     schedule = {
-        "backend": "onnxruntime-dagger-batched-v1",
+        "backend": "onnxruntime-dagger-batched-v2",
         "command": "tanat-ai42-collect-dagger-generation",
-        "contract_version": "AI42-dagger-collector-v1",
-        "intervention_policy": {
-            "metric": "minimum-masked-top2-logit-margin",
-            "threshold": threshold,
-            "min_gap_ticks": min_gap_ticks,
-        },
+        "contract_version": "AI42-dagger-collector-v2",
+        "intervention_policy": intervention_policy(
+            intervention_strategy, threshold, min_gap_ticks,
+        ),
         "match_schedule": [
             {
                 "controller_by_slot": list(spec.controller_by_slot),
@@ -183,6 +186,7 @@ def _start_runtime(
     max_steps: int,
     threshold: float,
     min_gap_ticks: int,
+    intervention_strategy: str,
 ) -> _MatchRuntime:
     side = spec.index % 2 + 1
     env = AssaultEnvProcess(env_executable, AI42_DAGGER_PROTOCOL_VERSION)
@@ -207,7 +211,9 @@ def _start_runtime(
     return _MatchRuntime(
         spec=spec, candidate_side=side, env=env, writer=writer,
         observation=observation,
-        gate=MarginInterventionGate(HERO_COUNT // 2, threshold, min_gap_ticks),
+        gate=build_intervention_gate(
+            HERO_COUNT // 2, intervention_strategy, threshold, min_gap_ticks,
+        ),
     )
 
 
@@ -253,6 +259,7 @@ def _collect_batch(
     max_steps: int,
     threshold: float,
     min_gap_ticks: int,
+    intervention_strategy: str,
 ) -> list[dict[str, Any]]:
     runtimes: list[_MatchRuntime] = []
     try:
@@ -263,6 +270,7 @@ def _collect_batch(
                 schedule_path=schedule_path, staging=staging,
                 max_steps=max_steps, threshold=threshold,
                 min_gap_ticks=min_gap_ticks,
+                intervention_strategy=intervention_strategy,
             ))
     except BaseException as exc:
         diagnostic = _abort_runtimes(runtimes)
@@ -361,6 +369,7 @@ def collect_dagger_generation(
     max_steps: int,
     intervention_margin: float,
     intervention_gap_ticks: int,
+    intervention_strategy: str = "margin",
     split_seed: int,
     validation_fraction: float,
     device: torch.device,
@@ -386,6 +395,7 @@ def collect_dagger_generation(
         runtime_lineage=runtime_lineage, threshold=intervention_margin,
         min_gap_ticks=intervention_gap_ticks, split_seed=split_seed,
         validation_fraction=validation_fraction,
+        intervention_strategy=intervention_strategy,
     )
     staging.joinpath("matches").mkdir(parents=True)
     schedule_path = staging / "schedule.json"
@@ -401,6 +411,7 @@ def collect_dagger_generation(
             schedule=schedule, staging=staging, max_steps=max_steps,
             threshold=intervention_margin,
             min_gap_ticks=intervention_gap_ticks,
+            intervention_strategy=intervention_strategy,
         ))
     merge = merge_go_staging(
         output, staging, schedule=schedule, specs=specs,
@@ -442,8 +453,11 @@ def main() -> None:
     parser.add_argument("--matches", type=int, default=8)
     parser.add_argument("--workers", type=int, default=4)
     parser.add_argument("--max-steps", type=int, default=4_500)
-    parser.add_argument("--intervention-margin", type=float, required=True)
+    parser.add_argument("--intervention-margin", type=float, default=0.08)
     parser.add_argument("--intervention-gap-ticks", type=int, default=5)
+    parser.add_argument(
+        "--intervention-strategy", choices=("margin", "periodic"), default="margin",
+    )
     parser.add_argument("--split-seed", type=int, default=42)
     parser.add_argument("--validation-fraction", type=float, default=0.25)
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
@@ -453,6 +467,7 @@ def main() -> None:
         seed=args.seed, matches=args.matches, workers=args.workers,
         max_steps=args.max_steps, intervention_margin=args.intervention_margin,
         intervention_gap_ticks=args.intervention_gap_ticks,
+        intervention_strategy=args.intervention_strategy,
         split_seed=args.split_seed, validation_fraction=args.validation_fraction,
         device=torch.device(args.device), staging=args.staging,
     )
