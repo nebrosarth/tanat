@@ -32,11 +32,11 @@ from .learner_ai42 import (
 )
 
 
-PROFILE_FORMAT = "AI42-bc-class-profile-v5"
+PROFILE_FORMAT = "AI42-bc-class-profile-v6"
 PROFILE_VERSION = PROFILE_FORMAT
 SUPERVISION_VERSION = "AI42-supervision-v2"
 PROTOCOL_VERSION = 13
-CLASS_BALANCE_POWER = 0.75
+CLASS_BALANCE_POWER = 1.0
 PROFILE_HEADS = HEAD_NAMES
 UNIFORM_FREQUENCY_HEADS = frozenset({"target", "offset"})
 

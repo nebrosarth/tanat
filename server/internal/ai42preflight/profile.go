@@ -60,7 +60,7 @@ func profileUnsigned(datasetHash string, ids []string, idHash string, counts map
 	return map[string]any{
 		"format": ProfileFormat, "profile_version": ProfileVersion, "supervision_version": SupervisionVersion, "protocol_version": ProtocolVersion,
 		"dataset_schema_version": "AI42-dataset-v1", "shard_schema_version": "AI42-go-shard-v2", "dataset_manifest_hash": datasetHash,
-		"train_match_ids": append([]string(nil), ids...), "train_match_ids_hash": idHash, "class_balance_power": 0.75,
+		"train_match_ids": append([]string(nil), ids...), "train_match_ids_hash": idHash, "class_balance_power": 1.0,
 		"supervision_controllers": uint8sAny(controllers),
 		"counts":                  countPayload, "weights": weightPayload,
 	}
@@ -84,7 +84,7 @@ func classBalanceWeights(counts []int) []float64 {
 		if count > 0 {
 			// PyTorch's class_balance_weights operates in float32. Keep each
 			// intermediate rounded to float32 before converting for JSON.
-			value := float32(math.Pow(float64(total/float32(count)), 0.75))
+			value := float32(total / float32(count))
 			result[index] = float64(value)
 			mean += value
 		}
@@ -152,11 +152,11 @@ func loadExistingProfile(raw []byte, expected Profile) (Profile, error) {
 		return Profile{}, fmt.Errorf("profile train-match ID hash does not match its ordered IDs")
 	}
 	power, err := asNumber(root["class_balance_power"], "profile.class_balance_power")
-	if err != nil || power != 0.75 {
+	if err != nil || power != 1.0 {
 		if err != nil {
 			return Profile{}, err
 		}
-		return Profile{}, fmt.Errorf("AI-42 BC-v2 requires class_balance_power=0.75")
+		return Profile{}, fmt.Errorf("AI-42 BC-v2 requires class_balance_power=1")
 	}
 	controllers, err := controllerList(root["supervision_controllers"], "profile.supervision_controllers")
 	if err != nil {

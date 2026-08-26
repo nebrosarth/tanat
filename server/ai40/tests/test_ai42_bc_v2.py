@@ -96,7 +96,8 @@ class AI42BCV2Tests(unittest.TestCase):
         self.assertEqual(defaults["model_width"], 192)
         self.assertEqual(defaults["entity_layers"], 2)
         self.assertEqual(defaults["num_heads"], 6)
-        self.assertEqual(defaults["class_balance_power"], 0.75)
+        self.assertEqual(defaults["class_balance_power"], 1.0)
+        self.assertEqual(defaults["offset_coordinate_loss_weight"], 0.5)
         self.assertNotIn("class_weight_overrides", defaults)
         self.assertNotIn("combat_focus", defaults)
         self.assertNotIn("trainable_scope", defaults)
@@ -181,6 +182,28 @@ class AI42BCV2Tests(unittest.TestCase):
         self.assertEqual(metrics["action"]["count"], 4)
         self.assertEqual(metrics["action"]["end_to_end_correct"], 3)
         json.dumps(metrics, sort_keys=True, allow_nan=False)
+
+    def test_offset_loss_preserves_flat_contract_and_adds_grid_geometry(self) -> None:
+        batch = _batch()
+        actor = AI42Actor(hidden_size=8, model_width=8, entity_layers=1, num_heads=2, ff_multiplier=1)
+        outputs = _outputs(batch)
+        model_kwargs = {
+            "hidden_size": 8, "model_width": 8, "entity_layers": 1,
+            "num_heads": 2, "ff_multiplier": 1,
+        }
+        flat = compute_behavior_cloning_loss(
+            actor, batch, AI42LearnerConfig(
+                model_kwargs=model_kwargs, offset_coordinate_loss_weight=0.0,
+            ), outputs=outputs,
+        )
+        geometric = compute_behavior_cloning_loss(
+            actor, batch, AI42LearnerConfig(
+                model_kwargs=model_kwargs, offset_coordinate_loss_weight=0.5,
+            ), outputs=outputs,
+        )
+        self.assertGreater(geometric.head_losses["offset"], flat.head_losses["offset"])
+        self.assertGreater(geometric.metrics["heads"]["offset"]["coordinate_loss"], 0.0)
+        self.assertEqual(geometric.class_counts["offset"], flat.class_counts["offset"])
 
     def test_weighted_probe_aggregation_is_partition_invariant(self) -> None:
         class FakeLearner:

@@ -13,7 +13,7 @@ import (
 const (
 	TorchProtocol      = "AI42-torch-preflight-v1"
 	BatchPlanVersion   = "AI42-bc-batch-plan-v2"
-	ProfileFormat      = "AI42-bc-class-profile-v5"
+	ProfileFormat      = "AI42-bc-class-profile-v6"
 	ProfileVersion     = ProfileFormat
 	SupervisionVersion = "AI42-supervision-v2"
 	ReplayScope        = "durable-v2"
@@ -75,12 +75,13 @@ type ModelConfig struct {
 // LearnerConfig is the worker's no-update learner configuration. ClassWeights
 // are always populated from the verified train-only profile.
 type LearnerConfig struct {
-	LearningRate      float64
-	WeightDecay       float64
-	ClassBalancePower float64
-	MaxGradientNorm   float64
-	HeadWeights       map[string]float64
-	ClassWeights      map[string][]float64
+	LearningRate               float64
+	WeightDecay                float64
+	ClassBalancePower          float64
+	OffsetCoordinateLossWeight float64
+	MaxGradientNorm            float64
+	HeadWeights                map[string]float64
+	ClassWeights               map[string][]float64
 }
 
 // Config is the strict native preflight view of the production training

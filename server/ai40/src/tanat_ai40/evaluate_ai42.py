@@ -96,6 +96,7 @@ def load_actor(checkpoint: Path, config_path: Path, device: torch.device) -> tup
         learning_rate=float(defaults["learning_rate"]),
         weight_decay=float(defaults["weight_decay"]),
         class_balance_power=float(defaults["class_balance_power"]),
+        offset_coordinate_loss_weight=float(defaults["offset_coordinate_loss_weight"]),
         max_gradient_norm=float(defaults["max_gradient_norm"]),
         head_weights=expected_head_weights,
         class_weights=manifest["class_weights"],

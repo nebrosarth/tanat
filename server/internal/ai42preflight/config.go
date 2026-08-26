@@ -12,7 +12,7 @@ var defaultConfig = Config{
 	SequenceLength:  64,
 	BatchSize:       8,
 	Learner: LearnerConfig{
-		LearningRate: 3e-4, WeightDecay: 1e-4, ClassBalancePower: 0.75, MaxGradientNorm: 1.0,
+		LearningRate: 3e-4, WeightDecay: 1e-4, ClassBalancePower: 1.0, OffsetCoordinateLossWeight: 0.5, MaxGradientNorm: 1.0,
 		HeadWeights: map[string]float64{"control": 1, "kind": 1, "target": 1, "offset": 1, "anchor": 1},
 	},
 	Seed: 4242, ValidationProbeLimit: 0,
@@ -86,11 +86,15 @@ func parseTrainingConfig(root map[string]any, config *Config) error {
 	if err != nil {
 		return err
 	}
-	requiredLearner := map[string]struct{}{"class_balance_power": {}, "max_gradient_norm": {}, "learning_rate": {}, "weight_decay": {}}
+	requiredLearner := map[string]struct{}{"class_balance_power": {}, "offset_coordinate_loss_weight": {}, "max_gradient_norm": {}, "learning_rate": {}, "weight_decay": {}}
 	if err := exactFields(learner, requiredLearner, map[string]struct{}{"head_weights": {}}, "training config.learner"); err != nil {
 		return err
 	}
 	config.Learner.ClassBalancePower, err = asNumber(learner["class_balance_power"], "training config.learner.class_balance_power")
+	if err != nil {
+		return err
+	}
+	config.Learner.OffsetCoordinateLossWeight, err = asNumber(learner["offset_coordinate_loss_weight"], "training config.learner.offset_coordinate_loss_weight")
 	if err != nil {
 		return err
 	}
@@ -275,15 +279,15 @@ func (config Config) Validate() error {
 	if config.BatchSize*config.SequenceLength > MaxBatchRows {
 		return fmt.Errorf("recurrent batch exceeds bounded row limit")
 	}
-	if config.Learner.ClassBalancePower != 0.75 {
-		return fmt.Errorf("AI-42 BC-v2 freezes class_balance_power at 0.75")
+	if config.Learner.ClassBalancePower != 1.0 {
+		return fmt.Errorf("AI-42 BC-v2 freezes class_balance_power at 1")
 	}
-	for name, value := range map[string]float64{"learning_rate": config.Learner.LearningRate, "weight_decay": config.Learner.WeightDecay, "class_balance_power": config.Learner.ClassBalancePower, "max_gradient_norm": config.Learner.MaxGradientNorm} {
+	for name, value := range map[string]float64{"learning_rate": config.Learner.LearningRate, "weight_decay": config.Learner.WeightDecay, "class_balance_power": config.Learner.ClassBalancePower, "offset_coordinate_loss_weight": config.Learner.OffsetCoordinateLossWeight, "max_gradient_norm": config.Learner.MaxGradientNorm} {
 		if value != value || value > 1e308 || value < -1e308 {
 			return fmt.Errorf("%s must be finite", name)
 		}
 	}
-	if config.Learner.LearningRate <= 0 || config.Learner.WeightDecay < 0 || config.Learner.MaxGradientNorm <= 0 {
+	if config.Learner.LearningRate <= 0 || config.Learner.WeightDecay < 0 || config.Learner.OffsetCoordinateLossWeight < 0 || config.Learner.MaxGradientNorm <= 0 {
 		return fmt.Errorf("learner rates and gradient norm are outside their valid ranges")
 	}
 	if len(config.Learner.HeadWeights) != 5 {

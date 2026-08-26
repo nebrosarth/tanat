@@ -181,7 +181,8 @@ def _training_config_defaults(path: Path) -> dict[str, Any]:
     if not isinstance(recurrent, dict) or set(recurrent) != {"sequence_length", "batch_size"}:
         raise AI42LearnerError("training config.recurrent_batch is invalid")
     required_learner = {
-        "class_balance_power", "max_gradient_norm", "learning_rate", "weight_decay",
+        "class_balance_power", "offset_coordinate_loss_weight", "max_gradient_norm",
+        "learning_rate", "weight_decay",
     }
     optional_learner = {"head_weights"}
     if (
@@ -204,6 +205,7 @@ def _training_config_defaults(path: Path) -> dict[str, Any]:
         **model,
         **recurrent,
         "class_balance_power": learner["class_balance_power"],
+        "offset_coordinate_loss_weight": learner["offset_coordinate_loss_weight"],
         "max_gradient_norm": learner["max_gradient_norm"],
         "learning_rate": learner["learning_rate"],
         "weight_decay": learner["weight_decay"],
@@ -233,6 +235,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--sequence-length", type=int, default=64)
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--class-balance-power", type=float, default=CLASS_BALANCE_POWER)
+    parser.add_argument("--offset-coordinate-loss-weight", type=float, default=0.5)
     parser.add_argument("--max-gradient-norm", type=float, default=1.0)
     parser.add_argument("--learning-rate", type=float, default=3e-4)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
@@ -325,6 +328,11 @@ def _validate_training_args(args: argparse.Namespace) -> None:
         raise AI42TrainingError(
             f"AI-42 BC-v2 freezes class-balance-power at {CLASS_BALANCE_POWER:g}"
         )
+    coordinate_weight = _finite_number(
+        args.offset_coordinate_loss_weight, "offset-coordinate-loss-weight",
+    )
+    if coordinate_weight < 0.0:
+        raise AI42TrainingError("offset-coordinate-loss-weight must be non-negative")
     validate_head_weights(args.head_weights)
     if (
         isinstance(args.gradient_accumulation_steps, bool)
@@ -1034,6 +1042,7 @@ def train(args: argparse.Namespace, *, clock: Callable[[], float] = time.monoton
         learning_rate=args.learning_rate,
         weight_decay=args.weight_decay,
         class_balance_power=profile.class_balance_power,
+        offset_coordinate_loss_weight=args.offset_coordinate_loss_weight,
         max_gradient_norm=args.max_gradient_norm,
         head_weights=normalized_head_weights,
         class_weights=final_class_weights,
