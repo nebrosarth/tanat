@@ -129,6 +129,41 @@ func TestShardV2GenerationManifestUsesCanonicalMetadata(t *testing.T) {
 	}
 }
 
+func TestStreamingShardMatchesInMemoryEncoding(t *testing.T) {
+	prepared := acceptancePrepared(t)
+	expected, err := encodeShard(prepared, "train")
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(t.TempDir(), "shard-000000.a42")
+	stats, err := writeGenerationShard(path, prepared, "train")
+	if err != nil {
+		t.Fatal(err)
+	}
+	actual, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(actual, expected) {
+		t.Fatal("streaming shard differs from the compatible in-memory encoding")
+	}
+	if stats.rawBytes != rawBytesFromShard(actual) {
+		t.Fatalf("streaming raw bytes=%d, decoded=%d", stats.rawBytes, rawBytesFromShard(actual))
+	}
+	if stats.storedBytes != len(actual) || stats.sha256 != sha256Hex(actual) {
+		t.Fatalf("streaming stored identity=%d/%s, want %d/%s", stats.storedBytes, stats.sha256, len(actual), sha256Hex(actual))
+	}
+}
+
+func TestWriteShardRejectsResizedPreparedColumn(t *testing.T) {
+	prepared := acceptancePrepared(t)
+	prepared.Entities = prepared.Entities[:len(prepared.Entities)-1]
+	var output bytes.Buffer
+	if err := WriteShard(&output, prepared); err == nil {
+		t.Fatal("resized prepared column was published")
+	}
+}
+
 func decodeShardV2Header(t *testing.T, payload []byte) ([]byte, map[string]any) {
 	t.Helper()
 	if len(payload) < len(ShardMagic)+4 || !bytes.HasPrefix(payload, []byte(ShardMagic)) {

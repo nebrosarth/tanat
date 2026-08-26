@@ -49,7 +49,6 @@ from .dataset_ai42 import (
 from .env import AI42_PROTOCOL_VERSION, AI42_REWARD_HASH, AI42_SCHEMA_HASH
 from .go_shard_ai42 import (
     GO_MANIFEST_FILENAME,
-    GO_SHARD_CODEC,
     GO_SHARD_MAGIC_V2,
     GO_SHARD_SCHEMA_VERSION_V2,
     compact_match_entry,
@@ -418,7 +417,7 @@ def _recanonical_shard(
         "row_count": match["tick_count"],
         "raw_bytes": header["raw_bytes"],
         "stored_bytes": len(rewritten),
-        "compression": GO_SHARD_CODEC,
+        "compression": header["codec"],
     }
     return rewritten, shard
 
@@ -502,7 +501,7 @@ def merge_go_staging(
         "runtime_manifest_hash": dataset.runtime_manifest_hash,
         "matches": len(dataset),
         "ticks": sum(int(entry["tick_count"]) for entry in dataset.manifest["matches"]),
-        "compression": GO_SHARD_CODEC,
+        "compression": dataset.compression,
         "decompressed_during_merge": False,
     }
 

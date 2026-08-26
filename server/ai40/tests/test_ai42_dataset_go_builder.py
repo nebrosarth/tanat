@@ -71,7 +71,7 @@ def _fake_generation(spec, schedule, root: Path) -> None:
             "row_count": 1,
             "raw_bytes": raw_bytes,
             "stored_bytes": len(shard),
-            "compression": "deflate-raw-6",
+            "compression": source_header["codec"],
         }],
     })
     manifest["manifest_hash"] = hash_payload({key: value for key, value in manifest.items() if key != "manifest_hash"})

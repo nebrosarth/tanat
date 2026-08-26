@@ -16,28 +16,34 @@ import (
 
 const (
 	ShardMagic               = "AI42GS2\x00"
-	ShardCodec               = "deflate-raw-6"
+	ShardCodec               = "deflate-raw-3"
 	ShardSchemaVersionV2     = "AI42-go-shard-v2"
 	RecurrentLineageSchemaV2 = "implicit-match-boundary-v1"
+	shardCompressionLevel    = 3
+	legacyShardCodec         = "deflate-raw-6"
 )
 
+func supportedShardCodec(codec string) bool {
+	return codec == ShardCodec || codec == legacyShardCodec
+}
+
 // WriteShard writes one exact AI42GS2 shard. The compressed payload is raw
-// DEFLATE level 6; the header and every array descriptor are canonical JSON.
+// DEFLATE level 3; the header and every array descriptor are canonical JSON.
 func WriteShard(w io.Writer, prepared *Prepared) error {
 	if prepared == nil {
 		return fmt.Errorf("ai42dataset: nil prepared match")
 	}
-	if err := prepared.Validate(); err != nil {
-		return err
-	}
+	// Finalize already performs the exhaustive value/shape validation.  The
+	// identity pass below re-hashes every published array and therefore also
+	// detects mutation after Finalize without repeating the full scalar scan.
 	if err := validatePublishIdentity(prepared); err != nil {
 		return err
 	}
-	shard, err := encodeShard(prepared, "train")
+	encoded, err := encodeShardWithStats(prepared, "train")
 	if err != nil {
 		return err
 	}
-	_, err = w.Write(shard)
+	_, err = w.Write(encoded.payload)
 	return err
 }
 
@@ -67,9 +73,9 @@ func WriteGenerationWithSplit(root string, prepared *Prepared, splitSeed int64, 
 	} else if !os.IsNotExist(err) {
 		return fmt.Errorf("ai42dataset: inspect generation destination: %w", err)
 	}
-	if err := prepared.Validate(); err != nil {
-		return err
-	}
+	// See WriteShard: publication verifies the sealed content identity.  The
+	// exhaustive semantic validation belongs to Capture.Finalize and strict
+	// readers, not a second hot-path pass over the same tens of megabytes.
 	if err := validatePublishIdentity(prepared); err != nil {
 		return err
 	}
@@ -85,11 +91,8 @@ func WriteGenerationWithSplit(root string, prepared *Prepared, splitSeed int64, 
 	shardName := "shard-000000.a42"
 	shardPath := filepath.Join(staging, shardName)
 	split := deterministicSplit(prepared.Metadata.MatchID, splitSeed, validationFraction)
-	shard, err := encodeShard(prepared, split)
+	encoded, err := writeGenerationShard(shardPath, prepared, split)
 	if err != nil {
-		return err
-	}
-	if err := atomicWrite(shardPath, shard); err != nil {
 		return err
 	}
 	match := matchEntry(prepared, shardName, split)
@@ -107,11 +110,11 @@ func WriteGenerationWithSplit(root string, prepared *Prepared, splitSeed int64, 
 		"matches":                []any{match},
 		"shards": []any{map[string]any{
 			"name":         shardName,
-			"sha256":       sha256Hex(shard),
+			"sha256":       encoded.sha256,
 			"match_ids":    []string{prepared.Metadata.MatchID},
 			"row_count":    prepared.TickCount,
-			"raw_bytes":    rawBytesFromShard(shard),
-			"stored_bytes": len(shard),
+			"raw_bytes":    encoded.rawBytes,
+			"stored_bytes": encoded.storedBytes,
 			"compression":  ShardCodec,
 		}},
 	}
@@ -131,23 +134,68 @@ func WriteGenerationWithSplit(root string, prepared *Prepared, splitSeed int64, 
 }
 
 func encodeShard(prepared *Prepared, split string) ([]byte, error) {
-	raw, descriptors, err := encodeArrays(prepared)
+	encoded, err := encodeShardWithStats(prepared, split)
 	if err != nil {
 		return nil, err
 	}
-	var compressed bytes.Buffer
-	compressor, err := flate.NewWriter(&compressed, 6)
+	return encoded.payload, nil
+}
+
+type encodedShard struct {
+	payload  []byte
+	rawBytes int
+}
+
+type storedShard struct {
+	rawBytes    int
+	storedBytes int
+	sha256      string
+}
+
+func encodeShardWithStats(prepared *Prepared, split string) (encodedShard, error) {
+	raw, descriptors, err := encodeArrays(prepared)
 	if err != nil {
-		return nil, fmt.Errorf("ai42dataset: create raw deflate writer: %w", err)
+		return encodedShard{}, err
+	}
+	var compressed bytes.Buffer
+	compressor, err := flate.NewWriter(&compressed, shardCompressionLevel)
+	if err != nil {
+		return encodedShard{}, fmt.Errorf("ai42dataset: create raw deflate writer: %w", err)
 	}
 	if _, err := compressor.Write(raw); err != nil {
-		return nil, fmt.Errorf("ai42dataset: compress shard payload: %w", err)
+		return encodedShard{}, fmt.Errorf("ai42dataset: compress shard payload: %w", err)
 	}
 	if err := compressor.Close(); err != nil {
-		return nil, fmt.Errorf("ai42dataset: close shard compressor: %w", err)
+		return encodedShard{}, fmt.Errorf("ai42dataset: close shard compressor: %w", err)
 	}
+	header := shardHeader(
+		prepared, split, descriptors, len(raw), compressed.Len(),
+		sha256Hex(raw), sha256Hex(compressed.Bytes()),
+	)
+	headerBytes := canonicalJSON(header)
+	if len(headerBytes) > 16*1024*1024 {
+		return encodedShard{}, fmt.Errorf("ai42dataset: shard header is too large")
+	}
+	var output bytes.Buffer
+	output.Grow(len(ShardMagic) + 4 + len(headerBytes) + compressed.Len())
+	output.WriteString(ShardMagic)
+	var length [4]byte
+	binary.LittleEndian.PutUint32(length[:], uint32(len(headerBytes)))
+	output.Write(length[:])
+	output.Write(headerBytes)
+	output.Write(compressed.Bytes())
+	return encodedShard{payload: output.Bytes(), rawBytes: len(raw)}, nil
+}
+
+func shardHeader(
+	prepared *Prepared,
+	split string,
+	descriptors []map[string]any,
+	rawBytes, compressedBytes int,
+	rawHash, payloadHash string,
+) map[string]any {
 	match := matchEntry(prepared, "shard-000000.a42", split)
-	header := map[string]any{
+	return map[string]any{
 		"shard_schema_version":   ShardSchemaVersionV2,
 		"protocol_version":       int(ProtocolVersion),
 		"schema_hash":            hashHex(prepared.Metadata.SchemaHash),
@@ -155,83 +203,365 @@ func encodeShard(prepared *Prepared, split string) ([]byte, error) {
 		"trajectory_schema_hash": hashHex(prepared.Metadata.TrajectorySchemaHash),
 		"runtime_manifest_hash":  hashHex(prepared.Metadata.RuntimeManifestHash),
 		"codec":                  ShardCodec,
-		"raw_bytes":              len(raw),
-		"stored_bytes":           compressed.Len(),
-		"raw_sha256":             sha256Hex(raw),
-		"payload_sha256":         sha256Hex(compressed.Bytes()),
+		"raw_bytes":              rawBytes,
+		"stored_bytes":           compressedBytes,
+		"raw_sha256":             rawHash,
+		"payload_sha256":         payloadHash,
 		"arrays":                 descriptors,
 		"matches":                []any{match},
 	}
+}
+
+func writeGenerationShard(path string, prepared *Prepared, split string) (storedShard, error) {
+	payload, err := os.CreateTemp(filepath.Dir(path), ".ai42-payload-*")
+	if err != nil {
+		return storedShard{}, fmt.Errorf("ai42dataset: create compressed payload: %w", err)
+	}
+	payloadName := payload.Name()
+	defer os.Remove(payloadName)
+
+	payloadHash := sha256.New()
+	payloadCounter := &countingWriter{writer: io.MultiWriter(payload, payloadHash)}
+	compressor, err := flate.NewWriter(payloadCounter, shardCompressionLevel)
+	if err != nil {
+		_ = payload.Close()
+		return storedShard{}, fmt.Errorf("ai42dataset: create raw deflate writer: %w", err)
+	}
+	rawHash := sha256.New()
+	rawCounter := &countingWriter{writer: io.MultiWriter(compressor, rawHash)}
+	descriptors, err := writeEncodedArrays(rawCounter, prepared)
+	if err != nil {
+		_ = compressor.Close()
+		_ = payload.Close()
+		return storedShard{}, err
+	}
+	if err := compressor.Close(); err != nil {
+		_ = payload.Close()
+		return storedShard{}, fmt.Errorf("ai42dataset: close shard compressor: %w", err)
+	}
+	if err := payload.Sync(); err != nil {
+		_ = payload.Close()
+		return storedShard{}, fmt.Errorf("ai42dataset: sync compressed payload: %w", err)
+	}
+	if err := payload.Close(); err != nil {
+		return storedShard{}, fmt.Errorf("ai42dataset: close compressed payload: %w", err)
+	}
+
+	header := shardHeader(
+		prepared, split, descriptors, rawCounter.count, payloadCounter.count,
+		hex.EncodeToString(rawHash.Sum(nil)), hex.EncodeToString(payloadHash.Sum(nil)),
+	)
 	headerBytes := canonicalJSON(header)
 	if len(headerBytes) > 16*1024*1024 {
-		return nil, fmt.Errorf("ai42dataset: shard header is too large")
+		return storedShard{}, fmt.Errorf("ai42dataset: shard header is too large")
 	}
-	var output bytes.Buffer
-	output.WriteString(ShardMagic)
+
+	payload, err = os.Open(payloadName)
+	if err != nil {
+		return storedShard{}, fmt.Errorf("ai42dataset: reopen compressed payload: %w", err)
+	}
+	defer payload.Close()
+	shard, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o644)
+	if err != nil {
+		return storedShard{}, fmt.Errorf("ai42dataset: create shard: %w", err)
+	}
+	shardHash := sha256.New()
+	shardCounter := &countingWriter{writer: io.MultiWriter(shard, shardHash)}
 	var length [4]byte
 	binary.LittleEndian.PutUint32(length[:], uint32(len(headerBytes)))
-	output.Write(length[:])
-	output.Write(headerBytes)
-	output.Write(compressed.Bytes())
-	return output.Bytes(), nil
+	for _, part := range [][]byte{[]byte(ShardMagic), length[:], headerBytes} {
+		if _, err := shardCounter.Write(part); err != nil {
+			_ = shard.Close()
+			return storedShard{}, fmt.Errorf("ai42dataset: write shard header: %w", err)
+		}
+	}
+	if _, err := io.Copy(shardCounter, payload); err != nil {
+		_ = shard.Close()
+		return storedShard{}, fmt.Errorf("ai42dataset: write shard payload: %w", err)
+	}
+	if err := shard.Sync(); err != nil {
+		_ = shard.Close()
+		return storedShard{}, fmt.Errorf("ai42dataset: sync shard: %w", err)
+	}
+	if err := shard.Close(); err != nil {
+		return storedShard{}, fmt.Errorf("ai42dataset: close shard: %w", err)
+	}
+	return storedShard{
+		rawBytes: rawCounter.count, storedBytes: shardCounter.count,
+		sha256: hex.EncodeToString(shardHash.Sum(nil)),
+	}, nil
+}
+
+type countingWriter struct {
+	writer io.Writer
+	count  int
+}
+
+func (w *countingWriter) Write(payload []byte) (int, error) {
+	written, err := w.writer.Write(payload)
+	w.count += written
+	return written, err
+}
+
+func writeEncodedArrays(w io.Writer, prepared *Prepared) ([]map[string]any, error) {
+	counter, ok := w.(*countingWriter)
+	if !ok {
+		counter = &countingWriter{writer: w}
+	}
+	scratch := make([]byte, 64*1024)
+	descriptors := make([]map[string]any, 0, len(arrayNames))
+	for _, name := range arrayNames {
+		start := counter.count
+		var err error
+		switch name {
+		case "hero":
+			err = writeF32Blocks(counter, scratch, prepared.Hero)
+		case "abilities":
+			err = writeF32Blocks(counter, scratch, prepared.Abilities)
+		case "entities":
+			err = writeF32Blocks(counter, scratch, prepared.Entities)
+		case "global":
+			err = writeF32Blocks(counter, scratch, prepared.Global)
+		case "entity_mask":
+			err = writeAll(counter, prepared.EntityMask)
+		case "kind_mask":
+			err = writeAll(counter, prepared.KindMask)
+		case "target_mask":
+			err = writeAll(counter, prepared.TargetMask)
+		case "skill_target_mask":
+			err = writeAll(counter, prepared.SkillTargetMask)
+		case "teacher_status":
+			err = writeAll(counter, prepared.TeacherStatus)
+		case "teacher_action":
+			err = writeActionBlocks(counter, scratch, prepared.TeacherAction)
+		case "projected_action":
+			err = writeActionBlocks(counter, scratch, prepared.ProjectedAction)
+		case "executed_action":
+			err = writeActionBlocks(counter, scratch, prepared.ExecutedAction)
+		case "executed_valid":
+			err = writeAll(counter, prepared.ExecutedValid)
+		case "rejection_reason":
+			err = writeAll(counter, prepared.RejectionReason)
+		case "rewards":
+			err = writeF32Blocks(counter, scratch, prepared.Rewards)
+		case "done":
+			err = writeAll(counter, prepared.Done)
+		case "winner":
+			err = writeI32Blocks(counter, scratch, prepared.Winner)
+		case "step":
+			err = writeU32Blocks(counter, scratch, prepared.Steps)
+		case "elapsed":
+			err = writeF32Blocks(counter, scratch, prepared.Elapsed)
+		case "invalid":
+			err = writeAll(counter, prepared.Invalid)
+		default:
+			return nil, fmt.Errorf("ai42dataset: unsupported array %q", name)
+		}
+		if err != nil {
+			return nil, fmt.Errorf("ai42dataset: encode array %s: %w", name, err)
+		}
+		descriptors = append(descriptors, map[string]any{
+			"name": name, "dtype": arrayDType(name), "shape": arrayShape(name, prepared.TickCount),
+			"offset": start, "nbytes": counter.count - start,
+		})
+	}
+	return descriptors, nil
 }
 
 func encodeArrays(prepared *Prepared) ([]byte, []map[string]any, error) {
-	var raw bytes.Buffer
+	total, err := encodedArraysSize(prepared)
+	if err != nil {
+		return nil, nil, err
+	}
+	raw := make([]byte, total)
+	offset := 0
 	descriptors := make([]map[string]any, 0, len(arrayNames))
 	for _, name := range arrayNames {
-		offset := raw.Len()
+		start := offset
 		switch name {
 		case "hero":
-			writeF32Slice(&raw, prepared.Hero)
+			offset = putF32Slice(raw, offset, prepared.Hero)
 		case "abilities":
-			writeF32Slice(&raw, prepared.Abilities)
+			offset = putF32Slice(raw, offset, prepared.Abilities)
 		case "entities":
-			writeF32Slice(&raw, prepared.Entities)
+			offset = putF32Slice(raw, offset, prepared.Entities)
 		case "global":
-			writeF32Slice(&raw, prepared.Global)
+			offset = putF32Slice(raw, offset, prepared.Global)
 		case "entity_mask":
-			raw.Write(prepared.EntityMask)
+			offset += copy(raw[offset:], prepared.EntityMask)
 		case "kind_mask":
-			raw.Write(prepared.KindMask)
+			offset += copy(raw[offset:], prepared.KindMask)
 		case "target_mask":
-			raw.Write(prepared.TargetMask)
+			offset += copy(raw[offset:], prepared.TargetMask)
 		case "skill_target_mask":
-			raw.Write(prepared.SkillTargetMask)
+			offset += copy(raw[offset:], prepared.SkillTargetMask)
 		case "teacher_status":
-			raw.Write(prepared.TeacherStatus)
+			offset += copy(raw[offset:], prepared.TeacherStatus)
 		case "teacher_action":
-			writeActionSlice(&raw, prepared.TeacherAction)
+			offset = putActionSlice(raw, offset, prepared.TeacherAction)
 		case "projected_action":
-			writeActionSlice(&raw, prepared.ProjectedAction)
+			offset = putActionSlice(raw, offset, prepared.ProjectedAction)
 		case "executed_action":
-			writeActionSlice(&raw, prepared.ExecutedAction)
+			offset = putActionSlice(raw, offset, prepared.ExecutedAction)
 		case "executed_valid":
-			raw.Write(prepared.ExecutedValid)
+			offset += copy(raw[offset:], prepared.ExecutedValid)
 		case "rejection_reason":
-			raw.Write(prepared.RejectionReason)
+			offset += copy(raw[offset:], prepared.RejectionReason)
 		case "rewards":
-			writeF32Slice(&raw, prepared.Rewards)
+			offset = putF32Slice(raw, offset, prepared.Rewards)
 		case "done":
-			raw.Write(prepared.Done)
+			offset += copy(raw[offset:], prepared.Done)
 		case "winner":
-			writeI32Slice(&raw, prepared.Winner)
+			offset = putI32Slice(raw, offset, prepared.Winner)
 		case "step":
-			writeU32Slice(&raw, prepared.Steps)
+			offset = putU32Slice(raw, offset, prepared.Steps)
 		case "elapsed":
-			writeF32Slice(&raw, prepared.Elapsed)
+			offset = putF32Slice(raw, offset, prepared.Elapsed)
 		case "invalid":
-			raw.Write(prepared.Invalid)
+			offset += copy(raw[offset:], prepared.Invalid)
 		default:
 			return nil, nil, fmt.Errorf("ai42dataset: unsupported array %q", name)
 		}
 		shape := arrayShape(name, prepared.TickCount)
 		descriptors = append(descriptors, map[string]any{
 			"name": name, "dtype": arrayDType(name), "shape": shape,
-			"offset": offset, "nbytes": raw.Len() - offset,
+			"offset": start, "nbytes": offset - start,
 		})
 	}
-	return raw.Bytes(), descriptors, nil
+	if offset != len(raw) {
+		return nil, nil, fmt.Errorf("ai42dataset: encoded array size=%d, expected=%d", offset, len(raw))
+	}
+	return raw, descriptors, nil
+}
+
+func encodedArraysSize(prepared *Prepared) (int, error) {
+	maxInt := int(^uint(0) >> 1)
+	total := 0
+	add := func(count, width int) error {
+		if count < 0 || width <= 0 || count > (maxInt-total)/width {
+			return fmt.Errorf("ai42dataset: encoded array size overflows native address space")
+		}
+		total += count * width
+		return nil
+	}
+	for _, item := range []struct{ count, width int }{
+		{len(prepared.Hero), 4}, {len(prepared.Abilities), 4}, {len(prepared.Entities), 4},
+		{len(prepared.Global), 4}, {len(prepared.EntityMask), 1}, {len(prepared.KindMask), 1},
+		{len(prepared.TargetMask), 1}, {len(prepared.SkillTargetMask), 1}, {len(prepared.TeacherStatus), 1},
+		{len(prepared.TeacherAction), 5}, {len(prepared.ProjectedAction), 5}, {len(prepared.ExecutedAction), 5},
+		{len(prepared.ExecutedValid), 1}, {len(prepared.RejectionReason), 1}, {len(prepared.Rewards), 4},
+		{len(prepared.Done), 1}, {len(prepared.Winner), 4}, {len(prepared.Steps), 4},
+		{len(prepared.Elapsed), 4}, {len(prepared.Invalid), 1},
+	} {
+		if err := add(item.count, item.width); err != nil {
+			return 0, err
+		}
+	}
+	return total, nil
+}
+
+func putF32Slice(dst []byte, offset int, values []float32) int {
+	for _, value := range values {
+		binary.LittleEndian.PutUint32(dst[offset:offset+4], math.Float32bits(value))
+		offset += 4
+	}
+	return offset
+}
+
+func putI32Slice(dst []byte, offset int, values []int32) int {
+	for _, value := range values {
+		binary.LittleEndian.PutUint32(dst[offset:offset+4], uint32(value))
+		offset += 4
+	}
+	return offset
+}
+
+func putU32Slice(dst []byte, offset int, values []uint32) int {
+	for _, value := range values {
+		binary.LittleEndian.PutUint32(dst[offset:offset+4], value)
+		offset += 4
+	}
+	return offset
+}
+
+func putActionSlice(dst []byte, offset int, values []Action) int {
+	for _, value := range values {
+		value.wireBytes(dst[offset : offset+5])
+		offset += 5
+	}
+	return offset
+}
+
+func writeAll(w io.Writer, payload []byte) error {
+	for len(payload) > 0 {
+		written, err := w.Write(payload)
+		if written > 0 {
+			payload = payload[written:]
+		}
+		if err != nil {
+			return err
+		}
+		if written == 0 {
+			return io.ErrShortWrite
+		}
+	}
+	return nil
+}
+
+func writeF32Blocks(w io.Writer, scratch []byte, values []float32) error {
+	const width = 4
+	for len(values) > 0 {
+		count := min(len(values), len(scratch)/width)
+		payload := scratch[:count*width]
+		putF32Slice(payload, 0, values[:count])
+		if err := writeAll(w, payload); err != nil {
+			return err
+		}
+		values = values[count:]
+	}
+	return nil
+}
+
+func writeI32Blocks(w io.Writer, scratch []byte, values []int32) error {
+	const width = 4
+	for len(values) > 0 {
+		count := min(len(values), len(scratch)/width)
+		payload := scratch[:count*width]
+		putI32Slice(payload, 0, values[:count])
+		if err := writeAll(w, payload); err != nil {
+			return err
+		}
+		values = values[count:]
+	}
+	return nil
+}
+
+func writeU32Blocks(w io.Writer, scratch []byte, values []uint32) error {
+	const width = 4
+	for len(values) > 0 {
+		count := min(len(values), len(scratch)/width)
+		payload := scratch[:count*width]
+		putU32Slice(payload, 0, values[:count])
+		if err := writeAll(w, payload); err != nil {
+			return err
+		}
+		values = values[count:]
+	}
+	return nil
+}
+
+func writeActionBlocks(w io.Writer, scratch []byte, values []Action) error {
+	const width = 5
+	for len(values) > 0 {
+		count := min(len(values), len(scratch)/width)
+		payload := scratch[:count*width]
+		putActionSlice(payload, 0, values[:count])
+		if err := writeAll(w, payload); err != nil {
+			return err
+		}
+		values = values[count:]
+	}
+	return nil
 }
 
 func arrayDType(name string) string {
@@ -332,6 +662,9 @@ func deterministicSplit(matchID string, seed int64, fraction float64) string {
 }
 
 func validatePublishIdentity(prepared *Prepared) error {
+	if err := validatePreparedShape(prepared); err != nil {
+		return err
+	}
 	view := Capture{data: *prepared}
 	for hero := 0; hero < HeroCount; hero++ {
 		expectedID := prepared.Metadata.MatchID + ":hero:" + prepared.Metadata.HeroIDs[hero]

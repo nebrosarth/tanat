@@ -1013,7 +1013,7 @@ func TestAssaultEnvAI30MatchIsDeterministic(t *testing.T) {
 	run := func() []StepResultV1 {
 		env := NewAssaultEnv()
 		defer env.Close()
-		cfg := externalAssaultReset(8140, 120)
+		cfg := externalAssaultReset(8140, 400)
 		for i := range cfg.Controllers {
 			cfg.Controllers[i] = AssaultControllerAI30
 		}
@@ -1021,8 +1021,8 @@ func TestAssaultEnvAI30MatchIsDeterministic(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		results := make([]StepResultV1, 0, 120)
-		for i := 0; i < 120 && !result.Done; i++ {
+		results := make([]StepResultV1, 0, 400)
+		for i := 0; i < 400 && !result.Done; i++ {
 			result, err = env.Step([AssaultHeroCount]HeroActionV1{})
 			if err != nil {
 				t.Fatal(err)

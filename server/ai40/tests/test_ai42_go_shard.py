@@ -68,7 +68,9 @@ def _match(shard_name: str) -> dict[str, object]:
     }
 
 
-def _generation() -> tuple[bytes, dict[str, object]]:
+def _generation(
+    *, codec: str = GO_SHARD_CODEC, compression_level: int = 3,
+) -> tuple[bytes, dict[str, object]]:
     shard_name = "shard-000000.a42"
     arrays = {
         name: np.zeros(_shape(name), dtype=_ARRAY_DTYPES[name])
@@ -92,7 +94,7 @@ def _generation() -> tuple[bytes, dict[str, object]]:
             "nbytes": nbytes,
         })
         offset += nbytes
-    compressor = zlib.compressobj(level=6, method=zlib.DEFLATED, wbits=-15)
+    compressor = zlib.compressobj(level=compression_level, method=zlib.DEFLATED, wbits=-15)
     compressed = compressor.compress(raw) + compressor.flush()
     match = _match(shard_name)
     header = {
@@ -102,7 +104,7 @@ def _generation() -> tuple[bytes, dict[str, object]]:
         "reward_hash": AI42_REWARD_HASH.hex(),
         "trajectory_schema_hash": AI42_TRAJECTORY_SCHEMA_HASH,
         "runtime_manifest_hash": hash_payload({"fixture": "go"}),
-        "codec": GO_SHARD_CODEC,
+        "codec": codec,
         "raw_bytes": len(raw),
         "stored_bytes": len(compressed),
         "raw_sha256": hashlib.sha256(raw).hexdigest(),
@@ -131,7 +133,7 @@ def _generation() -> tuple[bytes, dict[str, object]]:
             "row_count": 1,
             "raw_bytes": len(raw),
             "stored_bytes": len(shard),
-            "compression": GO_SHARD_CODEC,
+            "compression": codec,
         }],
     }
     manifest["manifest_hash"] = hash_payload(manifest)
@@ -139,6 +141,16 @@ def _generation() -> tuple[bytes, dict[str, object]]:
 
 
 class AI42GoShardTests(unittest.TestCase):
+    def test_legacy_level_6_generation_remains_readable(self) -> None:
+        shard, manifest = _generation(codec="deflate-raw-6", compression_level=6)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "manifest.json").write_bytes(canonical_json_bytes(manifest))
+            (root / "shard-000000.a42").write_bytes(shard)
+            dataset = load_go_dataset(root)
+            self.assertEqual(dataset.compression, "deflate-raw-6")
+            self.assertEqual(int(dataset.arrays_for_match("ai42-match-000000")["done"][0]), 1)
+
     def test_deterministic_lazy_decode_and_audit(self) -> None:
         first_shard, first_manifest = _generation()
         second_shard, second_manifest = _generation()

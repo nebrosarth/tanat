@@ -1407,6 +1407,10 @@ func (c *conn) mobsWithinLocked(x, y float32, r float64) []*mobState {
 			out = append(out, m)
 		}
 	}
+	// Skill payloads may consume the match RNG once per victim (damage rolls,
+	// proc chances). Returning Go-map order assigned those rolls to different
+	// mobs across otherwise identical headless runs.
+	sort.Slice(out, func(i, j int) bool { return out[i].id < out[j].id })
 	return out
 }
 
@@ -1551,6 +1555,7 @@ func (c *conn) mobsAlongLineLocked(cx, cy, tx, ty float32, halfWidth, maxLen flo
 			out = append(out, m)
 		}
 	}
+	sort.Slice(out, func(i, j int) bool { return out[i].id < out[j].id })
 	return out
 }
 

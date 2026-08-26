@@ -1263,16 +1263,23 @@ func (e *AssaultEnv) observationForConnWithScratchLocked(
 			mobs = append(mobs, mob)
 		}
 	}
+	// Accumulate normalized structure health in float64 and round only once.
+	// The reset/teacher path can source mobs from a Go map; repeated float32
+	// additions made this observation depend on that map's randomized iteration
+	// order even though the authoritative match state was identical.
+	var structureHealth [2]float64
 	for _, mob := range mobs {
 		if mob.dead || !mob.structure {
 			continue
 		}
-		idx := 6
+		idx := 0
 		if mob.teamVal() != team {
-			idx = 7
+			idx = 1
 		}
-		o.Global[idx] += safeFrac(mob.hp, mob.maxHealth())
+		structureHealth[idx] += float64(safeFrac(mob.hp, mob.maxHealth()))
 	}
+	o.Global[6] = float32(structureHealth[0])
+	o.Global[7] = float32(structureHealth[1])
 	if slot := e.assaultHeroSlot(c); slot >= 0 && e.wrongLaneCurriculum {
 		lane := int(e.laneAssignment[slot])
 		active := now < e.laneAssignmentUntil

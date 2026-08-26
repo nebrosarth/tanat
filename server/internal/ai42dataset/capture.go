@@ -930,28 +930,28 @@ func columnStrings(values []string, hero, stride int) []string {
 
 func (c *Capture) arrayColumnHash(name string, hero int) Hash {
 	h := sha256.New()
+	// entities is the widest float column. Reuse one block so hashing performs
+	// one write per hero/tick instead of thousands of four-byte interface calls.
+	scratch := make([]byte, MaxEntities*EntityFeatures*4)
+	writeFloats := func(values []float32) {
+		payload := scratch[:len(values)*4]
+		putF32Slice(payload, 0, values)
+		_, _ = h.Write(payload)
+	}
 	for tick := 0; tick < len(c.data.Steps); tick++ {
 		index := tick*HeroCount + hero
 		switch name {
 		case "hero":
-			for _, value := range c.data.Hero[index*HeroFeatures : (index+1)*HeroFeatures] {
-				writeF32(h, value)
-			}
+			writeFloats(c.data.Hero[index*HeroFeatures : (index+1)*HeroFeatures])
 		case "abilities":
 			start, end := index*AbilityCount*AbilityFeatures, (index+1)*AbilityCount*AbilityFeatures
-			for _, value := range c.data.Abilities[start:end] {
-				writeF32(h, value)
-			}
+			writeFloats(c.data.Abilities[start:end])
 		case "entities":
 			start, end := index*MaxEntities*EntityFeatures, (index+1)*MaxEntities*EntityFeatures
-			for _, value := range c.data.Entities[start:end] {
-				writeF32(h, value)
-			}
+			writeFloats(c.data.Entities[start:end])
 		case "global":
 			start, end := index*GlobalFeatures, (index+1)*GlobalFeatures
-			for _, value := range c.data.Global[start:end] {
-				writeF32(h, value)
-			}
+			writeFloats(c.data.Global[start:end])
 		case "entity_mask":
 			h.Write(c.data.EntityMask[index*MaxEntities : (index+1)*MaxEntities])
 		case "kind_mask":
@@ -1158,6 +1158,24 @@ func validatePrepared(data *Prepared) error {
 	return nil
 }
 
+// validatePreparedShape is the constant-work publication guard. Finalize has
+// already scanned every scalar, but exported slices are immutable only by
+// convention; checking all lengths before identity hashing prevents malformed
+// or resized Prepared values from reaching indexed hash code.
+func validatePreparedShape(data *Prepared) error {
+	if data == nil {
+		return metadataError("prepared", "nil prepared match")
+	}
+	ticks := data.TickCount
+	if ticks < 1 {
+		return fieldError("tick_count", -1, -1, "must be positive")
+	}
+	if len(data.Steps) != ticks || len(data.Elapsed) != ticks || len(data.Done) != ticks || len(data.Winner) != ticks {
+		return fieldError("arrays", -1, -1, "scalar column lengths do not equal tick_count")
+	}
+	return validateColumnLengths(data, ticks)
+}
+
 func validateColumnLengths(data *Prepared, ticks int) error {
 	expected := func(name string, got, want int) error {
 		if got != want {
@@ -1282,22 +1300,29 @@ func boolByte(value bool) uint8 {
 }
 
 func writeSlotObservation(w interface{ Write([]byte) (int, error) }, observation battleserver.AssaultObservationV1) {
+	var floats [(HeroFeatures + AbilityCount*AbilityFeatures + MaxEntities*EntityFeatures + GlobalFeatures) * 4]byte
+	offset := 0
+	put := func(value float32) {
+		binary.LittleEndian.PutUint32(floats[offset:offset+4], math.Float32bits(value))
+		offset += 4
+	}
 	for _, value := range observation.Hero {
-		writeF32(w, value)
+		put(value)
 	}
 	for _, ability := range observation.Abilities {
 		for _, value := range ability {
-			writeF32(w, value)
+			put(value)
 		}
 	}
 	for _, entity := range observation.Entities {
 		for _, value := range entity {
-			writeF32(w, value)
+			put(value)
 		}
 	}
 	for _, value := range observation.Global {
-		writeF32(w, value)
+		put(value)
 	}
+	_, _ = w.Write(floats[:offset])
 	_, _ = w.Write(observation.EntityMask[:])
 	_, _ = w.Write(observation.ActionMask.Kinds[:])
 	_, _ = w.Write(observation.ActionMask.Targets[:])

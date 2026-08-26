@@ -38,7 +38,7 @@ def _write_v1_generation(root: Path, *, match_count: int = 1) -> tuple[bytes, di
             descriptors.append(descriptor)
             raw_parts.append(raw[start:end] * match_count)
         raw = b"".join(raw_parts)
-        compressor = zlib.compressobj(level=6, method=zlib.DEFLATED, wbits=-15)
+        compressor = zlib.compressobj(level=3, method=zlib.DEFLATED, wbits=-15)
         compressed = compressor.compress(raw) + compressor.flush()
         base_match = manifest["matches"][0]
         matches = []
@@ -76,7 +76,7 @@ def _write_v1_generation(root: Path, *, match_count: int = 1) -> tuple[bytes, di
             "row_count": match_count,
             "raw_bytes": len(raw),
             "stored_bytes": len(shard),
-            "compression": "deflate-raw-6",
+            "compression": header["codec"],
         }]
         manifest["manifest_hash"] = hash_payload({
             key: value for key, value in manifest.items() if key != "manifest_hash"

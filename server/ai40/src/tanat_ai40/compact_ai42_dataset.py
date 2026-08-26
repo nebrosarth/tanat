@@ -12,7 +12,6 @@ from typing import Any, Mapping, Sequence
 from .dataset_ai42 import AI42DatasetError
 from .go_shard_ai42 import (
     GO_MANIFEST_FILENAME,
-    GO_SHARD_CODEC,
     GO_SHARD_MAGIC_V2,
     GO_SHARD_SCHEMA_VERSION_V1,
     GO_SHARD_SCHEMA_VERSION_V2,
@@ -65,7 +64,7 @@ def _rewrite_shard(
         "row_count": int(shard_entry["row_count"]),
         "raw_bytes": int(shard_entry["raw_bytes"]),
         "stored_bytes": len(rewritten),
-        "compression": GO_SHARD_CODEC,
+        "compression": header["codec"],
     }
 
 

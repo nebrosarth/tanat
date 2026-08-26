@@ -54,7 +54,9 @@ GO_SHARD_MAGIC_V2 = b"AI42GS2\0"
 # Go staging format.  Python publication uses the explicit v2 constants.
 GO_SHARD_SCHEMA_VERSION = GO_SHARD_SCHEMA_VERSION_V1
 GO_SHARD_MAGIC = GO_SHARD_MAGIC_V1
-GO_SHARD_CODEC = "deflate-raw-6"
+GO_SHARD_CODEC = "deflate-raw-3"
+GO_SHARD_LEGACY_CODEC = "deflate-raw-6"
+_GO_SHARD_CODECS = frozenset((GO_SHARD_CODEC, GO_SHARD_LEGACY_CODEC))
 GO_MANIFEST_FILENAME = "manifest.json"
 GO_V2_LINEAGE_SCHEMA = "implicit-match-boundary-v1"
 _SCHEMA_BY_MAGIC = {
@@ -267,7 +269,7 @@ def _validate_go_manifest(
             raise AI42GoShardError(f"{path}.name is invalid or duplicated")
         seen_shards.add(name)
         _hash_hex(shard["sha256"], f"{path}.sha256")
-        if shard["compression"] != GO_SHARD_CODEC:
+        if shard["compression"] not in _GO_SHARD_CODECS:
             raise AI42GoShardError(f"{path}.compression mismatch")
         _strict_int(shard["raw_bytes"], f"{path}.raw_bytes", minimum=1)
         _strict_int(shard["stored_bytes"], f"{path}.stored_bytes", minimum=1)
@@ -356,7 +358,7 @@ def _parse_header(payload: bytes, path: str) -> tuple[dict[str, Any], bytes]:
     compressed = payload[end:]
     if header["shard_schema_version"] != schema_version:
         raise AI42GoShardError(f"{path} shard schema mismatch")
-    if header["codec"] != GO_SHARD_CODEC:
+    if header["codec"] not in _GO_SHARD_CODECS:
         raise AI42GoShardError(f"{path} codec mismatch")
     if _strict_int(header["stored_bytes"], f"{path}.header.stored_bytes") != len(compressed):
         raise AI42GoShardError(f"{path} stored byte count mismatch")
@@ -439,7 +441,8 @@ class AI42GoDataset:
 
     @property
     def compression(self) -> str:
-        return GO_SHARD_CODEC
+        codecs = {str(shard["compression"]) for shard in self.manifest["shards"]}
+        return next(iter(codecs)) if len(codecs) == 1 else "mixed-deflate-raw"
 
     def match_ids(self, split: str | None = None) -> tuple[str, ...]:
         if split not in (None, "train", "validation"):
@@ -477,6 +480,8 @@ class AI42GoDataset:
         if len(payload) != shard["stored_bytes"] or _sha256_bytes(payload) != shard["sha256"]:
             raise AI42GoShardError(f"Go shard file integrity mismatch for {name}")
         header, compressed = _parse_header(payload, str(path))
+        if header["codec"] != shard["compression"]:
+            raise AI42GoShardError(f"{path} codec does not match manifest compression")
         if header["shard_schema_version"] != self.manifest["shard_schema_version"]:
             raise AI42GoShardError(f"{path} shard schema mismatch")
         if header["protocol_version"] != self.manifest["protocol_version"]:

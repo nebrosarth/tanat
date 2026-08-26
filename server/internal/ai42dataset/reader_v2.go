@@ -209,6 +209,7 @@ type shardRecord struct {
 	raw         map[string]any
 	name        string
 	sha256      string
+	compression string
 	rowCount    int
 	rawBytes    int64
 	storedBytes int64
@@ -1002,7 +1003,7 @@ func validateManifest(root string, manifest map[string]any, manifestHash string)
 			return nil, err
 		}
 		compression, ok := object["compression"].(string)
-		if !ok || compression != ShardCodec {
+		if !ok || !supportedShardCodec(compression) {
 			return nil, fmt.Errorf("ai42dataset: manifest shard %s compression mismatch", name)
 		}
 		rowCount, err := intFromField(object["row_count"], fmt.Sprintf("manifest.shards[%d].row_count", index), 1)
@@ -1060,7 +1061,7 @@ func validateManifest(root string, manifest map[string]any, manifestHash string)
 			}
 			ids[idIndex] = id
 		}
-		shard := &shardRecord{raw: object, name: name, sha256: sha, rowCount: rowCount, rawBytes: rawBytes, storedBytes: storedBytes, matchIDs: ids}
+		shard := &shardRecord{raw: object, name: name, sha256: sha, compression: compression, rowCount: rowCount, rawBytes: rawBytes, storedBytes: storedBytes, matchIDs: ids}
 		if _, exists := byShard[name]; exists {
 			return nil, fmt.Errorf("ai42dataset: duplicate shard %q", name)
 		}
@@ -1621,7 +1622,7 @@ func validateHeader(header map[string]any, shard *shardRecord, manifest map[stri
 			return fmt.Errorf("ai42dataset: shard %s %s mismatch", name, field)
 		}
 	}
-	if codec, ok := header["codec"].(string); !ok || codec != ShardCodec {
+	if codec, ok := header["codec"].(string); !ok || codec != shard.compression {
 		return fmt.Errorf("ai42dataset: shard %s codec mismatch", name)
 	}
 	if rawBytes, err := int64Field(header["raw_bytes"], name+".raw_bytes", 1); err != nil {

@@ -1233,12 +1233,22 @@ func botBarracksThreatReleaseSeverityLocked(inst *huntInstance, team int32, barr
 // intentionally ignored: once attackers leave, the defense assignment must
 // disappear and the roster may farm or gank again.
 func botStructureDirectThreatSeverityLocked(inst *huntInstance, team int32, structure *mobState, now, radius float64) int {
+	if inst == nil {
+		return 0
+	}
+	return botStructureDirectThreatSeverityWithVisionLocked(
+		inst, team, structure, now, radius, dotaTeamVisionSourcesLocked(inst, team, now),
+	)
+}
+
+func botStructureDirectThreatSeverityWithVisionLocked(
+	inst *huntInstance, team int32, structure *mobState, now, radius float64, visionSources []dotaVisionSource,
+) int {
 	if inst == nil || structure == nil || structure.dead || !structure.structure || structure.team != team {
 		return 0
 	}
 	r2 := float32(radius * radius)
 	severity := 0
-	visionSources := dotaTeamVisionSourcesLocked(inst, team, now)
 	for _, m := range botSortedMobs(inst) {
 		if m.dead || m.structure || !m.enemyOf(team) || !botVisibleEnemyMobLocked(team, m, visionSources) {
 			continue
@@ -1269,16 +1279,29 @@ func botStructureDirectThreatSeverityLocked(inst *huntInstance, team int32, stru
 }
 
 func (s *Server) botDefenseStructureThreatSeverityLocked(inst *huntInstance, team int32, structure *mobState, now float64) int {
+	if inst == nil {
+		return 0
+	}
+	return s.botDefenseStructureThreatSeverityWithVisionLocked(
+		inst, team, structure, now, dotaTeamVisionSourcesLocked(inst, team, now),
+	)
+}
+
+func (s *Server) botDefenseStructureThreatSeverityWithVisionLocked(
+	inst *huntInstance, team int32, structure *mobState, now float64, visionSources []dotaVisionSource,
+) int {
 	if structure == nil || structure.dead || !structure.structure || structure.team != team {
 		return 0
 	}
 	switch structure.dotaRole {
 	case gamedata.DotaCreepTower:
-		return botBarracksThreatSeverityLocked(inst, team, structure, now)
+		return botBarracksThreatSeverityWithinRadiusWithVisionLocked(
+			inst, team, structure, now, botBarracksImmediateRadius, botBarracksImmediateRadius, false, visionSources,
+		)
 	case gamedata.DotaAltar:
-		return botStructureDirectThreatSeverityLocked(inst, team, structure, now, botMacroBasePressureRadius)
+		return botStructureDirectThreatSeverityWithVisionLocked(inst, team, structure, now, botMacroBasePressureRadius, visionSources)
 	case gamedata.DotaGun:
-		return botStructureDirectThreatSeverityLocked(inst, team, structure, now, botBarracksImmediateRadius)
+		return botStructureDirectThreatSeverityWithVisionLocked(inst, team, structure, now, botBarracksImmediateRadius, visionSources)
 	default:
 		return 0
 	}
@@ -1306,11 +1329,12 @@ func (s *Server) botOwnDefenseStructureThreatLocked(inst *huntInstance, team int
 	}
 	var best *mobState
 	bestSeverity, bestPriority := 0, 0
+	visionSources := dotaTeamVisionSourcesLocked(inst, team, now)
 	for _, structure := range botSortedMobs(inst) {
 		if structure.team != team || !structure.structure {
 			continue
 		}
-		severity := s.botDefenseStructureThreatSeverityLocked(inst, team, structure, now)
+		severity := s.botDefenseStructureThreatSeverityWithVisionLocked(inst, team, structure, now, visionSources)
 		p := priority(structure.dotaRole)
 		if severity > bestSeverity ||
 			(severity == bestSeverity && severity > 0 && (p > bestPriority ||
@@ -1322,6 +1346,19 @@ func (s *Server) botOwnDefenseStructureThreatLocked(inst *huntInstance, team int
 }
 
 func botBarracksThreatSeverityWithinRadiusLocked(inst *huntInstance, team int32, barracks *mobState, now, localRadius, predictionRadius float64, requireETA bool) int {
+	if inst == nil {
+		return 0
+	}
+	return botBarracksThreatSeverityWithinRadiusWithVisionLocked(
+		inst, team, barracks, now, localRadius, predictionRadius, requireETA,
+		dotaTeamVisionSourcesLocked(inst, team, now),
+	)
+}
+
+func botBarracksThreatSeverityWithinRadiusWithVisionLocked(
+	inst *huntInstance, team int32, barracks *mobState, now, localRadius, predictionRadius float64,
+	requireETA bool, visionSources []dotaVisionSource,
+) int {
 	if inst == nil || inst.dota == nil || barracks == nil || barracks.dead || !barracks.structure || barracks.altar ||
 		barracks.team != team || barracks.dotaRole != gamedata.DotaCreepTower {
 		return 0
@@ -1329,7 +1366,6 @@ func botBarracksThreatSeverityWithinRadiusLocked(inst *huntInstance, team int32,
 	laneIndex := botNearestLaneToPointLocked(inst.dota, barracks.x, barracks.y)
 	radius2 := float32(botBarracksImmediateRadius * botBarracksImmediateRadius)
 	severity := 0
-	visionSources := dotaTeamVisionSourcesLocked(inst, team, now)
 	for _, m := range botSortedMobs(inst) {
 		if m.dead || m.structure || !m.enemyOf(team) || !botVisibleEnemyMobLocked(team, m, visionSources) {
 			continue
