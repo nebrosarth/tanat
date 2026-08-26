@@ -25,6 +25,25 @@ func TestCommandRunnerTimeoutDoesNotBlockOnWorkerStdin(t *testing.T) {
 	}
 }
 
+func TestCommandRunnerSetsDeterministicCUBLASWorkspace(t *testing.T) {
+	t.Setenv("AI42_PREFLIGHT_ENV_HELPER", "1")
+	t.Setenv("CUBLAS_WORKSPACE_CONFIG", ":16:8")
+	runner, err := NewCommandRunner([]string{os.Args[0], "-test.run=TestCommandRunnerEnvironmentHelper"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	output, err := runner.Run(context.Background(), []byte(`{"request":"bounded"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if output.ExitCode != 0 {
+		t.Fatalf("exit code=%d stderr=%s", output.ExitCode, output.Stderr)
+	}
+	if got := strings.TrimSpace(string(output.Stdout)); !strings.HasPrefix(got, deterministicCUBLASWorkspace) {
+		t.Fatalf("CUBLAS_WORKSPACE_CONFIG=%q", got)
+	}
+}
+
 func TestCommandRunnerWaitDelayBoundsInheritedPipeDescendant(t *testing.T) {
 	t.Setenv("AI42_PREFLIGHT_PIPE_PARENT", "1")
 	runner, err := NewCommandRunner([]string{os.Args[0], "-test.run=TestCommandRunnerPipeParentHelper"})
@@ -70,6 +89,14 @@ func TestCommandRunnerHelper(t *testing.T) {
 	}
 	_, _ = io.ReadAll(os.Stdin)
 	select {}
+}
+
+func TestCommandRunnerEnvironmentHelper(t *testing.T) {
+	if os.Getenv("AI42_PREFLIGHT_ENV_HELPER") != "1" {
+		return
+	}
+	_, _ = io.ReadAll(os.Stdin)
+	_, _ = os.Stdout.WriteString(os.Getenv("CUBLAS_WORKSPACE_CONFIG"))
 }
 
 func TestReadBoundedRejectsOverflow(t *testing.T) {

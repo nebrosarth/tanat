@@ -12,6 +12,7 @@ import (
 )
 
 const commandWaitDelay = time.Second
+const deterministicCUBLASWorkspace = ":4096:8"
 
 type commandRunner struct{ command []string }
 
@@ -38,6 +39,11 @@ func (runner *commandRunner) Run(ctx context.Context, request []byte) (TorchOutp
 	commandContext, cancel := context.WithCancel(ctx)
 	defer cancel()
 	command := exec.CommandContext(commandContext, runner.command[0], runner.command[1:]...)
+	// PyTorch deterministic algorithms require an explicit cuBLAS workspace
+	// configuration on CUDA 10.2 and newer. Set it on the supervised worker so
+	// every native preflight has the same deterministic contract, regardless of
+	// the parent shell environment.
+	command.Env = append(os.Environ(), "CUBLAS_WORKSPACE_CONFIG="+deterministicCUBLASWorkspace)
 	// Let os/exec own the stdin copy goroutine. A synchronous StdinPipe.Write
 	// could otherwise block forever if a faulty worker never reads its request,
 	// bypassing the supervisor timeout.
