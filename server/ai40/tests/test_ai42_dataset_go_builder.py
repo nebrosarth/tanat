@@ -220,6 +220,46 @@ class AI42GoBuilderTests(unittest.TestCase):
             "ai20_vs_ai30": {"train": 35, "validation": 5},
         })
 
+    def test_ai30_mirror_generation_config_is_independent(self) -> None:
+        config_root = Path(__file__).parents[1] / "config"
+        baseline = json.loads((config_root / "ai42_dataset01.json").read_text(encoding="utf-8"))
+        config = json.loads(
+            (config_root / "ai42_dataset02_ai30_mirror.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(config["match_count"], 320)
+        self.assertEqual(config["seed"], 520000)
+        self.assertEqual(config["split_seed"], 43)
+        self.assertEqual(config["workers"], 8)
+        self.assertEqual(config["in_flight"], 8)
+        self.assertEqual(config["max_steps"], 4500)
+        self.assertEqual(config["timeout_minutes"], 15.0)
+        self.assertEqual(config["validation_fraction"], 0.125)
+        self.assertEqual(config["match_id_prefix"], "ai42-ai30mirror02-match")
+        self.assertEqual(config["scenario_mix"], {
+            "ai30_mirror": {"train": 280, "validation": 40},
+        })
+
+        old_schedule, old_specs = build_go_schedule(
+            seed=baseline["seed"], match_count=baseline["match_count"],
+            max_steps=baseline["max_steps"], timeout_minutes=baseline["timeout_minutes"],
+            scenario="ai30_mirror", scenario_mix=baseline["scenario_mix"],
+            validation_fraction=baseline["validation_fraction"], split_seed=baseline["split_seed"],
+        )
+        new_schedule, new_specs = build_go_schedule(
+            seed=config["seed"], match_count=config["match_count"],
+            max_steps=config["max_steps"], timeout_minutes=config["timeout_minutes"],
+            scenario="ai30_mirror", scenario_mix=config["scenario_mix"],
+            validation_fraction=config["validation_fraction"], split_seed=config["split_seed"],
+            match_id_prefix=config["match_id_prefix"],
+        )
+        self.assertFalse({spec.seed for spec in old_specs} & {spec.seed for spec in new_specs})
+        self.assertFalse({spec.match_id for spec in old_specs} & {spec.match_id for spec in new_specs})
+        self.assertEqual(new_schedule["scenario_mix"], config["scenario_mix"])
+
+    def test_match_id_prefix_is_validated(self) -> None:
+        with self.assertRaisesRegex(ValueError, "match_id_prefix"):
+            build_match_specs(42, 1, "ai30_mirror", match_id_prefix="")
+
     def test_worker_count_determinism_split_and_both_side_directions(self) -> None:
         scenarios = ("ai30_vs_ai20", "ai20_vs_ai30", "ai30_vs_ai20", "ai20_vs_ai30")
         with tempfile.TemporaryDirectory() as directory:

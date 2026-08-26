@@ -144,14 +144,22 @@ class MatchSpec:
     side_by_slot: tuple[int, ...] = (0,) * (HERO_COUNT // 2) + (1,) * (HERO_COUNT // 2)
 
 
-def build_match_specs(seed: int, match_count: int, scenario: str | Sequence[str]) -> tuple[MatchSpec, ...]:
+def build_match_specs(
+    seed: int,
+    match_count: int,
+    scenario: str | Sequence[str],
+    *,
+    match_id_prefix: str = "ai42-match",
+) -> tuple[MatchSpec, ...]:
+    if not isinstance(match_id_prefix, str) or not match_id_prefix.strip():
+        raise ValueError("match_id_prefix must be a non-empty string")
     seeds = deterministic_seed_schedule(seed, match_count)
     scenarios = _scenario_schedule(scenario, match_count)
     return tuple(
         MatchSpec(
             index=index,
             seed=match_seed,
-            match_id=f"ai42-match-{index:06d}",
+            match_id=f"{match_id_prefix}-{index:06d}",
             scenario=match_scenario,
             controller_by_slot=_controllers_for_scenario(match_scenario),
             roster_ids=_roster_for_match(match_seed, index),

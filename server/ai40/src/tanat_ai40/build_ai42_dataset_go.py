@@ -163,6 +163,7 @@ def build_go_schedule(
     validation_fraction: float,
     split_seed: int,
     scenario_mix: Mapping[str, Any] | None = None,
+    match_id_prefix: str = "ai42-match",
 ) -> tuple[dict[str, Any], tuple[MatchSpec, ...]]:
     """Build the worker-independent canonical schedule consumed by Go."""
 
@@ -179,7 +180,9 @@ def build_go_schedule(
         scenario_values = _scenario_values_from_mix(seed, normalized_mix)
     else:
         scenario_values = _scenario_values(scenario, match_count)
-    specs = build_match_specs(seed, match_count, scenario_values)
+    specs = build_match_specs(
+        seed, match_count, scenario_values, match_id_prefix=match_id_prefix
+    )
     # The worker count is orchestration state, not dataset identity.  It is
     # intentionally absent from this manifest so worker-count changes produce
     # byte-identical shards and final manifests.
@@ -518,6 +521,7 @@ def build_ai42_dataset_go(
     staging: str | Path | None = None,
     validation_fraction: float = DEFAULT_VALIDATION_FRACTION,
     split_seed: int = 42,
+    match_id_prefix: str = "ai42-match",
     go_command: str | Path | Sequence[str] | None = None,
     go_workdir: str | Path | None = None,
     runner: Runner | None = None,
@@ -545,7 +549,7 @@ def build_ai42_dataset_go(
         seed=seed, match_count=match_count, max_steps=max_steps,
         timeout_minutes=timeout_minutes, scenario=scenario,
         validation_fraction=validation_fraction, split_seed=split_seed,
-        scenario_mix=scenario_mix,
+        scenario_mix=scenario_mix, match_id_prefix=match_id_prefix,
     )
     contract = _contract(
         schedule, specs, workers=workers, in_flight=active, go_command=command,
@@ -616,6 +620,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--staging", type=Path)
     parser.add_argument("--validation-fraction", type=float)
     parser.add_argument("--split-seed", type=int)
+    parser.add_argument("--match-id-prefix")
     return parser
 
 
@@ -646,6 +651,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         "in_flight": args.in_flight, "max_steps": args.max_steps,
         "timeout_minutes": args.timeout_minutes, "staging": args.staging,
         "validation_fraction": args.validation_fraction, "split_seed": args.split_seed,
+        "match_id_prefix": args.match_id_prefix,
         "go_workdir": args.go_workdir, "go_command": command,
     }
     for key, value in overrides.items():
