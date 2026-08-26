@@ -575,7 +575,7 @@ def _validate_request(request: Any) -> dict[str, Any]:
             _finite_number(item, f"request.learner.head_weights[{name!r}]")
     if "trainable_scope" in learner:
         scope = _string(learner["trainable_scope"], "request.learner.trainable_scope")
-        if scope not in {"all", "supervised_heads"}:
+        if scope not in {"all", "supervised_heads", "control_kind_heads"}:
             raise TorchPreflightError("request.learner.trainable_scope is invalid", code="schema_error")
     if "class_weights" in learner:
         if not isinstance(learner["class_weights"], Mapping):

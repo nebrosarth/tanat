@@ -472,7 +472,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--weight-decay", type=float, default=1e-4)
     parser.add_argument("--class-weight-overrides", dest="class_weight_overrides", default=None, help=argparse.SUPPRESS)
     parser.add_argument("--head-weights", dest="head_weights", default=dict(DEFAULT_HEAD_WEIGHTS), help=argparse.SUPPRESS)
-    parser.add_argument("--trainable-scope", choices=("all", "supervised_heads"), default="all", help=argparse.SUPPRESS)
+    parser.add_argument("--trainable-scope", choices=("all", "supervised_heads", "control_kind_heads"), default="all", help=argparse.SUPPRESS)
     parser.add_argument("--combat-focus", dest="combat_focus", default=dict(DEFAULT_COMBAT_FOCUS), help=argparse.SUPPRESS)
     parser.add_argument("--gradient-accumulation-steps", type=int, default=1, help="number of deterministic focused batches combined into one optimizer step")
     parser.add_argument("--retain-periodic-checkpoints", action="store_true", help="retain immutable step checkpoints for bounded candidate selection")

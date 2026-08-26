@@ -383,8 +383,8 @@ func (config Config) Validate() error {
 	if config.Learner.LearningRate <= 0 || config.Learner.WeightDecay < 0 || config.Learner.MaxGradientNorm <= 0 {
 		return fmt.Errorf("learner rates and gradient norm are outside their valid ranges")
 	}
-	if config.Learner.TrainableScope != "all" && config.Learner.TrainableScope != "supervised_heads" {
-		return fmt.Errorf("trainable_scope must be all or supervised_heads")
+	if config.Learner.TrainableScope != "all" && config.Learner.TrainableScope != "supervised_heads" && config.Learner.TrainableScope != "control_kind_heads" {
+		return fmt.Errorf("trainable_scope must be all, supervised_heads, or control_kind_heads")
 	}
 	if len(config.Learner.HeadWeights) != 5 {
 		return fmt.Errorf("head_weights must contain exactly the five AI-42 loss heads")

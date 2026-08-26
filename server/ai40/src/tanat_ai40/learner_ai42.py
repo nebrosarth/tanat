@@ -668,8 +668,10 @@ class AI42LearnerConfig:
             if not math.isfinite(number) or number < 0.0 or (name == "max_gradient_norm" and number == 0.0):
                 raise AI42LearnerError(f"{name} must be finite and positive where required")
         valid_heads = {"control", "kind", "target", "offset", "anchor"}
-        if self.trainable_scope not in {"all", "supervised_heads"}:
-            raise AI42LearnerError("trainable_scope must be 'all' or 'supervised_heads'")
+        if self.trainable_scope not in {"all", "supervised_heads", "control_kind_heads"}:
+            raise AI42LearnerError(
+                "trainable_scope must be 'all', 'supervised_heads', or 'control_kind_heads'",
+            )
         for name, value in self.head_weights.items():
             if name not in valid_heads or not math.isfinite(float(value)) or float(value) < 0:
                 raise AI42LearnerError(f"invalid head weight {name!r}")
@@ -1212,13 +1214,18 @@ class AI42Learner:
         rare-kind update from moving every other decision boundary.
         """
 
-        prefixes = (
+        supervised_prefixes = (
             "control_head.", "kind_head.", "target_query.", "entity_key.",
             "offset_head.", "anchor_head.",
         )
+        control_kind_prefixes = ("control_head.", "kind_head.")
         selected: list[nn.Parameter] = []
         for name, parameter in self.actor.named_parameters():
-            enabled = self.config.trainable_scope == "all" or name.startswith(prefixes)
+            enabled = (
+                self.config.trainable_scope == "all"
+                or self.config.trainable_scope == "supervised_heads" and name.startswith(supervised_prefixes)
+                or self.config.trainable_scope == "control_kind_heads" and name.startswith(control_kind_prefixes)
+            )
             parameter.requires_grad_(enabled)
             if enabled:
                 selected.append(parameter)

@@ -155,6 +155,12 @@ class AI42LearnerTest(unittest.TestCase):
         with self.assertRaisesRegex(AI42LearnerError, "trainable_scope"):
             AI42LearnerConfig(trainable_scope="backbone")
 
+    def test_control_kind_scope_excludes_parameter_heads(self) -> None:
+        AI42Learner(self.actor, AI42LearnerConfig(trainable_scope="control_kind_heads"))
+        trainable = {name for name, parameter in self.actor.named_parameters() if parameter.requires_grad}
+        self.assertTrue(trainable)
+        self.assertTrue(all(name.startswith(("control_head.", "kind_head.")) for name in trainable))
+
     @unittest.skipUnless(torch.cuda.is_available(), "CUDA batch-device gate")
     def test_batch_to_cuda_moves_every_tensor_field(self) -> None:
         moved = self.batch().to("cuda")
