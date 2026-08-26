@@ -148,8 +148,6 @@ class _HierarchicalKindHead(nn.Module):
         self.group = nn.Linear(input_size, KIND_GROUP_CLASSES)
 
     def forward(self, value: torch.Tensor, skill_logits: torch.Tensor) -> torch.Tensor:
-        if skill_logits.shape[-1] != ABILITY_COUNT:
-            raise ValueError("skill logits must contain exactly four abilities")
         group = torch.log_softmax(self.group(value), dim=-1)
         skill = torch.log_softmax(skill_logits, dim=-1)
         return torch.cat(

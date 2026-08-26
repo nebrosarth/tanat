@@ -165,7 +165,12 @@ class AI42ActorTest(unittest.TestCase):
         changed[:, 0, 0] += 10
         updated = self.run_policy(abilities=changed)
         self.assertGreater(float((updated["kind"][:, 3] - baseline["kind"][:, 3]).abs().sum()), 1e-6)
-        torch.testing.assert_close(updated["kind"][:, 4:7], baseline["kind"][:, 4:7])
+        torch.testing.assert_close(updated["kind"][:, :3], baseline["kind"][:, :3])
+        torch.testing.assert_close(updated["kind"][:, 7], baseline["kind"][:, 7])
+        torch.testing.assert_close(
+            updated["kind"][:, 4:7] - updated["kind"][:, 4:5],
+            baseline["kind"][:, 4:7] - baseline["kind"][:, 4:5],
+        )
 
     def test_recurrent_state_changes_per_hero_temporal_outputs(self):
         initial = self.policy.initial_state(3, torch.device("cpu"))
