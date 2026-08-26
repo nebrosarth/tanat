@@ -20,6 +20,7 @@ class _Value:
 
 class _Session:
     prefer_hold = False
+    kind = 3
 
     def get_inputs(self):
         return [_Value(name) for name in ACTOR_INPUT_NAMES]
@@ -36,7 +37,7 @@ class _Session:
         else:
             control[-1, CONTROL_CANCEL] = 20
         kind = np.zeros((batch, ACTION_KINDS), dtype=np.float32)
-        kind[:, 3] = 10
+        kind[:, self.kind] = 10
         target = np.zeros((batch, ACTION_KINDS, MAX_ENTITIES), dtype=np.float32)
         target[:, :, 2] = 10
         offset = np.zeros((batch, ACTION_KINDS, NAVIGATION_OFFSETS), dtype=np.float32)
@@ -118,6 +119,17 @@ class AI42ONNXInferenceTests(unittest.TestCase):
         bad.get_outputs = lambda: [_Value("wrong")]
         with self.assertRaises(ValueError):
             AI42ONNXEvaluationActor(bad, 5, hidden_size=4)
+
+    def test_attack_wire_discards_irrelevant_navigation_logits(self):
+        session = _Session()
+        session.kind = 2
+        actor = AI42ONNXEvaluationActor(session, 5, hidden_size=4)
+        actions, runtime, _ = actor.act([_Observation()], np.arange(5, dtype=np.intp))
+        issued = runtime == 0
+        self.assertTrue(issued.any())
+        self.assertTrue(np.all(actions[issued, 0] == 2))
+        self.assertTrue(np.all(actions[issued, 1] == 2))
+        self.assertTrue(np.all(actions[issued, 2:] == 0))
 
 
 if __name__ == "__main__":

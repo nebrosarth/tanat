@@ -23,6 +23,7 @@ class _FixedActor(torch.nn.Module):
         self.marker = torch.nn.Parameter(torch.zeros(()))
         self.seen_h: list[torch.Tensor] = []
         self.prefer_hold = False
+        self.kind = 3
 
     def initial_state(self, batch: int, device=None, dtype=None):
         dtype = dtype or torch.float32
@@ -41,7 +42,7 @@ class _FixedActor(torch.nn.Module):
         else:
             control[-1, CONTROL_CANCEL] = 20
         kind = torch.zeros((batch, ACTION_KINDS), device=hero.device)
-        kind[:, 3] = 10
+        kind[:, self.kind] = 10
         target = torch.zeros((batch, ACTION_KINDS, MAX_ENTITIES), device=hero.device)
         target[:, :, 2] = 10
         offset = torch.zeros((batch, ACTION_KINDS, NAVIGATION_OFFSETS), device=hero.device)
@@ -167,6 +168,19 @@ class AI42EvaluationTests(unittest.TestCase):
         self.assertTrue(torch.equal(actor.seen_h[1], torch.zeros_like(actor.seen_h[1])))
         self.assertTrue(torch.equal(actor.seen_h[2], torch.zeros_like(actor.seen_h[2])))
         self.assertTrue(torch.equal(actor.seen_h[3], torch.ones_like(actor.seen_h[3])))
+
+    def test_torch_attack_wire_discards_irrelevant_navigation_logits(self) -> None:
+        actor = _FixedActor()
+        actor.kind = 2
+        evaluator = AI42EvaluationActor(actor, 5, torch.device("cpu"))
+        actions, runtime, _ = evaluator.act(
+            [_Observations()], np.arange(5, dtype=np.intp),
+        )
+        issued = runtime == RUNTIME_CONTROL_ISSUE
+        self.assertTrue(issued.any())
+        self.assertTrue(np.all(actions[issued, 0] == 2))
+        self.assertTrue(np.all(actions[issued, 1] == 2))
+        self.assertTrue(np.all(actions[issued, 2:] == 0))
 
     def test_evaluation_reports_inference_and_environment_phase_profile(self) -> None:
         actor = _FixedActor()

@@ -224,6 +224,9 @@ class AI42EvaluationActor:
             anchors = output["anchor"][rows, kinds].float().argmax(dim=1)
             skills = (kinds >= 3) & (kinds <= 6)
             anchors = torch.where(skills, torch.zeros_like(anchors), anchors)
+            targets = torch.where((kinds >= 2) & (kinds <= 6), targets, torch.zeros_like(targets))
+            offsets = torch.where((kinds == 1) | skills, offsets, torch.zeros_like(offsets))
+            anchors = torch.where(kinds == 1, anchors, torch.zeros_like(anchors))
             actions = torch.stack((kinds, targets, offsets, anchors), dim=1).to(torch.int16)
             actions = torch.where(
                 (runtime_controls == RUNTIME_CONTROL_ISSUE).unsqueeze(1),

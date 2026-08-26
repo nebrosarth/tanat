@@ -195,11 +195,18 @@ def collect_dagger_match(
                 f"native DAgger writer exited {exit_code}: "
                 f"{writer_stderr.decode(errors='replace')}"
             )
-    except BaseException:
+    except BaseException as exc:
         if writer.poll() is None:
             writer.kill()
-            writer.wait()
-        raise
+        writer.wait()
+        if writer.stdout is not None and not writer.stdout.closed:
+            writer_stdout = writer.stdout.read()
+        if writer.stderr is not None and not writer.stderr.closed:
+            writer_stderr = writer.stderr.read()
+        diagnostic = writer_stderr.decode(errors="replace").strip()
+        raise RuntimeError(
+            f"DAgger collection failed: {exc}; native writer: {diagnostic or '<no stderr>'}"
+        ) from exc
     finally:
         for stream in (writer.stdin, writer.stdout, writer.stderr):
             if stream is not None and not stream.closed:

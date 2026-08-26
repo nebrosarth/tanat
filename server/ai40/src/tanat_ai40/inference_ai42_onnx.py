@@ -209,6 +209,12 @@ class AI42ONNXEvaluationActor:
         offsets = output["offset"][rows, kinds].argmax(axis=1)
         anchors = output["anchor"][rows, kinds].argmax(axis=1)
         anchors = np.where(skill_rows, 0, anchors)
+        # Canonical v13 wire: target belongs to attack/skills, local offsets to
+        # move/skills, and semantic anchors to move only. The server ignores
+        # irrelevant bytes, but durable strict replay intentionally does not.
+        targets = np.where((kinds >= 2) & (kinds <= 6), targets, 0)
+        offsets = np.where((kinds == 1) | skill_rows, offsets, 0)
+        anchors = np.where(kinds == 1, anchors, 0)
         control_margin = _top_two_margin(runtime_logits)
         kind_margin = _top_two_margin(np.where(kind_mask, output["kind"], -1e9))
         selected_target_logits = np.where(
