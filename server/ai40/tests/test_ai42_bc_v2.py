@@ -115,6 +115,25 @@ class AI42BCV2Tests(unittest.TestCase):
         self.assertEqual(len(q5_defaults["class_weight_overrides"]["kind"]), 8)
         self.assertEqual(q5_defaults["class_weight_overrides"]["kind"][0], 0.0)
         self.assertEqual(q5_defaults["class_weight_overrides"]["kind"][7], 0.0)
+        q6_path = Path(__file__).resolve().parents[1] / "config" / "ai42_bc_training_q6.json"
+        q6_defaults = train_ai42_bc._training_config_defaults(q6_path)
+        self.assertTrue(q6_defaults["combat_focus"]["enabled"])
+        self.assertEqual(q6_defaults["combat_focus"]["rare_kinds"], [4, 6])
+        self.assertEqual(q6_defaults["learning_rate"], 0.00005)
+        q7_path = Path(__file__).resolve().parents[1] / "config" / "ai42_bc_training_q7.json"
+        q7_defaults = train_ai42_bc._training_config_defaults(q7_path)
+        self.assertEqual(q7_defaults["combat_focus"]["kind_repeats"]["4"], 4)
+        self.assertEqual(q7_defaults["combat_focus"]["kind_repeats"]["2"], 0)
+        self.assertEqual(q7_defaults["learning_rate"], 0.00002)
+        q8_path = Path(__file__).resolve().parents[1] / "config" / "ai42_bc_training_q8.json"
+        q8_defaults = train_ai42_bc._training_config_defaults(q8_path)
+        self.assertEqual(q8_defaults["gradient_accumulation_steps"], 8)
+        self.assertEqual(q8_defaults["combat_focus"]["kind_repeats"]["2"], 1)
+        self.assertEqual(q8_defaults["validation_batches"], 4)
+        q9_path = Path(__file__).resolve().parents[1] / "config" / "ai42_bc_training_q9.json"
+        q9_defaults = train_ai42_bc._training_config_defaults(q9_path)
+        self.assertTrue(q9_defaults["retain_periodic_checkpoints"])
+        self.assertEqual(q9_defaults["checkpoint_interval"], 5)
 
         base = json.loads(q3_path.read_text(encoding="utf-8"))
         malformed = {
@@ -455,6 +474,16 @@ class AI42BCV2Tests(unittest.TestCase):
             self.assertTrue(torch.equal(before_rng, torch.get_rng_state()))
             for name, value in source.state_dict().items():
                 torch.testing.assert_close(target.state_dict()[name], value, atol=0, rtol=0)
+            changed_dataset_manifest = build_learner_manifest(
+                target, target_config, "b" * 64,
+                protocol_version=13, dataset_schema_version="v2", shard_schema_version="s2",
+            )
+            with self.assertRaisesRegex(CheckpointError, "dataset_hash"):
+                load_ai42_model_warm_start(path, target, changed_dataset_manifest)
+            changed_state = load_ai42_model_warm_start(
+                path, target, changed_dataset_manifest, allow_dataset_change=True,
+            )
+            self.assertEqual(changed_state.source_dataset_hash, "a" * 64)
             payload = torch.load(path, map_location="cpu", weights_only=True)
             name = next(iter(payload["model_state_dict"]))
             payload["model_state_dict"][name] = payload["model_state_dict"][name] + 1

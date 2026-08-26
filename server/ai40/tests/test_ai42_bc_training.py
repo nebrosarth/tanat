@@ -102,6 +102,16 @@ class _MixedControllerDataset(_TinyDataset):
         yield f"{split}-000", arrays
 
 
+class _CombatDataset(_TinyDataset):
+    """One rare combat decision followed by ordinary WAIT-only slots."""
+
+    def iter_matches(self, split: str):
+        _, arrays = next(super().iter_matches(split))
+        arrays["teacher_status"][0, 0] = TeacherStatus.ACTION
+        arrays["teacher_action"]["kind"][0, 0] = 4
+        yield f"{split}-000", arrays
+
+
 def _args(output: Path, *extra: str):
     return train_ai42_bc.build_parser().parse_args([
         "--execute", "--device", "cpu", "--dataset", "dummy", "--output", str(output),
@@ -355,6 +365,66 @@ class AI42BCTrainingTests(unittest.TestCase):
             self.assertEqual(
                 full_payload["artifact_hashes"]["optimizer"], resumed_payload["artifact_hashes"]["optimizer"],
             )
+
+    def test_combat_focus_repeats_rare_rows_then_preserves_joint_batch(self) -> None:
+        args = _args(Path("unused"))
+        focus = {
+            "enabled": True,
+            "kinds": [2, 3, 4, 5, 6],
+            "rare_kinds": [4, 6],
+            "focused_repeats": 1,
+            "rare_focused_repeats": 2,
+        }
+        batches = list(train_ai42_bc._iter_plan_batches(
+            _CombatDataset(), ("train-000",), "train", args, torch.device("cpu"),
+            combat_focus=focus,
+        ))
+        # Ten original hero-slot batches plus three focused copies for the
+        # skill-2 row. The fourth batch is the untouched joint source batch.
+        self.assertEqual(len(batches), 13)
+        for batch in batches[:3]:
+            self.assertEqual(batch.supervision_mask.sum().item(), 1)
+            self.assertEqual(batch.teacher_actions[0, 0, 0].item(), 4)
+        self.assertEqual(batches[3].teacher_actions[0, 0, 0].item(), 4)
+        self.assertEqual(batches[3].teacher_status[0, 0].item(), TeacherStatus.ACTION)
+
+        resumed = list(train_ai42_bc._iter_plan_batches(
+            _CombatDataset(), ("train-000",), "train", args, torch.device("cpu"),
+            combat_focus=focus, skip_batches=3, max_batches=1,
+        ))
+        self.assertEqual(len(resumed), 1)
+        torch.testing.assert_close(resumed[0].teacher_actions, batches[3].teacher_actions)
+
+    def test_gradient_accumulation_is_persisted_in_batch_plan(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory)
+            with mock.patch.object(train_ai42_bc, "load_dataset", return_value=_TinyDataset()):
+                report = train_ai42_bc.train(
+                    _args(
+                        output, "--max-steps", "1", "--gradient-accumulation-steps", "2",
+                    ),
+                    clock=lambda: 0.0,
+                )
+            self.assertEqual(report["optimizer_steps"], 1)
+            self.assertEqual(report["batch_plan"]["batch_cursor"], 2)
+            self.assertEqual(report["batch_plan"]["gradient_accumulation_steps"], 2)
+            self.assertEqual(report["gradient_accumulation_steps"], 2)
+
+    def test_periodic_candidates_can_be_retained_for_bounded_selection(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory)
+            with mock.patch.object(train_ai42_bc, "load_dataset", return_value=_TinyDataset()):
+                report = train_ai42_bc.train(
+                    _args(
+                        output, "--max-steps", "1", "--checkpoint-interval", "1",
+                        "--retain-periodic-checkpoints",
+                    ),
+                    clock=lambda: 0.0,
+                )
+            candidate = output / "periodic" / "step-000001.pt"
+            self.assertTrue(candidate.is_file())
+            self.assertEqual(report["batch_plan"]["retained_periodic_checkpoints"], [str(candidate)])
+            self.assertEqual(report["retain_periodic_checkpoints"], True)
 
     def test_validation_probe_is_seeded_hash_ranked_and_stratified(self) -> None:
         dataset = _StratifiedDataset()

@@ -1173,6 +1173,19 @@ class AI42Learner:
     def clip_gradients(self, max_norm: float | None = None) -> float:
         return clip_grad_norm_finite(self.actor.parameters(), self.config.max_gradient_norm if max_norm is None else max_norm)
 
+    def scale_gradients(self, factor: float) -> None:
+        """Scale an accumulated gradient set before clipping/stepping."""
+
+        if isinstance(factor, bool) or not isinstance(factor, (int, float)):
+            raise AI42LearnerError("gradient scale must be numeric")
+        factor = float(factor)
+        if not math.isfinite(factor) or factor <= 0.0:
+            raise AI42LearnerError("gradient scale must be finite and positive")
+        for parameter in self.actor.parameters():
+            if parameter.grad is not None:
+                parameter.grad.mul_(factor)
+                _finite_tensor(parameter.grad, "scaled gradient")
+
     def optimizer_step(self) -> None:
         """Perform the explicitly requested future update after finite checks."""
 
@@ -1578,6 +1591,7 @@ def load_ai42_model_warm_start(
     expected_manifest: Mapping[str, Any],
     *,
     map_location: str | torch.device = "cpu",
+    allow_dataset_change: bool = False,
 ) -> WarmStartState:
     """Restore model weights from a fully validated prior generation only.
 
@@ -1597,7 +1611,11 @@ def load_ai42_model_warm_start(
         raise CheckpointError(f"cannot hash warm-start checkpoint: {exc}") from exc
     artifact = inspect_ai42_checkpoint(source, None, model=model, map_location=map_location)
     source_manifest = dict(artifact.manifest)
+    if not isinstance(allow_dataset_change, bool):
+        raise CheckpointError("allow_dataset_change must be boolean")
     for field in ("protocol_version", "dataset_hash", "dataset_schema_version", "shard_schema_version"):
+        if field == "dataset_hash" and allow_dataset_change:
+            continue
         if field in target or field in source_manifest:
             if source_manifest.get(field) != target.get(field):
                 raise CheckpointError(f"warm-start {field} is incompatible")

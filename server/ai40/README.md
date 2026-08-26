@@ -231,6 +231,34 @@ recovers combat, but it is not deployable. The run-report SHA-256 is
 the diagnostic evaluation SHA-256 is
 `73f33ac99f17d7c98a1d179beb0dc3fb35f603f11e1658ebed7a6fd2715e11a8`.
 
+### Q6-Q9 dataset02 and bounded candidate selection
+
+Dataset02 contains 320 deterministic AI-30 mirror matches under manifest hash
+`f551d9c152f3ed21d1ece0fcf9fd90bfcc82764d0471b02c5751dfe75e29fcc6`.
+Its 647,848 ticks occupy 7.75 GB after native raw-deflate compression. Q6
+proved that repeating one mixed combat mask collapses the policy into ordinary
+attack; Q7's sequential per-kind masks collapsed it back into movement.
+
+Q8/Q9 instead accumulate eight deterministic focused batches into one averaged
+gradient before clipping and stepping. The persisted cursor advances by all
+eight batches only after a successful optimizer step, preserving exact resume
+across deadline interruption. Q9 also retains immutable candidates every five
+steps so the useful transition between movement-only and attack-heavy policies
+is not overwritten by the final checkpoint. The 300-second CUDA run completed
+47 optimizer steps and retained steps 5 through 45.
+
+All nine periodic candidates were screened in 10 side-balanced matches against
+AI-30. Steps 25 and 45 then received the 40-match gate. Step 25 scored `.4375`
+(2 wins, 7 losses, 31 draws). Step 45 scored `.6125` (14 wins, 5 losses,
+21 draws), emitted no invalid actions, and used every skill. Its action mix was
+11.39% move, 81.72% attack, 4.36% skill-2, and 1.22% across skills 1/3/4.
+Checkpoint SHA-256:
+`b2b9fd3c181502da118af0fd2d932c53490ea0284d008259020d17c44d4bb56b`.
+This is the current BC/DAgger seed, not a deployment candidate: its ordinary
+attack rate remains too high and it won only from side 1 in this fixed-side
+evaluation schedule. The next data stage must aggregate policy-reached combat
+states and teacher corrections instead of further tuning global class counts.
+
 Run the evaluator from `server` with:
 
 ```powershell

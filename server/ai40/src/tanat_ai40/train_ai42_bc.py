@@ -10,7 +10,7 @@ validation, loss calculation, and exact checkpoint serialization remain in
 from __future__ import annotations
 
 import argparse
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 import hashlib
 import json
 import math
@@ -37,6 +37,8 @@ from .bc_profile_ai42 import (
     save_ai42_profile,
 )
 from .learner_ai42 import (
+    ACTION_STATUS,
+    ATTACK_KIND,
     AI42Batch,
     AI42Learner,
     AI42LearnerConfig,
@@ -44,6 +46,7 @@ from .learner_ai42 import (
     HEAD_CLASS_COUNTS,
     HEAD_NAMES,
     LossResult,
+    SKILL_KINDS,
     build_learner_manifest,
     inspect_ai42_checkpoint,
     iter_ai42_dataset_batches,
@@ -68,10 +71,92 @@ GATE_HEAD_ACCURACY_FLOOR = 0.01
 DEFAULT_HEAD_WEIGHTS = {
     "control": 1.0, "kind": 1.0, "target": 1.0, "offset": 1.0, "anchor": 1.0,
 }
+DEFAULT_COMBAT_FOCUS = {
+    "enabled": False,
+    "kinds": [ATTACK_KIND, *SKILL_KINDS],
+    "rare_kinds": [4, 6],
+    "focused_repeats": 1,
+    "rare_focused_repeats": 2,
+}
 
 
 class AI42TrainingError(AI42LearnerError):
     """Raised for an invalid or unsuccessful executable BC run."""
+
+
+def validate_combat_focus(value: Any) -> dict[str, Any]:
+    """Validate the deterministic combat-focused recurrent curriculum."""
+
+    if value is None:
+        value = DEFAULT_COMBAT_FOCUS
+    required = set(DEFAULT_COMBAT_FOCUS)
+    optional = {"kind_repeats"}
+    if not isinstance(value, Mapping) or not required.issubset(value) or set(value) - required - optional:
+        raise AI42TrainingError(
+            "training.combat_focus must contain exactly "
+            + ", ".join(sorted(DEFAULT_COMBAT_FOCUS)),
+        )
+    enabled = value["enabled"]
+    if not isinstance(enabled, bool):
+        raise AI42TrainingError("training.combat_focus.enabled must be boolean")
+
+    normalized_lists: dict[str, list[int]] = {}
+    allowed = {ATTACK_KIND, *SKILL_KINDS}
+    for name in ("kinds", "rare_kinds"):
+        raw = value[name]
+        if not isinstance(raw, (list, tuple)) or isinstance(raw, (str, bytes)):
+            raise AI42TrainingError(f"training.combat_focus.{name} must be an integer list")
+        if any(isinstance(item, bool) or not isinstance(item, int) for item in raw):
+            raise AI42TrainingError(f"training.combat_focus.{name} must be an integer list")
+        values = [int(item) for item in raw]
+        if len(set(values)) != len(values) or any(item not in allowed for item in values):
+            raise AI42TrainingError(
+                f"training.combat_focus.{name} must contain unique attack/skill kinds",
+            )
+        normalized_lists[name] = sorted(values)
+    if enabled and not normalized_lists["kinds"]:
+        raise AI42TrainingError("enabled training.combat_focus.kinds cannot be empty")
+    if not set(normalized_lists["rare_kinds"]).issubset(normalized_lists["kinds"]):
+        raise AI42TrainingError("training.combat_focus.rare_kinds must be a subset of kinds")
+
+    repeats: dict[str, int] = {}
+    for name in ("focused_repeats", "rare_focused_repeats"):
+        raw = value[name]
+        if isinstance(raw, bool) or not isinstance(raw, int) or raw < 0 or raw > 8:
+            raise AI42TrainingError(f"training.combat_focus.{name} must be an integer in [0, 8]")
+        repeats[name] = raw
+    if enabled and repeats["focused_repeats"] < 1:
+        raise AI42TrainingError("enabled training.combat_focus.focused_repeats must be positive")
+    normalized = {"enabled": enabled, **normalized_lists, **repeats}
+    if "kind_repeats" in value:
+        raw_kind_repeats = value["kind_repeats"]
+        if not isinstance(raw_kind_repeats, Mapping):
+            raise AI42TrainingError("training.combat_focus.kind_repeats must be a mapping")
+        expected_keys = {str(kind) for kind in normalized_lists["kinds"]}
+        if set(raw_kind_repeats) != expected_keys:
+            raise AI42TrainingError(
+                "training.combat_focus.kind_repeats must contain every focused kind exactly once",
+            )
+        kind_repeats: dict[str, int] = {}
+        for key in sorted(raw_kind_repeats, key=int):
+            raw = raw_kind_repeats[key]
+            if isinstance(raw, bool) or not isinstance(raw, int) or raw < 0 or raw > 8:
+                raise AI42TrainingError(
+                    f"training.combat_focus.kind_repeats[{key!r}] must be an integer in [0, 8]",
+                )
+            kind_repeats[key] = raw
+        if enabled and not any(kind_repeats.values()):
+            raise AI42TrainingError("enabled training.combat_focus.kind_repeats cannot be all zero")
+        normalized["kind_repeats"] = kind_repeats
+    return normalized
+
+
+def combat_focus_hash(value: Mapping[str, Any] | None) -> str:
+    normalized = validate_combat_focus(value)
+    encoded = json.dumps(
+        normalized, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
 
 
 def validate_head_weights(value: Any) -> dict[str, float]:
@@ -312,7 +397,10 @@ def _training_config_defaults(path: Path) -> dict[str, Any]:
     required_training = {
         "seed", "max_optimizer_seconds", "max_steps", "epochs", "validation_batches", "validation_epsilon",
     }
-    optional_training = {"checkpoint_interval", "validation_matches"}
+    optional_training = {
+        "checkpoint_interval", "validation_matches", "combat_focus", "gradient_accumulation_steps",
+        "retain_periodic_checkpoints",
+    }
     if not isinstance(training, dict) or not required_training.issubset(training) or set(training) - required_training - optional_training:
         raise AI42LearnerError("training config.training is invalid")
     raw_overrides = learner.get("class_weight_overrides", {})
@@ -320,6 +408,7 @@ def _training_config_defaults(path: Path) -> dict[str, Any]:
         raise AI42LearnerError("training config learner.class_weight_overrides must be a mapping")
     normalized_overrides = validate_class_weight_overrides(raw_overrides)
     normalized_head_weights = validate_head_weights(learner.get("head_weights"))
+    normalized_combat_focus = validate_combat_focus(training.get("combat_focus"))
     return {
         **model,
         **recurrent,
@@ -332,6 +421,9 @@ def _training_config_defaults(path: Path) -> dict[str, Any]:
         },
         "head_weights": normalized_head_weights,
         **training,
+        "combat_focus": normalized_combat_focus,
+        "gradient_accumulation_steps": training.get("gradient_accumulation_steps", 1),
+        "retain_periodic_checkpoints": training.get("retain_periodic_checkpoints", False),
     }
 
 
@@ -358,6 +450,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--weight-decay", type=float, default=1e-4)
     parser.add_argument("--class-weight-overrides", dest="class_weight_overrides", default=None, help=argparse.SUPPRESS)
     parser.add_argument("--head-weights", dest="head_weights", default=dict(DEFAULT_HEAD_WEIGHTS), help=argparse.SUPPRESS)
+    parser.add_argument("--combat-focus", dest="combat_focus", default=dict(DEFAULT_COMBAT_FOCUS), help=argparse.SUPPRESS)
+    parser.add_argument("--gradient-accumulation-steps", type=int, default=1, help="number of deterministic focused batches combined into one optimizer step")
+    parser.add_argument("--retain-periodic-checkpoints", action="store_true", help="retain immutable step checkpoints for bounded candidate selection")
     parser.add_argument("--seed", type=int, default=DEFAULT_SEED)
     parser.add_argument("--max-optimizer-seconds", type=float, default=MAX_OPTIMIZER_SECONDS)
     parser.add_argument("--max-steps", type=int, default=1, help="total optimizer step target, including resumed steps")
@@ -370,6 +465,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--profile", type=Path, help="frozen AI-42 class-balance profile JSON")
     parser.add_argument("--warm-start", "--warm-start-from", dest="warm_start", type=Path, help="validated accepted generation; restore model weights only")
     parser.add_argument("--warm-start-accepted", action="store_true", help="use the accepted generation in the output run directory")
+    parser.add_argument("--allow-warm-start-dataset-change", action="store_true", help="allow a fully validated compatible model warm start from another immutable dataset")
     parser.add_argument("--execute", action="store_true", help="explicitly authorize optimizer updates")
     return parser
 
@@ -402,6 +498,9 @@ def _seed_everything(seed: int) -> None:
     np.random.seed(seed % (1 << 32))
     torch.manual_seed(seed)
     if torch.cuda.is_available():
+        # Deterministic CuBLAS kernels require this before the first CUDA GEMM.
+        # Keep training reproducible without a workstation shell-profile hook.
+        os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
         torch.cuda.manual_seed_all(seed)
     torch.use_deterministic_algorithms(True)
     if torch.backends.cudnn.is_available():
@@ -438,12 +537,23 @@ def _validate_training_args(args: argparse.Namespace) -> None:
     if not math.isclose(float(args.class_balance_power), CLASS_BALANCE_POWER, rel_tol=0.0, abs_tol=0.0):
         raise AI42TrainingError("AI-42 BC-v2 freezes class-balance-power at 0.5")
     validate_head_weights(args.head_weights)
+    args.combat_focus = validate_combat_focus(args.combat_focus)
+    if (
+        isinstance(args.gradient_accumulation_steps, bool)
+        or not isinstance(args.gradient_accumulation_steps, int)
+        or not 1 <= args.gradient_accumulation_steps <= 64
+    ):
+        raise AI42TrainingError("gradient_accumulation_steps must be an integer in [1, 64]")
+    if not isinstance(args.retain_periodic_checkpoints, bool):
+        raise AI42TrainingError("retain_periodic_checkpoints must be boolean")
     if args.resume is not None and (args.warm_start is not None or args.warm_start_accepted):
         raise AI42TrainingError("--warm-start and --resume are mutually exclusive")
     if args.checkpoint is not None and (args.warm_start is not None or args.warm_start_accepted):
         raise AI42TrainingError("--warm-start and --checkpoint are mutually exclusive")
     if args.warm_start_accepted and args.output is None:
         raise AI42TrainingError("--warm-start-accepted requires --output/--run-dir")
+    if args.allow_warm_start_dataset_change and args.warm_start is None and not args.warm_start_accepted:
+        raise AI42TrainingError("--allow-warm-start-dataset-change requires a warm start")
 
 
 def _sha256_file(path: Path) -> str:
@@ -570,29 +680,71 @@ def _iter_plan_batches(
     *,
     max_batches: int | None = None,
     skip_batches: int = 0,
+    combat_focus: Mapping[str, Any] | None = None,
 ):
     if skip_batches < 0:
         raise AI42TrainingError("skip_batches must be non-negative")
     view = _OrderedDatasetView(dataset, match_ids, split)
     eligible_index = 0
     yielded = 0
-    for batch in iter_ai42_dataset_batches(
+    focus = validate_combat_focus(combat_focus)
+
+    def variants(batch: AI42Batch) -> tuple[AI42Batch, ...]:
+        if not focus["enabled"]:
+            return (batch,)
+        action_rows = batch.teacher_status == ACTION_STATUS
+        if "kind_repeats" in focus:
+            focused_batches: list[AI42Batch] = []
+            ordered = sorted(
+                ((int(kind), repeats) for kind, repeats in focus["kind_repeats"].items()),
+                key=lambda item: (-item[1], item[0]),
+            )
+            for kind, repeats in ordered:
+                if repeats < 1:
+                    continue
+                focused_mask = (
+                    batch.loss_mask & action_rows & (batch.teacher_actions[..., 0] == kind)
+                )
+                if bool(focused_mask.any()):
+                    focused = replace(batch, loss_mask=focused_mask)
+                    focused_batches.extend((focused,) * repeats)
+            return (*focused_batches, batch)
+        kind_rows = torch.zeros_like(action_rows, dtype=torch.bool)
+        for kind in focus["kinds"]:
+            kind_rows |= batch.teacher_actions[..., 0] == kind
+        focused_mask = batch.loss_mask & action_rows & kind_rows
+        if not bool(focused_mask.any()):
+            return (batch,)
+        focused = replace(batch, loss_mask=focused_mask)
+        repeats = int(focus["focused_repeats"])
+        rare_rows = torch.zeros_like(action_rows, dtype=torch.bool)
+        for kind in focus["rare_kinds"]:
+            rare_rows |= batch.teacher_actions[..., 0] == kind
+        if bool((focused_mask & rare_rows).any()):
+            repeats += int(focus["rare_focused_repeats"])
+        # Focused copies retain the complete recurrent observation sequence;
+        # only their supervised rows are restricted. The original joint batch
+        # always follows, preventing combat recovery from erasing movement.
+        return (*((focused,) * repeats), batch)
+
+    for source_batch in iter_ai42_dataset_batches(
         view, split=split, sequence_length=args.sequence_length, batch_size=args.batch_size,
     ):
         # Count only batches with effective ACTION/WAIT/HOLD/CANCEL rows. A
         # deterministic dataset can begin with UNAVAILABLE-only controller
         # slots; those batches are not optimizer examples and must not consume
         # the persisted resume cursor.
-        if not bool(batch.supervision_mask.any()):
-            continue
-        if eligible_index < skip_batches:
+        for batch in variants(source_batch):
+            if not bool(batch.supervision_mask.any()):
+                continue
+            if eligible_index < skip_batches:
+                eligible_index += 1
+                continue
+            if max_batches is not None and yielded >= max_batches:
+                return
             eligible_index += 1
-            continue
-        if max_batches is not None and yielded >= max_batches:
-            break
-        eligible_index += 1
-        yielded += 1
-        yield batch.to(device)
+            yielded += 1
+            yield batch.to(device)
 
 
 def _batch_plan(dataset: Any, args: argparse.Namespace) -> dict[str, Any]:
@@ -602,6 +754,7 @@ def _batch_plan(dataset: Any, args: argparse.Namespace) -> dict[str, Any]:
     if not train_match_ids or not validation_match_ids:
         raise AI42TrainingError("validated dataset must contain train and validation probe matches")
     train_probe_match_ids = train_match_ids[:1]
+    focus = validate_combat_focus(args.combat_focus)
     payload = {
         "version": BATCH_PLAN_VERSION,
         "seed": args.seed,
@@ -609,6 +762,9 @@ def _batch_plan(dataset: Any, args: argparse.Namespace) -> dict[str, Any]:
         "batch_size": args.batch_size,
         "train_match_ids": list(train_match_ids),
         "validation_match_ids": list(validation_match_ids),
+        "combat_focus": focus,
+        "combat_focus_hash": combat_focus_hash(focus),
+        "gradient_accumulation_steps": args.gradient_accumulation_steps,
     }
     digest = hashlib.sha256(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
     validation_digest = hashlib.sha256(
@@ -1162,6 +1318,8 @@ def train(args: argparse.Namespace, *, clock: Callable[[], float] = time.monoton
         class_weights={head: list(final_class_weights[head]) for head in HEAD_NAMES},
         head_weights=normalized_head_weights,
         head_weights_hash=normalized_head_weights_hash,
+        combat_focus=plan["combat_focus"],
+        combat_focus_hash=plan["combat_focus_hash"],
     )
 
     resume_path = args.resume or args.checkpoint
@@ -1193,6 +1351,7 @@ def train(args: argparse.Namespace, *, clock: Callable[[], float] = time.monoton
             raise AI42TrainingError("--warm-start and resume are mutually exclusive")
         warm_start_state = load_ai42_model_warm_start(
             warm_start_path, actor, manifest, map_location=device,
+            allow_dataset_change=args.allow_warm_start_dataset_change,
         )
     if resume_path is not None:
         if not resume_path.is_file():
@@ -1254,8 +1413,11 @@ def train(args: argparse.Namespace, *, clock: Callable[[], float] = time.monoton
     while global_step < args.max_steps and epoch < args.epochs and not deadline_reached:
         completed_epoch = True
         saw_batch = False
+        accumulation_count = 0
+        accumulation_loss = 0.0
         for batch in _iter_plan_batches(
             dataset, plan["train_match_ids"], "train", args, device, skip_batches=batch_cursor,
+            combat_focus=plan["combat_focus"],
         ):
             saw_batch = True
             if global_step >= args.max_steps:
@@ -1265,7 +1427,12 @@ def train(args: argparse.Namespace, *, clock: Callable[[], float] = time.monoton
                 deadline_reached = True
                 completed_epoch = False
                 break
-            result = learner.backward(batch.to(device), zero_grad=True)
+            result = learner.backward(batch.to(device), zero_grad=accumulation_count == 0)
+            accumulation_count += 1
+            accumulation_loss += _finite_number(result.loss.detach().cpu().item(), "training loss")
+            if accumulation_count < args.gradient_accumulation_steps:
+                continue
+            learner.scale_gradients(1.0 / accumulation_count)
             gradient_norm = learner.clip_gradients()
             # Fail closed: a backward pass that consumes the remaining budget
             # never reaches optimizer.step().
@@ -1277,9 +1444,11 @@ def train(args: argparse.Namespace, *, clock: Callable[[], float] = time.monoton
             learner.optimizer_step()
             run_steps += 1
             global_step += 1
-            batch_cursor += 1
+            batch_cursor += accumulation_count
             gradient_norms.append(_finite_number(gradient_norm, "gradient norm"))
-            training_losses.append(_finite_number(result.loss.detach().cpu().item(), "training loss"))
+            training_losses.append(accumulation_loss / accumulation_count)
+            accumulation_count = 0
+            accumulation_loss = 0.0
             if run_steps % args.checkpoint_interval == 0:
                 periodic_checkpoint_count += 1
                 periodic_extra = {
@@ -1297,7 +1466,17 @@ def train(args: argparse.Namespace, *, clock: Callable[[], float] = time.monoton
                     "head_weights_hash": normalized_head_weights_hash,
                 }
                 checkpoint_started = float(clock())
-                learner.save_checkpoint(latest_path, manifest, step=global_step, epoch=epoch, extra=periodic_extra)
+                if args.retain_periodic_checkpoints:
+                    periodic_path = run_root / "periodic" / f"step-{global_step:06d}.pt"
+                    periodic_path.parent.mkdir(parents=True, exist_ok=True)
+                    learner.save_checkpoint(
+                        periodic_path, manifest, step=global_step, epoch=epoch, extra=periodic_extra,
+                    )
+                    _atomic_copy_file(periodic_path, latest_path)
+                else:
+                    learner.save_checkpoint(
+                        latest_path, manifest, step=global_step, epoch=epoch, extra=periodic_extra,
+                    )
                 periodic_checkpoint_seconds += max(0.0, float(clock()) - checkpoint_started)
             if float(clock()) >= deadline:
                 deadline_reached = True
@@ -1309,6 +1488,12 @@ def train(args: argparse.Namespace, *, clock: Callable[[], float] = time.monoton
                 # with the same deterministic stream contract.
                 completed_epoch = False
                 break
+        if accumulation_count:
+            # A partial accumulation has not changed model/optimizer state and
+            # therefore must not advance the durable stream cursor. This also
+            # makes deadline interruption and exact resume equivalent to an
+            # uninterrupted run.
+            learner.optimizer.zero_grad(set_to_none=True)
         if completed_epoch and (saw_batch or batch_cursor > 0):
             # A periodic checkpoint can be taken immediately after the final
             # batch, before the iterator returns and the epoch is normalized.
@@ -1381,6 +1566,8 @@ def train(args: argparse.Namespace, *, clock: Callable[[], float] = time.monoton
         "class_weight_provenance": class_weight_provenance,
         "head_weights": normalized_head_weights,
         "head_weights_hash": normalized_head_weights_hash,
+        "combat_focus": plan["combat_focus"],
+        "combat_focus_hash": plan["combat_focus_hash"],
         "warm_start": None if warm_start_state is None else {
             "source_path": warm_start_state.source_path,
             "source_file_sha256": warm_start_state.source_file_sha256,
@@ -1389,6 +1576,9 @@ def train(args: argparse.Namespace, *, clock: Callable[[], float] = time.monoton
             "source_model_hash": warm_start_state.source_model_hash,
             "source_model_artifact_hash": warm_start_state.source_model_artifact_hash,
             "source_dataset_hash": warm_start_state.source_dataset_hash,
+            "target_dataset_hash": dataset_hash,
+            "dataset_changed": warm_start_state.source_dataset_hash != dataset_hash,
+            "dataset_change_allowed": bool(args.allow_warm_start_dataset_change),
             "source_step": warm_start_state.source_step,
             "source_epoch": warm_start_state.source_epoch,
             "optimizer_restored": False,
@@ -1480,6 +1670,10 @@ def train(args: argparse.Namespace, *, clock: Callable[[], float] = time.monoton
         "class_weight_provenance": extra["class_weight_provenance"],
         "head_weights": extra["head_weights"],
         "head_weights_hash": extra["head_weights_hash"],
+        "combat_focus": extra["combat_focus"],
+        "combat_focus_hash": extra["combat_focus_hash"],
+        "gradient_accumulation_steps": plan["gradient_accumulation_steps"],
+        "retain_periodic_checkpoints": bool(args.retain_periodic_checkpoints),
         "warm_start": extra["warm_start"],
         "improvement": {
             "epsilon": epsilon,
@@ -1513,6 +1707,12 @@ def train(args: argparse.Namespace, *, clock: Callable[[], float] = time.monoton
             "batch_cursor": batch_cursor,
             "train_match_ids": plan["train_match_ids"],
             "validation_match_ids": plan["validation_match_ids"],
+            "combat_focus": plan["combat_focus"],
+            "combat_focus_hash": plan["combat_focus_hash"],
+            "gradient_accumulation_steps": plan["gradient_accumulation_steps"],
+            "retained_periodic_checkpoints": sorted(
+                str(path) for path in (run_root / "periodic").glob("step-*.pt")
+            ) if args.retain_periodic_checkpoints else [],
         },
         "periodic_checkpoint_seconds": periodic_checkpoint_seconds,
         "periodic_checkpoint_count": periodic_checkpoint_count,
@@ -1610,5 +1810,5 @@ sha256_file = _sha256_file
 
 __all__ = [
     "AI42TrainingError", "DEFAULT_SEED", "GATE_HEAD_ACCURACY_FLOOR", "GATE_LOSS_IMPROVEMENT", "GATE_CONTROL_RECALL_FLOOR", "MAX_OPTIMIZER_SECONDS", "ProbeSummary", "ValidationSummary",
-    "atomic_write_json", "build_parser", "class_weight_overrides_hash", "evaluate_probe", "head_weights_hash", "main", "promotion_gate", "run_training", "sha256_file", "train", "validate_class_weight_overrides", "validate_head_weights",
+    "atomic_write_json", "build_parser", "class_weight_overrides_hash", "combat_focus_hash", "evaluate_probe", "head_weights_hash", "main", "promotion_gate", "run_training", "sha256_file", "train", "validate_class_weight_overrides", "validate_combat_focus", "validate_head_weights",
 ]
