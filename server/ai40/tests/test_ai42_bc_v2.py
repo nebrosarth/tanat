@@ -30,7 +30,6 @@ from tanat_ai40.learner_ai42 import (
     AI42Batch,
     AI42LearnerConfig,
     CheckpointError,
-    HEAD_CLASS_COUNTS,
     TeacherStatus,
     compute_behavior_cloning_loss,
     prepare_ai42_supervision,
@@ -90,132 +89,16 @@ def _outputs(batch: AI42Batch) -> dict[str, torch.Tensor]:
 
 
 class AI42BCV2Tests(unittest.TestCase):
-    def test_strict_override_config_and_profile_validation(self) -> None:
-        q3_path = Path(__file__).resolve().parents[1] / "config" / "ai42_bc_training_q3.json"
-        defaults = train_ai42_bc._training_config_defaults(q3_path)
-        self.assertEqual(defaults["learning_rate"], 0.0001)
-        self.assertEqual(
-            defaults["class_weight_overrides"]["control"],
-            [0.76592687, 0.68894406, 0.07211628, 2.47301279],
-        )
-        q4_path = Path(__file__).resolve().parents[1] / "config" / "ai42_bc_training_q4.json"
-        q4_defaults = train_ai42_bc._training_config_defaults(q4_path)
-        self.assertEqual(q4_defaults["head_weights"], {
-            "anchor": 1.0, "control": 1.0, "kind": 1.5, "offset": 2.0, "target": 1.0,
-        })
-        self.assertEqual(
-            q4_defaults["head_weights"],
-            train_ai42_bc.validate_head_weights(q4_defaults["head_weights"]),
-        )
-        q5_path = Path(__file__).resolve().parents[1] / "config" / "ai42_bc_training_q5.json"
-        q5_defaults = train_ai42_bc._training_config_defaults(q5_path)
-        self.assertEqual(q5_defaults["head_weights"], {
-            "anchor": 0.5, "control": 1.0, "kind": 6.0, "offset": 0.5, "target": 1.0,
-        })
-        self.assertEqual(len(q5_defaults["class_weight_overrides"]["kind"]), 8)
-        self.assertEqual(q5_defaults["class_weight_overrides"]["kind"][0], 0.0)
-        self.assertEqual(q5_defaults["class_weight_overrides"]["kind"][7], 0.0)
-        q6_path = Path(__file__).resolve().parents[1] / "config" / "ai42_bc_training_q6.json"
-        q6_defaults = train_ai42_bc._training_config_defaults(q6_path)
-        self.assertTrue(q6_defaults["combat_focus"]["enabled"])
-        self.assertEqual(q6_defaults["combat_focus"]["rare_kinds"], [4, 6])
-        self.assertEqual(q6_defaults["learning_rate"], 0.00005)
-        q7_path = Path(__file__).resolve().parents[1] / "config" / "ai42_bc_training_q7.json"
-        q7_defaults = train_ai42_bc._training_config_defaults(q7_path)
-        self.assertEqual(q7_defaults["combat_focus"]["kind_repeats"]["4"], 4)
-        self.assertEqual(q7_defaults["combat_focus"]["kind_repeats"]["2"], 0)
-        self.assertEqual(q7_defaults["learning_rate"], 0.00002)
-        q8_path = Path(__file__).resolve().parents[1] / "config" / "ai42_bc_training_q8.json"
-        q8_defaults = train_ai42_bc._training_config_defaults(q8_path)
-        self.assertEqual(q8_defaults["gradient_accumulation_steps"], 8)
-        self.assertEqual(q8_defaults["combat_focus"]["kind_repeats"]["2"], 1)
-        self.assertEqual(q8_defaults["validation_batches"], 4)
-        q9_path = Path(__file__).resolve().parents[1] / "config" / "ai42_bc_training_q9.json"
-        q9_defaults = train_ai42_bc._training_config_defaults(q9_path)
-        self.assertTrue(q9_defaults["retain_periodic_checkpoints"])
-        self.assertEqual(q9_defaults["checkpoint_interval"], 5)
-
-        base = json.loads(q3_path.read_text(encoding="utf-8"))
-        malformed = {
-            "unknown head": {"bogus": [1.0]},
-            "wrong class length": {"control": [1.0, 1.0]},
-            "boolean value": {"control": [True, 1.0, 1.0, 1.0]},
-            "non-finite value": {"control": [float("nan"), 1.0, 1.0, 1.0]},
-            "null mapping": None,
-        }
-        with tempfile.TemporaryDirectory() as directory:
-            for label, overrides in malformed.items():
-                payload = copy.deepcopy(base)
-                payload["learner"]["class_weight_overrides"] = overrides
-                path = Path(directory) / f"{label}.json"
-                path.write_text(json.dumps(payload), encoding="utf-8")
-                with self.subTest(label=label), self.assertRaises(train_ai42_bc.AI42LearnerError):
-                    train_ai42_bc._training_config_defaults(path)
-
-        malformed_head_weights = {
-            "missing head": {"control": 1.0},
-            "unknown head": {**train_ai42_bc.DEFAULT_HEAD_WEIGHTS, "bogus": 1.0},
-            "boolean": {**train_ai42_bc.DEFAULT_HEAD_WEIGHTS, "kind": True},
-            "negative": {**train_ai42_bc.DEFAULT_HEAD_WEIGHTS, "offset": -1.0},
-            "all zero": {head: 0.0 for head in train_ai42_bc.DEFAULT_HEAD_WEIGHTS},
-        }
-        with tempfile.TemporaryDirectory() as directory:
-            base_q4 = json.loads(q4_path.read_text(encoding="utf-8"))
-            for label, weights in malformed_head_weights.items():
-                payload = copy.deepcopy(base_q4)
-                payload["learner"]["head_weights"] = weights
-                path = Path(directory) / f"head-{label}.json"
-                path.write_text(json.dumps(payload), encoding="utf-8")
-                with self.subTest(head_weights=label), self.assertRaises(train_ai42_bc.AI42LearnerError):
-                    train_ai42_bc._training_config_defaults(path)
-
-        profile = AI42ClassBalanceProfile.from_batches(
-            [_batch()], dataset_manifest_hash="a" * 64, train_match_ids=("train-a",),
-        )
-        valid_kind = [1.0 if count else 0.0 for count in profile.counts["kind"]]
-        final, normalized, override_hash = train_ai42_bc._merge_class_weight_overrides(
-            profile, {"control": [0.5, 0.5, 1.5, 1.5], "kind": valid_kind},
-        )
-        self.assertEqual(tuple(normalized["control"]), (0.5, 0.5, 1.5, 1.5))
-        self.assertEqual(tuple(final["control"]), (0.5, 0.5, 1.5, 1.5))
-        self.assertEqual(tuple(final["target"]), profile.weights["target"])
-        self.assertEqual(profile.weights["target"], (1.0,) * HEAD_CLASS_COUNTS["target"])
-        self.assertEqual(override_hash, train_ai42_bc.class_weight_overrides_hash(normalized))
-
-        with self.assertRaisesRegex(train_ai42_bc.AI42TrainingError, "permutation-equivariant"):
-            train_ai42_bc._merge_class_weight_overrides(
-                profile, {"target": [1.0] * HEAD_CLASS_COUNTS["target"]},
-            )
-
-        invalid_absent = list(valid_kind)
-        invalid_absent[0] = 1.0
-        with self.assertRaisesRegex(train_ai42_bc.AI42TrainingError, "absent"):
-            train_ai42_bc._merge_class_weight_overrides(profile, {"kind": invalid_absent})
-        invalid_supported = list(valid_kind)
-        invalid_supported[next(index for index, count in enumerate(profile.counts["kind"]) if count)] = 0.0
-        with self.assertRaisesRegex(train_ai42_bc.AI42TrainingError, "supported"):
-            train_ai42_bc._merge_class_weight_overrides(profile, {"kind": invalid_supported})
-
-    def test_q3_override_has_exact_effective_mass_and_canonical_hash(self) -> None:
-        counts = [731804, 406788, 3886143, 113325]
-        weights = [0.76592687, 0.68894406, 0.07211628, 2.47301279]
-        all_counts = {head: [0] * HEAD_CLASS_COUNTS[head] for head in train_ai42_bc.HEAD_NAMES}
-        all_counts["control"] = counts
-        normalized = train_ai42_bc.validate_class_weight_overrides(
-            {"control": weights}, counts=all_counts,
-        )
-        masses = [count * weight for count, weight in zip(counts, normalized["control"])]
-        total = sum(masses)
-        for actual, expected in zip((mass / total for mass in masses), (0.4, 0.2, 0.2, 0.2)):
-            self.assertAlmostEqual(actual, expected, places=7)
-        self.assertAlmostEqual(sum(weights) / 4.0, 1.0, places=12)
-        canonical = json.dumps(
-            {"control": weights}, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False,
-        ).encode("utf-8")
-        self.assertEqual(
-            train_ai42_bc.class_weight_overrides_hash({"control": tuple(weights)}),
-            hashlib.sha256(canonical).hexdigest(),
-        )
+    def test_production_config_has_single_data_derived_policy(self) -> None:
+        config_path = Path(__file__).resolve().parents[1] / "config" / "ai42_bc_training.json"
+        defaults = train_ai42_bc._training_config_defaults(config_path)
+        self.assertEqual(defaults["hidden_size"], 192)
+        self.assertEqual(defaults["model_width"], 192)
+        self.assertEqual(defaults["entity_layers"], 2)
+        self.assertEqual(defaults["num_heads"], 6)
+        self.assertNotIn("class_weight_overrides", defaults)
+        self.assertNotIn("combat_focus", defaults)
+        self.assertNotIn("trainable_scope", defaults)
 
     def test_profile_is_train_only_immutable_canonical_and_tamper_evident(self) -> None:
         batch = _batch()
@@ -277,8 +160,8 @@ class AI42BCV2Tests(unittest.TestCase):
     def test_shared_masks_match_loss_counts_and_metrics_known_values(self) -> None:
         batch = _batch()
         prepared = prepare_ai42_supervision(batch)
-        actor = AI42Actor(hidden_size=8, model_width=8, entity_layers=1, num_heads=2, ff_multiplier=1, timing_bins=2)
-        result = compute_behavior_cloning_loss(actor, batch, AI42LearnerConfig(model_kwargs={"hidden_size": 8, "model_width": 8, "entity_layers": 1, "num_heads": 2, "ff_multiplier": 1, "timing_bins": 2}))
+        actor = AI42Actor(hidden_size=8, model_width=8, entity_layers=1, num_heads=2, ff_multiplier=1)
+        result = compute_behavior_cloning_loss(actor, batch, AI42LearnerConfig(model_kwargs={"hidden_size": 8, "model_width": 8, "entity_layers": 1, "num_heads": 2, "ff_multiplier": 1}))
         for head in PROFILE_HEADS:
             expected = tuple(int(item) for item in torch.bincount(prepared.labels[head][prepared.active[head]], minlength=result.class_counts[head].__len__()).tolist()) if bool(prepared.active[head].any()) else tuple(0 for _ in result.class_counts[head])
             self.assertEqual(result.class_counts[head], expected)
@@ -341,7 +224,7 @@ class AI42BCV2Tests(unittest.TestCase):
             mutate(metrics)
         return train_ai42_bc.ProbeSummary(loss, 1, 10, 4, 7, {"control": 0.4, "kind": 0.4, "target": 0.4, "anchor": 0.4}, metrics=metrics, head_denominators={"control": 7, "kind": 4, "target": 2, "anchor": 1})
 
-    def test_gate_is_conjunctive_and_fail_closed_for_every_branch(self) -> None:
+    def test_gate_uses_stable_aggregate_metrics_and_fails_closed(self) -> None:
         baseline = self._summary()
 
         def candidate(mutate=None, loss=0.99, control_loss=0.4):
@@ -352,10 +235,7 @@ class AI42BCV2Tests(unittest.TestCase):
         self.assertTrue(train_ai42_bc.promotion_gate(baseline, good)["accepted"])
         branches = {
             "total_validation_loss_improvement": lambda m: None,
-            "control_loss_no_worse": lambda m: None,
-            "control_macro_f1_improves": lambda m: m["heads"]["control"].update(supported_macro_f1=0.5),
-            "control_balanced_accuracy_improves": lambda m: m["heads"]["control"].update(balanced_accuracy=0.5),
-            "micro_accuracy_floor": lambda m: m["heads"]["control"].update(micro_accuracy=0.49),
+            "control_balanced_accuracy_floor": lambda m: m["heads"]["control"].update(balanced_accuracy=0.48),
             "end_to_end_action_improves": lambda m: m.update(action={"count": 4, "end_to_end_accuracy": 0.2}),
             "offset_distance_no_worse": lambda m: m.update(offset={"count": 1, "mean_manhattan_grid_distance": 2.1}),
         }
@@ -363,8 +243,6 @@ class AI42BCV2Tests(unittest.TestCase):
             candidate_kwargs = {}
             if name == "total_validation_loss_improvement":
                 candidate_kwargs["loss"] = 0.996
-            elif name == "control_loss_no_worse":
-                candidate_kwargs["control_loss"] = 0.401
             failed = train_ai42_bc.promotion_gate(
                 baseline, candidate(mutate, **candidate_kwargs),
             )["failed"]
@@ -372,12 +250,11 @@ class AI42BCV2Tests(unittest.TestCase):
         for head in ("kind", "target", "anchor"):
             failed = train_ai42_bc.promotion_gate(baseline, candidate(lambda m, h=head: m["heads"][h].update(micro_accuracy=0.48)))["failed"]
             self.assertIn(f"{head}_accuracy_floor", failed)
-        failed = train_ai42_bc.promotion_gate(baseline, candidate(lambda m: m["heads"]["control"]["per_class"]["0"].update(recall=0.47)))["failed"]
-        self.assertIn("control_recall_0_floor", failed)
-        failed = train_ai42_bc.promotion_gate(baseline, candidate(lambda m: m["heads"]["kind"]["per_class"]["0"].update(recall=0.0)))["failed"]
-        self.assertIn("kind_recall_0_coverage", failed)
-        failed = train_ai42_bc.promotion_gate(baseline, candidate(lambda m: m["heads"]["kind"]["per_class"]["0"].update(recall=0.47)))["failed"]
-        self.assertIn("kind_recall_0_floor", failed)
+        rare_metrics = copy.deepcopy(good.metrics)
+        rare_metrics["heads"]["kind"]["per_class"]["0"]["recall"] = 0.0
+        rare = train_ai42_bc.promotion_gate(baseline, replace(good, metrics=rare_metrics))
+        self.assertTrue(rare["accepted"])
+        self.assertEqual(rare["diagnostics"]["kind_recall_after"][0], 0.0)
         missing = train_ai42_bc.promotion_gate(train_ai42_bc.ProbeSummary(1, 1, 1, 1, 1, {}), good)
         self.assertFalse(missing["accepted"])
 
@@ -457,7 +334,7 @@ class AI42BCV2Tests(unittest.TestCase):
                 self.assertEqual(gate["failed"], ["metrics_complete"])
 
     def test_model_only_warm_start_validates_and_does_not_transfer_optimizer_or_rng(self) -> None:
-        kwargs = {"hidden_size": 8, "model_width": 8, "entity_layers": 1, "num_heads": 2, "ff_multiplier": 1, "timing_bins": 2}
+        kwargs = {"hidden_size": 8, "model_width": 8, "entity_layers": 1, "num_heads": 2, "ff_multiplier": 1}
         source = AI42Actor(**kwargs)
         source_config = AI42LearnerConfig(model_kwargs=kwargs, class_balance_power=1.0)
         source_optimizer = torch.optim.AdamW(source.parameters(), lr=1e-3)

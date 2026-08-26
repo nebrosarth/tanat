@@ -70,31 +70,27 @@ type ModelConfig struct {
 	EntityLayers int
 	NumHeads     int
 	FFMultiplier int
-	TimingBins   int
 }
 
 // LearnerConfig is the worker's no-update learner configuration. ClassWeights
 // are always populated from the verified train-only profile.
 type LearnerConfig struct {
-	LearningRate         float64
-	WeightDecay          float64
-	ClassBalancePower    float64
-	MaxGradientNorm      float64
-	TrainableScope       string
-	HeadWeights          map[string]float64
-	ClassWeights         map[string][]float64
-	ClassWeightOverrides map[string][]float64
+	LearningRate      float64
+	WeightDecay       float64
+	ClassBalancePower float64
+	MaxGradientNorm   float64
+	HeadWeights       map[string]float64
+	ClassWeights      map[string][]float64
 }
 
-// Config is the strict native preflight configuration. Training controls in a
-// Q3 config are parsed for compatibility but are never used to authorize an
-// optimizer update.
+// Config is the strict native preflight view of the production training
+// configuration. Training controls never authorize an optimizer update here.
 type Config struct {
 	ProtocolVersion int
 	Model           ModelConfig
 	SequenceLength  int
 	BatchSize       int
-	// ValidationProbeLimit follows the Q3 trainer: an explicit
+	// ValidationProbeLimit follows the trainer: an explicit
 	// validation_matches value wins, otherwise validation_batches is used.
 	// Zero means retain every validated match (the validation-only config has
 	// no trainer sampling limit).

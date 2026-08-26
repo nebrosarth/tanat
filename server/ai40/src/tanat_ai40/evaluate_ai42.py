@@ -67,7 +67,7 @@ def _file_sha256(path: Path) -> str:
 def _model_kwargs(defaults: Mapping[str, Any]) -> dict[str, int]:
     names = (
         "hidden_size", "model_width", "entity_layers", "num_heads",
-        "ff_multiplier", "timing_bins",
+        "ff_multiplier",
     )
     return {name: int(defaults[name]) for name in names}
 

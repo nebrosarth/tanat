@@ -81,8 +81,6 @@ class AI42ActorONNXWrapper(nn.Module):
             output["target"],
             output["offset"],
             output["anchor"],
-            output["timing"],
-            output["timing_aux"],
             output["h"],
             output["c"],
         )
@@ -432,11 +430,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--manifest", type=Path, help="expected manifest JSON")
     parser.add_argument("--manifest-output", type=Path)
-    parser.add_argument("--hidden-size", type=int, default=384)
-    parser.add_argument("--model-width", type=int, default=384)
-    parser.add_argument("--entity-layers", type=int, default=4)
-    parser.add_argument("--num-heads", type=int, default=8)
-    parser.add_argument("--timing-bins", type=int, default=4)
+    parser.add_argument("--hidden-size", type=int, default=192)
+    parser.add_argument("--model-width", type=int, default=192)
+    parser.add_argument("--entity-layers", type=int, default=2)
+    parser.add_argument("--num-heads", type=int, default=6)
     parser.add_argument("--opset", type=int, default=18)
     return parser
 
@@ -451,7 +448,6 @@ def main(argv: Sequence[str] | None = None) -> AI42ExportResult:
         model_width=args.model_width,
         entity_layers=args.entity_layers,
         num_heads=args.num_heads,
-        timing_bins=args.timing_bins,
     )
     actor.eval()
     if args.checkpoint is not None:

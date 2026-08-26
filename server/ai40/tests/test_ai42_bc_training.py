@@ -120,21 +120,11 @@ class _ControllerFilteredDataset(_MixedControllerDataset):
         yield match_id, arrays
 
 
-class _CombatDataset(_TinyDataset):
-    """One rare combat decision followed by ordinary WAIT-only slots."""
-
-    def iter_matches(self, split: str):
-        _, arrays = next(super().iter_matches(split))
-        arrays["teacher_status"][0, 0] = TeacherStatus.ACTION
-        arrays["teacher_action"]["kind"][0, 0] = 4
-        yield f"{split}-000", arrays
-
-
 def _args(output: Path, *extra: str):
     return train_ai42_bc.build_parser().parse_args([
         "--execute", "--device", "cpu", "--dataset", "dummy", "--output", str(output),
         "--hidden-size", "8", "--model-width", "8", "--entity-layers", "1",
-        "--num-heads", "2", "--ff-multiplier", "1", "--timing-bins", "2",
+        "--num-heads", "2", "--ff-multiplier", "1",
         "--sequence-length", "1", "--batch-size", "1", "--epochs", "1",
         "--validation-batches", "1", *extra,
     ])
@@ -185,7 +175,7 @@ def _mock_probe_summary(loss: float, control_loss: float | None = None) -> train
 
 
 class AI42BCTrainingTests(unittest.TestCase):
-    def test_promotion_rejects_zero_recall_for_supported_action_kind(self) -> None:
+    def test_promotion_reports_zero_rare_recall_without_overfitting_gate(self) -> None:
         baseline = _mock_probe_summary(1.0)
         candidate = _mock_probe_summary(0.5)
         baseline.metrics["heads"]["kind"]["per_class"]["1"]["support"] = 0
@@ -195,8 +185,8 @@ class AI42BCTrainingTests(unittest.TestCase):
         candidate.metrics["heads"]["kind"]["per_class"]["2"]["support"] = 1
         candidate.metrics["heads"]["kind"]["per_class"]["2"]["recall"] = 0.0
         gate = train_ai42_bc.promotion_gate(baseline, candidate)
-        self.assertFalse(gate["accepted"])
-        self.assertIn("kind_recall_2_coverage", gate["failed"])
+        self.assertTrue(gate["accepted"])
+        self.assertEqual(gate["diagnostics"]["kind_recall_after"][2], 0.0)
 
     def test_budget_has_hard_cap_and_fake_clock_stops_before_step(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -222,14 +212,16 @@ class AI42BCTrainingTests(unittest.TestCase):
                  mock.patch.object(train_ai42_bc, "evaluate_probe", side_effect=lambda *_: next(summaries)):
                 report = train_ai42_bc.train(_args(output, "--max-steps", "1"), clock=lambda: 0.0)
             self.assertTrue(report["accepted"])
-            self.assertTrue((output / "accepted.pt").is_file())
-            first_accepted = (output / "accepted.pt").read_bytes()
+            pointer_path = output / train_ai42_bc.ACCEPTED_POINTER_FILENAME
+            pointer_before = pointer_path.read_bytes()
+            pointer = json.loads(pointer_before)
+            accepted_generation = output / pointer["checkpoint"]
+            first_accepted = accepted_generation.read_bytes()
             payload = torch.load(output / "latest.pt", map_location="cpu", weights_only=True)
             self.assertEqual(payload["step"], 1)
             self.assertGreaterEqual(report["optimizer_steps"], 1)
-            self.assertTrue((output / "best.pt").is_file())
             torch.manual_seed(4242)
-            initial = AI42Actor(hidden_size=8, model_width=8, entity_layers=1, num_heads=2, ff_multiplier=1, timing_bins=2)
+            initial = AI42Actor(hidden_size=8, model_width=8, entity_layers=1, num_heads=2, ff_multiplier=1)
             self.assertTrue(any(
                 not torch.equal(payload["model_state_dict"][name], value)
                 for name, value in initial.state_dict().items()
@@ -243,13 +235,13 @@ class AI42BCTrainingTests(unittest.TestCase):
                  mock.patch.object(train_ai42_bc, "evaluate_probe", side_effect=lambda *_: next(summaries)):
                 rejected = train_ai42_bc.train(_args(output, "--max-steps", "1"), clock=lambda: 0.0)
             self.assertFalse(rejected["accepted"])
-            self.assertEqual(first_accepted, (output / "accepted.pt").read_bytes())
+            self.assertEqual(pointer_before, pointer_path.read_bytes())
+            self.assertEqual(first_accepted, accepted_generation.read_bytes())
 
-    def test_class_weight_provenance_is_bound_to_manifest_checkpoint_and_report(self) -> None:
+    def test_profile_class_weights_are_bound_to_manifest_checkpoint_and_report(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             output = Path(directory)
             args = _args(output, "--max-steps", "1")
-            args.class_weight_overrides = {"control": [0.0, 1.0, 0.0, 0.0]}
             args.head_weights = {
                 "control": 1.0, "kind": 1.5, "target": 1.0, "offset": 2.0, "anchor": 1.0,
             }
@@ -264,12 +256,10 @@ class AI42BCTrainingTests(unittest.TestCase):
             payload = torch.load(output / "latest.pt", map_location="cpu", weights_only=True)
             manifest = payload["manifest"]
             extra = payload["extra"]
-            self.assertEqual(manifest["class_weight_overrides"], {"control": [0.0, 1.0, 0.0, 0.0]})
-            self.assertEqual(manifest["class_weight_overrides_hash"], report["class_weight_overrides_hash"])
             self.assertEqual(manifest["class_weights"], report["class_weights"])
-            self.assertEqual(extra["class_weight_overrides_hash"], report["class_weight_overrides_hash"])
             self.assertEqual(extra["class_weights"], report["class_weights"])
             self.assertEqual(extra["class_weight_provenance"]["final"], report["class_weights"])
+            self.assertEqual(extra["class_weight_provenance"]["source"], "train_profile")
             self.assertEqual(manifest["head_weights"], args.head_weights)
             self.assertEqual(manifest["head_weights_hash"], report["head_weights_hash"])
             self.assertEqual(extra["head_weights"], args.head_weights)
@@ -393,35 +383,6 @@ class AI42BCTrainingTests(unittest.TestCase):
         np.testing.assert_array_equal(batches[0].hero_ids[:, 0], np.asarray([5, 6, 7, 8, 9]))
         self.assertEqual(int(batches[0].supervision_mask.sum()), 10)
 
-    def test_combat_focus_repeats_rare_rows_then_preserves_joint_batch(self) -> None:
-        args = _args(Path("unused"))
-        focus = {
-            "enabled": True,
-            "kinds": [2, 3, 4, 5, 6],
-            "rare_kinds": [4, 6],
-            "focused_repeats": 1,
-            "rare_focused_repeats": 2,
-        }
-        batches = list(train_ai42_bc._iter_plan_batches(
-            _CombatDataset(), ("train-000",), "train", args, torch.device("cpu"),
-            combat_focus=focus,
-        ))
-        # Ten original hero-slot batches plus three focused copies for the
-        # skill-2 row. The fourth batch is the untouched joint source batch.
-        self.assertEqual(len(batches), 13)
-        for batch in batches[:3]:
-            self.assertEqual(batch.supervision_mask.sum().item(), 1)
-            self.assertEqual(batch.teacher_actions[0, 0, 0].item(), 4)
-        self.assertEqual(batches[3].teacher_actions[0, 0, 0].item(), 4)
-        self.assertEqual(batches[3].teacher_status[0, 0].item(), TeacherStatus.ACTION)
-
-        resumed = list(train_ai42_bc._iter_plan_batches(
-            _CombatDataset(), ("train-000",), "train", args, torch.device("cpu"),
-            combat_focus=focus, skip_batches=3, max_batches=1,
-        ))
-        self.assertEqual(len(resumed), 1)
-        torch.testing.assert_close(resumed[0].teacher_actions, batches[3].teacher_actions)
-
     def test_gradient_accumulation_is_persisted_in_batch_plan(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             output = Path(directory)
@@ -464,7 +425,7 @@ class AI42BCTrainingTests(unittest.TestCase):
         self.assertEqual({scenarios[match_id] for match_id in first[:2]}, {"alpha", "beta"})
         self.assertNotEqual(first, changed)
 
-    def test_report_failure_does_not_replace_accepted_or_best(self) -> None:
+    def test_report_failure_does_not_replace_accepted_pointer(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             output = Path(directory)
             accepted_summaries = iter((
@@ -474,9 +435,11 @@ class AI42BCTrainingTests(unittest.TestCase):
             with mock.patch.object(train_ai42_bc, "load_dataset", return_value=_TinyDataset()), \
                  mock.patch.object(train_ai42_bc, "evaluate_probe", side_effect=lambda *_: next(accepted_summaries)):
                 train_ai42_bc.train(_args(output, "--max-steps", "1"), clock=lambda: 0.0)
-            accepted_before = (output / "accepted.pt").read_bytes()
-            best_before = (output / "best.pt").read_bytes()
-            pointer_before = (output / train_ai42_bc.ACCEPTED_POINTER_FILENAME).read_bytes()
+            pointer_path = output / train_ai42_bc.ACCEPTED_POINTER_FILENAME
+            pointer_before = pointer_path.read_bytes()
+            pointer = json.loads(pointer_before)
+            generation_path = output / pointer["checkpoint"]
+            generation_before = generation_path.read_bytes()
             improved_summaries = iter((
                 _mock_probe_summary(1.0), _mock_probe_summary(1.0),
                 _mock_probe_summary(0.4), _mock_probe_summary(0.4),
@@ -486,9 +449,8 @@ class AI42BCTrainingTests(unittest.TestCase):
                  mock.patch.object(train_ai42_bc, "_atomic_write_json", side_effect=OSError("injected report failure")):
                 with self.assertRaises(OSError):
                     train_ai42_bc.train(_args(output, "--max-steps", "1"), clock=lambda: 0.0)
-            self.assertEqual(accepted_before, (output / "accepted.pt").read_bytes())
-            self.assertEqual(best_before, (output / "best.pt").read_bytes())
-            self.assertEqual(pointer_before, (output / train_ai42_bc.ACCEPTED_POINTER_FILENAME).read_bytes())
+            self.assertEqual(pointer_before, pointer_path.read_bytes())
+            self.assertEqual(generation_before, generation_path.read_bytes())
 
     def test_corrupt_prior_generation_with_stale_payload_hashes_is_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -523,43 +485,6 @@ class AI42BCTrainingTests(unittest.TestCase):
             self.assertTrue(report["accepted"])
             self.assertTrue(report["improvement"]["prior_accepted_present"])
             self.assertFalse(report["improvement"]["prior_accepted_compatible"])
-
-    def test_second_alias_promotion_failure_keeps_pointer_authoritative(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            output = Path(directory)
-            summaries = iter((
-                _mock_probe_summary(1.0), _mock_probe_summary(1.0),
-                _mock_probe_summary(0.5), _mock_probe_summary(0.5),
-            ))
-            with mock.patch.object(train_ai42_bc, "load_dataset", return_value=_TinyDataset()), \
-                 mock.patch.object(train_ai42_bc, "evaluate_probe", side_effect=lambda *_: next(summaries)):
-                train_ai42_bc.train(_args(output), clock=lambda: 0.0)
-            before = json.loads((output / train_ai42_bc.ACCEPTED_POINTER_FILENAME).read_text(encoding="utf-8"))
-
-            summaries = iter((
-                _mock_probe_summary(1.0), _mock_probe_summary(1.0),
-                _mock_probe_summary(0.4), _mock_probe_summary(0.4),
-            ))
-            original_copy = train_ai42_bc._atomic_copy_file
-            calls = []
-
-            def fail_second(source, destination):
-                calls.append(destination.name)
-                if len(calls) == 2:
-                    raise OSError("injected second promotion failure")
-                return original_copy(source, destination)
-
-            with mock.patch.object(train_ai42_bc, "load_dataset", return_value=_TinyDataset()), \
-                 mock.patch.object(train_ai42_bc, "evaluate_probe", side_effect=lambda *_: next(summaries)), \
-                 mock.patch.object(train_ai42_bc, "_atomic_copy_file", side_effect=fail_second):
-                report = train_ai42_bc.train(_args(output), clock=lambda: 0.0)
-            after = json.loads((output / train_ai42_bc.ACCEPTED_POINTER_FILENAME).read_text(encoding="utf-8"))
-            self.assertTrue(report["accepted"])
-            self.assertEqual(calls, ["accepted.pt", "best.pt"])
-            self.assertGreater(after["generation"], before["generation"])
-            self.assertEqual(report["promotion"]["compatibility_aliases"]["errors"].keys(), {"best"})
-            self.assertEqual(after["sha256"], train_ai42_bc._sha256_file(output / after["checkpoint"]))
-            self.assertEqual(after["bytes"], (output / after["checkpoint"]).stat().st_size)
 
     def test_probe_total_is_weighted_sum_of_head_micro_losses(self) -> None:
         class FakeLearner:

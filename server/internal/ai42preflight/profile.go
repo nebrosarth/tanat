@@ -109,51 +109,6 @@ func profileClassWeights(head string, counts []int) []float64 {
 	return classBalanceWeights(counts)
 }
 
-func mergeClassWeights(profile Profile, overrides map[string][]float64) (map[string][]float64, error) {
-	result := cloneWeights(profile.Weights)
-	for head, values := range overrides {
-		if head == "target" {
-			return nil, fmt.Errorf("target class-weight overrides are forbidden because entity slots are permutation-equivariant")
-		}
-		counts, ok := profile.Counts[head]
-		if !ok {
-			return nil, fmt.Errorf("class-weight override contains unknown head %q", head)
-		}
-		if len(values) != len(counts) {
-			return nil, fmt.Errorf("class-weight override %q has wrong length", head)
-		}
-		supported := 0
-		mean := 0.0
-		for index, value := range values {
-			if !math.IsNaN(value) && !math.IsInf(value, 0) && value >= 0 {
-			} else {
-				return nil, fmt.Errorf("class-weight override %s[%d] is non-finite or negative", head, index)
-			}
-			if counts[index] == 0 && value != 0 {
-				return nil, fmt.Errorf("class-weight override for absent %s class %d must be zero", head, index)
-			}
-			if counts[index] > 0 {
-				if value <= 0 {
-					return nil, fmt.Errorf("class-weight override for supported %s class %d must be positive", head, index)
-				}
-				supported++
-				mean += value
-			}
-		}
-		if supported == 0 {
-			for _, value := range values {
-				if value != 0 {
-					return nil, fmt.Errorf("class-weight override %s must be all zero when absent", head)
-				}
-			}
-		} else if math.Abs(mean/float64(supported)-1) > 2e-6 {
-			return nil, fmt.Errorf("class-weight override %s must be mean-one over supported classes", head)
-		}
-		result[head] = append([]float64(nil), values...)
-	}
-	return result, nil
-}
-
 func loadExistingProfile(raw []byte, expected Profile) (Profile, error) {
 	value, err := decodeCanonical(raw, "profile", 8*1024*1024)
 	if err != nil {

@@ -72,12 +72,10 @@ ACTOR_OUTPUT_NAMES = (
     "target",
     "offset",
     "anchor",
-    "timing",
-    "timing_aux",
     "next_h",
     "next_c",
 )
-ACTION_MASK_NAMES = ("kind", "target", "offset", "anchor", "timing", "timing_aux")
+ACTION_MASK_NAMES = ("kind", "target", "offset", "anchor")
 LIVE_PROFILE_WIRING = False
 
 
@@ -123,14 +121,14 @@ class AI42Manifest:
     """
 
     manifest_version: str = "AI42-manifest-v1"
-    model_version: str = "AI42-model-v1"
-    config_version: str = "AI42-config-v1"
+    model_version: str = "AI42-model-v2"
+    config_version: str = "AI42-config-v2"
     checkpoint_version: str = "AI42-checkpoint-v1"
     observation_version: str = "AI42-observation-v1"
     action_version: str = "AI42-action-v1"
     trajectory_version: str = "AI42-trajectory-v1"
-    model_hash: str = hash_bytes(b"AI42-model-v1")
-    config_hash: str = hash_bytes(b"AI42-config-v1")
+    model_hash: str = hash_bytes(b"AI42-model-v2-direct-ability-kind")
+    config_hash: str = hash_bytes(b"AI42-config-v2-compact")
     checkpoint_hash: str = hash_bytes(b"AI42-checkpoint-v1")
     observation_hash: str = hash_bytes(b"AI42-observation-v1")
     action_hash: str = hash_bytes(b"AI42-action-v1")
@@ -933,13 +931,11 @@ class AI42InferenceAdapter:
                 return None
 
         kind_mask = mask_or_none("kind", 0, ACTION_KINDS)
-        timing_bins = int(getattr(self.actor, "timing_bins", 0))
-        selected = [-1] * 6
+        selected = [-1] * 4
         if (
             kind_mask is not None
             and bool(kind_mask.any())
             and entity_mask is not None
-            and timing_bins > 0
         ):
             kind = int(torch.where(kind_mask)[0][0].item())
             entity_valid = entity_mask.reshape(-1).detach().cpu().bool()
@@ -947,8 +943,6 @@ class AI42InferenceAdapter:
                 mask_or_none("target", kind, entity_valid.numel()),
                 mask_or_none("offset", kind, NAVIGATION_OFFSETS),
                 mask_or_none("anchor", kind, NAVIGATION_ANCHORS),
-                mask_or_none("timing", kind, timing_bins),
-                mask_or_none("timing_aux", kind, timing_bins),
             )
             target_mask = masks_by_head[0]
             if target_mask is not None:
@@ -962,7 +956,7 @@ class AI42InferenceAdapter:
                         if mask is not None
                     ),
                 ]
-        kind, target, offset, anchor, timing, timing_aux = selected
+        kind, target, offset, anchor = selected
         issued = kind >= 0
         action = {
             "control": CONTROL_ISSUE if issued else -1,
@@ -971,8 +965,6 @@ class AI42InferenceAdapter:
             "target": target,
             "offset": offset,
             "anchor": anchor,
-            "timing": timing,
-            "timing_aux": timing_aux,
             "valid": kind >= 0,
             "issued": issued,
             "fallback": True,
@@ -994,16 +986,11 @@ class AI42InferenceAdapter:
             if self._manifest_error is not None:
                 return self._fallback(slot, "manifest_mismatch", masks, entity_mask)
             entity_slots = int(values["entities"].shape[1])
-            timing_bins = int(getattr(self.actor, "timing_bins", 0))
-            if timing_bins < 1:
-                raise InferenceSchemaError("actor timing_bins must be positive")
             # Validate the complete mask schema before invoking the actor.
             _mask_for(masks, "kind", 0, ACTION_KINDS)
             _mask_for(masks, "target", 0, entity_slots)
             _mask_for(masks, "offset", 0, NAVIGATION_OFFSETS)
             _mask_for(masks, "anchor", 0, NAVIGATION_ANCHORS)
-            _mask_for(masks, "timing", 0, timing_bins)
-            _mask_for(masks, "timing_aux", 0, timing_bins)
             old_h, old_c = self.state_store.get(slot)
             kwargs = {name: values[name] for name in ("hero", "abilities", "entities", "global_state", "entity_mask")}
             if "hero_ids" in values:
@@ -1018,7 +1005,7 @@ class AI42InferenceAdapter:
                 raise InferenceSchemaError("actor output must be a mapping")
             allowed_output = {
                 "control", "kind", "target", "offset", "anchor", "direction", "distance",
-                "timing", "timing_aux", "h", "c", "next_h", "next_c",
+                "h", "c", "next_h", "next_c",
             }
             unexpected_output = set(output) - allowed_output
             if unexpected_output:
@@ -1055,8 +1042,6 @@ class AI42InferenceAdapter:
                     "target": -1,
                     "offset": -1,
                     "anchor": -1,
-                    "timing": -1,
-                    "timing_aux": -1,
                     "valid": True,
                     "issued": False,
                     "fallback": False,
@@ -1066,18 +1051,14 @@ class AI42InferenceAdapter:
             target_logits = _output_tensor(output, "target")
             offset_logits = _output_tensor(output, "offset", "direction")
             anchor_logits = _output_tensor(output, "anchor", "distance")
-            timing_logits = _output_tensor(output, "timing")
-            timing_aux_logits = _output_tensor(output, "timing_aux")
             if tuple(kind_logits.shape) != (1, ACTION_KINDS):
                 raise InferenceSchemaError(f"kind logits shape {tuple(kind_logits.shape)} is invalid")
             expected_shapes = {
                 "target": (1, ACTION_KINDS, entity_slots),
                 "offset": (1, ACTION_KINDS, NAVIGATION_OFFSETS),
                 "anchor": (1, ACTION_KINDS, NAVIGATION_ANCHORS),
-                "timing": (1, ACTION_KINDS, int(getattr(self.actor, "timing_bins", timing_logits.shape[-1]))),
-                "timing_aux": (1, ACTION_KINDS, int(getattr(self.actor, "timing_bins", timing_aux_logits.shape[-1]))),
             }
-            for name, value in (("target", target_logits), ("offset", offset_logits), ("anchor", anchor_logits), ("timing", timing_logits), ("timing_aux", timing_aux_logits)):
+            for name, value in (("target", target_logits), ("offset", offset_logits), ("anchor", anchor_logits)):
                 if tuple(value.shape) != expected_shapes[name]:
                     raise InferenceSchemaError(f"{name} logits/state shape {tuple(value.shape)} is invalid")
             kind_mask = _mask_for(masks, "kind", 0, ACTION_KINDS)
@@ -1087,10 +1068,6 @@ class AI42InferenceAdapter:
             target = _masked_argmax(target_logits[0, kind], target_mask, "target")
             offset = _masked_argmax(offset_logits[0, kind], _mask_for(masks, "offset", kind, NAVIGATION_OFFSETS), "offset")
             anchor = _masked_argmax(anchor_logits[0, kind], _mask_for(masks, "anchor", kind, NAVIGATION_ANCHORS), "anchor")
-            timing_size = int(timing_logits.shape[-1])
-            timing = _masked_argmax(timing_logits[0, kind], _mask_for(masks, "timing", kind, timing_size), "timing")
-            timing_aux_size = int(timing_aux_logits.shape[-1])
-            timing_aux = _masked_argmax(timing_aux_logits[0, kind], _mask_for(masks, "timing_aux", kind, timing_aux_size), "timing_aux")
             self.state_store.set(slot, next_h, next_c)
             action = {
                 "control": control,
@@ -1099,8 +1076,6 @@ class AI42InferenceAdapter:
                 "target": target,
                 "offset": offset,
                 "anchor": anchor,
-                "timing": timing,
-                "timing_aux": timing_aux,
                 "valid": True,
                 "issued": True,
                 "fallback": False,

@@ -55,7 +55,6 @@ MAX_MODEL_MEMORY_BYTES = 512 * 1024 * 1024
 
 _MODEL_PARAMETER_BYTES = 4
 _MODEL_MEMORY_COPIES = 8
-_DEFAULT_TIMING_BINS = 4
 
 
 @dataclass(frozen=True, slots=True)
@@ -178,12 +177,12 @@ def _estimated_model_parameters(
     total += 16 * hidden_size * model_width + 4 * hidden_size * hidden_size + 8 * hidden_size
     total += projection(hidden_size, model_width)
     total += linear(hidden_size, CONTROL_CLASSES)
-    total += linear(hidden_size, ACTION_KINDS)
+    total += linear(hidden_size, ACTION_KINDS - ABILITY_COUNT)
+    total += linear(model_width, 1)
     total += ACTION_KINDS * model_width
     total += 2 * linear(model_width, model_width)
     total += linear(model_width, NAVIGATION_OFFSETS)
     total += linear(model_width, NAVIGATION_ANCHORS)
-    total += 2 * linear(model_width, _DEFAULT_TIMING_BINS)
     return total
 
 
@@ -301,8 +300,6 @@ def _check_actor_outputs(
         "target": (batch_size, ACTION_KINDS, MAX_ENTITIES),
         "offset": (batch_size, ACTION_KINDS, NAVIGATION_OFFSETS),
         "anchor": (batch_size, ACTION_KINDS, NAVIGATION_ANCHORS),
-        "timing": (batch_size, ACTION_KINDS, _DEFAULT_TIMING_BINS),
-        "timing_aux": (batch_size, ACTION_KINDS, _DEFAULT_TIMING_BINS),
         "direction": (batch_size, ACTION_KINDS, NAVIGATION_OFFSETS),
         "distance": (batch_size, ACTION_KINDS, NAVIGATION_ANCHORS),
         "h": (batch_size, hidden_size),
@@ -334,10 +331,10 @@ def run_smoke(
     batch_size: int = 10,
     iterations: int = 20,
     backward: bool = True,
-    hidden_size: int = 384,
-    model_width: int = 384,
-    entity_layers: int = 4,
-    num_heads: int = 8,
+    hidden_size: int = 192,
+    model_width: int = 192,
+    entity_layers: int = 2,
+    num_heads: int = 6,
 ) -> SmokeReport:
     _validate_smoke_config(
         device_name=device_name,
@@ -447,10 +444,10 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--batch-size", type=int, default=10)
     parser.add_argument("--iterations", type=int, default=20)
     parser.add_argument("--no-backward", action="store_true")
-    parser.add_argument("--hidden-size", type=int, default=384)
-    parser.add_argument("--model-width", type=int, default=384)
-    parser.add_argument("--entity-layers", type=int, default=4)
-    parser.add_argument("--num-heads", type=int, default=8)
+    parser.add_argument("--hidden-size", type=int, default=192)
+    parser.add_argument("--model-width", type=int, default=192)
+    parser.add_argument("--entity-layers", type=int, default=2)
+    parser.add_argument("--num-heads", type=int, default=6)
     parser.add_argument("--json-output", type=Path)
     return parser
 

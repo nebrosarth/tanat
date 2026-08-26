@@ -1,12 +1,11 @@
 {
   "protocol_version": 13,
   "model": {
-    "hidden_size": 384,
-    "model_width": 384,
-    "entity_layers": 4,
-    "num_heads": 8,
-    "ff_multiplier": 4,
-    "timing_bins": 4
+    "hidden_size": 192,
+    "model_width": 192,
+    "entity_layers": 2,
+    "num_heads": 6,
+    "ff_multiplier": 4
   },
   "recurrent_batch": {
     "sequence_length": 64,

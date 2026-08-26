@@ -83,7 +83,7 @@ try {
     $env:PYTHONPATH = if ($previousPythonPath) {
         "$sourceRoot$([IO.Path]::PathSeparator)$previousPythonPath"
     } else { $sourceRoot }
-    $config = Join-Path $packageRoot "config\ai42_bc_preflight.json"
+    $config = Join-Path $packageRoot "config\ai42_bc_training.json"
     $workerTimeout = "5m"
 
     # Keep every user argument as its own native-process argument. Go owns the

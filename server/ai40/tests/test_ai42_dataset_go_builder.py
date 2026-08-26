@@ -139,7 +139,7 @@ class AI42GoBuilderTests(unittest.TestCase):
                 "--dataset", str(destination), "--device", "cpu",
                 "--hidden-size", "8", "--model-width", "8",
                 "--entity-layers", "1", "--num-heads", "2",
-                "--ff-multiplier", "1", "--timing-bins", "2",
+                "--ff-multiplier", "1",
                 "--sequence-length", "1", "--batch-size", "1",
             ]
             error = io.StringIO()

@@ -115,9 +115,6 @@ func TestTargetProfileWeightsAreUniformAcrossExchangeableSlots(t *testing.T) {
 			t.Fatalf("target slot %d weight=%v, want 1", index, weight)
 		}
 	}
-	if _, err := mergeClassWeights(profile, map[string][]float64{"target": profile.Weights["target"]}); err == nil || !strings.Contains(err.Error(), "permutation-equivariant") {
-		t.Fatalf("target override error=%v", err)
-	}
 }
 
 func TestEligibilityEvidenceDoesNotOvercountControlMasks(t *testing.T) {
@@ -145,38 +142,17 @@ func TestEligibilityEvidenceDoesNotOvercountControlMasks(t *testing.T) {
 	}
 }
 
-func TestLoadConfigRejectsUnknownAndAcceptsQ3Overrides(t *testing.T) {
-	q3 := filepath.Join("..", "..", "ai40", "config", "ai42_bc_training_q3.json")
-	config, err := LoadConfig(q3)
+func TestLoadConfigRejectsUnknownAndAcceptsProductionConfig(t *testing.T) {
+	path := filepath.Join("..", "..", "ai40", "config", "ai42_bc_training.json")
+	config, err := LoadConfig(path)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if config.Learner.LearningRate != 1e-4 || len(config.Learner.ClassWeightOverrides["control"]) != 4 {
-		t.Fatalf("unexpected Q3 config: %+v", config.Learner)
+	if config.Learner.LearningRate != 3e-4 || config.Model.ModelWidth != 192 || config.Model.EntityLayers != 2 {
+		t.Fatalf("unexpected production config: %+v %+v", config.Model, config.Learner)
 	}
-	q4 := filepath.Join("..", "..", "ai40", "config", "ai42_bc_training_q4.json")
-	q4Config, err := LoadConfig(q4)
-	if err != nil {
-		t.Fatal(err)
-	}
-	wantHeadWeights := map[string]float64{"control": 1, "kind": 1.5, "target": 1, "offset": 2, "anchor": 1}
-	if !reflect.DeepEqual(q4Config.Learner.HeadWeights, wantHeadWeights) {
-		t.Fatalf("unexpected Q4 head weights: %#v", q4Config.Learner.HeadWeights)
-	}
-	scopePath := filepath.Join(t.TempDir(), "scope.json")
-	scopeConfig := `{"protocol_version":13,"model":{"hidden_size":8,"model_width":8,"entity_layers":1,"num_heads":2,"ff_multiplier":1,"timing_bins":2},"recurrent_batch":{"sequence_length":4,"batch_size":2},"learner":{"learning_rate":0.00001,"weight_decay":0.0001,"class_balance_power":0.5,"max_gradient_norm":1,"trainable_scope":"supervised_heads"},"training":{"seed":4242,"max_optimizer_seconds":300,"max_steps":1,"epochs":1,"validation_batches":1,"validation_epsilon":0.0001}}`
-	if err := os.WriteFile(scopePath, []byte(scopeConfig), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	scoped, err := LoadConfig(scopePath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if scoped.Learner.TrainableScope != "supervised_heads" {
-		t.Fatalf("unexpected trainable scope: %q", scoped.Learner.TrainableScope)
-	}
-	path := filepath.Join(t.TempDir(), "unknown.json")
-	if err := os.WriteFile(path, []byte(`{"protocol_version":13,"model":{"hidden_size":1,"model_width":1,"entity_layers":1,"num_heads":1,"ff_multiplier":1,"timing_bins":1},"recurrent_batch":{"sequence_length":1,"batch_size":1},"learner":{"class_balance_power":0.5,"max_gradient_norm":1,"timing_loss_enabled":false,"optimizer_step_allowed_in_preflight":false,"unknown":true}}`), 0o600); err != nil {
+	path = filepath.Join(t.TempDir(), "unknown.json")
+	if err := os.WriteFile(path, []byte(`{"protocol_version":13,"model":{"hidden_size":1,"model_width":1,"entity_layers":1,"num_heads":1,"ff_multiplier":1},"recurrent_batch":{"sequence_length":1,"batch_size":1},"learner":{"learning_rate":0.0003,"weight_decay":0.0001,"class_balance_power":0.5,"max_gradient_norm":1,"unknown":true},"training":{"seed":4242,"max_optimizer_seconds":300,"max_steps":1,"epochs":1,"validation_batches":1,"validation_epsilon":0.0001}}`), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := LoadConfig(path); err == nil || !strings.Contains(err.Error(), "unknown") {
@@ -629,7 +605,7 @@ func TestValidateWorkerOutputRejectsProtocolFaults(t *testing.T) {
 func BenchmarkCanonicalWorkerRequest(b *testing.B) {
 	value := map[string]any{
 		"protocol": TorchProtocol, "request_sha256": strings.Repeat("a", 64), "seed": 4242, "device": "cpu",
-		"model":      map[string]any{"hidden_size": 384, "model_width": 384, "entity_layers": 4, "num_heads": 8, "ff_multiplier": 4, "timing_bins": 4},
+		"model":      map[string]any{"hidden_size": 192, "model_width": 192, "entity_layers": 2, "num_heads": 6, "ff_multiplier": 4},
 		"learner":    map[string]any{"learning_rate": 3e-4, "weight_decay": 1e-4, "class_balance_power": 0.5, "max_gradient_norm": 1.0},
 		"warm_start": map[string]any{"path": "warm.pt", "sha256": strings.Repeat("b", 64), "dataset_hash": strings.Repeat("c", 64), "allow_dataset_change": false},
 		"batch":      map[string]any{"kind": "bundle", "path": "batch.json", "sha256": strings.Repeat("c", 64)},

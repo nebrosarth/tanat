@@ -128,14 +128,13 @@ class AI42Actor(nn.Module):
 
     def __init__(
         self,
-        hidden_size: int = 384,
+        hidden_size: int = 192,
         hero_vocab_size: int = 128,
         *,
-        model_width: int = 384,
-        entity_layers: int = 4,
-        num_heads: int = 8,
+        model_width: int = 192,
+        entity_layers: int = 2,
+        num_heads: int = 6,
         ff_multiplier: int = 4,
-        timing_bins: int = 4,
         ability_action_start: int = 3,
     ):
         super().__init__()
@@ -149,8 +148,6 @@ class AI42Actor(nn.Module):
             raise ValueError("model_width must be divisible by num_heads")
         if ff_multiplier < 1:
             raise ValueError("ff_multiplier must be positive")
-        if timing_bins < 1:
-            raise ValueError("timing_bins must be positive")
         if not 0 <= ability_action_start <= ACTION_KINDS - ABILITY_COUNT:
             raise ValueError("ability action range does not fit in ACTION_KINDS")
 
@@ -158,7 +155,6 @@ class AI42Actor(nn.Module):
         self.model_width = model_width
         self.entity_layers = entity_layers
         self.num_heads = num_heads
-        self.timing_bins = timing_bins
         self.ability_action_start = ability_action_start
 
         self.hero_encoder = _Projection(HERO_FEATURES, model_width)
@@ -189,18 +185,17 @@ class AI42Actor(nn.Module):
         # Control is emitted directly from recurrent memory and gates the
         # action-parameter heads during teacher replay and inference.
         self.control_head = nn.Linear(hidden_size, CONTROL_CLASSES)
-        self.kind_head = nn.Linear(hidden_size, ACTION_KINDS)
+        # Non-skill actions are classified from recurrent state.  Each skill
+        # logit is scored from its own ability token plus that same state, so
+        # cooldown/readiness of Skill1 cannot be erased by mean pooling with
+        # the other three abilities.
+        self.kind_head = nn.Linear(hidden_size, ACTION_KINDS - ABILITY_COUNT)
+        self.ability_kind_head = nn.Linear(model_width, 1)
         self.action_kind_embedding = nn.Embedding(ACTION_KINDS, model_width)
         self.target_query = nn.Linear(model_width, model_width)
         self.entity_key = nn.Linear(model_width, model_width)
         self.offset_head = nn.Linear(model_width, NAVIGATION_OFFSETS)
         self.anchor_head = nn.Linear(model_width, NAVIGATION_ANCHORS)
-
-        # These heads are reserved until the timing contract is defined.  They
-        # are emitted for checkpoint/teacher compatibility but are not consumed
-        # by the current action protocol or used as a value estimate.
-        self.timing_head = nn.Linear(model_width, timing_bins)
-        self.timing_aux_head = nn.Linear(model_width, timing_bins)
 
     @property
     def direction_head(self) -> nn.Linear:
@@ -359,19 +354,27 @@ class AI42Actor(nn.Module):
         )
 
         control_logits = self.control_head(h)
-        kind_logits = self.kind_head(h)
+        non_skill_logits = self.kind_head(h)
+        skill_start = self.ability_action_start
+        skill_logits = self.ability_kind_head(
+            action_context[:, skill_start:skill_start + ABILITY_COUNT]
+        ).squeeze(-1)
+        kind_logits = torch.cat(
+            (
+                non_skill_logits[:, :skill_start],
+                skill_logits,
+                non_skill_logits[:, skill_start:],
+            ),
+            dim=-1,
+        )
         offset_logits = self.offset_head(action_context)
         anchor_logits = self.anchor_head(action_context)
-        timing_logits = self.timing_head(action_context)
-        timing_aux_logits = self.timing_aux_head(action_context)
         return {
             "control": control_logits,
             "kind": kind_logits,
             "target": target_logits,
             "offset": offset_logits,
             "anchor": anchor_logits,
-            "timing": timing_logits,
-            "timing_aux": timing_aux_logits,
             # Preserve the AI-41 names while the AI-42 protocol is reserved.
             "direction": offset_logits,
             "distance": anchor_logits,
@@ -399,8 +402,6 @@ def selected_action_logits(
         "target": output["target"][rows, kinds],
         "offset": output["offset"][rows, kinds],
         "anchor": output["anchor"][rows, kinds],
-        "timing": output["timing"][rows, kinds],
-        "timing_aux": output["timing_aux"][rows, kinds],
         "h": output["h"],
         "c": output["c"],
     }

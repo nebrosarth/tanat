@@ -66,7 +66,7 @@ func makeReport(config Config, options Options, generation *ai42dataset.Generati
 		"format": "AI42-bc-run-report-v1", "mode": "preflight", "status": "ok", "ok": true, "accepted": false, "execute_required_for_training": true, "training_implemented": true, "python_fallback": false,
 		"device": device, "seed": int(config.Seed), "deterministic_order": true, "parameter_count": parameterCount, "parameters_unchanged": workerInvariant(workerResult, "parameters_unchanged"),
 		"manifest": manifest, "dataset": dataset, "loss": workerResult["loss"], "checkpoint": workerResult["warm_start"], "warm_start": workerResult["warm_start"], "profile": profilePayload,
-		"class_weight_overrides": overridesAsAny(config.Learner.ClassWeightOverrides), "class_weights": weightsAsAny(weights), "head_weights": headWeights, "head_weights_hash": headWeightsHash, "trainable_scope": config.Learner.TrainableScope, "batch_plan": batchPlan, "hashes": hashes,
+		"class_weights": weightsAsAny(weights), "class_weight_source": "train_profile", "head_weights": headWeights, "head_weights_hash": headWeightsHash, "batch_plan": batchPlan, "hashes": hashes,
 		"torch": workerResult, "native_evidence": nativeEvidence, "replay_scope": ReplayScope, "timings": timings, "invariants": invariants,
 	}
 }
@@ -90,18 +90,6 @@ func countsAsAny(value map[string][]int) map[string]any {
 	}
 	return result
 }
-func overridesAsAny(value map[string][]float64) map[string]any {
-	result := map[string]any{}
-	for head, values := range value {
-		items := make([]any, len(values))
-		for index, item := range values {
-			items[index] = item
-		}
-		result[head] = items
-	}
-	return result
-}
-
 func scalarWeightsAsAny(value map[string]float64) map[string]any {
 	result := make(map[string]any, len(value))
 	for head, weight := range value {

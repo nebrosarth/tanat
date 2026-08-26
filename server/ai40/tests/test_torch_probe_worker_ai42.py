@@ -26,7 +26,6 @@ MODEL = {
     "entity_layers": 1,
     "num_heads": 2,
     "ff_multiplier": 1,
-    "timing_bins": 2,
 }
 LEARNER = {
     "learning_rate": 0.0003,
@@ -86,7 +85,7 @@ def _rebind(request: dict[str, object]) -> None:
 
 
 class TorchAI42ProbeWorkerTests(unittest.TestCase):
-    def _checkpoint(self, directory: Path, *, name: str = "accepted.pt", seed: int = 7) -> tuple[Path, str]:
+    def _checkpoint(self, directory: Path, *, name: str = "checkpoint.pt", seed: int = 7) -> tuple[Path, str]:
         torch.manual_seed(seed)
         actor = AI42Actor(**MODEL)
         config = AI42LearnerConfig(model_kwargs=MODEL)
@@ -282,7 +281,6 @@ class TorchAI42ProbeWorkerTests(unittest.TestCase):
                 "entity_layers": 4096,
                 "num_heads": 8,
                 "ff_multiplier": 4096,
-                "timing_bins": 4096,
             }
             _rebind(model_request)
             with mock.patch.object(worker, "AI42Actor") as actor_constructor:

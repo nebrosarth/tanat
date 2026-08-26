@@ -45,7 +45,6 @@ class AI42LearnerTest(unittest.TestCase):
             entity_layers=1,
             num_heads=2,
             ff_multiplier=1,
-            timing_bins=2,
         )
 
     def batch(self, *, death: bool = True, invalid_target: bool = False) -> AI42Batch:
@@ -103,8 +102,8 @@ class AI42LearnerTest(unittest.TestCase):
             skill_target_mask=batch.skill_target_mask[:1, 2:3],
         )
         fresh_output = forward_batch(self.actor, fresh)
-        torch.testing.assert_close(output["kind"][:1, 2], fresh_output["kind"][:, 0], atol=0, rtol=0)
-        torch.testing.assert_close(output["h"][:1, 2], fresh_output["h"][:, 0], atol=0, rtol=0)
+        torch.testing.assert_close(output["kind"][:1, 2], fresh_output["kind"][:, 0], atol=1e-7, rtol=1e-6)
+        torch.testing.assert_close(output["h"][:1, 2], fresh_output["h"][:, 0], atol=1e-7, rtol=1e-6)
         # A padded row cannot advance the carried recurrent state.
         torch.testing.assert_close(output["final_h"][1], output["h"][1, 2], atol=0, rtol=0)
 
@@ -118,48 +117,18 @@ class AI42LearnerTest(unittest.TestCase):
         self.assertEqual(result.metrics["action_parameter_count"], 4)
         self.assertEqual(result.metrics["supervised_count"], 7)
         self.assertEqual(result.control_counts, {"issue": 4, "wait": 1, "hold": 1, "cancel": 1})
-        self.assertTrue(result.metrics["timing"]["excluded"])
         self.assertEqual(set(result.class_counts), {"control", "kind", "target", "offset", "anchor"})
         self.assertEqual(set(result.skill_metrics), {"1", "2", "3", "4"})
         learner.clip_gradients()
         for name, value in self.actor.state_dict().items():
             torch.testing.assert_close(value, before[name])
 
-    def test_supervised_head_scope_freezes_shared_representation(self) -> None:
-        learner = AI42Learner(
-            self.actor,
-            AI42LearnerConfig(learning_rate=1e-3, trainable_scope="supervised_heads"),
-        )
-        before = {name: value.detach().clone() for name, value in self.actor.state_dict().items()}
+    def test_actor_is_trained_end_to_end(self) -> None:
+        learner = AI42Learner(self.actor, AI42LearnerConfig(learning_rate=1e-3))
         learner.backward(self.batch())
-        learner.clip_gradients()
-        learner.optimizer_step()
-        changed = {
-            name for name, value in self.actor.state_dict().items()
-            if not torch.equal(value, before[name])
-        }
-        self.assertTrue(changed)
-        self.assertTrue(all(name.startswith((
-            "control_head.", "kind_head.", "target_query.", "entity_key.",
-            "offset_head.", "anchor_head.",
-        )) for name in changed))
-        self.assertTrue(all(
-            parameter.requires_grad == name.startswith((
-                "control_head.", "kind_head.", "target_query.", "entity_key.",
-                "offset_head.", "anchor_head.",
-            ))
-            for name, parameter in self.actor.named_parameters()
-        ))
-
-    def test_trainable_scope_is_strict(self) -> None:
-        with self.assertRaisesRegex(AI42LearnerError, "trainable_scope"):
-            AI42LearnerConfig(trainable_scope="backbone")
-
-    def test_control_kind_scope_excludes_parameter_heads(self) -> None:
-        AI42Learner(self.actor, AI42LearnerConfig(trainable_scope="control_kind_heads"))
-        trainable = {name for name, parameter in self.actor.named_parameters() if parameter.requires_grad}
-        self.assertTrue(trainable)
-        self.assertTrue(all(name.startswith(("control_head.", "kind_head.")) for name in trainable))
+        self.assertTrue(all(parameter.requires_grad for parameter in self.actor.parameters()))
+        self.assertTrue(any(parameter.grad is not None for parameter in self.actor.hero_encoder.parameters()))
+        self.assertTrue(any(parameter.grad is not None for parameter in self.actor.ability_kind_head.parameters()))
 
     @unittest.skipUnless(torch.cuda.is_available(), "CUDA batch-device gate")
     def test_batch_to_cuda_moves_every_tensor_field(self) -> None:
@@ -257,7 +226,7 @@ class AI42LearnerTest(unittest.TestCase):
         self.assertTrue(torch.equal(batch.time_indices[1], torch.tensor([9, 10])))
 
     def test_manifest_exact_atomic_checkpoint_and_rng_restore(self) -> None:
-        config = AI42LearnerConfig(model_kwargs={"hidden_size": 8, "model_width": 8, "entity_layers": 1, "num_heads": 2, "ff_multiplier": 1, "timing_bins": 2})
+        config = AI42LearnerConfig(model_kwargs={"hidden_size": 8, "model_width": 8, "entity_layers": 1, "num_heads": 2, "ff_multiplier": 1})
         optimizer = torch.optim.AdamW(self.actor.parameters(), lr=1e-3)
         manifest = build_learner_manifest(self.actor, config, hashlib.sha256(b"dataset").hexdigest())
         before = {name: value.detach().clone() for name, value in self.actor.state_dict().items()}

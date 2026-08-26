@@ -44,9 +44,8 @@ class _Session:
         offset[:, :, 7] = 10
         anchor = np.zeros((batch, ACTION_KINDS, NAVIGATION_ANCHORS), dtype=np.float32)
         anchor[:, :, 4] = 10
-        timing = np.zeros((batch, ACTION_KINDS, 4), dtype=np.float32)
         return [
-            control, kind, target, offset, anchor, timing, timing.copy(),
+            control, kind, target, offset, anchor,
             feed["h"] + 1, feed["c"] + 1,
         ]
 

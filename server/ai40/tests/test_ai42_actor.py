@@ -32,7 +32,6 @@ class AI42ActorTest(unittest.TestCase):
             entity_layers=2,
             num_heads=4,
             ff_multiplier=2,
-            timing_bins=3,
         ).eval()
         self.hero, self.abilities, self.entities, self.global_state, self.mask = self.inputs()
 
@@ -73,8 +72,6 @@ class AI42ActorTest(unittest.TestCase):
         self.assertEqual(output["target"].shape, (3, ACTION_KINDS, 7))
         self.assertEqual(output["offset"].shape, (3, ACTION_KINDS, NAVIGATION_OFFSETS))
         self.assertEqual(output["anchor"].shape, (3, ACTION_KINDS, NAVIGATION_ANCHORS))
-        self.assertEqual(output["timing"].shape, (3, ACTION_KINDS, 3))
-        self.assertEqual(output["timing_aux"].shape, (3, ACTION_KINDS, 3))
         self.assertIs(output["offset"], output["direction"])
         self.assertIs(output["anchor"], output["distance"])
         self.assertNotIn("value", output)
@@ -89,7 +86,7 @@ class AI42ActorTest(unittest.TestCase):
             entities=self.entities[:, permutation],
             entity_mask=self.mask[:, permutation],
         )
-        for key in ("control", "kind", "offset", "anchor", "timing", "timing_aux", "h", "c"):
+        for key in ("control", "kind", "offset", "anchor", "h", "c"):
             torch.testing.assert_close(output[key], permuted[key], rtol=1e-5, atol=1e-6)
         torch.testing.assert_close(
             permuted["target"], output["target"][:, :, permutation], rtol=1e-5, atol=1e-6,
@@ -127,6 +124,17 @@ class AI42ActorTest(unittest.TestCase):
         self.assertGreater(
             float((ability_output["kind"] - self.run_policy()["kind"]).abs().sum()), 1e-6,
         )
+
+    def test_each_ability_token_scores_its_own_skill_kind(self):
+        with torch.no_grad():
+            self.policy.ability_to_hero.weight.zero_()
+            self.policy.ability_to_hero.bias.zero_()
+        baseline = self.run_policy()
+        changed = self.abilities.clone()
+        changed[:, 0, 0] += 10
+        updated = self.run_policy(abilities=changed)
+        self.assertGreater(float((updated["kind"][:, 3] - baseline["kind"][:, 3]).abs().sum()), 1e-6)
+        torch.testing.assert_close(updated["kind"][:, 4:7], baseline["kind"][:, 4:7])
 
     def test_recurrent_state_changes_per_hero_temporal_outputs(self):
         initial = self.policy.initial_state(3, torch.device("cpu"))
@@ -168,14 +176,13 @@ class AI42ActorTest(unittest.TestCase):
         self.assertEqual(selected["target"].shape, (3, 7))
         self.assertEqual(selected["offset"].shape, (3, NAVIGATION_OFFSETS))
         self.assertEqual(selected["anchor"].shape, (3, NAVIGATION_ANCHORS))
-        self.assertEqual(selected["timing"].shape, (3, 3))
         torch.testing.assert_close(selected["direction"], selected["offset"])
         torch.testing.assert_close(selected["distance"], selected["anchor"])
 
     def test_production_default_is_in_target_parameter_range(self):
         policy = AI42Actor()
-        self.assertGreaterEqual(parameter_count(policy), 8_000_000)
-        self.assertLessEqual(parameter_count(policy), 25_000_000)
+        self.assertGreaterEqual(parameter_count(policy), 2_000_000)
+        self.assertLessEqual(parameter_count(policy), 6_000_000)
 
 
 if __name__ == "__main__":

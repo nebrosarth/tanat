@@ -80,7 +80,7 @@ WORKER_TIMEOUT="5m"
 # Arrays preserve each user value as one argument; exec/go never invokes a
 # shell for the worker or for user-supplied paths and flags. The selected
 # interpreter is passed as a fixed path; worker module selection remains in Go.
-native_args=(run ./cmd/ai42preflight --config "$PACKAGE_ROOT/config/ai42_bc_preflight.json")
+native_args=(run ./cmd/ai42preflight --config "$PACKAGE_ROOT/config/ai42_bc_training.json")
 native_args+=("$@")
 native_args+=(
     --torch-python "$PYTHON_BIN"

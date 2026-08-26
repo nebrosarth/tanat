@@ -14,7 +14,6 @@ from .env import (
     self_play_rosters,
 )
 if TYPE_CHECKING:
-    from .critic_ai42 import AI42CentralizedCritic, AI42Critic
     from .model_ai42_actor import AI42Actor, AI42MicroActor, AI42Policy
 
 __all__ = [
@@ -30,8 +29,6 @@ __all__ = [
     "AI42Actor",
     "AI42MicroActor",
     "AI42Policy",
-    "AI42CentralizedCritic",
-    "AI42Critic",
 ]
 
 
@@ -45,13 +42,6 @@ def __getattr__(name: str):
             "AI42Actor": AI42Actor,
             "AI42MicroActor": AI42MicroActor,
             "AI42Policy": AI42Policy,
-        }
-    elif name in {"AI42CentralizedCritic", "AI42Critic"}:
-        from .critic_ai42 import AI42CentralizedCritic, AI42Critic
-
-        exports = {
-            "AI42CentralizedCritic": AI42CentralizedCritic,
-            "AI42Critic": AI42Critic,
         }
     else:
         raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

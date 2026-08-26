@@ -15,7 +15,7 @@ tests, короткими protocol/inference smoke-проверками и ст�
 ## 2. Архитектурные принципы
 
 - Actor получает только доступное конкретному герою состояние с учётом тумана войны.
-- Centralized critic используется только при обучении и может получать полное авторитетное состояние матча; в production inference он отсутствует.
+- На этапе behavior cloning используется только actor. Centralized critic добавляется отдельным модулем при переходе к PPO и может получать полное авторитетное состояние матча; в production inference он отсутствует.
 - Observation, action, teacher trajectory, checkpoint и inference manifest имеют независимые версии и hashes.
 - Одна shared micro-policy обслуживает все аватары; hero/ability embeddings задают специализацию.
 - Командные решения отделены от микроконтроля по частоте, интерфейсу и тестам.
@@ -40,15 +40,18 @@ tests, короткими protocol/inference smoke-проверками и ст�
 
 ### 3.2 Micro actor
 
-- 2–4 entity-attention блока, model width 256–384;
+- текущая BC-baseline: 2 entity-attention блока, model width 192;
 - temporal core: gated recurrent memory либо GTrXL с ограниченной памятью;
 - shared weights и отдельное recurrent state каждого героя;
 - recurrent control head `ISSUE/WAIT/HOLD/CANCEL`, затем для `ISSUE`
-  autoregressive heads `action kind -> target -> point/anchor -> timing`;
+  heads `action kind -> target -> point/anchor`;
 - отдельные контексты для навыков, телепортации и расходников;
 - macro assignment входит в actor observation как условие, а не как безусловная команда: retreat, stun, death и safety имеют приоритет.
 
-Micro-policy работает с текущей частотой 5 Гц. Целевой начальный размер модели — 8–25 млн параметров.
+Micro-policy работает с текущей частотой 5 Гц. Compact BC-baseline содержит
+2,181,609 параметров. Размер увеличивается только при подтверждённом underfit на
+train и validation; timing head возвращается только после появления исполняемого
+сервером duration/repeat-контракта.
 
 ### 3.3 Team macro policy
 
@@ -71,7 +74,8 @@ Macro-policy не выдаёт координат движения и не уп�
 
 ### 3.4 Centralized multi-head critic
 
-Critic получает полное состояние только в learner:
+Critic не входит в текущий BC-контур. На этапе PPO он получает полное состояние
+только в learner:
 
 - все десять героев и скрытые server-authoritative сущности;
 - состояния линий, построек, волн и cooldown;
@@ -156,7 +160,7 @@ Dataset pipeline обязан публиковать class balance и accuracy/l
 ## 7. Риски и решения
 
 - **Недостоверная симуляция:** обучение блокируется до прохождения protocol и gameplay invariants.
-- **Слишком большая модель:** начинать с width 256 и измерять inference/learner memory до расширения.
+- **Слишком большая модель:** начинать с width 192 и измерять underfit, inference и learner throughput до расширения.
 - **Transformer instability:** gated/pre-norm blocks, gradient clipping и recurrent baseline остаются обязательным ablation.
 - **Macro/micro конфликт:** versioned assignment contract и server safety priority.
 - **Reward hacking:** component returns, win-rate evaluation и scripted/historical opponents анализируются раздельно.
@@ -173,11 +177,16 @@ Dataset pipeline обязан публиковать class balance и accuracy/l
 
 ## 9. Статус реализации на 2026-08-25
 
-Реализованы P0-P7 и предобучающий actor-BC контур: immutable AI-30 dataset,
+Реализованы protocol/actor/dataset/export/preflight части P0-P2 и P5-P7, а
+также предобучающий actor-BC контур: immutable AI-30 dataset,
 match-disjoint split, recurrent batching, explicit `ISSUE/WAIT/HOLD/CANCEL`
 loss, exact atomic checkpoints, native control-first runtime и отдельные
 no-training preflight/smoke команды. Skill-навигация v13 закреплена как
 `offset81_only`; фиктивные skill anchors отклоняются.
+
+P3 centralized critic и отдельная learned P4 macro-policy отложены до PPO и
+появления соответствующих returns/teacher labels. Скриптовый orchestrator и
+macro assignment в observation при этом остаются частью среды.
 
 Cross-language hash v13 закреплён golden-значением
 `915e2e4547ccf727567304839f4780c60d48521f3dd1f0dbef7c4a5cc9131274`.
@@ -215,7 +224,8 @@ Native 8-match pilot записал 17,513 ticks за 8.58 s collection time и 
 s wall time. V2 был скомпактирован без decompression и rerun: устранено около
 1.012 GB metadata overhead при сохранении compressed payload и hashes.
 
-Удалённые тесты: 13 passed. CUDA BC preflight прошёл с 12,118,772 params,
+Историческая проверка actor-v1: 13 удалённых тестов passed. CUDA BC preflight
+прошёл с 12,118,772 params,
 finite loss `13.3901386261`, grad norm `11.6460485458`, checkpoint roundtrip
 `true` и `parameters_unchanged true`; `training_implemented false`. Optimizer
 step и training в этом preflight не выполнялись. Live deployment не выполнялся
@@ -249,7 +259,7 @@ python -m tanat_ai40.train_ai42_bc `
 периодический и финальный candidate публикуются как `latest.pt`. Accepted
 promotion создаёт новую immutable generation, валидирует полный digest pointer,
 checkpoint и сериализованных artifact hashes, затем атомарно публикует
-`accepted_pointer.json`; `accepted.pt` и `best.pt` — только compatibility aliases.
+`accepted_pointer.json`.
 Конфигурация задаёт `max_steps=1000`; фактический run остановился на 131-м
 шаге из-за 300-секундного deadline.
 
@@ -266,3 +276,18 @@ live-интеграции или корректности gameplay.
 macro-F1 и balanced accuracy; end-to-end action correctness; offset top-k и
 distance; затем повторные 5-minute/resume прогоны и headless evaluation. В
 этом результате не выполнялись live deployment, ONNX или PPO.
+
+### 9.3 Compact actor v2
+
+После аудита архитектуры экспериментальные Q3-Q13 конфиги, неиспользуемые
+timing heads, standalone macro network и centralized critic удалены из текущего
+BC product surface. Actor уменьшен до width 192, двух attention blocks и
+2,181,609 параметров. Skill1-Skill4 получают отдельные logits из собственных
+ability tokens; обучение всегда end-to-end, class weights формируются только по
+immutable train profile. Accepted checkpoint публикуется одним механизмом:
+immutable generation плюс атомарный `accepted_pointer.json`.
+
+Actor-v2 checkpoint-несовместим с actor-v1. Первый v2 run начинается с
+детерминированной инициализации seed 4242; следующие итерации используют
+warm-start после native preflight. До нового измерения старые результаты 9.1 и
+9.2 являются историческим baseline, а не оценкой compact v2.

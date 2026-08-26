@@ -59,7 +59,6 @@ class AI42RuntimeTest(unittest.TestCase):
             entity_layers=1,
             num_heads=2,
             ff_multiplier=1,
-            timing_bins=2,
         ).eval()
         with torch.no_grad():
             self.actor.control_head.bias.fill_(-100.0)
@@ -83,8 +82,6 @@ class AI42RuntimeTest(unittest.TestCase):
             "target": torch.tensor([[False, True] + [False] * (entity_slots - 2)] * 8),
             "offset": torch.tensor([[False] * 5 + [True] + [False] * 75] * 8),
             "anchor": torch.tensor([[False, False, False, True] + [False] * 11] * 8),
-            "timing": torch.tensor([[False, True]] * 8),
-            "timing_aux": torch.tensor([[True, False]] * 8),
         }
 
     def test_runtime_import_is_actor_only_and_has_no_live_profile_wiring(self) -> None:
@@ -165,8 +162,6 @@ class AI42RuntimeTest(unittest.TestCase):
         self.assertEqual(dict(result.action)["target"], 1)
         self.assertEqual(dict(result.action)["offset"], 5)
         self.assertEqual(dict(result.action)["anchor"], 3)
-        self.assertEqual(dict(result.action)["timing"], 1)
-        self.assertEqual(dict(result.action)["timing_aux"], 0)
 
         bad = self.observation()
         bad["hero"][0] = float("nan")
@@ -215,11 +210,9 @@ class AI42RuntimeTest(unittest.TestCase):
                     self.assertEqual(result["target"], 1)
                     self.assertEqual(result["offset"], 5)
                     self.assertEqual(result["anchor"], 3)
-                    self.assertEqual(result["timing"], 1)
-                    self.assertEqual(result["timing_aux"], 0)
                 else:
                     for field in (
-                        "kind", "target", "offset", "anchor", "timing", "timing_aux",
+                        "kind", "target", "offset", "anchor",
                     ):
                         self.assertEqual(result[field], -1)
 

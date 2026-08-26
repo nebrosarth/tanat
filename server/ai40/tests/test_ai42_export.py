@@ -16,7 +16,6 @@ try:
 except (ImportError, OSError):
     ort = None
 
-from tanat_ai40.critic_ai42 import AI42CentralizedCritic
 from tanat_ai40.env import (
     ABILITY_COUNT,
     ABILITY_FEATURES,
@@ -83,7 +82,6 @@ class AI42ExportTest(unittest.TestCase):
             entity_layers=1,
             num_heads=2,
             ff_multiplier=1,
-            timing_bins=2,
         ).eval()
 
     def inputs(self, batch: int = 2) -> tuple[torch.Tensor, ...]:
@@ -105,18 +103,17 @@ class AI42ExportTest(unittest.TestCase):
             "hero", "abilities", "entities", "global_state", "entity_mask", "h", "c",
         ])
         self.assertEqual([*ACTOR_OUTPUT_NAMES], [
-            "control", "kind", "target", "offset", "anchor", "timing", "timing_aux",
-            "next_h", "next_c",
+            "control", "kind", "target", "offset", "anchor", "next_h", "next_c",
         ])
         self.assertEqual(tuple(output[0].shape), (1, 4))
         self.assertEqual(tuple(output[1].shape), (1, 8))
         self.assertEqual(tuple(output[-1].shape), (1, 8))
 
-    def test_critic_cannot_be_exported(self) -> None:
+    def test_non_actor_cannot_be_exported(self) -> None:
         with self.assertRaises(TypeError):
-            AI42ActorONNXWrapper(AI42CentralizedCritic(test_size=True))  # type: ignore[arg-type]
+            AI42ActorONNXWrapper(torch.nn.Linear(2, 2))  # type: ignore[arg-type]
         with self.assertRaises(TypeError):
-            export_ai42_actor(AI42CentralizedCritic(test_size=True), "unused.onnx")  # type: ignore[arg-type]
+            export_ai42_actor(torch.nn.Linear(2, 2), "unused.onnx")  # type: ignore[arg-type]
 
     def test_export_passes_named_dynamic_batch_interface(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

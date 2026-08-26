@@ -16,11 +16,11 @@ The request shape is intentionally narrow::
       "device": "cpu",
       "model": {"hidden_size": 8, "model_width": 8,
                 "entity_layers": 1, "num_heads": 2,
-                "ff_multiplier": 1, "timing_bins": 2},
+                "ff_multiplier": 1},
       "learner": {"learning_rate": 0.0003, "weight_decay": 0.0001,
                    "class_balance_power": 0.5,
                    "max_gradient_norm": 1.0},
-      "warm_start": {"path": "accepted.pt", "sha256": "..."},
+      "warm_start": {"path": "checkpoint.pt", "sha256": "..."},
       "batch": {"kind": "inline", "sha256": "...", "value": { ... }}
     }
 
@@ -98,11 +98,11 @@ _REQUEST_FIELDS = frozenset({
 })
 _MODEL_FIELDS = frozenset({
     "hidden_size", "model_width", "entity_layers", "num_heads",
-    "ff_multiplier", "timing_bins",
+    "ff_multiplier",
 })
 _LEARNER_FIELDS = frozenset({
     "learning_rate", "weight_decay", "class_balance_power",
-    "max_gradient_norm", "head_weights", "class_weights", "trainable_scope",
+    "max_gradient_norm", "head_weights", "class_weights",
 })
 _LEARNER_REQUIRED = frozenset({
     "learning_rate", "weight_decay", "class_balance_power", "max_gradient_norm",
@@ -399,7 +399,6 @@ def _estimated_model_parameters(model: Mapping[str, Any]) -> int:
     width = int(model["model_width"])
     layers = int(model["entity_layers"])
     multiplier = int(model["ff_multiplier"])
-    timing_bins = int(model["timing_bins"])
 
     def linear(inputs: int, outputs: int) -> int:
         return inputs * outputs + outputs
@@ -425,12 +424,12 @@ def _estimated_model_parameters(model: Mapping[str, Any]) -> int:
     total += 16 * hidden * width + 4 * hidden * hidden + 8 * hidden
     total += projection(hidden, width)
     total += linear(hidden, 4)
-    total += linear(hidden, ACTION_KINDS)
+    total += linear(hidden, ACTION_KINDS - ABILITY_COUNT)
+    total += linear(width, 1)
     total += ACTION_KINDS * width
     total += 2 * linear(width, width)
     total += linear(width, NAVIGATION_OFFSETS)
     total += linear(width, NAVIGATION_ANCHORS)
-    total += 2 * linear(width, timing_bins)
     return total
 
 
@@ -573,10 +572,6 @@ def _validate_request(request: Any) -> dict[str, Any]:
         for name, item in learner["head_weights"].items():
             _string(name, "request.learner.head_weights key")
             _finite_number(item, f"request.learner.head_weights[{name!r}]")
-    if "trainable_scope" in learner:
-        scope = _string(learner["trainable_scope"], "request.learner.trainable_scope")
-        if scope not in {"all", "supervised_heads", "control_kind_heads"}:
-            raise TorchPreflightError("request.learner.trainable_scope is invalid", code="schema_error")
     if "class_weights" in learner:
         if not isinstance(learner["class_weights"], Mapping):
             raise TorchPreflightError("request.learner.class_weights must be an object", code="schema_error")
@@ -703,8 +698,6 @@ def run_preflight(request: Mapping[str, Any]) -> dict[str, Any]:
         for name in ("head_weights", "class_weights"):
             if name in validated["learner"]:
                 learner_kwargs[name] = validated["learner"][name]
-        if "trainable_scope" in validated["learner"]:
-            learner_kwargs["trainable_scope"] = validated["learner"]["trainable_scope"]
         config = AI42LearnerConfig(model_kwargs=model_kwargs, **learner_kwargs)
 
         warm_spec = validated["warm_start"]

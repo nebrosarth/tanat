@@ -147,8 +147,8 @@ class AI42ActorSmokeTests(unittest.TestCase):
     def test_smoke_checks_shape_for_every_actor_output(self) -> None:
         real_forward = AI42Actor.forward
         output_names = (
-            "control", "kind", "target", "offset", "anchor", "timing",
-            "timing_aux", "direction", "distance", "h", "c",
+            "control", "kind", "target", "offset", "anchor",
+            "direction", "distance", "h", "c",
         )
         for name in output_names:
             with self.subTest(name=name):
